@@ -82,7 +82,7 @@ VR Video Passthrough Server does not train matting models itself. It consumes up
 ## Notes
 
 - The codebase is currently tuned for a local Windows machine rather than a hosted deployment.
-- Alpha passthrough is exposed as a virtual DLNA item named `Alpha Passthrough`.
+- Alpha passthrough is exposed as a virtual DLNA item named `VR Passthrough Server`.
 - The current pipeline is tuned for VR180 half-equirectangular sources rather than generic 360-degree or flat video workflows.
 - See [README.zh-CN.md](README.zh-CN.md) for the Chinese version.
 

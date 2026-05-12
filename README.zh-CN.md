@@ -84,7 +84,7 @@ VR视频透视服务器 本身不训练抠像模型，只使用下列上游项�
 ## 说明
 
 - 本项目当前主要面向本地 Windows 机器运行，而不是作为托管服务部署。
-- Alpha 直通在 DLNA 中显示为虚拟条目 `Alpha Passthrough`。
+- Alpha 直通在 DLNA 中显示为虚拟条目 `VR Passthrough Server`。
 - 英文版请见 [README.md](README.md)。
 
 ## 许可
