@@ -1,0 +1,243 @@
+﻿"""PyNvVideoCodec adapters for GPU-resident NV12 decode and encode.
+
+The wrappers expose decoded CUDA Array Interface planes to CuPy and wrap the
+contiguous composited NV12 buffer as the AppFrame shape expected by the PyNv
+encoder. Keeping this boundary small limits PyNv-specific assumptions in the
+rest of the server.
+"""
+from __future__ import annotations
+
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
+
+
+@dataclass(frozen=True)
+class CudaPlane:
+    """A CUDA Array Interface plane owned by a PyNvVideoCodec DecodedFrame."""
+
+    view: Any
+    owner: Any
+    shape: tuple[int, ...]
+    strides: tuple[int, ...]
+    dtype: str
+    ptr: int
+    readonly: bool
+
+    @classmethod
+    def from_view(cls, view: Any, owner: Any) -> "CudaPlane":
+        cai = getattr(view, "__cuda_array_interface__", None)
+        if not cai:
+            raise TypeError(f"object does not expose CUDA Array Interface: {type(view)!r}")
+        data = cai.get("data")
+        if not data or not isinstance(data, tuple):
+            raise TypeError(f"invalid CUDA Array Interface data field: {data!r}")
+        return cls(
+            view=view,
+            owner=owner,
+            shape=tuple(cai["shape"]),
+            strides=tuple(cai.get("strides") or ()),
+            dtype=str(cai["typestr"]),
+            ptr=int(data[0]),
+            readonly=bool(data[1]),
+        )
+
+    @property
+    def nbytes(self) -> int:
+        if not self.shape:
+            return 0
+        if self.strides:
+            return max(1, self.shape[0] * self.row_stride_bytes)
+        n = 1
+        for dim in self.shape:
+            n *= dim
+        return n * self.itemsize
+
+    @property
+    def itemsize(self) -> int:
+        if self.dtype in {"|u1", "uint8", "u1"}:
+            return 1
+        if self.dtype in {"<u2", ">u2", "|u2", "uint16", "u2"}:
+            return 2
+        if self.dtype and self.dtype[-1:].isdigit():
+            try:
+                return int(self.dtype[-1])
+            except Exception:
+                pass
+        return 1
+
+    @property
+    def row_stride_bytes(self) -> int:
+        if self.strides:
+            stride = int(self.strides[0])
+            # PyNvVideoCodec reports P016/P010 plane strides as element counts
+            # even though CUDA Array Interface normally uses byte strides.
+            if self._strides_are_elements():
+                return stride * self.itemsize
+            return stride
+        width = int(self.shape[1]) if len(self.shape) > 1 else int(self.shape[0] if self.shape else 0)
+        return width * self.itemsize
+
+    def _strides_are_elements(self) -> bool:
+        return bool(self.itemsize > 1 and self.strides and any(int(s) % self.itemsize for s in self.strides))
+
+    @property
+    def cupy_strides(self) -> tuple[int, ...] | None:
+        if not self.strides:
+            return None
+        if self.itemsize <= 1:
+            return self.strides
+        if self._strides_are_elements():
+            return tuple(int(s) * self.itemsize for s in self.strides)
+        return self.strides
+
+    def as_cupy(self, dtype=None):
+        """Return a zero-copy CuPy ndarray view over the plane."""
+        import cupy as cp
+
+        cp_dtype = dtype or (cp.uint16 if self.itemsize == 2 else cp.uint8)
+        mem = cp.cuda.UnownedMemory(self.ptr, self.nbytes, self.owner)
+        mp = cp.cuda.MemoryPointer(mem, 0)
+        return cp.ndarray(self.shape, dtype=cp_dtype, memptr=mp, strides=self.cupy_strides)
+
+
+@dataclass(frozen=True)
+class GpuNv12Frame:
+    """GPU-resident NV12 frame decoded by PyNvVideoCodec."""
+
+    owner: Any
+    y: CudaPlane
+    uv: CudaPlane
+    width: int
+    height: int
+    pts: int
+
+    @classmethod
+    def from_decoded_frame(cls, frame: Any, width: int, height: int) -> "GpuNv12Frame":
+        planes = frame.cuda()
+        if len(planes) < 2:
+            raise RuntimeError(f"expected at least 2 NV12 planes, got {len(planes)}")
+        return cls(
+            owner=frame,
+            y=CudaPlane.from_view(planes[0], frame),
+            uv=CudaPlane.from_view(planes[1], frame),
+            width=width,
+            height=height,
+            pts=int(frame.getPTS()),
+        )
+
+
+@dataclass(frozen=True)
+class GpuP016Frame:
+    """GPU-resident 10-bit 4:2:0 frame decoded into P016/P010-like planes."""
+
+    owner: Any
+    y: CudaPlane
+    uv: CudaPlane
+    width: int
+    height: int
+    pts: int
+
+    @classmethod
+    def from_decoded_frame(cls, frame: Any, width: int, height: int) -> "GpuP016Frame":
+        planes = frame.cuda()
+        if len(planes) < 2:
+            raise RuntimeError(f"expected at least 2 P016 planes, got {len(planes)}")
+        y = CudaPlane.from_view(planes[0], frame)
+        uv = CudaPlane.from_view(planes[1], frame)
+        if y.itemsize < 2 or uv.itemsize < 2:
+            raise RuntimeError(f"expected uint16 P016 planes, got y={y.dtype} uv={uv.dtype}")
+        return cls(
+            owner=frame,
+            y=y,
+            uv=uv,
+            width=width,
+            height=height,
+            pts=int(frame.getPTS()),
+        )
+
+
+@dataclass(frozen=True)
+class PyNvVideoInfo:
+    """Basic video metadata reported by PyNvVideoCodec.SimpleDecoder."""
+    width: int
+    height: int
+    fps: float
+    duration: float
+    codec_name: str
+    bitrate: float
+    num_frames: int
+
+
+class PyNvSimpleDecoder:
+    """Thin wrapper around PyNvVideoCodec.SimpleDecoder."""
+
+    def __init__(self, src: Path, gpu_id: int = 0, bit_depth: int = 8):
+        import PyNvVideoCodec as nvc
+
+        self.src = Path(src).resolve()
+        self.gpu_id = gpu_id
+        self.bit_depth = int(bit_depth or 8)
+        self._decoder = nvc.SimpleDecoder(
+            str(self.src),
+            gpu_id=gpu_id,
+            use_device_memory=True,
+            output_color_type=nvc.OutputColorType.NATIVE,
+        )
+        meta = self._decoder.get_stream_metadata()
+        self.info = PyNvVideoInfo(
+            width=int(meta.width),
+            height=int(meta.height),
+            fps=float(meta.average_fps),
+            duration=float(meta.duration),
+            codec_name=str(meta.codec_name),
+            bitrate=float(meta.bitrate),
+            num_frames=int(meta.num_frames),
+        )
+
+    def __len__(self) -> int:
+        return len(self._decoder)
+
+    def frame_at(self, index: int) -> GpuNv12Frame | GpuP016Frame:
+        frame = self._decoder[index]
+        if self.bit_depth > 8:
+            return GpuP016Frame.from_decoded_frame(frame, self.info.width, self.info.height)
+        return GpuNv12Frame.from_decoded_frame(frame, self.info.width, self.info.height)
+
+    def stop(self) -> None:
+        stop = getattr(self._decoder, "stop", None)
+        if callable(stop):
+            try:
+                stop()
+            except AttributeError:
+                # PyNvVideoCodec 2.1.0 exposes SimpleDecoder.stop() in Python,
+                # but the wrapped native object does not implement stop().
+                pass
+
+
+class CudaArrayView:
+    """Expose a CuPy array slice through CUDA Array Interface for PyNv."""
+    def __init__(self, arr: Any):
+        self.arr = arr
+
+    @property
+    def __cuda_array_interface__(self):
+        cai = dict(self.arr.__cuda_array_interface__)
+        cai["shape"] = tuple(cai["shape"])
+        if cai.get("strides") is not None:
+            cai["strides"] = tuple(cai["strides"])
+        return cai
+
+
+class GpuNv12AppFrame:
+    """AppFrame wrapper accepted by PyNvVideoCodec encoder for GPU NV12 input."""
+
+    def __init__(self, nv12_dev: Any, width: int, height: int):
+        self.nv12_dev = nv12_dev
+        self.width = int(width)
+        self.height = int(height)
+        self.y = CudaArrayView(nv12_dev[: self.height, :].reshape(self.height, self.width, 1))
+        self.uv = CudaArrayView(nv12_dev[self.height :, :].reshape(self.height // 2, self.width // 2, 2))
+
+    def cuda(self):
+        return [self.y, self.uv]

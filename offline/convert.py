@@ -1,0 +1,210 @@
+﻿"""Offline passthrough conversion CLI used by the desktop UI.
+
+The implementation delegates to the currently validated offline conversion
+scripts while keeping UI-facing entry points outside tools/.
+"""
+from __future__ import annotations
+
+import argparse
+import os
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+VIDEO_EXTS = {".mp4", ".mkv", ".mov", ".m4v"}
+
+ENGINES = {
+    "rvm_fast": ("rvm", ROOT / "models" / "rvm_mobilenetv3_fp32.onnx"),
+    "rvm_balanced": ("rvm", ROOT / "models" / "rvm_resnet50_fp32.onnx"),
+    "matanyone2": ("matanyone2_onnx", None),
+}
+
+ENGINE_TAGS = {
+    "rvm_fast": "rvm1",
+    "rvm_balanced": "rvm2",
+    "matanyone2": "matanyone2",
+}
+
+RVM_DEFAULT_ARGS = {
+    "input_size": 1024,
+    "skip_frames": 0,
+    "fps": 30.0,
+    "bitrate": "live",
+    "preset": "P5",
+    "cq": -1,
+}
+
+
+def _script_for(mode: str) -> Path:
+    if mode == "alpha":
+        return ROOT / "tools" / "offline_alpha_passthrough.py"
+    if mode == "green":
+        return ROOT / "tools" / "offline_passthrough.py"
+    raise ValueError(f"unsupported mode: {mode}")
+
+
+def _default_out(src: Path, mode: str) -> Path:
+    suffix = "_FISHEYE180_alpha.mp4" if mode == "alpha" else "_passthrough.mp4"
+    return src.with_name(f"{src.stem}{suffix}")
+
+
+def _time_tag(seconds: float) -> str:
+    total = max(0, int(round(seconds)))
+    h, rem = divmod(total, 3600)
+    m, s = divmod(rem, 60)
+    return f"{h:02d}{m:02d}{s:02d}"
+
+
+def _duration_tag(seconds: float) -> str:
+    total = max(0, int(round(seconds)))
+    if total <= 0:
+        return "ALL"
+    if total % 60 == 0:
+        return f"{total // 60}M"
+    return f"{total}S"
+
+
+def _single_out(src: Path, args: argparse.Namespace) -> Path:
+    engine_tag = ENGINE_TAGS[args.engine]
+    start_tag = f"S{_time_tag(args.start)}"
+    duration_tag = _duration_tag(args.duration)
+    suffix = "FISHEYE180_alpha" if args.mode == "alpha" else "passthrough"
+    return src.with_name(f"{src.stem}_{engine_tag}_{start_tag}_{duration_tag}_{suffix}.mp4")
+
+
+def _video_files(root: Path, recursive: bool) -> list[Path]:
+    iterator = root.rglob("*") if recursive else root.iterdir()
+    out: list[Path] = []
+    for path in iterator:
+        if not path.is_file() or path.suffix.lower() not in VIDEO_EXTS:
+            continue
+        if "passthrough" in path.name.lower():
+            continue
+        out.append(path)
+    return sorted(out, key=lambda p: str(p).lower())
+
+
+def _base_cmd(args: argparse.Namespace, src: Path, out: Path) -> list[str]:
+    engine, model = ENGINES[args.engine]
+    cmd = [
+        sys.executable,
+        str(_script_for(args.mode)),
+        str(src),
+        "--engine",
+        engine,
+        "--out",
+        str(out),
+        "--audio",
+        "copy",
+    ]
+    if model is not None:
+        cmd.extend(["--model", str(model)])
+    if args.start > 0:
+        cmd.extend(["--start", str(args.start)])
+    if args.duration > 0:
+        cmd.extend(["--duration", str(args.duration)])
+    fps = float(args.fps or 0.0)
+    if fps > 0:
+        cmd.extend(["--fps", str(fps)])
+    if engine == "rvm":
+        cmd.extend(["--input-size", str(args.input_size)])
+        cmd.extend(["--alpha-stride", str(int(args.skip_frames) + 1)])
+        cmd.append("--sbs-batch")
+        cmd.extend(["--bitrate", str(args.bitrate)])
+        cmd.extend(["--preset", str(args.preset)])
+        cmd.extend(["--cq", str(getattr(args, "cq", RVM_DEFAULT_ARGS["cq"]))])
+    return cmd
+
+
+def _run_one(args: argparse.Namespace, src: Path) -> int:
+    default_out = _single_out(src, args) if getattr(args, "command", "") == "single" else _default_out(src, args.mode)
+    if getattr(args, "out_dir", ""):
+        out = Path(args.out_dir).resolve() / default_out.name
+    else:
+        out = Path(args.out).resolve() if args.out else default_out
+    if out.exists() and args.skip_existing:
+        print(f"[offline] skip existing: {out}")
+        return 0
+    out.parent.mkdir(parents=True, exist_ok=True)
+    cmd = _base_cmd(args, src, out)
+    print("[offline] run: " + subprocess.list2cmdline(cmd), flush=True)
+    env = dict(os.environ)
+    env["PYTHONUNBUFFERED"] = "1"
+    return subprocess.run(cmd, env=env).returncode
+
+
+def _gpu_vram_gb() -> float:
+    exe = shutil.which("nvidia-smi")
+    if not exe:
+        return 0.0
+    try:
+        out = subprocess.check_output(
+            [exe, "--query-gpu=memory.total", "--format=csv,noheader,nounits"],
+            text=True,
+            stderr=subprocess.DEVNULL,
+        )
+        first = out.strip().splitlines()[0]
+        return float(first.strip()) / 1024.0
+    except Exception:
+        return 0.0
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description="Offline passthrough converter")
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    single = sub.add_parser("single", help="convert one video")
+    single.add_argument("video")
+    single.add_argument("--out", default="")
+    single.add_argument("--out-dir", default="")
+    single.add_argument("--mode", choices=["green", "alpha"], default="green")
+    single.add_argument("--engine", choices=sorted(ENGINES), default="rvm_fast")
+    single.add_argument("--start", type=float, default=0.0)
+    single.add_argument("--duration", type=float, default=0.0)
+    single.add_argument("--fps", type=float, default=RVM_DEFAULT_ARGS["fps"])
+    single.add_argument("--input-size", type=int, default=RVM_DEFAULT_ARGS["input_size"])
+    single.add_argument("--skip-frames", type=int, choices=[0, 1, 2], default=RVM_DEFAULT_ARGS["skip_frames"])
+    single.add_argument("--bitrate", default=RVM_DEFAULT_ARGS["bitrate"])
+    single.add_argument("--preset", default=RVM_DEFAULT_ARGS["preset"])
+    single.add_argument("--cq", type=int, default=RVM_DEFAULT_ARGS["cq"])
+    single.add_argument("--skip-existing", action="store_true")
+
+    batch = sub.add_parser("batch", help="convert all videos under a directory")
+    batch.add_argument("directory")
+    batch.add_argument("--mode", choices=["green", "alpha"], default="green")
+    batch.add_argument("--engine", choices=sorted(ENGINES), default="rvm_fast")
+    batch.add_argument("--recursive", action=argparse.BooleanOptionalAction, default=True)
+    batch.add_argument("--skip-existing", action="store_true")
+    batch.add_argument("--fps", type=float, default=RVM_DEFAULT_ARGS["fps"])
+    batch.add_argument("--input-size", type=int, default=RVM_DEFAULT_ARGS["input_size"])
+    batch.add_argument("--skip-frames", type=int, choices=[0, 1, 2], default=RVM_DEFAULT_ARGS["skip_frames"])
+    batch.add_argument("--bitrate", default=RVM_DEFAULT_ARGS["bitrate"])
+    batch.add_argument("--preset", default=RVM_DEFAULT_ARGS["preset"])
+    batch.add_argument("--cq", type=int, default=RVM_DEFAULT_ARGS["cq"])
+    batch.set_defaults(out="", start=0.0, duration=0.0)
+
+    args = parser.parse_args(argv)
+    if args.engine == "matanyone2":
+        print("[offline] MatAnyone2 requires an NVIDIA GPU with at least 16GB VRAM.", flush=True)
+        vram = _gpu_vram_gb()
+        if vram < 15.5:
+            print(f"[offline] insufficient GPU VRAM: detected={vram:.1f}GB required=16GB", flush=True)
+            return 2
+    if args.command == "single":
+        return _run_one(args, Path(args.video).resolve())
+
+    root = Path(args.directory).resolve()
+    failures = 0
+    files = _video_files(root, args.recursive)
+    print(f"[offline] batch files={len(files)} root={root}", flush=True)
+    for src in files:
+        rc = _run_one(args, src)
+        if rc != 0:
+            failures += 1
+    return 1 if failures else 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

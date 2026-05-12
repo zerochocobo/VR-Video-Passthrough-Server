@@ -1,0 +1,101 @@
+﻿"""Small local health endpoint available while the main server is warming up.
+
+run_server.bat can expose this on localhost so test automation can tell whether
+the process is alive before uvicorn starts listening on the DLNA HTTP port.
+"""
+from __future__ import annotations
+
+import json
+import threading
+import time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from typing import Any
+
+from utils.logger import get
+
+_lock = threading.Lock()
+_started_at = time.time()
+_state: dict[str, Any] = {
+    "phase": "starting",
+    "message": "process starting",
+    "started_at": _started_at,
+    "updated_at": _started_at,
+}
+_server: ThreadingHTTPServer | None = None
+_thread: threading.Thread | None = None
+
+
+def set_startup_phase(phase: str, message: str = "") -> None:
+    now = time.time()
+    with _lock:
+        _state["phase"] = phase
+        _state["message"] = message
+        _state["updated_at"] = now
+
+
+def get_startup_state() -> dict[str, Any]:
+    now = time.time()
+    with _lock:
+        state = dict(_state)
+    state["uptime_sec"] = round(now - float(state["started_at"]), 3)
+    state["age_sec"] = round(now - float(state["updated_at"]), 3)
+    return state
+
+
+class _StatusHandler(BaseHTTPRequestHandler):
+    server_version = "PTStartupStatus/1.0"
+
+    def do_GET(self) -> None:
+        if self.path.split("?", 1)[0] not in {"/", "/status", "/health"}:
+            self.send_error(404)
+            return
+        body = json.dumps(get_startup_state(), sort_keys=True).encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, fmt: str, *args: Any) -> None:
+        get("startup_status").debug("127.0.0.1 status: " + fmt, *args)
+
+
+def start_startup_status_server(port: int) -> None:
+    global _server, _thread
+    if port <= 0:
+        return
+    if _server is not None:
+        return
+    try:
+        server = ThreadingHTTPServer(("127.0.0.1", port), _StatusHandler)
+    except OSError as e:
+        get("startup_status").warning("startup status port unavailable: 127.0.0.1:%d (%s)", port, e)
+        return
+    server.daemon_threads = True
+    thread = threading.Thread(target=server.serve_forever, name="startup-status", daemon=True)
+    _server = server
+    _thread = thread
+    thread.start()
+    get("startup_status").info("startup status listening on http://127.0.0.1:%d/status", port)
+
+
+def stop_startup_status_server() -> None:
+    global _server, _thread
+    server = _server
+    thread = _thread
+    _server = None
+    _thread = None
+    if server is None:
+        return
+    def _shutdown() -> None:
+        server.shutdown()
+
+    shutdown_thread = threading.Thread(target=_shutdown, name="startup-status-shutdown", daemon=True)
+    shutdown_thread.start()
+    shutdown_thread.join(timeout=1.0)
+    if shutdown_thread.is_alive():
+        get("startup_status").warning("startup status shutdown timed out; closing socket")
+    server.server_close()
+    if thread is not None and thread.is_alive():
+        thread.join(timeout=1.0)

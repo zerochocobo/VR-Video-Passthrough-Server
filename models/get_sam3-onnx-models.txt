@@ -1,0 +1,57 @@
+English
+
+SAM3 ONNX models are not bundled with this project.
+
+Download the exported SAM3 ONNX files from:
+https://huggingface.co/wkentaro/sam3-onnx-models/tree/main
+
+Place the downloaded files directly in this folder:
+`models/sam3_onnx/`
+
+Required files:
+- `sam3_image_encoder.onnx`
+- `sam3_image_encoder.onnx.data`
+- `sam3_decoder.onnx`
+- `sam3_decoder.onnx.data`
+- `sam3_language_encoder.onnx`
+- `sam3_language_encoder.onnx.data`
+
+The `.onnx.data` files are required because the exported SAM3 models use
+external initializers. The `.onnx` files will not load correctly without the
+matching `.onnx.data` files beside them.
+
+This project uses SAM3 only as a bootstrap/prepass model for MatAnyone2
+workflows. If you only use the main realtime passthrough path, SAM3 is not
+required.
+
+Recommended check:
+- verify all six files exist in `models/sam3_onnx/`
+- keep each `.onnx.data` file beside its matching `.onnx` file
+
+中文
+
+SAM3 ONNX 模型不随本项目内置。
+
+请从以下地址下载导出的 SAM3 ONNX 文件：
+https://huggingface.co/wkentaro/sam3-onnx-models/tree/main
+
+下载后，请将文件直接放到：
+`models/sam3_onnx/`
+
+必需文件：
+- `sam3_image_encoder.onnx`
+- `sam3_image_encoder.onnx.data`
+- `sam3_decoder.onnx`
+- `sam3_decoder.onnx.data`
+- `sam3_language_encoder.onnx`
+- `sam3_language_encoder.onnx.data`
+
+`.onnx.data` 文件是必须的，因为这个导出的 SAM3 模型使用了外部
+initializer。没有配套的 `.onnx.data`，`.onnx` 文件无法正确加载。
+
+本项目里，SAM3 只用于 MatAnyone2 的首帧/预处理引导流程。如果只使用
+主实时透传流程，则不需要 SAM3。
+
+建议检查：
+- 确认 `models/sam3_onnx/` 下这 6 个文件都存在
+- 每个 `.onnx.data` 都要和对应的 `.onnx` 放在同一目录

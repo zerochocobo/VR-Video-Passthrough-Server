@@ -1,0 +1,36 @@
+﻿# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+
+*.egg-info
+
+# Virtual environments
+.venv
+.claude
+uv
+set
+
+#other big Files
+*.mp4
+*.pt
+*.aac
+*.ass
+*.srt
+*.psd
+*.spec
+uv.lock
+*.onnx
+*.onnx.data
+
+#cache or prompt
+cache/
+build/
+debug_output/
+runtime_cache/
+prompt/
+reference/
+baseline/
+

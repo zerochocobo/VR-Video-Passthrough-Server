@@ -1,0 +1,433 @@
+﻿# VR Video Passthrough Server - Project Guide
+
+VR Video Passthrough Server is a local DLNA/UPnP media server for VR video playback.
+It exposes a local video library to DLNA clients and can generate a realtime
+passthrough stream by applying RVM video matting, compositing the foreground over
+a green background, and encoding the result for playback.
+
+The current production-oriented path is PyNvVideoCodec + GPU matting + HEVC
+output. The older FFmpeg subprocess pipeline remains available as a fallback and
+for diagnostics.
+
+## Quick Start
+
+Recommended Windows startup profile:
+
+```bat
+run_server.bat
+```
+
+Direct development start:
+
+```bat
+uv run python main.py
+```
+
+Useful environment variables are prefixed with `PT_`. The current production
+defaults live in `config.py`; use `run_server.bat` only as a convenience
+launcher unless temporarily overriding values for diagnostics.
+
+## Current Product Behavior
+
+- DLNA discovery uses SSDP on UDP/1900.
+- HTTP media/control defaults to port `8200`.
+- The advertised server name defaults to `VR Video Passthrough Server` and can be
+  changed with `PT_SERVER_NAME`.
+- The video directory defaults to `G:\Downloads` and can be changed with
+  `PT_VIDEO_DIR`.
+- Physical folders under `VIDEO_DIR` are exposed as DLNA folders.
+- Each normal video is listed as:
+  - the original media item;
+  - a `*-passthrough-live` item.
+- `PT_PASSTHROUGH_OUTPUT_MODE` controls generated live entries:
+  - `green`: existing green-background chroma-key live entry;
+  - `alpha`: experimental DeoVR alpha-packed fisheye live entry titled
+    `Alpha Passthrough`;
+  - `all`: expose both green and alpha live entries.
+- The older pseudo-VOD `/passthrough/{name}` endpoint still exists in HTTP code
+  but is hidden from the DLNA catalog for now.
+- `*-passthrough-live` is directly playable for short videos.
+- For longer videos, `*-passthrough-live` is a chapter container. Entering it
+  shows coarse start points backed by `/passthrough_live/{name}?t=<seconds>`.
+- Live chapter rules:
+  - max items: `PT_PASSTHROUGH_LIVE_CHAPTER_MAX_ITEMS`, default `10`;
+  - minimum interval: `PT_PASSTHROUGH_LIVE_CHAPTER_MIN_INTERVAL_SEC`, default
+    `180` seconds;
+  - first item is always `Play from start` at `0` seconds;
+  - titles use `HH:MM`, not seconds;
+  - computed intervals round up to whole minutes;
+  - candidate starts with `<= 60` seconds remaining are omitted.
+- Files whose name contains `passthrough` are treated as already-derived media
+  and do not get additional passthrough/live virtual entries.
+- Thumbnails are cached and live/passthrough entries reuse the raw thumbnail to
+  avoid loading matting during browsing.
+
+## Top-Level Layout
+
+```text
+VR Video Passthrough Server/
+|-- main.py                    Process entry point and startup sequence.
+|-- config.py                  Global config with PT_* environment overrides.
+|-- run_server.bat             Recommended Windows startup profile.
+|-- pyproject.toml             Python dependencies and project metadata.
+|-- PROJECT.md                 This document.
+|-- dlna/                      UPnP/DLNA discovery and ContentDirectory.
+|-- http_app/                  FastAPI app and HTTP routes.
+|-- pipeline/                  Decode, matting, encode, thumbnail pipelines.
+|-- ui/                        PySide6 desktop UI, pages, i18n, and process control.
+|-- offline/                   Production offline conversion entry points.
+|-- utils/                     Shared helpers for cache, logs, metadata, etc.
+|-- tools/                     Benchmarks, probes, scans, warmup utilities.
+|-- models/                    ONNX matting models.
+|-- videos/                    Default local input video directory.
+|-- runtime_cache/             Runtime caches, thumbnails, and warmup marker.
+|-- debug_output/              Runtime logs and diagnostic outputs.
+|-- baseline/                  Performance baseline records and scan outputs.
+|-- prompt/                    Handover notes and investigation reports.
+```
+
+## Application Entry Points
+
+### `main.py`
+
+Startup order:
+
+1. Configure runtime cache directories before CUDA-heavy imports.
+2. Start the optional local startup-status endpoint.
+3. Run startup GPU warmup when enabled.
+4. Log the active pipeline configuration.
+5. Ensure Windows Firewall rules when possible.
+6. Start the SSDP background thread.
+7. Create the FastAPI app and run uvicorn.
+8. Stop SSDP/status helpers during shutdown.
+
+Shutdown behavior is tuned for Ctrl+C: uvicorn graceful shutdown timeout is kept
+short and KeyboardInterrupt tracebacks are suppressed where possible.
+
+### `config.py`
+
+Central configuration. Most values are overridable with `PT_*` environment
+variables through `_env()` / `_env_any()`.
+
+Important groups:
+
+- Network and DLNA identity: `LAN_IP`, `HTTP_PORT`, `SERVER_NAME`, UUID/USN.
+- Media library: `VIDEO_DIR`, `VIDEO_EXTS`, `PASSTHROUGH_SUFFIX`.
+- Matting: model path, input size, warmup settings.
+- Passthrough encode: container, codec, bitrate, GOP, FPS cap, live chapters.
+- FFmpeg decode: hardware acceleration, output pixel format, optional downscale.
+- Thumbnail timeout and runtime cache settings.
+
+### `run_server.bat`
+
+Windows convenience launcher for real-device testing. Runtime defaults are kept
+in `config.py`; add temporary `set PT_*` lines here only for diagnostics or
+one-off client compatibility tests. The script exits with Python's error code.
+
+## DLNA Package
+
+### `dlna/ssdp.py`
+
+Minimal SSDP responder/notifier:
+
+- listens on `239.255.255.250:1900`;
+- replies to `M-SEARCH`;
+- sends periodic `ssdp:alive` notifications;
+- sends `ssdp:byebye` on shutdown.
+
+### `dlna/descriptions.py`
+
+Builds static UPnP XML documents:
+
+- `/description.xml` device description;
+- `/cds.xml` ContentDirectory SCPD;
+- `/cm.xml` ConnectionManager SCPD.
+
+### `dlna/content_directory.py`
+
+Implements ContentDirectory SOAP Browse logic:
+
+- maps physical subdirectories to DIDL containers (`d:<relative/path>`);
+- emits original video items;
+- emits passthrough-live direct items or chapter containers;
+- generates chapter items with `?t=<seconds>` start offsets;
+- estimates sizes/bitrates for virtual resources;
+- skips derived links for filenames containing `passthrough`.
+
+### `dlna/profiles.py`
+
+Small helpers for DLNA protocolInfo details:
+
+- passthrough DLNA profile name;
+- advertised frame rate when FPS cap is set.
+
+## HTTP App Package
+
+### `http_app/server.py`
+
+FastAPI app factory. It mounts DLNA routes and media routes.
+
+### `http_app/routes_dlna.py`
+
+UPnP HTTP endpoints:
+
+- `GET /description.xml`;
+- `GET /cds.xml`;
+- `GET /cm.xml`;
+- `POST /control/cds`;
+- `POST /control/cm`.
+
+### `http_app/routes_media.py`
+
+Media and passthrough routes:
+
+- `GET /media/{name}`: raw source file with HTTP Range support.
+- `GET /thumb/{name}`: cached JPEG thumbnail.
+- `GET /passthrough_live/{name}`: live passthrough stream, normally MPEG-TS.
+- `HEAD/GET /passthrough/{name}`: pseudo-VOD byte/time-seek experiment; still
+  implemented but hidden from DLNA listings.
+
+This module also owns passthrough concurrency control. The default server allows
+one active passthrough stream at a time to avoid NVENC/NVDEC and shared-matting
+resource contention.
+
+## Pipeline Package
+
+### `pipeline/pynv_stream.py`
+
+Production PyNv passthrough stream:
+
+```text
+PyNv decode -> GPU matting/composite -> PyNv HEVC encode -> FFmpeg mux
+```
+
+Responsibilities:
+
+- PyNv preflight and preflight cache;
+- PyNv decoder/encoder lifecycle;
+- GPU stream synchronization before NVENC reads composited NV12;
+- FFmpeg muxing to fMP4 or MPEG-TS;
+- stderr draining;
+- reader/worker thread coordination;
+- per-stream FPS cap for adaptive live playback;
+- throughput and stage timing diagnostics.
+
+### `pipeline/pynv_io.py`
+
+Thin PyNvVideoCodec adapters:
+
+- exposes decoded GPU NV12 planes through CUDA Array Interface;
+- wraps composited contiguous NV12 CuPy buffers as PyNv encoder AppFrame input.
+
+### `pipeline/matting.py`
+
+ONNX Runtime matting and compositing:
+
+- supports the RVM ONNX matting model used by the realtime path;
+- handles SBS splitting and RVM recurrent state;
+- supports CPU/BGR and GPU/NV12 paths;
+- includes CuPy RawKernel preprocess and composite kernels;
+- exposes the shared `Matter` instance through `get_matter()`.
+
+### `pipeline/ffmpeg_io.py`
+
+Legacy FFmpeg subprocess wrappers:
+
+- `probe()` / `probe_cached()` through ffprobe;
+- `DecoderProcess` for source seek/decode to raw BGR24/NV12;
+- `EncoderProcess` for raw frame input to fMP4/MPEG-TS output.
+
+### `pipeline/stream.py`
+
+Legacy passthrough stream using FFmpeg decode + Matter + FFmpeg encode.
+It remains useful as fallback and for comparing with the PyNv path.
+
+### `pipeline/thumbnail.py`
+
+Thumbnail generation and cache:
+
+- extracts one frame near 10% of duration, capped at 30 seconds;
+- writes JPEG cache files under `runtime_cache/thumbs/`;
+- uses stat-based fingerprints to invalidate stale thumbnails;
+- reuses raw thumbnails for live/passthrough catalog items;
+- has a configurable ffmpeg timeout to avoid browse/shutdown stalls.
+
+## Utils Package
+
+### `utils/cache_key.py`
+
+Stat-sensitive file identity helpers:
+
+- short SHA1 fingerprint from path, size, and mtime;
+- tuple `stat_key()` for in-memory caches.
+
+### `utils/bitrate_estimator.py`
+
+Persistent bitrate/size estimator for virtual passthrough resources:
+
+- default estimates from configured bitrates;
+- EWMA cache of actual emitted bitrate;
+- stat/config keyed to avoid stale hits.
+
+### `utils/video_metadata.py`
+
+ffprobe metadata and backend routing policy:
+
+- color metadata;
+- timing/CFR metadata;
+- codec/pixel-format/bit-depth metadata;
+- PyNv-vs-FFmpeg decision rules;
+- CFR source-index mapping for capped output FPS.
+
+### `utils/gpu_runtime_cache.py`
+
+CUDA/CuPy/ORT runtime cache setup and startup warmup:
+
+- pins cache directories under `runtime_cache/`;
+- builds a model/GPU/provider warmup key;
+- writes `gpu_warmup_marker.json`;
+- uses a warmup lock to avoid concurrent cache builds.
+
+### `utils/startup_status.py`
+
+Tiny localhost status server used during startup warmup so tests can see the
+process is alive before the main DLNA HTTP port is listening.
+
+### `utils/firewall.py`
+
+Windows Firewall helper:
+
+- ensures inbound TCP for HTTP port;
+- ensures inbound UDP/1900 for SSDP;
+- uses direct netsh when elevated or UAC `runas` batch otherwise.
+
+### `utils/logger.py`
+
+Shared logging setup for stdout and `debug_output/server.log`.
+
+## Tools Package
+
+### `tools/bench.py`
+
+Local diagnostics and benchmarks:
+
+- `play`: open a raw or passthrough URL with ffplay;
+- `bench`: pull HTTP output through ffmpeg and report stats;
+- `pipeline`: decode + matting/composite benchmark;
+- `transcode`: decode + matting + encode benchmark;
+- `decode`: decode-only benchmark;
+- `decode-matrix`: split FFmpeg decode/download/pipe costs;
+- `matting`: repeat one-frame matting path tests.
+
+### `tools/scan_videos.py`
+
+Offline library scanner:
+
+- probes metadata for many files;
+- classifies backend decisions;
+- optional strict PyNv first-frame decode test;
+- writes CSV, JSON summary, and baseline text.
+
+### `tools/warmup_gpu_cache.py`
+
+CLI for GPU runtime cache inspection/build:
+
+- print warmup key and marker status;
+- force warmup;
+- check-only mode for startup/install flows.
+
+### PyNv probe tools
+
+Development probes used while building the PyNv path:
+
+- `pynv_decode_probe.py`;
+- `pynv_encode_probe.py`;
+- `pynv_mux_probe.py`;
+- `pynv_transcode_probe.py`;
+- `pynv_matting_probe.py`;
+- `pynv_fullchain_probe.py`.
+
+### Other diagnostics
+
+- `gpu_video_probe.py`: inspect local GPU/video stack.
+- `ort_cold_probe.py`: isolate ONNX Runtime CUDA cold-start behavior.
+
+## Runtime Data Directories
+
+These directories are generated or environment-specific:
+
+- `runtime_cache/thumbs/`: JPEG thumbnails.
+- `runtime_cache/`: CUDA ComputeCache, CuPy cache, ORT cache, warmup marker.
+- `debug_output/`: server log and local diagnostic outputs.
+- `baseline/`: manually kept performance baselines and scan outputs.
+- `.venv/`, `.uv-cache/`: uv/Python environment data.
+
+## Key Configuration Reference
+
+| Variable | Default / Current Intent | Purpose |
+|---|---:|---|
+| `PT_SERVER_NAME` | `VR Video Passthrough Server` | DLNA/SSDP friendly name. |
+| `PT_LAN_IP` | auto-detect | LAN address advertised to DLNA clients. |
+| `PT_HTTP_PORT` | `8200` | HTTP media/control port. |
+| `PT_VIDEO_DIR` | `G:\Downloads` | Media library root. |
+| `PT_MODEL_PATH` | RVM MobileNetV3 fp32 | ONNX matting model. |
+| `PT_MATTING_INPUT_SIZE` | `512` | Matting reference input size. |
+| `PT_MATTING_SPLIT_SBS` | `1` | Split side-by-side VR frames before matting. |
+| `PT_ALPHA_STRIDE` | `3` | Run matting once every N output frames, reuse alpha otherwise. |
+| `PT_USE_PYNV` | `1` | Enable PyNv backend for eligible sources. |
+| `PT_PASSTHROUGH_MAX_FPS` | `30` | Output FPS cap. |
+| `PT_PASSTHROUGH_OUTPUT_MODE` | `green` | Generated passthrough layout: `none`, `green`, `alpha`, or `all` to expose both passthrough entries. |
+| `PT_ALPHA_PASSTHROUGH_TITLE` | `Alpha Passthrough` | DLNA virtual item title when alpha output mode is enabled. |
+| `PT_COMPOSITE_BG_RGB` | `808080` | Green-screen/composite background color as RGB hex. UI presets: `808080`, `C8C8C8`, `2BE640`, `0047BB`. |
+| `PT_PASSTHROUGH_SEND_REALTIME_PACING` | `1` | Pace live HTTP delivery to player-safe bitrate. |
+| `PT_PASSTHROUGH_SEND_PACING_MULTIPLIER` | `2.0` | Multiplier applied to estimated live send bitrate so MPEG-TS/VBV bursts do not starve player buffering. |
+| `PT_PASSTHROUGH_SEND_MIN_BPS` | `100000000` | Minimum paced live HTTP send bitrate. |
+| `PT_PASSTHROUGH_PRODUCER_REALTIME_PACING` | `0` | Optional PyNv worker wall-clock pacing; default off to preserve producer FPS headroom. |
+| `PT_PASSTHROUGH_REALTIME_PACING` | `1` | Compatibility alias for send pacing. |
+| `PT_PASSTHROUGH_HEVC_BITRATE` | `50M` | PyNv HEVC output target bitrate. |
+| `PT_PASSTHROUGH_AUDIO_MPEGTS_OUTPUT_RATE` | `48000` | Live MPEG-TS AAC output sample rate. |
+| `PT_PASSTHROUGH_AUDIO_MPEGTS_OUTPUT_CHANNELS` | `2` | Live MPEG-TS AAC output channels, stereo. |
+| `PT_PASSTHROUGH_AUDIO_MPEGTS_SLATE` | `1` | Use green-screen slate while first AAC cache is built. |
+| `PT_PASSTHROUGH_AUDIO_MPEGTS_SLATE_DIRECT_AFTER` | `1.0` | On cache miss, stop waiting for full AAC cache after this many seconds and feed this playback from direct source demux while the full cache continues. |
+| `PT_PASSTHROUGH_GOP` | `60` | Encoder GOP size. |
+| `PT_PASSTHROUGH_MAX_CONCURRENT` | `1` | Concurrent passthrough stream limit. |
+| `PT_PASSTHROUGH_LIVE_CHAPTER_MIN_INTERVAL_SEC` | `180` | Minimum live chapter spacing and short-video threshold. |
+| `PT_PASSTHROUGH_LIVE_CHAPTER_MAX_ITEMS` | `10` | Max live chapter entries. |
+| `PT_THUMB_FFMPEG_TIMEOUT_SEC` | `3` | Thumbnail extraction timeout. |
+| `PT_STARTUP_GPU_WARMUP` | `1` | Warm CUDA/ORT caches before serving. |
+| `PT_STARTUP_STATUS_PORT` | `8299` | Local status port during warmup. |
+
+## Typical Request Flow
+
+```text
+DLNA client
+  |
+  |-- SSDP M-SEARCH -----------------> dlna/ssdp.py
+  |
+  |-- GET /description.xml ----------> routes_dlna -> descriptions.py
+  |-- POST /control/cds Browse ------> routes_dlna -> content_directory.py
+  |                                      returns folders, raw items, live chapter containers/items
+  |
+  |-- GET /media/{name} -------------> routes_media -> FileResponse with Range
+  |-- GET /thumb/{name} -------------> routes_media -> thumbnail.py -> runtime_cache/thumbs/
+  |
+  |-- GET /passthrough_live/{name}?t=seconds
+        -> routes_media
+        -> PyNvPassthroughStream when eligible
+        -> PyNv decode
+        -> Matter GPU matting/composite
+        -> PyNv HEVC encode
+        -> FFmpeg mux
+        -> StreamingResponse
+```
+
+## Notes for Future Work
+
+- The pseudo-VOD `/passthrough` path is intentionally still in the code but is
+  hidden from DLNA because several clients probe/seek generated media in ways
+  that do not match realtime generation.
+- Live chapter containers are the current coarse seek strategy.
+- Startup GPU warmup is important on systems where ORT CUDA first-run JIT is
+  expensive.
+- Keep handover notes in `prompt/HANDOVER_YYYYMMDD.md` when making meaningful
+  project changes.

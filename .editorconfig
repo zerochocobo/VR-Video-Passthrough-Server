@@ -1,0 +1,11 @@
+﻿root = true
+
+[*]
+end_of_line = crlf
+insert_final_newline = true
+
+[*.{py,md,json,toml,qss,txt,bat,yml,yaml}]
+charset = utf-8-bom
+
+[{.gitignore,.editorconfig,LICENSE}]
+charset = utf-8-bom
