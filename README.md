@@ -8,10 +8,11 @@ VR Video Passthrough Server is a Windows-first VR DLNA media server for local pl
 
 ## Project Origin
 
-I originally wanted to build a VR video passthrough tool. Someone remarked that I was merely reinventing the wheel.
-I replied: "That old wheel from years ago is too outdated. It's time for a new one."
-Seven days later, the new wheel was born.
-This is the miracle of the AI era.
+I originally wanted to build a VR video passthrough tool.   
+Someone said: "You’re just reinventing the wheel."  
+I replied: "That old wheel from years ago is too outdated. It's time for a new one."  
+Seven days later, the new wheel was born.    
+This is the miracle of the AI era.    
 
 ## Features
 
