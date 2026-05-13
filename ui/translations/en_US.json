@@ -11,7 +11,8 @@
   "dialog.warning": "Warning",
   "dialog.stop_server_first": "Please stop the server first to avoid GPU resource conflicts.",
   "dialog.stop_offline_first": "Please stop the offline task first to avoid GPU resource conflicts.",
-  "group.quick_config": "Quick Settings (restart to apply changes)",
+  "group.quick_config_short": "Quick Settings",
+  "group.quick_config": "Quick Settings (restart server to apply changes)",
   "language.system": "Follow system",
   "mode.green": "Green-screen mode",
   "mode.alpha": "Alpha passthrough mode",
@@ -134,4 +135,18 @@
   "startup.copy_report": "Copy hardware report",
   "startup.report_copied": "Copied to clipboard",
   "startup.cancel": "Cancel"
+,
+  "button.close": "Close",
+  "subtitle.style_config": "Style Settings",
+  "player_support.window_title": "Player Support",
+  "player_support.table_title": "Tested on Meta Quest 3",
+  "player_support.player": "Player",
+  "player_support.alpha": "Alpha passthrough",
+  "player_support.gray_green": "Gray green screen",
+  "player_support.chroma_key": "ChromaKey green screen",
+  "player_support.website": "Website",
+  "player_support.notes": "Notes",
+  "player_support.supported": "Supported",
+  "player_support.official_site": "Official site",
+  "player_support.install_notes": "Installation notes"
 }

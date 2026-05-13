@@ -11,7 +11,8 @@
   "dialog.warning": "確認",
   "dialog.stop_server_first": "GPUリソースの競合を避けるため、先にサーバーを停止してください。",
   "dialog.stop_offline_first": "GPUリソースの競合を避けるため、先にオフライン処理を停止してください。",
-  "group.quick_config": "クイック設定（変更後は再起動で反映）",
+  "group.quick_config_short": "クイック設定",
+  "group.quick_config": "クイック設定（変更後はサーバー再起動で反映）",
   "language.system": "システムに従う",
   "mode.green": "グリーンスクリーンモード",
   "mode.alpha": "Alpha透過モード",
@@ -134,4 +135,18 @@
   "startup.copy_report": "ハードウェアレポートをコピー",
   "startup.report_copied": "クリップボードにコピーしました",
   "startup.cancel": "キャンセル"
+,
+  "button.close": "閉じる",
+  "subtitle.style_config": "スタイル設定",
+  "player_support.window_title": "プレイヤー対応状況",
+  "player_support.table_title": "Meta Quest 3 でテスト済み",
+  "player_support.player": "プレイヤー",
+  "player_support.alpha": "Alpha パススルー",
+  "player_support.gray_green": "グレーグリーンスクリーン",
+  "player_support.chroma_key": "ChromaKey グリーンスクリーン",
+  "player_support.website": "Web サイト",
+  "player_support.notes": "備考",
+  "player_support.supported": "対応",
+  "player_support.official_site": "公式サイト",
+  "player_support.install_notes": "インストール説明"
 }

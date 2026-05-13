@@ -572,21 +572,36 @@ class SubtitlePage(QWidget):
         QMessageBox.information(self, self.i18n.t("subtitle.mode_help_title"), self.i18n.t("subtitle.mode_help_msg"))
 
     def load_values(self) -> None:
-        data = self.draft
-        mode = str(data.get("subtitle_mode", "dual"))
-        {"auto": self.mode_dual, "dual": self.mode_dual, "left": self.mode_left, "right": self.mode_right}.get(mode, self.mode_dual).setChecked(True)
-        distance = int(float(data.get("subtitle_distance_m", 4.0)))
-        self.distance.setCurrentIndex(max(0, min(9, distance - 1)))
-        alpha_percent = int(round((1.0 - float(data.get("subtitle_alpha", 1.0))) * 100))
-        self.alpha.setCurrentIndex(max(0, min(7, alpha_percent // 10)))
-        direction = str(data.get("subtitle_direction", "horizontal_bottom"))
-        index = self.direction.findData(direction)
-        if index >= 0:
-            self.direction.setCurrentIndex(index)
-        color = str(data.get("subtitle_color", "") or "")
-        color_index = self.subtitle_color.findData(color)
-        if color_index >= 0:
-            self.subtitle_color.setCurrentIndex(color_index)
+        controls = [
+            self.mode_dual,
+            self.mode_left,
+            self.mode_right,
+            self.distance,
+            self.alpha,
+            self.direction,
+            self.subtitle_color,
+        ]
+        for control in controls:
+            control.blockSignals(True)
+        try:
+            data = self.draft
+            mode = str(data.get("subtitle_mode", "dual"))
+            {"auto": self.mode_dual, "dual": self.mode_dual, "left": self.mode_left, "right": self.mode_right}.get(mode, self.mode_dual).setChecked(True)
+            distance = int(float(data.get("subtitle_distance_m", 4.0)))
+            self.distance.setCurrentIndex(max(0, min(9, distance - 1)))
+            alpha_percent = int(round((1.0 - float(data.get("subtitle_alpha", 1.0))) * 100))
+            self.alpha.setCurrentIndex(max(0, min(7, alpha_percent // 10)))
+            direction = str(data.get("subtitle_direction", "horizontal_bottom"))
+            index = self.direction.findData(direction)
+            if index >= 0:
+                self.direction.setCurrentIndex(index)
+            color = str(data.get("subtitle_color", "") or "")
+            color_index = self.subtitle_color.findData(color)
+            if color_index >= 0:
+                self.subtitle_color.setCurrentIndex(color_index)
+        finally:
+            for control in controls:
+                control.blockSignals(False)
         self.update_region_label()
         self.update_distance_visibility()
 

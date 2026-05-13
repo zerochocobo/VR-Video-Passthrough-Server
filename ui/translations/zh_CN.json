@@ -11,7 +11,8 @@
   "dialog.warning": "提示",
   "dialog.stop_server_first": "请先停止服务器，避免显卡资源冲突",
   "dialog.stop_offline_first": "请先停止离线任务，避免显卡资源冲突",
-  "group.quick_config": "快速配置(修改后重启生效)",
+  "group.quick_config_short": "快速配置",
+  "group.quick_config": "快速配置（修改后重启服务器生效）",
   "language.system": "跟随系统",
   "mode.green": "绿幕模式",
   "mode.alpha": "Alpha直通模式",
@@ -134,4 +135,18 @@
   "startup.copy_report": "复制硬件报告",
   "startup.report_copied": "已复制到剪贴板",
   "startup.cancel": "取消"
+,
+  "button.close": "关闭",
+  "subtitle.style_config": "样式配置",
+  "player_support.window_title": "播放器支持",
+  "player_support.table_title": "基于 Meta Quest 3 设备测试",
+  "player_support.player": "播放器",
+  "player_support.alpha": "Alpha 直通",
+  "player_support.gray_green": "灰色绿幕",
+  "player_support.chroma_key": "ChromaKey 绿幕",
+  "player_support.website": "网站",
+  "player_support.notes": "备注",
+  "player_support.supported": "支持",
+  "player_support.official_site": "官网",
+  "player_support.install_notes": "安装说明"
 }
