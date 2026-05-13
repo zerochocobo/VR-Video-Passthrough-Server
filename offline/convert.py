@@ -45,6 +45,13 @@ def _script_for(mode: str) -> Path:
     raise ValueError(f"unsupported mode: {mode}")
 
 
+def _tool_command(mode: str) -> list[str]:
+    if getattr(sys, "frozen", False):
+        tool = "offline_alpha_passthrough" if mode == "alpha" else "offline_passthrough"
+        return [sys.executable, "tool", tool]
+    return [sys.executable, str(_script_for(mode))]
+
+
 def _default_out(src: Path, mode: str) -> Path:
     suffix = "_FISHEYE180_alpha.mp4" if mode == "alpha" else "_passthrough.mp4"
     return src.with_name(f"{src.stem}{suffix}")
@@ -89,8 +96,7 @@ def _video_files(root: Path, recursive: bool) -> list[Path]:
 def _base_cmd(args: argparse.Namespace, src: Path, out: Path) -> list[str]:
     engine, model = ENGINES[args.engine]
     cmd = [
-        sys.executable,
-        str(_script_for(args.mode)),
+        *_tool_command(args.mode),
         str(src),
         "--engine",
         engine,

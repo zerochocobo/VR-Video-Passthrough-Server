@@ -46,13 +46,47 @@ def _apply_debug_arg(args: argparse.Namespace) -> None:
         config.DEBUG_LOGS = True
 
 
+def _force_line_buffered_stdio() -> None:
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is None:
+            continue
+        try:
+            reconfigure(line_buffering=True, write_through=True)
+        except Exception:
+            pass
+
+
+def _run_legacy_tool(tool_main, tool_name: str, tool_args: list[str]) -> int:
+    _force_line_buffered_stdio()
+    original_argv = sys.argv[:]
+    try:
+        sys.argv = [tool_name, *tool_args]
+        return tool_main()
+    finally:
+        sys.argv = original_argv
+
+
 def main(argv: list[str] | None = None) -> int:
     """Start the DLNA media server process."""
 
     if argv and argv[0] == "offline":
+        _force_line_buffered_stdio()
         from offline.convert import main as offline_main
 
         return offline_main(argv[1:])
+    if argv and argv[0] == "tool":
+        if len(argv) < 2:
+            raise SystemExit("tool name required")
+        tool_name = argv[1]
+        tool_args = argv[2:]
+        if tool_name == "offline_passthrough":
+            from tools.offline_passthrough import main as tool_main
+        elif tool_name == "offline_alpha_passthrough":
+            from tools.offline_alpha_passthrough import main as tool_main
+        else:
+            raise SystemExit(f"unknown tool: {tool_name}")
+        return _run_legacy_tool(tool_main, tool_name, tool_args)
 
     args = _parse_args(argv)
     _apply_debug_arg(args)

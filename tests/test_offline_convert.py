@@ -1,9 +1,11 @@
 ﻿from __future__ import annotations
 
 import shutil
+import sys
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import offline.convert as convert
 
@@ -69,6 +71,24 @@ class OfflineConvertTests(unittest.TestCase):
         self.assertIn("-1", cmd)
         self.assertIn("--audio", cmd)
         self.assertIn("copy", cmd)
+
+    def test_frozen_command_uses_internal_tool_subcommand(self) -> None:
+        args = SimpleNamespace(
+            mode="green",
+            engine="rvm_fast",
+            start=0.0,
+            duration=0.0,
+            fps=30.0,
+            input_size=1024,
+            skip_frames=0,
+            bitrate="live",
+            preset="P5",
+            cq=-1,
+        )
+        with patch.object(sys, "frozen", True, create=True), patch.object(sys, "executable", r"C:\App\pt_core.exe"):
+            cmd = convert._base_cmd(args, Path("input.mp4"), Path("out.mp4"))
+        self.assertEqual(cmd[:3], [r"C:\App\pt_core.exe", "tool", "offline_passthrough"])
+        self.assertNotIn("offline_passthrough.py", cmd[1:3])
 
     def test_balanced_engine_uses_resnet_model(self) -> None:
         args = SimpleNamespace(

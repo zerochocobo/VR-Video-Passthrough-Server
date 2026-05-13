@@ -20,6 +20,7 @@ class SettingsTests(unittest.TestCase):
 
     def test_passthrough_mode_mapping(self) -> None:
         s = self._settings()
+        self.assertEqual(s.passthrough_mode(), "all")
         cases = [
             (False, False, "none"),
             (True, False, "green"),

@@ -89,17 +89,29 @@ def get_startup_state() -> dict[str, Any]:
 class _StatusHandler(BaseHTTPRequestHandler):
     server_version = "PTStartupStatus/1.0"
 
+    def handle(self) -> None:
+        try:
+            super().handle()
+        except (BrokenPipeError, ConnectionAbortedError, ConnectionResetError, OSError) as e:
+            get("startup_status").debug("startup status client disconnected: %s", e)
+
     def do_GET(self) -> None:
         if self.path.split("?", 1)[0] not in {"/", "/status", "/health"}:
-            self.send_error(404)
+            try:
+                self.send_error(404)
+            except (BrokenPipeError, ConnectionAbortedError, ConnectionResetError, OSError) as e:
+                get("startup_status").debug("startup status client disconnected during 404: %s", e)
             return
         body = json.dumps(get_startup_state(), sort_keys=True).encode("utf-8")
-        self.send_response(200)
-        self.send_header("Content-Type", "application/json; charset=utf-8")
-        self.send_header("Cache-Control", "no-store")
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
+        try:
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+        except (BrokenPipeError, ConnectionAbortedError, ConnectionResetError, OSError) as e:
+            get("startup_status").debug("startup status client disconnected during response: %s", e)
 
     def log_message(self, fmt: str, *args: Any) -> None:
         get("startup_status").debug("127.0.0.1 status: " + fmt, *args)
