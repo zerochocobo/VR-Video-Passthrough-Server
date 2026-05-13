@@ -20,6 +20,12 @@ VR视频透视服务器 是一个以 Windows 为主要运行平台的 VR DLNA �
 - 字幕预览与字幕样式配置
 - 面向 8K 级源视频的显存与吞吐优化，尽量保持硬件可承受范围内的实时 30fps 输出
 
+## 透视视频效果图
+
+| Alpha Passthrough | 绿幕 Passthrough |
+| --- | --- |
+| ![Alpha Passthrough 效果图](resources/sample_alpha.jpg) | ![绿幕 Passthrough 效果图](resources/sample_green.jpg) |
+
 ## 运行要求
 
 - Windows 10 / 11
@@ -38,6 +44,18 @@ uv run python main.py
 ```bash
 uv run python -m ui.app
 ```
+
+## 支持的 VR 视频播放器
+
+基于 Meta Quest 3 设备测试。
+
+| 播放器 | Alpha 直通 | 灰色绿幕 | ChromaKey 绿幕 | 网站 | 备注 |
+| --- | --- | --- | --- | --- | --- |
+| Skybox VR Player 2.0.2 Preview | 支持 | - | 支持 | [官网](https://skybox.xyz) | [安装说明](https://forum.skybox.xyz/d/2920-skybox-quest-v202-preview-performance-improvements) |
+| Moon Player | - | 支持 | 支持 | [官网](https://moonvrplayer.com) | - |
+| 4XVR Video Player | 支持 | - | 支持 | [官网](https://www.4xvr.net/) | - |
+| DeoVR player | 支持 | - | 支持 | [官网](https://deovr.com/) | - |
+| HereSphere VR Video Player | 支持 | - | 支持 | [官网](https://heresphere.com/) | - |
 
 ## 配置说明
 

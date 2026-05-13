@@ -18,6 +18,12 @@ VR Video Passthrough Server is a Windows-first VR DLNA media server for local pl
 - Subtitle preview and style configuration
 - Aggressive VRAM-aware pipeline tuning aimed at keeping realtime output smooth, including 8K-class source playback targets where the hardware can sustain them
 
+## Passthrough Output Examples
+
+| Alpha Passthrough | Green-screen Passthrough |
+| --- | --- |
+| ![Alpha Passthrough example](resources/sample_alpha.jpg) | ![Green-screen Passthrough example](resources/sample_green.jpg) |
+
 ## Requirements
 
 - Windows 10 / 11
@@ -36,6 +42,18 @@ Launch the desktop UI:
 ```bash
 uv run python -m ui.app
 ```
+
+## Supported VR Players
+
+Tested on Meta Quest 3.
+
+| Player | Alpha passthrough | Gray green screen | ChromaKey green screen | Website | Notes |
+| --- | --- | --- | --- | --- | --- |
+| Skybox VR Player 2.0.2 Preview | Supported | - | Supported | [Official site](https://skybox.xyz) | [Installation notes](https://forum.skybox.xyz/d/2920-skybox-quest-v202-preview-performance-improvements) |
+| Moon Player | - | Supported | Supported | [Official site](https://moonvrplayer.com) | - |
+| 4XVR Video Player | Supported | - | Supported | [Official site](https://www.4xvr.net/) | - |
+| DeoVR player | Supported | - | Supported | [Official site](https://deovr.com/) | - |
+| HereSphere VR Video Player | Supported | - | Supported | [Official site](https://heresphere.com/) | - |
 
 ## Configuration Notes
 
