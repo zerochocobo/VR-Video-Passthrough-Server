@@ -1,0 +1,44 @@
+{
+  "rows": [
+    {
+      "player": "Skybox VR Player 2.0.2 Preview",
+      "alpha": true,
+      "gray_green": false,
+      "chroma_key": true,
+      "website_url": "https://skybox.xyz",
+      "notes_url": "https://forum.skybox.xyz/d/2920-skybox-quest-v202-preview-performance-improvements"
+    },
+    {
+      "player": "Moon Player",
+      "alpha": false,
+      "gray_green": true,
+      "chroma_key": true,
+      "website_url": "https://moonvrplayer.com",
+      "notes_url": ""
+    },
+    {
+      "player": "4XVR Video Player",
+      "alpha": true,
+      "gray_green": false,
+      "chroma_key": true,
+      "website_url": "https://www.4xvr.net/",
+      "notes_url": ""
+    },
+    {
+      "player": "DeoVR player",
+      "alpha": true,
+      "gray_green": false,
+      "chroma_key": true,
+      "website_url": "https://deovr.com/",
+      "notes_url": ""
+    },
+    {
+      "player": "HereSphere VR Video Player",
+      "alpha": true,
+      "gray_green": false,
+      "chroma_key": true,
+      "website_url": "https://heresphere.com/",
+      "notes_url": ""
+    }
+  ]
+}
