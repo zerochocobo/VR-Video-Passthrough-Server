@@ -2,9 +2,11 @@
 
 English | [中文](README.zh-CN.md) | [日本語](README.ja-JP.md)
 
-VR Video Passthrough Server is a Windows-first VR DLNA media server for local playback and desktop control. It is designed primarily for VR180 half-equirectangular video sources. It exposes a local video library over DLNA/UPnP and can serve realtime passthrough streams with either green-screen compositing or alpha passthrough output. It also supports realtime subtitle embedding in the passthrough stream. A PySide6 desktop UI is included for local management and offline generation workflows.
+VR Video Passthrough Server aims to make every VR video passthrough-capable, enabling mixed reality (MR).
 
 ![VR Video Passthrough Server overview](resources/intro_en_s.png)
+
+It is a Windows-first VR DLNA local media server for desktop control and offline generation workflows. It exposes a local video library over DLNA/UPnP and supports realtime passthrough stream output, with switching between green-screen compositing and Alpha passthrough, as well as realtime subtitle embedding. VR Video Passthrough Server is primarily designed for VR180 half-equirectangular video sources.
 
 ## Project Origin
 

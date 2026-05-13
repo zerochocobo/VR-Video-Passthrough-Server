@@ -24,6 +24,8 @@ set
 uv.lock
 *.onnx
 *.onnx.data
+*.zip
+*.7z
 
 #cache or prompt
 cache/

@@ -2,11 +2,11 @@
 
 中文 | [English](README.md) | [日本語](README.ja-JP.md)
 
-VR视频透视服务器 主要面向 VR180 半等柱体投影（half-equirectangular）视频源。
+VR视频透视服务器 的目标是让所有VR视频都可以透视，实现混合现实(MR)。
 
 ![VR视频透视服务器概览](resources/intro_cn_s.png)
 
-VR视频透视服务器 是一个以 Windows 为主要运行平台的 VR DLNA 本地媒体服务器，兼顾桌面控制和离线生成流程。它通过 DLNA/UPnP 暴露本地视频库，并支持实时透视流输出，可在绿幕合成和 Alpha 直通之间切换，同时支持实时字幕嵌入。项目同时提供基于 PySide6 的桌面 UI，方便本机管理和批量处理。
+它是以 Windows 为主要运行平台的 VR DLNA 本地媒体服务器，兼顾桌面控制和离线生成流程。它通过 DLNA/UPnP 暴露本地视频库，并支持实时透视流输出，可在绿幕合成和 Alpha 直通之间切换，同时支持实时字幕嵌入。VR视频透视服务器 主要面向 VR180 半等柱体投影（half-equirectangular）视频源。
 
 ## 项目起源
 
