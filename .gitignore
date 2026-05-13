@@ -30,7 +30,6 @@ cache/
 build/
 debug_output/
 runtime_cache/
-prompt/
 reference/
 baseline/
 
