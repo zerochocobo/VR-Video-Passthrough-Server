@@ -293,6 +293,7 @@ class SubtitlePage(QWidget):
         self.distance = QComboBox()
         self.alpha = QComboBox()
         self.direction = QComboBox()
+        self.subtitle_color = QComboBox()
         self.original_canvas = PreviewCanvas(selectable=True)
         self.preview_canvas = PreviewCanvas(selectable=False)
         self.log = QTextEdit()
@@ -368,6 +369,9 @@ class SubtitlePage(QWidget):
         self.direction_label = QLabel()
         option_row.addWidget(self.direction_label)
         option_row.addWidget(self.direction)
+        self.subtitle_color_label = QLabel()
+        option_row.addWidget(self.subtitle_color_label)
+        option_row.addWidget(self.subtitle_color)
         option_row.addStretch(1)
 
         canvases = QHBoxLayout()
@@ -415,7 +419,7 @@ class SubtitlePage(QWidget):
         for button in (self.mode_dual, self.mode_left, self.mode_right):
             button.toggled.connect(self.save_values)
             button.toggled.connect(self.update_distance_visibility)
-        for combo in (self.distance, self.alpha, self.direction):
+        for combo in (self.distance, self.alpha, self.direction, self.subtitle_color):
             combo.currentIndexChanged.connect(self.save_values)
 
     def browse_video(self) -> None:
@@ -511,7 +515,13 @@ class SubtitlePage(QWidget):
         info = self.video_info or get_video_info(self.video_path.text())
         if not info:
             raise RuntimeError("Unable to read video info")
-        return create_preview_ass(info, SUBTITLE_TEMPLATE_PATH, self.i18n.t("subtitle.preview_test_text"))
+        return create_preview_ass(
+            info,
+            SUBTITLE_TEMPLATE_PATH,
+            self.i18n.t("subtitle.preview_test_text"),
+            subtitle_color=str(self.draft.get("subtitle_color") or ""),
+            background_color=str(self.settings.data.get("background_color") or "808080"),
+        )
 
     def open_preview_viewer(self) -> None:
         if self.preview_canvas.pixmap is None:
@@ -544,6 +554,7 @@ class SubtitlePage(QWidget):
             {
                 "subtitle_mode": mode,
                 "subtitle_direction": direction,
+                "subtitle_color": str(self.subtitle_color.currentData() or ""),
                 "subtitle_distance_m": float(self._distance_m()),
                 "subtitle_alpha": max(0.0, min(1.0, 1.0 - self._alpha_percent() / 100.0)),
                 "subtitle_v360": True,
@@ -572,6 +583,10 @@ class SubtitlePage(QWidget):
         index = self.direction.findData(direction)
         if index >= 0:
             self.direction.setCurrentIndex(index)
+        color = str(data.get("subtitle_color", "") or "")
+        color_index = self.subtitle_color.findData(color)
+        if color_index >= 0:
+            self.subtitle_color.setCurrentIndex(color_index)
         self.update_region_label()
         self.update_distance_visibility()
 
@@ -622,9 +637,11 @@ class SubtitlePage(QWidget):
         self.distance_label.setText(self.i18n.t("subtitle.distance"))
         self.alpha_label.setText(self.i18n.t("subtitle.alpha"))
         self.direction_label.setText(self.i18n.t("subtitle.direction"))
+        self.subtitle_color_label.setText(self.i18n.t("subtitle.srt_color"))
         self.original_box.setTitle(self.i18n.t("subtitle.original"))
         self.preview_box.setTitle(self.i18n.t("subtitle.preview"))
         self.direction.blockSignals(True)
+        self.subtitle_color.blockSignals(True)
         try:
             self.direction.clear()
             for key, value in (
@@ -636,6 +653,17 @@ class SubtitlePage(QWidget):
                 ("subtitle.vertical_right", "vertical_right"),
             ):
                 self.direction.addItem(self.i18n.t(key), value)
+            self.subtitle_color.clear()
+            for key, value in (
+                ("subtitle.color_inverse_bg", ""),
+                ("subtitle.color_white_black", "FFFFFF"),
+                ("subtitle.color_black_white", "000000"),
+                ("subtitle.color_green_black", "5AFF65"),
+                ("subtitle.color_yellow_black", "FFFF00"),
+                ("subtitle.color_red_black", "FF0000"),
+            ):
+                self.subtitle_color.addItem(self.i18n.t(key), value)
         finally:
             self.direction.blockSignals(False)
+            self.subtitle_color.blockSignals(False)
         self.load_values()

@@ -141,6 +141,30 @@ def _write_temp_ass(lines: list[str]) -> str:
         tmp.close()
 
 
+def _rgb_hex(value: str, default: str = "FFFFFF") -> tuple[int, int, int]:
+    text = str(value or default).strip()
+    if text.startswith("#"):
+        text = text[1:]
+    if len(text) != 6:
+        text = default
+    try:
+        return int(text[0:2], 16), int(text[2:4], 16), int(text[4:6], 16)
+    except ValueError:
+        return _rgb_hex(default, "FFFFFF")
+
+
+def _ass_color_from_rgb(value: str) -> str:
+    r, g, b = _rgb_hex(value, "FFFFFF")
+    return f"&H00{b:02X}{g:02X}{r:02X}"
+
+
+def _srt_preview_color(subtitle_color: str, background_color: str) -> str:
+    if str(subtitle_color or "").strip():
+        return _ass_color_from_rgb(subtitle_color)
+    r, g, b = _rgb_hex(background_color, "808080")
+    return f"&H00{255 - b:02X}{255 - g:02X}{255 - r:02X}"
+
+
 def _read_text(path: str | Path) -> str:
     data = Path(path).read_bytes()
     for encoding in ("utf-8-sig", "utf-8", "gb18030", "cp932", "utf-16"):
@@ -347,7 +371,14 @@ def apply_subtitle_direction(source_ass: str, subtitle_direction: str = "horizon
     return _write_temp_ass(out)
 
 
-def create_preview_ass(video_info: dict, template_path: Path, text: str) -> str:
+def create_preview_ass(
+    video_info: dict,
+    template_path: Path,
+    text: str,
+    *,
+    subtitle_color: str = "",
+    background_color: str = "808080",
+) -> str:
     preview_width, preview_height = _preview_dimensions(int(video_info["width"]), int(video_info["height"]))
     width = max(1, preview_width // 2)
     height = max(1, preview_height)
@@ -360,7 +391,7 @@ def create_preview_ass(video_info: dict, template_path: Path, text: str) -> str:
         jp_size=round(30 * scale),
         marginv=round(32 * scale),
         alignment=5,
-        DefaultPrimaryColour="&H005AFF65",
+        DefaultPrimaryColour=_srt_preview_color(subtitle_color, background_color),
         DefaultOutlineColour="&H00000000",
         SecondaryPrimaryColour="&H00FFFFFF",
         SecondaryOutlineColour="&H00000000",

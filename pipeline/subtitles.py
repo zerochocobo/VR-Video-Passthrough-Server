@@ -32,6 +32,14 @@ class SubtitleCue:
     start: float
     end: float
     text: str
+    lines: tuple["SubtitleLine", ...] = ()
+
+
+@dataclass(frozen=True)
+class SubtitleLine:
+    text: str
+    primary_color: tuple[int, int, int] | None = None
+    outline_color: tuple[int, int, int] | None = None
 
 
 def find_subtitle_for_video(video_path: Path) -> Path | None:
@@ -94,6 +102,21 @@ def _clean_ass_text(text: str) -> str:
     return "\n".join(line.strip() for line in text.splitlines()).strip()
 
 
+def _parse_ass_color(value: str) -> tuple[int, int, int] | None:
+    text = str(value or "").strip()
+    match = re.search(r"&H([0-9A-Fa-f]{6,8})", text)
+    if not match:
+        return None
+    hex_text = match.group(1)[-6:]
+    try:
+        b = int(hex_text[0:2], 16)
+        g = int(hex_text[2:4], 16)
+        r = int(hex_text[4:6], 16)
+    except ValueError:
+        return None
+    return r, g, b
+
+
 def _subtitle_color() -> tuple[int, int, int]:
     if config.SUBTITLE_COLOR is not None:
         return config.SUBTITLE_COLOR
@@ -132,18 +155,46 @@ def _parse_srt(path: Path) -> list[SubtitleCue]:
 def _parse_ass(path: Path) -> list[SubtitleCue]:
     cues: list[SubtitleCue] = []
     in_events = False
+    in_styles = False
     fields: list[str] = []
     text_index = 9
     start_index = 1
     end_index = 2
+    style_index = 3
+    style_fields: list[str] = []
+    style_name_index = 0
+    style_primary_index = 3
+    style_outline_index = 5
+    style_colors: dict[str, tuple[tuple[int, int, int] | None, tuple[int, int, int] | None]] = {}
     for line in _read_text(path).splitlines():
         stripped = line.strip()
         lower = stripped.lower()
+        if lower == "[v4+ styles]":
+            in_styles = True
+            in_events = False
+            continue
         if lower == "[events]":
             in_events = True
+            in_styles = False
             continue
-        if stripped.startswith("[") and lower != "[events]":
+        if stripped.startswith("[") and lower not in {"[events]", "[v4+ styles]"}:
             in_events = False
+            in_styles = False
+            continue
+        if in_styles and lower.startswith("format:"):
+            style_fields = [part.strip().lower() for part in stripped.split(":", 1)[1].split(",")]
+            style_name_index = style_fields.index("name") if "name" in style_fields else 0
+            style_primary_index = style_fields.index("primarycolour") if "primarycolour" in style_fields else 3
+            style_outline_index = style_fields.index("outlinecolour") if "outlinecolour" in style_fields else 5
+            continue
+        if in_styles and lower.startswith("style:"):
+            parts = line.split(":", 1)[1].split(",")
+            if len(parts) <= max(style_name_index, style_primary_index, style_outline_index):
+                continue
+            style_colors[parts[style_name_index].strip().lower()] = (
+                _parse_ass_color(parts[style_primary_index]),
+                _parse_ass_color(parts[style_outline_index]),
+            )
             continue
         if not in_events:
             continue
@@ -152,26 +203,36 @@ def _parse_ass(path: Path) -> list[SubtitleCue]:
             text_index = fields.index("text") if "text" in fields else 9
             start_index = fields.index("start") if "start" in fields else 1
             end_index = fields.index("end") if "end" in fields else 2
+            style_index = fields.index("style") if "style" in fields else 3
             continue
         if not lower.startswith("dialogue:"):
             continue
         payload = line.split(":", 1)[1]
         max_splits = max(len(fields) - 1, text_index, 9)
         parts = payload.split(",", max_splits)
-        if len(parts) <= max(text_index, start_index, end_index):
+        if len(parts) <= max(text_index, start_index, end_index, style_index):
             continue
         text = _clean_ass_text(parts[text_index])
         if not text:
             continue
         try:
-            cues.append(SubtitleCue(_ass_time_to_sec(parts[start_index]), _ass_time_to_sec(parts[end_index]), text))
+            style_name = parts[style_index].strip().lower()
+            primary, outline = style_colors.get(style_name, (None, None))
+            cues.append(
+                SubtitleCue(
+                    _ass_time_to_sec(parts[start_index]),
+                    _ass_time_to_sec(parts[end_index]),
+                    text,
+                    (SubtitleLine(text, primary, outline),),
+                )
+            )
         except ValueError:
             continue
     return _merge_same_time_cues(cues)
 
 
 def _merge_same_time_cues(cues: list[SubtitleCue]) -> list[SubtitleCue]:
-    grouped: dict[tuple[int, int], list[str]] = {}
+    grouped: dict[tuple[int, int], list[SubtitleLine]] = {}
     order: list[tuple[int, int]] = []
     times: dict[tuple[int, int], tuple[float, float]] = {}
     for cue in sorted(cues, key=lambda item: (item.start, item.end)):
@@ -180,9 +241,16 @@ def _merge_same_time_cues(cues: list[SubtitleCue]) -> list[SubtitleCue]:
             grouped[key] = []
             order.append(key)
             times[key] = (cue.start, cue.end)
-        if cue.text not in grouped[key]:
-            grouped[key].append(cue.text)
-    return [SubtitleCue(times[key][0], times[key][1], "\n".join(grouped[key])) for key in order]
+        lines = cue.lines or (SubtitleLine(cue.text),)
+        existing_texts = {line.text for line in grouped[key]}
+        for line in lines:
+            if line.text not in existing_texts:
+                grouped[key].append(line)
+                existing_texts.add(line.text)
+    return [
+        SubtitleCue(times[key][0], times[key][1], "\n".join(line.text for line in grouped[key]), tuple(grouped[key]))
+        for key in order
+    ]
 
 
 class SubtitleRenderer:
@@ -195,8 +263,8 @@ class SubtitleRenderer:
         suffix = path.suffix.lower()
         self.cues = _parse_ass(path) if suffix == ".ass" else _parse_srt(path)
         self.starts = [cue.start for cue in self.cues]
-        self._cache: dict[tuple[str, int, int, str, str, str, str, str, str], tuple[np.ndarray, int, int]] = {}
-        self._pending: dict[tuple[str, int, int, str, str, str, str, str, str], concurrent.futures.Future] = {}
+        self._cache: dict[tuple, tuple[np.ndarray, int, int]] = {}
+        self._pending: dict[tuple, concurrent.futures.Future] = {}
         self._lock = threading.Lock()
         self._font = self._load_font()
         log.info("subtitle loaded: %s cues=%d mode=%s direction=%s", path.name, len(self.cues), config.SUBTITLE_MODE, config.SUBTITLE_DIRECTION)
@@ -224,23 +292,27 @@ class SubtitleRenderer:
                 continue
         return ImageFont.load_default()
 
-    def text_at(self, seconds: float) -> str:
+    def cue_at(self, seconds: float) -> SubtitleCue | None:
         if not self.cues:
-            return ""
+            return None
         idx = bisect.bisect_right(self.starts, seconds) - 1
         if idx < 0:
-            return ""
+            return None
         cue = self.cues[idx]
         if cue.start <= seconds < cue.end:
-            return cue.text
-        return ""
+            return cue
+        return None
+
+    def text_at(self, seconds: float) -> str:
+        cue = self.cue_at(seconds)
+        return cue.text if cue is not None else ""
 
     def overlay_for_time(self, seconds: float) -> tuple[np.ndarray, int, int] | None:
-        text = self.text_at(seconds)
-        if not text:
+        cue = self.cue_at(seconds)
+        if cue is None or not cue.text:
             self._prewarm_around(seconds)
             return None
-        key = self._overlay_key(text)
+        key = self._overlay_key(cue)
         cached_overlay: tuple[np.ndarray, int, int] | None = None
         with self._lock:
             cached = self._cache.get(key)
@@ -267,9 +339,18 @@ class SubtitleRenderer:
         self._prewarm_around(seconds)
         return overlay
 
-    def _overlay_key(self, text: str) -> tuple[str, int, int, str, str, str, str, str, str]:
+    def _overlay_key(self, cue: SubtitleCue) -> tuple:
+        line_key = tuple(
+            (
+                line.text,
+                line.primary_color,
+                line.outline_color,
+            )
+            for line in (cue.lines or (SubtitleLine(cue.text),))
+        )
         return (
-            text,
+            cue.text,
+            line_key,
             self.eye_width,
             self.eye_height,
             config.SUBTITLE_DIRECTION,
@@ -283,18 +364,22 @@ class SubtitleRenderer:
     def _prewarm_around(self, seconds: float) -> None:
         idx = max(0, bisect.bisect_left(self.starts, seconds))
         for cue in self.cues[idx : idx + 4]:
-            self._submit_render(self._overlay_key(cue.text))
+            self._submit_render(self._overlay_key(cue))
 
-    def _submit_render(self, key: tuple[str, int, int, str, str, str, str, str, str]) -> None:
+    def _submit_render(self, key: tuple) -> None:
         with self._lock:
             if key in self._cache or key in self._pending:
                 return
             future = _PROJECT_EXECUTOR.submit(self._render_and_store, key)
             self._pending[key] = future
 
-    def _render_and_store(self, key: tuple[str, int, int, str, str, str, str, str, str]) -> tuple[np.ndarray, int, int]:
+    def _render_and_store(self, key: tuple) -> tuple[np.ndarray, int, int]:
         started = time.perf_counter()
-        overlay = self._render_text_overlay(key[0])
+        lines = tuple(
+            SubtitleLine(line_text, primary, outline)
+            for line_text, primary, outline in key[1]
+        )
+        overlay = self._render_text_overlay(lines)
         elapsed_ms = (time.perf_counter() - started) * 1000.0
         with self._lock:
             self._cache[key] = overlay
@@ -303,31 +388,15 @@ class SubtitleRenderer:
             log.info("subtitle overlay rendered: text_len=%d elapsed=%.1fms cache=%d pending=%d", len(key[0]), elapsed_ms, len(self._cache), len(self._pending))
         return overlay
 
-    def _render_text_overlay(self, text: str) -> tuple[np.ndarray, int, int]:
+    def _render_text_overlay(self, styled_lines: tuple[SubtitleLine, ...]) -> tuple[np.ndarray, int, int]:
         direction = config.SUBTITLE_DIRECTION
-        if direction.startswith("vertical"):
-            text = self._verticalize_text(text)
         max_width = max(64, int(self.eye_width * 0.86))
         margin = max(4, int(round(self.eye_height * float(config.SUBTITLE_MARGIN_V_SCALE))))
         stroke = max(0, int(round(getattr(self._font, "size", 24) * float(config.SUBTITLE_OUTLINE_SCALE))))
-        lines = self._wrap_text(text, max_width)
-        dummy = Image.new("RGBA", (8, 8), (0, 0, 0, 0))
-        draw = ImageDraw.Draw(dummy)
-        boxes = [draw.textbbox((0, 0), line, font=self._font, stroke_width=stroke) for line in lines]
-        width = min(max_width, max((box[2] - box[0] for box in boxes), default=1) + stroke * 2)
-        line_heights = [box[3] - box[1] for box in boxes] or [1]
-        line_gap = max(2, int(round(getattr(self._font, "size", 24) * 0.18)))
-        height = sum(line_heights) + line_gap * max(0, len(lines) - 1) + stroke * 2
-        image = Image.new("RGBA", (max(1, width), max(1, height)), (0, 0, 0, 0))
-        draw = ImageDraw.Draw(image)
-        fill = (*_subtitle_color(), int(round(255 * float(config.SUBTITLE_ALPHA))))
-        outline = (*config.SUBTITLE_OUTLINE_COLOR, int(round(255 * float(config.SUBTITLE_ALPHA))))
-        y = stroke
-        for line, box, line_h in zip(lines, boxes, line_heights):
-            line_w = box[2] - box[0]
-            x = max(0, (width - line_w) // 2)
-            draw.text((x, y), line, font=self._font, fill=fill, stroke_width=stroke, stroke_fill=outline)
-            y += line_h + line_gap
+        if direction.startswith("vertical"):
+            image = self._render_vertical_image(styled_lines, stroke)
+        else:
+            image = self._render_horizontal_image(styled_lines, max_width, stroke)
         if direction.startswith("vertical"):
             top = max(0, (self.eye_height - image.height) // 2)
             if direction.endswith("left"):
@@ -347,6 +416,82 @@ class SubtitleRenderer:
         if config.SUBTITLE_V360:
             return self._project_flat_to_eye(image, left, top)
         return np.asarray(image, dtype=np.uint8), left, top
+
+    def _render_horizontal_image(self, styled_lines: tuple[SubtitleLine, ...], max_width: int, stroke: int) -> Image.Image:
+        draw_lines = self._layout_horizontal_lines(styled_lines, max_width)
+        dummy = Image.new("RGBA", (8, 8), (0, 0, 0, 0))
+        draw = ImageDraw.Draw(dummy)
+        boxes = [draw.textbbox((0, 0), line.text, font=self._font, stroke_width=stroke) for line in draw_lines]
+        width = min(max_width, max((box[2] - box[0] for box in boxes), default=1) + stroke * 2)
+        line_heights = [box[3] - box[1] for box in boxes] or [1]
+        line_gap = max(2, int(round(getattr(self._font, "size", 24) * 0.18)))
+        height = sum(line_heights) + line_gap * max(0, len(draw_lines) - 1) + stroke * 2
+        image = Image.new("RGBA", (max(1, width), max(1, height)), (0, 0, 0, 0))
+        draw = ImageDraw.Draw(image)
+        alpha = int(round(255 * float(config.SUBTITLE_ALPHA)))
+        y = stroke
+        for line, box, line_h in zip(draw_lines, boxes, line_heights):
+            line_w = box[2] - box[0]
+            x = max(0, (width - line_w) // 2)
+            fill_rgb = line.primary_color or _subtitle_color()
+            outline_rgb = line.outline_color or config.SUBTITLE_OUTLINE_COLOR
+            draw.text(
+                (x, y),
+                line.text,
+                font=self._font,
+                fill=(*fill_rgb, alpha),
+                stroke_width=stroke,
+                stroke_fill=(*outline_rgb, alpha),
+            )
+            y += line_h + line_gap
+        return image
+
+    def _render_vertical_image(self, styled_lines: tuple[SubtitleLine, ...], stroke: int) -> Image.Image:
+        columns = [
+            (line, [char for char in line.text.replace("\r", "").replace("\n", "") if not char.isspace()])
+            for line in styled_lines
+            if line.text.strip()
+        ]
+        if not columns:
+            columns = [(SubtitleLine(""), [""])]
+        dummy = Image.new("RGBA", (8, 8), (0, 0, 0, 0))
+        draw = ImageDraw.Draw(dummy)
+        font_size = max(1, int(getattr(self._font, "size", 24)))
+        col_gap = max(6, int(round(font_size * 0.28)))
+        char_gap = max(0, int(round(font_size * 0.02)))
+        measured: list[tuple[SubtitleLine, list[str], int, list[tuple[int, int, int, int]]]] = []
+        for source, chars in columns:
+            boxes = [draw.textbbox((0, 0), char, font=self._font, stroke_width=stroke) for char in chars]
+            col_width = max((box[2] - box[0] for box in boxes), default=font_size) + stroke * 2
+            measured.append((source, chars, col_width, boxes))
+        width = sum(item[2] for item in measured) + col_gap * max(0, len(measured) - 1)
+        height = max(
+            (sum(box[3] - box[1] for box in item[3]) + char_gap * max(0, len(item[3]) - 1) + stroke * 2 for item in measured),
+            default=font_size,
+        )
+        image = Image.new("RGBA", (max(1, width), max(1, height)), (0, 0, 0, 0))
+        draw = ImageDraw.Draw(image)
+        alpha = int(round(255 * float(config.SUBTITLE_ALPHA)))
+        x = 0
+        for source, chars, col_width, boxes in measured:
+            fill_rgb = source.primary_color or _subtitle_color()
+            outline_rgb = source.outline_color or config.SUBTITLE_OUTLINE_COLOR
+            col_height = sum(box[3] - box[1] for box in boxes) + char_gap * max(0, len(boxes) - 1) + stroke * 2
+            y = max(stroke, (height - col_height) // 2 + stroke)
+            for char, box in zip(chars, boxes):
+                char_w = box[2] - box[0]
+                char_h = box[3] - box[1]
+                draw.text(
+                    (x + max(0, (col_width - char_w) // 2), y),
+                    char,
+                    font=self._font,
+                    fill=(*fill_rgb, alpha),
+                    stroke_width=stroke,
+                    stroke_fill=(*outline_rgb, alpha),
+                )
+                y += char_h + char_gap
+            x += col_width + col_gap
+        return image
 
     def _project_flat_to_eye(self, image: Image.Image, left: int, top: int) -> tuple[np.ndarray, int, int]:
         src = np.asarray(image, dtype=np.uint8)
@@ -438,14 +583,12 @@ class SubtitleRenderer:
                 out.append(line)
         return out or [text]
 
-    @staticmethod
-    def _verticalize_text(text: str) -> str:
-        tokens: list[str] = []
-        for char in text.replace("\n", ""):
-            if char.isspace():
-                continue
-            tokens.append(char)
-        return "\n".join(tokens)
+    def _layout_horizontal_lines(self, styled_lines: tuple[SubtitleLine, ...], max_width: int) -> list[SubtitleLine]:
+        out: list[SubtitleLine] = []
+        for source in styled_lines or (SubtitleLine(""),):
+            for wrapped in self._wrap_text(source.text, max_width):
+                out.append(SubtitleLine(wrapped, source.primary_color, source.outline_color))
+        return [line for line in out if line.text] or [SubtitleLine("")]
 
     def parallax_px(self) -> int:
         distance_m = max(0.1, float(config.SUBTITLE_DISTANCE_M))

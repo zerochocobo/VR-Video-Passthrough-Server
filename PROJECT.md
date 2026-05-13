@@ -429,5 +429,8 @@ DLNA client
 - Live chapter containers are the current coarse seek strategy.
 - Startup GPU warmup is important on systems where ORT CUDA first-run JIT is
   expensive.
+- Translation JSON files under `ui/translations/` are intentionally kept as
+  UTF-8 with BOM. When editing or generating them programmatically, read/write
+  with `utf-8-sig` and preserve the BOM.
 - Keep handover notes in `prompt/HANDOVER_YYYYMMDD.md` when making meaningful
   project changes.
