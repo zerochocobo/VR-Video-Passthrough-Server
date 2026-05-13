@@ -66,6 +66,27 @@ class GpuWarmupMarker:
     created_at: str
 
 
+@dataclass(frozen=True)
+class ColdStartReport:
+    """Prediction of how long the next GPU warmup will take.
+
+    Used by the UI startup overlay to set user expectations BEFORE warmup
+    actually starts. Pure read-only function; never triggers warmup itself.
+    """
+    cold: bool
+    reason: str  # cache_hit | marker_missing | key_changed | inspect_failed
+    gpu_name: str
+    compute_capability: str
+    driver_version: str
+    onnxruntime_version: str
+    is_known_slow: bool   # True for Blackwell (sm_120+) without bundled cubin
+    estimate_sec: float
+    marker_exists: bool
+    previous_elapsed_sec: float
+    changed_fields: list[str]
+    detail: str
+
+
 class WarmupLock:
     def __init__(self, path: Path, timeout_sec: float = 300.0, poll_sec: float = 1.0, stale_sec: float = 3600.0):
         self.path = path
@@ -243,6 +264,192 @@ def marker_matches(key: GpuWarmupKey, marker_path: Path = MARKER_PATH) -> bool:
 def write_marker(marker: GpuWarmupMarker, marker_path: Path = MARKER_PATH) -> None:
     marker_path.parent.mkdir(parents=True, exist_ok=True)
     marker_path.write_text(json.dumps(asdict(marker), indent=2, ensure_ascii=False), encoding="utf-8")
+
+
+# Compute capability >= 12.0 means Blackwell. As of early 2026, the public
+# onnxruntime-gpu wheels (<=1.21) do NOT ship cubin for sm_120, so the first
+# CUDA EP session on these GPUs spends 2+ minutes JIT-compiling PTX. We treat
+# this combination as "known slow" so the UI can warn users in advance.
+_KNOWN_SLOW_CC_MAJOR = 12
+_KNOWN_SLOW_ORT_VERSION_MIN_INCLUSIVE = (1, 22)
+
+# Default ETA buckets used when no usable history exists in the marker.
+_ETA_CACHE_HIT_SEC = 4.0
+_ETA_KEY_CHANGED_SEC = 30.0
+_ETA_FIRST_RUN_NORMAL_SEC = 45.0
+_ETA_FIRST_RUN_KNOWN_SLOW_SEC = 150.0
+
+
+def _parse_ort_version(text: str) -> tuple[int, ...]:
+    parts: list[int] = []
+    for part in str(text or "").split("."):
+        digits = ""
+        for ch in part:
+            if ch.isdigit():
+                digits += ch
+            else:
+                break
+        if not digits:
+            break
+        parts.append(int(digits))
+    return tuple(parts)
+
+
+def _is_known_slow_combo(cc: str, ort_version: str) -> bool:
+    try:
+        major_str, _, _ = cc.partition(".")
+        major = int(major_str)
+    except (ValueError, AttributeError):
+        return False
+    if major < _KNOWN_SLOW_CC_MAJOR:
+        return False
+    parsed = _parse_ort_version(ort_version)
+    if not parsed:
+        return True  # Unknown ORT on Blackwell: assume slow.
+    return parsed < _KNOWN_SLOW_ORT_VERSION_MIN_INCLUSIVE
+
+
+def _read_marker_dict(marker_path: Path) -> dict | None:
+    try:
+        return json.loads(marker_path.read_text(encoding="utf-8-sig"))
+    except FileNotFoundError:
+        return None
+    except Exception:
+        return None
+
+
+def _diff_key_fields(current: dict, previous: dict) -> list[str]:
+    changed: list[str] = []
+    for k, v in current.items():
+        if previous.get(k) != v:
+            changed.append(k)
+    for k in previous.keys():
+        if k not in current and k not in changed:
+            changed.append(k)
+    return changed
+
+
+def predict_warmup_state(marker_path: Path | None = None) -> ColdStartReport:
+    """Inspect cache state and return a non-blocking prediction.
+
+    Safe to call from the UI process before any heavy GPU init: only reads the
+    marker JSON and queries cupy/ort for version info. The actual matting
+    Matter() and ORT session are NOT created here.
+    """
+    marker_path = Path(marker_path) if marker_path is not None else MARKER_PATH
+
+    gpu_name = ""
+    compute_capability = ""
+    driver_version = ""
+    onnxruntime_version = ""
+    inspect_failed = False
+    detail = ""
+
+    try:
+        import cupy as cp  # type: ignore
+
+        props = cp.cuda.runtime.getDeviceProperties(0)
+        raw_name = props.get("name", "")
+        gpu_name = raw_name.decode() if isinstance(raw_name, bytes) else str(raw_name)
+        compute_capability = f"{props.get('major', '?')}.{props.get('minor', '?')}"
+    except Exception as e:
+        inspect_failed = True
+        detail = f"cupy probe failed: {e}"
+
+    try:
+        driver_version = _driver_version()
+    except Exception:
+        driver_version = ""
+
+    try:
+        import onnxruntime as ort  # type: ignore
+
+        onnxruntime_version = str(getattr(ort, "__version__", ""))
+    except Exception:
+        onnxruntime_version = ""
+
+    is_known_slow = _is_known_slow_combo(compute_capability, onnxruntime_version)
+
+    marker = _read_marker_dict(marker_path)
+    marker_exists = marker is not None
+
+    previous_elapsed_sec = 0.0
+    if marker_exists:
+        try:
+            previous_elapsed_sec = float(marker.get("verified_second_pass_sec") or 0.0)
+        except (TypeError, ValueError):
+            previous_elapsed_sec = 0.0
+
+    cold = True
+    reason = "marker_missing"
+    changed_fields: list[str] = []
+
+    if inspect_failed:
+        cold = True
+        reason = "inspect_failed"
+        estimate = _ETA_FIRST_RUN_KNOWN_SLOW_SEC if is_known_slow else _ETA_FIRST_RUN_NORMAL_SEC
+        return ColdStartReport(
+            cold=cold,
+            reason=reason,
+            gpu_name=gpu_name,
+            compute_capability=compute_capability,
+            driver_version=driver_version,
+            onnxruntime_version=onnxruntime_version,
+            is_known_slow=is_known_slow,
+            estimate_sec=estimate,
+            marker_exists=marker_exists,
+            previous_elapsed_sec=previous_elapsed_sec,
+            changed_fields=changed_fields,
+            detail=detail,
+        )
+
+    current_key_dict: dict | None = None
+    try:
+        current_key = build_warmup_key()
+        current_key_dict = asdict(current_key)
+    except Exception as e:
+        inspect_failed = True
+        detail = f"warmup-key build failed: {e}"
+
+    if marker_exists and current_key_dict is not None:
+        prev_key = marker.get("key") if isinstance(marker, dict) else None
+        if isinstance(prev_key, dict):
+            if prev_key == current_key_dict:
+                cold = False
+                reason = "cache_hit"
+            else:
+                cold = True
+                reason = "key_changed"
+                changed_fields = _diff_key_fields(current_key_dict, prev_key)
+        else:
+            cold = True
+            reason = "marker_invalid"
+
+    if not cold:
+        estimate = max(1.0, previous_elapsed_sec or _ETA_CACHE_HIT_SEC)
+    elif reason == "key_changed" and changed_fields and set(changed_fields).issubset(
+        {"providers", "shapes", "input_size"}
+    ):
+        estimate = _ETA_KEY_CHANGED_SEC
+    elif is_known_slow:
+        estimate = _ETA_FIRST_RUN_KNOWN_SLOW_SEC
+    else:
+        estimate = _ETA_FIRST_RUN_NORMAL_SEC
+
+    return ColdStartReport(
+        cold=cold,
+        reason=reason,
+        gpu_name=gpu_name,
+        compute_capability=compute_capability,
+        driver_version=driver_version,
+        onnxruntime_version=onnxruntime_version,
+        is_known_slow=is_known_slow,
+        estimate_sec=float(estimate),
+        marker_exists=marker_exists,
+        previous_elapsed_sec=previous_elapsed_sec,
+        changed_fields=changed_fields,
+        detail=detail,
+    )
 
 
 def warmup_gpu_runtime_cache(force: bool = False, timeout_sec: float = 300.0, runs_per_shape: int = 3) -> GpuWarmupMarker:

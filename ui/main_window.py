@@ -1,8 +1,11 @@
 ﻿from __future__ import annotations
 
+from pathlib import Path
+
 from PySide6.QtGui import QFont
 from PySide6.QtWidgets import QLabel, QMainWindow, QMessageBox, QWidget
 
+from ui.diagnostics import build_diagnostic_report
 from ui.i18n import I18n, system_language
 from ui.metadata import load_app_metadata
 from ui.pages.home_page import HOME_COMPACT_WIDTH, HOME_HEIGHT, HomePage
@@ -11,9 +14,11 @@ from ui.pages.subtitle_page import SUBTITLE_PAGE_HEIGHT, SUBTITLE_PAGE_WIDTH, Su
 from ui.resources import app_icon
 from ui.services.offline_process import OfflineProcess
 from ui.services.server_process import ServerProcess
-from ui.settings import Settings
+from ui.services.startup_status_poller import DEFAULT_PORT as STATUS_DEFAULT_PORT, StartupStatusPoller
+from ui.settings import ROOT as UI_ROOT, Settings
 from ui.styles import font_for_language
 from ui.widgets.current_page_stack import CurrentPageStackedWidget
+from ui.widgets.startup_overlay import StartupOverlay
 
 
 SUPPORTED_LANGUAGES = ("zh_CN", "en_US", "ja_JP")
@@ -58,8 +63,15 @@ class MainWindow(QMainWindow):
         self.subtitle.back_button.clicked.connect(lambda: self.stack.setCurrentWidget(self.home))
         self.stack.currentChanged.connect(self._page_changed)
         self.server.output.connect(self.home.append_log)
+        self.server.output.connect(self._scan_server_output_for_ready)
         self.server.state_changed.connect(self.home.set_server_running)
+        self.server.state_changed.connect(self._server_state_changed)
         self.offline_process.state_changed.connect(self._offline_state_changed)
+        # Startup overlay + status poller (lazy: created when first needed).
+        self.startup_overlay: StartupOverlay | None = None
+        self.status_poller = StartupStatusPoller(port=STATUS_DEFAULT_PORT, parent=self)
+        self.status_poller.updated.connect(self._on_startup_status)
+        self.status_poller.finished.connect(self._on_startup_finished)
         self._sync_language_combo()
         self.retranslate()
         app_font = QFont()
@@ -120,6 +132,11 @@ class MainWindow(QMainWindow):
         env["PT_DEBUG_LOGS"] = "1" if self.home.debug_toggle.isChecked() else "0"
         self.home.clear_log()
         self.server.start(env)
+        # Show the startup overlay so non-technical users see a friendly
+        # progress dialog while the server warms up the GPU (potentially
+        # 2+ minutes on first run with sm_120 GPUs).
+        self._open_startup_overlay()
+        self.status_poller.start()
 
     def open_offline(self) -> None:
         if self.server.is_running():
@@ -145,6 +162,138 @@ class MainWindow(QMainWindow):
             self.stack.setCurrentWidget(self.offline)
 
     def closeEvent(self, event) -> None:
+        self.status_poller.stop()
+        if self.startup_overlay is not None:
+            self.startup_overlay.close()
         self.server.stop()
         self.offline_process.stop()
         super().closeEvent(event)
+
+    # ---- Startup overlay glue ----
+
+    def _open_startup_overlay(self) -> None:
+        if self.startup_overlay is None:
+            self.startup_overlay = StartupOverlay(self.i18n, self)
+            self.startup_overlay.cancelRequested.connect(self._cancel_startup)
+            self.startup_overlay.copyReportRequested.connect(self._copy_startup_report)
+        overlay = self.startup_overlay
+        overlay.reset()
+        overlay.show()
+        overlay.raise_()
+        overlay.activateWindow()
+
+    def _on_startup_status(self, status: dict) -> None:
+        if self.startup_overlay is None or not self.startup_overlay.isVisible():
+            return
+        self.startup_overlay.apply_status(status)
+
+    def _on_startup_finished(self, phase: str) -> None:
+        if self.startup_overlay is None:
+            return
+        if phase == "listening":
+            # The server has bound the DLNA HTTP port and is truly ready to
+            # serve clients. Brief "done" flash so the user sees a confirmation
+            # before the overlay disappears.
+            merged = dict(self.startup_overlay.last_status() or {})
+            merged["phase"] = phase
+            merged["progress"] = 1.0
+            self.startup_overlay.apply_status(merged)
+            self.startup_overlay.close()
+        elif phase == "failed":
+            # Keep overlay visible so the user can read the failure and copy a
+            # report. The server process exits on its own. Merge into the
+            # last seen status so that step/cold/gpu_name/reason emitted by
+            # the server before the crash are preserved in the report.
+            merged = dict(self.startup_overlay.last_status() or {})
+            merged["phase"] = "failed"
+            if not merged.get("message"):
+                merged["message"] = self.i18n.t("startup.failed_generic")
+            self.startup_overlay.apply_status(merged)
+
+    def _cancel_startup(self) -> None:
+        # User explicitly aborted the long wait. Stop both the poller and the
+        # server process so resources are released cleanly.
+        self.status_poller.stop()
+        self.server.stop()
+        if self.startup_overlay is not None:
+            self.startup_overlay.close()
+
+    def _server_log_path(self) -> Path:
+        """Return where the server writes ``server.log`` (rotated).
+
+        Mirrors :mod:`utils.logger` so the diagnostic report can include the
+        most recent crash output without depending on the server module being
+        importable from the UI process.
+        """
+        return UI_ROOT / "debug_output" / "server.log"
+
+    def _copy_startup_report(self) -> None:
+        marker_path = UI_ROOT / "runtime_cache" / "gpu_warmup_marker.json"
+        log_path = self._server_log_path()
+        status = self.startup_overlay.last_status() if self.startup_overlay is not None else None
+        report = build_diagnostic_report(
+            app_version=self.metadata.display_version,
+            language=self.i18n.language,
+            last_status=status,
+            marker_path=marker_path if marker_path.exists() else marker_path,
+            log_path=log_path,
+        )
+        StartupOverlay.copy_to_clipboard(report)
+        if self.startup_overlay is not None:
+            self.startup_overlay.update_diagnostic_text(report)
+            self.startup_overlay.show_copy_confirmation()
+
+    def _scan_server_output_for_ready(self, text: str) -> None:
+        """Fallback close: watch server stdout for uvicorn's ready banner.
+
+        The primary path is the /status poller on 127.0.0.1:8299. On a machine
+        where 8299 is blocked (firewall, port conflict, IPv4 disabled, etc.)
+        we still need the overlay to disappear once the server is actually
+        listening. uvicorn always prints "Uvicorn running on http://0.0.0.0:..."
+        when ready, and we capture stdout via ServerProcess.output regardless
+        of the status endpoint's health.
+        """
+        if self.startup_overlay is None or not self.startup_overlay.isVisible():
+            return
+        if "Uvicorn running on" not in text and "Application startup complete" not in text:
+            return
+        last = self.startup_overlay.last_status()
+        if last is not None and str(last.get("phase") or "") == "listening":
+            return  # Normal path already closed (or is about to close) the overlay.
+        merged = dict(last or {})
+        merged["phase"] = "listening"
+        merged["progress"] = 1.0
+        merged["message"] = (merged.get("message") or "").strip() or self.i18n.t("startup.complete")
+        self.status_poller.stop()
+        self.startup_overlay.apply_status(merged)
+        self.startup_overlay.close()
+
+    def _server_state_changed(self, running: bool) -> None:
+        if not running:
+            self.status_poller.stop()
+            if self.startup_overlay is not None and self.startup_overlay.isVisible():
+                last = self.startup_overlay.last_status() or {}
+                phase = str(last.get("phase") or "")
+                if phase == "listening":
+                    # Clean stop after the server became ready — just hide.
+                    # NOTE: ``warmed`` is intentionally NOT treated as success
+                    # here. After warmed the server still has to install
+                    # firewall rules, start SSDP, and bind the DLNA HTTP port.
+                    # A process that died at ``warmed`` is a failure.
+                    self.startup_overlay.close()
+                else:
+                    # Server process exited before becoming ready. The 8299
+                    # /status endpoint is normally shut down within milliseconds
+                    # of the failure being published, so the 500 ms poller can
+                    # easily miss the "failed" transition. Synthesize the
+                    # terminal state here so the overlay flips to the failed
+                    # view (with the "Copy hardware report" button still
+                    # available) instead of sitting on a stale "warming"
+                    # snapshot with the indeterminate bar spinning forever.
+                    merged = dict(last)
+                    merged["phase"] = "failed"
+                    if not merged.get("message"):
+                        merged["message"] = self.i18n.t("startup.failed_generic")
+                    if not merged.get("detail"):
+                        merged["detail"] = "server process exited before warmup completed"
+                    self.startup_overlay.apply_status(merged)

@@ -1,7 +1,11 @@
-﻿"""Small local health endpoint available while the main server is warming up.
+"""Small local health endpoint available while the main server is warming up.
 
 run_server.bat can expose this on localhost so test automation can tell whether
 the process is alive before uvicorn starts listening on the DLNA HTTP port.
+
+The structured fields (step, step_index, step_total, progress, eta_sec,
+cold, is_known_slow, gpu_*) are read by the UI startup overlay to show a
+human-friendly "first GPU initialization" experience instead of a blank wait.
 """
 from __future__ import annotations
 
@@ -20,17 +24,57 @@ _state: dict[str, Any] = {
     "message": "process starting",
     "started_at": _started_at,
     "updated_at": _started_at,
+    # Structured fields (optional; populated as startup progresses).
+    "step": "",
+    "step_index": 0,
+    "step_total": 0,
+    "progress": 0.0,           # 0.0..1.0
+    "eta_sec": 0.0,            # estimated remaining seconds for current phase
+    "elapsed_sec": 0.0,        # elapsed seconds inside current phase
+    "cold": False,             # True when warmup is a cache miss
+    "is_known_slow": False,    # True for sm_120 without bundled cubin etc.
+    "gpu_name": "",
+    "compute_capability": "",
+    "driver_version": "",
+    "onnxruntime_version": "",
+    "reason": "",              # cache_hit | marker_missing | key_changed | ...
+    "detail": "",
 }
 _server: ThreadingHTTPServer | None = None
 _thread: threading.Thread | None = None
 
 
-def set_startup_phase(phase: str, message: str = "") -> None:
+def set_startup_phase(phase: str, message: str = "", **fields: Any) -> None:
+    """Update the structured startup state.
+
+    Backwards compatible: existing callers pass (phase, message). New callers
+    can additionally pass any subset of step, step_index, step_total, progress,
+    eta_sec, elapsed_sec, cold, is_known_slow, gpu_name, compute_capability,
+    driver_version, onnxruntime_version, reason, detail.
+
+    Unknown keys are stored verbatim so the endpoint stays forward-compatible.
+    """
     now = time.time()
     with _lock:
         _state["phase"] = phase
         _state["message"] = message
         _state["updated_at"] = now
+        for key, value in fields.items():
+            _state[key] = value
+
+
+def reset_startup_progress() -> None:
+    """Clear structured per-step fields between phases.
+
+    Keeps phase/message/timestamps in place; only zeros the moving values.
+    """
+    with _lock:
+        _state["step"] = ""
+        _state["step_index"] = 0
+        _state["step_total"] = 0
+        _state["progress"] = 0.0
+        _state["eta_sec"] = 0.0
+        _state["elapsed_sec"] = 0.0
 
 
 def get_startup_state() -> dict[str, Any]:

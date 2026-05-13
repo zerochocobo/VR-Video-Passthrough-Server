@@ -18,9 +18,18 @@ import config
 from dlna.ssdp import SSDPServer
 from http_app.server import create_app
 from utils.firewall import ensure_rules
-from utils.gpu_runtime_cache import configure_gpu_runtime_cache, warmup_gpu_runtime_cache
+from utils.gpu_runtime_cache import (
+    configure_gpu_runtime_cache,
+    predict_warmup_state,
+    warmup_gpu_runtime_cache,
+)
 from utils.logger import get, setup
-from utils.startup_status import set_startup_phase, start_startup_status_server, stop_startup_status_server
+from utils.startup_status import (
+    reset_startup_progress,
+    set_startup_phase,
+    start_startup_status_server,
+    stop_startup_status_server,
+)
 
 
 def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -57,7 +66,42 @@ def main(argv: list[str] | None = None) -> int:
     log.info("MODEL_PATH=%s (exists=%s)", config.MODEL_PATH, config.MODEL_PATH.exists())
     log.info("GPU_RUNTIME_CACHE=%s", cache_env)
     if config.STARTUP_GPU_WARMUP:
-        set_startup_phase("warming", "GPU runtime warmup")
+        # Publish a prediction first so the UI can show the expected duration
+        # before any heavy CUDA work begins. Failure to predict is non-fatal.
+        try:
+            prediction = predict_warmup_state()
+            set_startup_phase(
+                "warming",
+                ("first-time GPU initialization" if prediction.cold else "verifying GPU cache"),
+                step="predict",
+                step_index=0,
+                step_total=4,
+                progress=0.0,
+                eta_sec=prediction.estimate_sec,
+                elapsed_sec=0.0,
+                cold=prediction.cold,
+                is_known_slow=prediction.is_known_slow,
+                gpu_name=prediction.gpu_name,
+                compute_capability=prediction.compute_capability,
+                driver_version=prediction.driver_version,
+                onnxruntime_version=prediction.onnxruntime_version,
+                reason=prediction.reason,
+                detail=prediction.detail,
+            )
+            log.info(
+                "warmup prediction: cold=%s reason=%s known_slow=%s eta=%.1fs gpu=%s cc=%s ort=%s",
+                prediction.cold,
+                prediction.reason,
+                prediction.is_known_slow,
+                prediction.estimate_sec,
+                prediction.gpu_name,
+                prediction.compute_capability,
+                prediction.onnxruntime_version,
+            )
+        except Exception as e:
+            log.warning("warmup prediction failed (non-fatal): %s", e)
+            set_startup_phase("warming", "GPU runtime warmup")
+
         log.info(
             "startup GPU warmup begin: force=%s timeout=%.1fs runs_per_shape=%d",
             config.STARTUP_GPU_WARMUP_FORCE,
@@ -66,28 +110,69 @@ def main(argv: list[str] | None = None) -> int:
         )
         warmup_start = time.perf_counter()
         try:
+            # Note: warmup_gpu_runtime_cache is a single blocking call. We can't
+            # currently emit per-substep events without restructuring it, but we
+            # do report the "running" sub-step so the UI knows the ORT session
+            # is loading and JIT compilation is in progress.
+            set_startup_phase(
+                "warming",
+                "loading ONNX Runtime CUDA and running warmup",
+                step="ort_session_and_runs",
+                step_index=1,
+                step_total=4,
+                progress=0.1,
+            )
             marker = warmup_gpu_runtime_cache(
                 force=config.STARTUP_GPU_WARMUP_FORCE,
                 timeout_sec=max(1.0, config.STARTUP_GPU_WARMUP_TIMEOUT),
                 runs_per_shape=max(1, config.STARTUP_GPU_WARMUP_RUNS_PER_SHAPE),
             )
         except Exception as e:
-            set_startup_phase("failed", f"startup GPU warmup failed: {e}")
+            set_startup_phase(
+                "failed",
+                f"startup GPU warmup failed: {e}",
+                step="failed",
+                progress=0.0,
+                detail=str(e),
+            )
             log.exception("startup GPU warmup failed; server will not start: %s", e)
+            # Give the UI poller (500 ms interval) one more chance to read the
+            # "failed" status before we tear down the local /status endpoint.
+            # Without this delay the UI sometimes sees only the prior "warming"
+            # snapshot and falls back to the synthesized failed state, which
+            # loses the precise detail/message published by this branch.
+            time.sleep(0.8)
             stop_startup_status_server()
             return 1
-        set_startup_phase("warmed", "GPU runtime warmup complete")
+        warmup_elapsed = time.perf_counter() - warmup_start
+        set_startup_phase(
+            "warmed",
+            "GPU runtime warmup complete",
+            step="warmed",
+            step_index=4,
+            step_total=4,
+            progress=1.0,
+            eta_sec=0.0,
+            elapsed_sec=warmup_elapsed,
+        )
         log.info(
             "startup GPU warmup done: elapsed=%.3fs marker_elapsed=%.3fs verified_second_pass=%.3fs cache_files=%d cache_size=%d",
-            time.perf_counter() - warmup_start,
+            warmup_elapsed,
             marker.elapsed_sec,
             marker.verified_second_pass_sec,
             marker.cache_file_count_after_warmup,
             marker.cache_size_after_warmup,
         )
     else:
-        set_startup_phase("warmed", "startup GPU warmup disabled")
+        set_startup_phase(
+            "warmed",
+            "startup GPU warmup disabled",
+            step="warmed",
+            progress=1.0,
+            eta_sec=0.0,
+        )
         log.info("startup GPU warmup disabled")
+    reset_startup_progress()
     from pipeline.matting import matter_device
     log.info(
         "PIPELINE: HWACCEL=%s DECODE_MAX_SIDE=%d DECODE_PIX_FMT=%s PASSTHROUGH_MAX_FPS=%.2f "
@@ -122,7 +207,7 @@ def main(argv: list[str] | None = None) -> int:
     ssdp.start()
 
     app = create_app()
-    set_startup_phase("listening", f"uvicorn starting on 0.0.0.0:{config.HTTP_PORT}")
+    set_startup_phase("http_starting", f"uvicorn starting on 0.0.0.0:{config.HTTP_PORT}")
     try:
         uvicorn.run(
             app,
