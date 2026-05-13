@@ -18,7 +18,7 @@ DEFAULTS = {
     "language": system_language(),
     "video_dirs": [str(ROOT / "videos")],
     "mode_green": True,
-    "mode_alpha": False,
+    "mode_alpha": True,
     "background_color": "00FF00",
     "alpha_stride": 3,
     "passthrough_max_fps": 30,
