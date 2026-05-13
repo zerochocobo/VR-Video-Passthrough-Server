@@ -3,7 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from PySide6.QtCore import QPoint, QSize, Qt
-from PySide6.QtGui import QColor, QIcon, QPainter, QPixmap
+from PySide6.QtGui import QColor, QFont, QIcon, QPainter, QPen, QPixmap
 from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
@@ -12,6 +12,7 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QLineEdit,
+    QMessageBox,
     QPushButton,
     QSizePolicy,
     QTabWidget,
@@ -27,6 +28,7 @@ from ui.page_icons import BACK_ICON_SIZE, back_icon
 
 OFFLINE_LABEL_WIDTH = 132
 ACTION_ICON_SIZE = 20
+HELP_ICON_SIZE = 20
 
 
 def _action_icon(kind: str) -> QIcon:
@@ -43,6 +45,32 @@ def _action_icon(kind: str) -> QIcon:
         painter.drawPolygon([QPoint(6, 4), QPoint(6, 16), QPoint(16, 10)])
     painter.end()
     return QIcon(pixmap)
+
+
+def _help_icon() -> QIcon:
+    pixmap = QPixmap(HELP_ICON_SIZE, HELP_ICON_SIZE)
+    pixmap.fill(Qt.transparent)
+    painter = QPainter(pixmap)
+    painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+    painter.setPen(QPen(QColor("#4f5965"), 2))
+    painter.setBrush(Qt.BrushStyle.NoBrush)
+    painter.drawEllipse(2, 2, HELP_ICON_SIZE - 4, HELP_ICON_SIZE - 4)
+    font = QFont()
+    font.setBold(True)
+    font.setPointSize(11)
+    painter.setFont(font)
+    painter.drawText(pixmap.rect(), Qt.AlignCenter, "?")
+    painter.end()
+    return QIcon(pixmap)
+
+
+def _help_button() -> QPushButton:
+    button = QPushButton()
+    button.setIcon(_help_icon())
+    button.setIconSize(QSize(HELP_ICON_SIZE, HELP_ICON_SIZE))
+    button.setFixedWidth(32)
+    button.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
+    return button
 
 
 def _label() -> QLabel:
@@ -175,10 +203,13 @@ class OfflinePage(QWidget):
         browse_out.clicked.connect(lambda: self._browse_dir(self.single_out_dir))
         self.single_mode = self._mode_combo()
         self.single_engine = self._engine_combo()
+        self.single_matanyone_help = _help_button()
         self.single_skip_frames = self._skip_frames_combo()
         self.single_skip = QCheckBox()
         self.single_skip.setChecked(True)
         self.start_single.clicked.connect(self.run_single)
+        self.single_engine.currentIndexChanged.connect(self._update_matanyone_help_visibility)
+        self.single_matanyone_help.clicked.connect(self.show_matanyone_help)
         row_video = QHBoxLayout()
         row_video.addWidget(self.single_video)
         row_video.addWidget(browse_video)
@@ -200,7 +231,11 @@ class OfflinePage(QWidget):
         grid.addWidget(self.single_labels["mode"], 2, 0)
         grid.addWidget(self.single_mode, 2, 1, alignment=Qt.AlignLeft)
         grid.addWidget(self.single_labels["engine"], 3, 0)
-        grid.addWidget(self.single_engine, 3, 1, alignment=Qt.AlignLeft)
+        single_engine_row = QHBoxLayout()
+        single_engine_row.addWidget(self.single_engine)
+        single_engine_row.addWidget(self.single_matanyone_help)
+        single_engine_row.addStretch(1)
+        grid.addLayout(single_engine_row, 3, 1)
         grid.addWidget(self.single_labels["performance"], 4, 0)
         grid.addLayout(self._performance_row(self.single_skip_frames), 4, 1)
         grid.addWidget(self.single_labels["time"], 5, 0)
@@ -217,12 +252,15 @@ class OfflinePage(QWidget):
         browse_dir.clicked.connect(lambda: self._browse_dir(self.batch_dir))
         self.batch_mode = self._mode_combo()
         self.batch_engine = self._engine_combo()
+        self.batch_matanyone_help = _help_button()
         self.batch_skip_frames = self._skip_frames_combo()
         self.batch_recursive = QCheckBox()
         self.batch_recursive.setChecked(True)
         self.batch_skip = QCheckBox()
         self.batch_skip.setChecked(True)
         self.start_batch.clicked.connect(self.run_batch)
+        self.batch_engine.currentIndexChanged.connect(self._update_matanyone_help_visibility)
+        self.batch_matanyone_help.clicked.connect(self.show_matanyone_help)
         row_dir = QHBoxLayout()
         row_dir.addWidget(self.batch_dir)
         row_dir.addWidget(browse_dir)
@@ -239,7 +277,11 @@ class OfflinePage(QWidget):
         grid.addWidget(self.batch_labels["mode"], 1, 0)
         grid.addWidget(self.batch_mode, 1, 1, alignment=Qt.AlignLeft)
         grid.addWidget(self.batch_labels["engine"], 2, 0)
-        grid.addWidget(self.batch_engine, 2, 1, alignment=Qt.AlignLeft)
+        batch_engine_row = QHBoxLayout()
+        batch_engine_row.addWidget(self.batch_engine)
+        batch_engine_row.addWidget(self.batch_matanyone_help)
+        batch_engine_row.addStretch(1)
+        grid.addLayout(batch_engine_row, 2, 1)
         grid.addWidget(self.batch_labels["performance"], 3, 0)
         grid.addLayout(self._performance_row(self.batch_skip_frames), 3, 1)
         grid.addWidget(self.batch_recursive, 4, 1)
@@ -289,6 +331,17 @@ class OfflinePage(QWidget):
         visible = self.single_duration.currentData() == "custom"
         self.single_custom_minutes_label.setVisible(visible)
         self.single_custom_minutes.setVisible(visible)
+
+    def _update_matanyone_help_visibility(self) -> None:
+        self.single_matanyone_help.setVisible(self.single_engine.currentData() == "matanyone2")
+        self.batch_matanyone_help.setVisible(self.batch_engine.currentData() == "matanyone2")
+
+    def show_matanyone_help(self) -> None:
+        QMessageBox.information(
+            self,
+            self.i18n.t("offline.matanyone_help_title"),
+            self.i18n.t("offline.matanyone_help_msg"),
+        )
 
     def run_single(self) -> None:
         args = [
@@ -370,6 +423,9 @@ class OfflinePage(QWidget):
             combo.setItemText(0, self.i18n.t("engine.rvm_fast"))
             combo.setItemText(1, self.i18n.t("engine.rvm_balanced"))
             combo.setItemText(2, self.i18n.t("engine.matanyone2"))
+        self.single_matanyone_help.setToolTip(self.i18n.t("offline.matanyone_help_title"))
+        self.batch_matanyone_help.setToolTip(self.i18n.t("offline.matanyone_help_title"))
+        self._update_matanyone_help_visibility()
         for index, key in enumerate(("offline.duration_15s", "offline.duration_30s", "offline.duration_1m", "offline.duration_custom", "offline.duration_full")):
             self.single_duration.setItemText(index, self.i18n.t(key))
         self.single_custom_minutes_label.setText(self.i18n.t("offline.minutes"))

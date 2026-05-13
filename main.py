@@ -176,6 +176,7 @@ def main(argv: list[str] | None = None) -> int:
     from pipeline.matting import matter_device
     log.info(
         "PIPELINE: HWACCEL=%s DECODE_MAX_SIDE=%d DECODE_PIX_FMT=%s PASSTHROUGH_MAX_FPS=%.2f "
+        "ALPHA_STRIDE=%d "
         "MATTING_INPUT_SIZE=%d WARMUP_RUNS=%d "
         "USE_PYNV=%s VCODEC=%s HEVC_BITRATE=%s HEVC_BF=%s CONTAINER=%s SEEK_MODE=%s OUTPUT_MODE=%s "
         "MAX_CONCURRENT=%d PAD_TO_LENGTH=%s COMPOSITE_DEVICE=%s PYNV_10BIT=%s PYNV_10BIT_SHIFT=%d",
@@ -183,6 +184,7 @@ def main(argv: list[str] | None = None) -> int:
         config.DECODE_MAX_SIDE,
         config.DECODE_PIX_FMT,
         config.PASSTHROUGH_MAX_FPS,
+        config.ALPHA_STRIDE,
         config.MATTING_INPUT_SIZE,
         config.MATTING_WARMUP_RUNS,
         config.USE_PYNV,

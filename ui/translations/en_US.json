@@ -111,7 +111,7 @@
   "subtitle.mode_help_msg": "Both Eyes: subtitles are shown in both left and right eye images. Set the subtitle display distance in meters, ideally matching the scene depth around the subtitles. Otherwise, long viewing may cause eye strain or dizziness.\n\nSingle Eye: subtitles are shown only in the left or right eye. Choosing the dominant eye lets the brain read mainly through that eye, which can feel easier and does not require setting a distance.",
   "subtitle.save_done": "Saved!",
   "offline.performance": "Performance",
-  "offline.frame_skip": "Frame skip",
+  "offline.frame_skip": "Mask frame skip",
   "offline.skip_none": "None",
   "offline.skip_1": "1",
   "offline.skip_2": "2",
@@ -149,4 +149,15 @@
   "player_support.supported": "Supported",
   "player_support.official_site": "Official site",
   "player_support.install_notes": "Installation notes"
+,
+  "offline.matanyone_help_title": "MatAnyone2 Model Setup",
+  "offline.matanyone_help_msg": "Check the instructions in the models folder, then download the SAM3 model and MatAnyone2 model."
+,
+  "group.performance_config_short": "Performance Settings",
+  "group.performance_config": "Performance Settings (restart server to apply changes)",
+  "performance.output_fps": "Output FPS",
+  "performance.output_size": "Output size",
+  "performance.output_size_original": "Same as source",
+  "performance.output_size_4k": "4096 (4K)",
+  "performance.output_size_8k": "8192 (8K)"
 }

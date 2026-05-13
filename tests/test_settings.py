@@ -37,7 +37,10 @@ class SettingsTests(unittest.TestCase):
         s.data["subtitle_color"] = ""
         env = s.server_env()
         self.assertNotIn("PT_SUBTITLE_COLOR", env)
-        self.assertEqual(env["PT_COMPOSITE_BG_RGB"], "808080")
+        self.assertEqual(env["PT_COMPOSITE_BG_RGB"], "00FF00")
+        self.assertEqual(env["PT_ALPHA_STRIDE"], "3")
+        self.assertEqual(env["PT_PASSTHROUGH_MAX_FPS"], "30")
+        self.assertEqual(env["PT_DECODE_MAX_SIDE"], "4096")
 
     def test_server_env_contains_video_dirs(self) -> None:
         s = self._settings()
@@ -46,6 +49,12 @@ class SettingsTests(unittest.TestCase):
 
         self.assertEqual(env["PT_VIDEO_DIR"], r"D:\VR|E:\VR")
         self.assertNotIn("PT_DEBUG_LOGS", env)
+
+    def test_server_env_keeps_zero_decode_max_side(self) -> None:
+        s = self._settings()
+        s.data["decode_max_side"] = 0
+        env = s.server_env()
+        self.assertEqual(env["PT_DECODE_MAX_SIDE"], "0")
 
     def test_restore_default_subtitle_style(self) -> None:
         s = self._settings()

@@ -9,12 +9,20 @@ from ui.i18n import system_language
 ROOT = Path(sys.executable).resolve().parent if getattr(sys, "frozen", False) else Path(__file__).resolve().parents[1]
 SETTINGS_PATH = ROOT / "runtime_cache" / "ui_settings.json"
 
+
+def _setting_value(data: dict, key: str, default):
+    value = data.get(key)
+    return default if value is None or value == "" else value
+
 DEFAULTS = {
     "language": system_language(),
     "video_dirs": [str(ROOT / "videos")],
     "mode_green": True,
     "mode_alpha": False,
-    "background_color": "808080",
+    "background_color": "00FF00",
+    "alpha_stride": 3,
+    "passthrough_max_fps": 30,
+    "decode_max_side": 4096,
     "subtitle_enable": True,
     "subtitle_mode": "auto",
     "subtitle_direction": "horizontal_bottom",
@@ -68,7 +76,10 @@ class Settings:
         env = {
             "PT_VIDEO_DIR": "|".join(self.video_dirs()),
             "PT_PASSTHROUGH_OUTPUT_MODE": self.passthrough_mode(),
-            "PT_COMPOSITE_BG_RGB": str(self.data.get("background_color") or "808080"),
+            "PT_COMPOSITE_BG_RGB": str(self.data.get("background_color") or "00FF00"),
+            "PT_ALPHA_STRIDE": str(_setting_value(self.data, "alpha_stride", 3)),
+            "PT_PASSTHROUGH_MAX_FPS": str(_setting_value(self.data, "passthrough_max_fps", 30)),
+            "PT_DECODE_MAX_SIDE": str(_setting_value(self.data, "decode_max_side", 4096)),
             "PT_SUBTITLE_ENABLE": "1" if self.data.get("subtitle_enable") else "0",
             "PT_SUBTITLE_MODE": str(self.data.get("subtitle_mode") or "auto"),
             "PT_SUBTITLE_DIRECTION": str(self.data.get("subtitle_direction") or "horizontal_bottom"),

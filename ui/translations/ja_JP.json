@@ -111,7 +111,7 @@
   "subtitle.mode_help_msg": "両眼モード：字幕を左右両方の映像に表示します。字幕の表示距離（m）を設定し、できるだけ映像内の字幕周辺の奥行きに合わせてください。合わない場合、長時間の視聴で目の疲れやめまいの原因になることがあります。\n\n片眼モード：字幕を左眼または右眼のみに表示します。利き目を選ぶと読みやすく、距離設定も不要です。",
   "subtitle.save_done": "保存しました!",
   "offline.performance": "パフォーマンス",
-  "offline.frame_skip": "フレームスキップ",
+  "offline.frame_skip": "マスクフレームスキップ",
   "offline.skip_none": "なし",
   "offline.skip_1": "1",
   "offline.skip_2": "2",
@@ -149,4 +149,15 @@
   "player_support.supported": "対応",
   "player_support.official_site": "公式サイト",
   "player_support.install_notes": "インストール説明"
+,
+  "offline.matanyone_help_title": "MatAnyone2 モデル設定",
+  "offline.matanyone_help_msg": "models フォルダー内の説明ファイルを確認し、SAM3 モデルと MatAnyone2 モデルをダウンロードしてください。"
+,
+  "group.performance_config_short": "パフォーマンス設定",
+  "group.performance_config": "パフォーマンス設定（変更後はサーバー再起動で反映）",
+  "performance.output_fps": "出力FPS",
+  "performance.output_size": "出力サイズ",
+  "performance.output_size_original": "元動画と同じ",
+  "performance.output_size_4k": "4096（4K）",
+  "performance.output_size_8k": "8192（8K）"
 }

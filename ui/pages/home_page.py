@@ -47,6 +47,15 @@ def _retain_size_when_hidden(widget: QWidget) -> None:
     widget.setSizePolicy(policy)
 
 
+def _int_setting(value, default: int) -> int:
+    if value is None or value == "":
+        return default
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
 def _apply_switch_style(widget: QCheckBox) -> None:
     widget.setObjectName("Switch")
     widget.setStyleSheet(
@@ -275,7 +284,7 @@ class HomePage(QWidget):
         self.bg_color.addItem("", "0000FF")
         self.bg_color.setFixedWidth(170)
         _retain_size_when_hidden(self.bg_color)
-        idx = self.bg_color.findData(settings.data.get("background_color", "808080"))
+        idx = self.bg_color.findData(settings.data.get("background_color", "00FF00"))
         self.bg_color.setCurrentIndex(max(0, idx))
 
         self.subtitle_enable = QCheckBox()
@@ -403,12 +412,85 @@ class HomePage(QWidget):
         group_layout.addWidget(log_row_widget)
         quick_config_layout.addWidget(self.config_header)
         quick_config_layout.addWidget(self.config_content)
+        performance_config = QWidget()
+        performance_config.setObjectName("QuickConfig")
+        performance_config.setStyleSheet(quick_config.styleSheet())
+        performance_layout = QVBoxLayout(performance_config)
+        performance_layout.setContentsMargins(0, 0, 0, 0)
+        performance_layout.setSpacing(0)
+        self.performance_header = QToolButton()
+        self.performance_header.setObjectName("QuickConfigHeader")
+        self.performance_header.setCheckable(True)
+        self.performance_header.setChecked(False)
+        self.performance_header.setArrowType(Qt.ArrowType.RightArrow)
+        self.performance_header.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
+        self.performance_header.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.performance_header.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self.performance_header.setStyleSheet(self.config_header.styleSheet())
+        self.performance_content = QWidget()
+        self.performance_content.setObjectName("QuickConfigContent")
+        performance_content_layout = QVBoxLayout(self.performance_content)
+        performance_content_layout.setContentsMargins(10, 8, 10, 8)
+        performance_content_layout.setSpacing(4)
+        self.performance_mask_skip_label = QLabel()
+        self.performance_fps_label = QLabel()
+        self.performance_output_size_label = QLabel()
+        self.performance_mask_skip = QComboBox()
+        self.performance_mask_skip.addItem("", 1)
+        self.performance_mask_skip.addItem("", 2)
+        self.performance_mask_skip.addItem("", 3)
+        self.performance_mask_skip.setFixedWidth(120)
+        idx = self.performance_mask_skip.findData(_int_setting(settings.data.get("alpha_stride"), 3))
+        self.performance_mask_skip.setCurrentIndex(max(0, idx))
+        self.performance_fps = QComboBox()
+        for value in (20, 30, 40):
+            self.performance_fps.addItem(str(value), value)
+        self.performance_fps.setFixedWidth(120)
+        idx = self.performance_fps.findData(_int_setting(settings.data.get("passthrough_max_fps"), 30))
+        self.performance_fps.setCurrentIndex(max(0, idx))
+        self.performance_output_size = QComboBox()
+        self.performance_output_size.addItem("", 0)
+        self.performance_output_size.addItem("", 4096)
+        self.performance_output_size.addItem("", 8192)
+        self.performance_output_size.setFixedWidth(150)
+        idx = self.performance_output_size.findData(_int_setting(settings.data.get("decode_max_side"), 4096))
+        self.performance_output_size.setCurrentIndex(max(0, idx))
+        mask_skip_row_widget = QWidget()
+        mask_skip_row_widget.setFixedHeight(CONFIG_ROW_HEIGHT)
+        mask_skip_row = QHBoxLayout(mask_skip_row_widget)
+        mask_skip_row.setContentsMargins(0, 0, 0, 0)
+        mask_skip_row.addWidget(self.performance_mask_skip_label)
+        mask_skip_row.addWidget(self.performance_mask_skip)
+        mask_skip_row.addStretch(1)
+        fps_row_widget = QWidget()
+        fps_row_widget.setFixedHeight(CONFIG_ROW_HEIGHT)
+        fps_row = QHBoxLayout(fps_row_widget)
+        fps_row.setContentsMargins(0, 0, 0, 0)
+        fps_row.addWidget(self.performance_fps_label)
+        fps_row.addWidget(self.performance_fps)
+        fps_row.addStretch(1)
+        output_size_row_widget = QWidget()
+        output_size_row_widget.setFixedHeight(CONFIG_ROW_HEIGHT)
+        output_size_row = QHBoxLayout(output_size_row_widget)
+        output_size_row.setContentsMargins(0, 0, 0, 0)
+        output_size_row.addWidget(self.performance_output_size_label)
+        output_size_row.addWidget(self.performance_output_size)
+        output_size_row.addStretch(1)
+        performance_content_layout.addWidget(mask_skip_row_widget)
+        performance_content_layout.addWidget(fps_row_widget)
+        performance_content_layout.addWidget(output_size_row_widget)
+        performance_layout.addWidget(self.performance_header)
+        performance_layout.addWidget(self.performance_content)
+        self.performance_content.setVisible(False)
         for label in (
             self.video_dirs_title,
             self.green_mode_label,
             self.alpha_mode_label,
             self.subtitle_enable_label,
             self.log_toggle_label,
+            self.performance_mask_skip_label,
+            self.performance_fps_label,
+            self.performance_output_size_label,
         ):
             label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
 
@@ -420,6 +502,7 @@ class HomePage(QWidget):
         left_layout.addLayout(title_box)
         left_layout.addLayout(buttons)
         left_layout.addWidget(quick_config)
+        left_layout.addWidget(performance_config)
         left_layout.addStretch(1)
         left_layout.addWidget(self.project_link)
         layout = QHBoxLayout(self)
@@ -428,6 +511,7 @@ class HomePage(QWidget):
         layout.addWidget(left_panel)
         layout.addWidget(self.log)
         self.config_group = quick_config
+        self.performance_group = performance_config
         self.retranslate()
         self._bind_settings()
 
@@ -453,7 +537,11 @@ class HomePage(QWidget):
         self.alpha_mode.toggled.connect(self._save)
         self.bg_color.currentIndexChanged.connect(self._save)
         self.subtitle_enable.toggled.connect(self._save)
+        self.performance_mask_skip.currentIndexChanged.connect(self._save)
+        self.performance_fps.currentIndexChanged.connect(self._save)
+        self.performance_output_size.currentIndexChanged.connect(self._save)
         self.config_header.toggled.connect(self._toggle_quick_config)
+        self.performance_header.toggled.connect(self._toggle_performance_config)
         self.green_mode.toggled.connect(self._update_enabled)
         self.subtitle_enable.toggled.connect(self._update_enabled)
         self.log_toggle.toggled.connect(self._update_enabled)
@@ -466,6 +554,9 @@ class HomePage(QWidget):
         self.settings.data["mode_green"] = self.green_mode.isChecked()
         self.settings.data["mode_alpha"] = self.alpha_mode.isChecked()
         self.settings.data["background_color"] = self.bg_color.currentData()
+        self.settings.data["alpha_stride"] = self.performance_mask_skip.currentData()
+        self.settings.data["passthrough_max_fps"] = self.performance_fps.currentData()
+        self.settings.data["decode_max_side"] = self.performance_output_size.currentData()
         self.settings.data["subtitle_enable"] = self.subtitle_enable.isChecked()
         self.settings.save()
 
@@ -500,15 +591,40 @@ class HomePage(QWidget):
         self._adjust_window()
 
     def _toggle_quick_config(self, expanded: bool) -> None:
+        if expanded and self.performance_header.isChecked():
+            self.performance_header.blockSignals(True)
+            self.performance_header.setChecked(False)
+            self.performance_header.blockSignals(False)
+            self.performance_content.setVisible(False)
+            self.performance_header.setArrowType(Qt.ArrowType.RightArrow)
+            self._update_performance_config_title()
         self.config_content.setVisible(expanded)
         self.config_header.setArrowType(Qt.ArrowType.DownArrow if expanded else Qt.ArrowType.RightArrow)
         self._update_quick_config_title()
         self.config_group.updateGeometry()
         self._adjust_window()
 
+    def _toggle_performance_config(self, expanded: bool) -> None:
+        if expanded and self.config_header.isChecked():
+            self.config_header.blockSignals(True)
+            self.config_header.setChecked(False)
+            self.config_header.blockSignals(False)
+            self.config_content.setVisible(False)
+            self.config_header.setArrowType(Qt.ArrowType.RightArrow)
+            self._update_quick_config_title()
+        self.performance_content.setVisible(expanded)
+        self.performance_header.setArrowType(Qt.ArrowType.DownArrow if expanded else Qt.ArrowType.RightArrow)
+        self._update_performance_config_title()
+        self.performance_group.updateGeometry()
+        self._adjust_window()
+
     def _update_quick_config_title(self) -> None:
         key = "group.quick_config" if self.config_header.isChecked() else "group.quick_config_short"
         self.config_header.setText(self.i18n.t(key))
+
+    def _update_performance_config_title(self) -> None:
+        key = "group.performance_config" if self.performance_header.isChecked() else "group.performance_config_short"
+        self.performance_header.setText(self.i18n.t(key))
 
     def _current_home_height(self) -> int:
         return HOME_HEIGHT
@@ -551,6 +667,9 @@ class HomePage(QWidget):
             self.alpha_mode_label,
             self.subtitle_enable_label,
             self.log_toggle_label,
+            self.performance_mask_skip_label,
+            self.performance_fps_label,
+            self.performance_output_size_label,
         )
         width = max(label.sizeHint().width() for label in labels)
         for label in labels:
@@ -565,6 +684,7 @@ class HomePage(QWidget):
         self.server_button.setText(self.i18n.t("button.start_server"))
         self.offline_button.setText(self.i18n.t("button.offline"))
         self._update_quick_config_title()
+        self._update_performance_config_title()
         self.video_dirs_manage_button.setToolTip(self.i18n.t("button.manage"))
         self.video_dirs_title.setText(self.i18n.t("video_dirs.label"))
         self.green_mode.setText("")
@@ -579,6 +699,14 @@ class HomePage(QWidget):
         self.log_toggle_label.setText(self.i18n.t("log.show"))
         self.debug_toggle.setText("")
         self.debug_toggle_label.setText(self.i18n.t("log.debug"))
+        self.performance_mask_skip_label.setText(self.i18n.t("offline.frame_skip"))
+        self.performance_fps_label.setText(self.i18n.t("performance.output_fps"))
+        self.performance_output_size_label.setText(self.i18n.t("performance.output_size"))
+        for i, key in enumerate(("offline.skip_none", "offline.skip_1", "offline.skip_2")):
+            self.performance_mask_skip.setItemText(i, self.i18n.t(key))
+        self.performance_output_size.setItemText(0, self.i18n.t("performance.output_size_original"))
+        self.performance_output_size.setItemText(1, self.i18n.t("performance.output_size_4k"))
+        self.performance_output_size.setItemText(2, self.i18n.t("performance.output_size_8k"))
         self.update_video_dirs_summary()
         for i, key in enumerate(("bg.neutral_gray", "bg.light_gray", "bg.soft_green", "bg.soft_blue")):
             self.bg_color.setItemText(i, self.i18n.t(key))

@@ -401,10 +401,10 @@ CUDA_CACHE_MAXSIZE = _env("CUDA_CACHE_MAXSIZE", "4294967296")
 # ---- Composite background color ----
 # PT_COMPOSITE_BG_RGB:
 #   Background color used after matting, written as RGB hex `RRGGBB` or
-#   `#RRGGBB`. Default `808080` is the recommended green-screen color for
-#   external VR player keying. Use `2BE640` when a green background is needed.
-COMPOSITE_BG_RGB_HEX = _env("COMPOSITE_BG_RGB", "808080")
-COMPOSITE_BG_RGB = _rgb_hex(COMPOSITE_BG_RGB_HEX, "808080")
+#   `#RRGGBB`. Default `00FF00` is the ChromaKey green used by the UI default.
+#   Use gray values such as `808080` for players that key better on gray.
+COMPOSITE_BG_RGB_HEX = _env("COMPOSITE_BG_RGB", "00FF00")
+COMPOSITE_BG_RGB = _rgb_hex(COMPOSITE_BG_RGB_HEX, "00FF00")
 
 # OpenCV/Numpy frames and legacy GPU BGR kernels use BGR channel order.
 GREEN_BGR = (COMPOSITE_BG_RGB[2], COMPOSITE_BG_RGB[1], COMPOSITE_BG_RGB[0])

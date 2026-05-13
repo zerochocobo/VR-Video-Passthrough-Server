@@ -76,8 +76,27 @@ class UiSmokeTests(unittest.TestCase):
                 window.home.alpha_mode_label.width(),
                 window.home.subtitle_enable_label.width(),
                 window.home.log_toggle_label.width(),
+                window.home.performance_mask_skip_label.width(),
+                window.home.performance_fps_label.width(),
+                window.home.performance_output_size_label.width(),
             }
             self.assertEqual(len(quick_label_widths), 1)
+            self.assertTrue(window.home.config_header.isChecked())
+            self.assertFalse(window.home.performance_header.isChecked())
+            self.assertTrue(window.home.performance_content.isHidden())
+            self.assertEqual(window.home.performance_mask_skip.itemData(0), 1)
+            self.assertEqual(window.home.performance_mask_skip.itemData(2), 3)
+            self.assertEqual(window.home.performance_fps.itemData(1), 30)
+            self.assertEqual(window.home.performance_output_size.itemData(0), 0)
+            self.assertEqual(window.home.performance_output_size.itemData(1), 4096)
+            window.home.performance_output_size.setCurrentIndex(0)
+            app.processEvents()
+            self.assertEqual(window.settings.data["decode_max_side"], 0)
+            window.home.performance_header.setChecked(True)
+            app.processEvents()
+            self.assertFalse(window.home.config_header.isChecked())
+            self.assertTrue(window.home.config_content.isHidden())
+            self.assertFalse(window.home.performance_content.isHidden())
             self.assertEqual(window.stack.count(), 3)
             base_size = window.size()
             self.assertEqual(base_size.height(), 508)
@@ -132,6 +151,11 @@ class UiSmokeTests(unittest.TestCase):
             self.assertEqual(window.offline.single_skip_frames.count(), 3)
             self.assertEqual(window.offline.single_skip_frames.currentData(), 0)
             self.assertEqual(window.offline.batch_skip_frames.count(), 3)
+            self.assertTrue(window.offline.single_matanyone_help.isHidden())
+            self.assertTrue(window.offline.batch_matanyone_help.isHidden())
+            window.offline.single_engine.setCurrentIndex(2)
+            app.processEvents()
+            self.assertFalse(window.offline.single_matanyone_help.isHidden())
             self.assertEqual(window.offline.log.document().maximumBlockCount(), UI_LOG_MAX_BLOCKS)
             self.assertTrue(hasattr(window.offline, "single_out_dir"))
             self.assertFalse(window.offline.start_single.icon().isNull())
