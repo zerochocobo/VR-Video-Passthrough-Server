@@ -13,12 +13,7 @@ import runpy
 import sys
 import time
 
-import uvicorn
-
 import config
-from dlna.ssdp import SSDPServer
-from http_app.server import create_app
-from utils.firewall import ensure_rules
 from utils.gpu_runtime_cache import (
     configure_gpu_runtime_cache,
     predict_warmup_state,
@@ -278,15 +273,23 @@ def main(argv: list[str] | None = None) -> int:
     )
 
     set_startup_phase("firewall", "ensuring firewall rules")
+    from utils.firewall import ensure_rules
+
     ensure_rules()
 
     set_startup_phase("ssdp", "starting SSDP")
+    from dlna.ssdp import SSDPServer
+
     ssdp = SSDPServer()
     ssdp.start()
+
+    from http_app.server import create_app
 
     app = create_app()
     set_startup_phase("http_starting", f"uvicorn starting on 0.0.0.0:{config.HTTP_PORT}")
     try:
+        import uvicorn
+
         uvicorn.run(
             app,
             host="0.0.0.0",

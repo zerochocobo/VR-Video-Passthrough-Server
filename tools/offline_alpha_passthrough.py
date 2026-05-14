@@ -1025,6 +1025,7 @@ class MatAnyone2OnnxEngine(OfflineMattingEngine):
         self.bootstrap_dilate = max(0, int(bootstrap_dilate))
         self.bootstrap_soft = bool(bootstrap_soft)
         self.segment_frames = max(0, int(segment_frames))
+        self.alpha_stride = max(1, int(config.ALPHA_STRIDE))
         self._frame_index = 0
         self._source_frame_index = -1
         manifest_path = model_dir / "manifest.json"
@@ -1076,12 +1077,13 @@ class MatAnyone2OnnxEngine(OfflineMattingEngine):
         self._mask_cache: list[np.ndarray] | None = None
         self.segment_masks: dict[int, list[np.ndarray]] = {}
         self._active_segment_start = -1
+        self._cached_alpha_sbs = None
         self.profile = defaultdict(list)
         print(
             f"[offline] MatAnyone2 ONNX loaded dir={model_dir} input={self.in_w}x{self.in_h} "
             f"sbs=per-eye bootstrap={'mask' if mask else 'sam3'} sam3_prompt={sam3_prompt!r} "
             f"bootstrap_erode={self.bootstrap_erode} bootstrap_dilate={self.bootstrap_dilate} "
-            f"bootstrap_soft={self.bootstrap_soft} segment_frames={self.segment_frames} "
+            f"bootstrap_soft={self.bootstrap_soft} segment_frames={self.segment_frames} alpha_stride={self.alpha_stride} "
             f"batch2={self.batch2_enabled} dtype={self.tensor_dtype.__name__} "
             f"fused_update={self.propagate_update is not None} step_update={self.step_update is not None} "
             f"providers={providers}"
@@ -1262,6 +1264,7 @@ class MatAnyone2OnnxEngine(OfflineMattingEngine):
         for eye in self.eyes:
             eye.reset()
         self._active_segment_start = -1
+        self._cached_alpha_sbs = None
 
     def set_segment_masks(self, segment_start: int, masks: "list[np.ndarray]"):
         self.segment_masks[int(segment_start)] = masks
@@ -1448,14 +1451,24 @@ class MatAnyone2OnnxEngine(OfflineMattingEngine):
         eye_w = w // 2
         if eye_w <= 0 or w < 2 * h:
             raise RuntimeError(f"MatAnyone2 ONNX offline engine expects SBS input, got {w}x{h}")
-        if self.batch2_enabled:
+        should_update = (
+            self._cached_alpha_sbs is None
+            or self.alpha_stride <= 1
+            or self._frame_index % self.alpha_stride == 0
+        )
+        if should_update and self.batch2_enabled:
             alpha_sbs = self._run_eyes_batch2(self._preprocess_eyes_batch2(eye_w), h, w)
-        else:
+            self._cached_alpha_sbs = alpha_sbs
+        elif should_update:
             left = self._run_eye(self._preprocess_eye(0, eye_w), h, w, 0)
             right = self._run_eye(self._preprocess_eye(eye_w, eye_w), h, w, 1)
             t0 = time.perf_counter()
             alpha_sbs = self.np.ascontiguousarray(self.np.concatenate([left, right], axis=1))
             self.profile["alpha_concat"].append((time.perf_counter() - t0) * 1000)
+            self._cached_alpha_sbs = alpha_sbs
+        else:
+            alpha_sbs = self._cached_alpha_sbs
+            self.profile["alpha_reuse"].append(0.0)
         self._frame_index += 1
         t0 = time.perf_counter()
         out = self.packer.pack_uploaded(alpha_sbs, h, w)
@@ -1473,6 +1486,7 @@ class MatAnyone2OnnxEngine(OfflineMattingEngine):
             "mask_memory",
             "first_refine",
             "alpha_concat",
+            "alpha_reuse",
             "alpha_pack",
         ]
         lines = []
@@ -1695,9 +1709,11 @@ def _precompute_sam3_segment_masks_subprocess(args, src: Path, source_fps: float
     tmp_dir = config.ROOT / "debug_output" / "_sam3_prepass"
     tmp_dir.mkdir(parents=True, exist_ok=True)
     result_path = tmp_dir / f"sam3_prepass_{int(time.time() * 1000)}_{id(args)}.npz"
-    cmd = [
-        sys.executable,
-        str(Path(__file__).resolve()),
+    if getattr(sys, "frozen", False):
+        cmd = [sys.executable, "tool", "offline_alpha_passthrough"]
+    else:
+        cmd = [sys.executable, str(Path(__file__).resolve())]
+    cmd += [
         str(src),
         "--engine",
         "matanyone2_onnx",

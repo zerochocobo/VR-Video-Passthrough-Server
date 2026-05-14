@@ -114,9 +114,9 @@ def _base_cmd(args: argparse.Namespace, src: Path, out: Path) -> list[str]:
     fps = float(args.fps or 0.0)
     if fps > 0:
         cmd.extend(["--fps", str(fps)])
+    cmd.extend(["--alpha-stride", str(int(args.skip_frames) + 1)])
     if engine == "rvm":
         cmd.extend(["--input-size", str(args.input_size)])
-        cmd.extend(["--alpha-stride", str(int(args.skip_frames) + 1)])
         cmd.append("--sbs-batch")
         cmd.extend(["--bitrate", str(args.bitrate)])
         cmd.extend(["--preset", str(args.preset)])
