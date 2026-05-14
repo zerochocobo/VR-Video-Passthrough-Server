@@ -157,6 +157,7 @@ def configure_gpu_runtime_cache() -> GpuRuntimeCacheEnv:
     os.environ["CUDA_CACHE_MAXSIZE"] = config.CUDA_CACHE_MAXSIZE
     os.environ["CUDA_CACHE_PATH"] = str(cuda_dir)
     os.environ["CUPY_CACHE_DIR"] = str(cupy_dir)
+    os.environ.setdefault("CUPY_COMPILE_WITH_PTX", "1")
     os.environ["TMP"] = str(tmp_dir)
     os.environ["TEMP"] = str(tmp_dir)
     tmp_dir.mkdir(parents=True, exist_ok=True)

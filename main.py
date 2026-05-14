@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import runpy
 import sys
 import time
 
@@ -67,8 +68,49 @@ def _run_legacy_tool(tool_main, tool_name: str, tool_args: list[str]) -> int:
         sys.argv = original_argv
 
 
+def _run_internal_python_module(argv: list[str] | None) -> int | None:
+    """Handle subprocess probes that call the frozen exe like python -m."""
+    if not argv:
+        return None
+
+    args = list(argv)
+    if args[0] == "-m":
+        if len(args) < 2:
+            return 2
+        module_name = args[1]
+        module_args = args[2:]
+    else:
+        module_name = args[0]
+        module_args = args[1:]
+
+    allowed_prefixes = ("cuda.pathfinder.",)
+    if not module_name.startswith(allowed_prefixes):
+        return None
+
+    _force_line_buffered_stdio()
+    original_argv = sys.argv[:]
+    try:
+        sys.argv = [module_name, *module_args]
+        try:
+            runpy.run_module(module_name, run_name="__main__", alter_sys=True)
+        except SystemExit as exc:
+            code = exc.code
+            if code is None:
+                return 0
+            if isinstance(code, int):
+                return code
+            return 1
+        return 0
+    finally:
+        sys.argv = original_argv
+
+
 def main(argv: list[str] | None = None) -> int:
     """Start the DLNA media server process."""
+
+    internal_module_result = _run_internal_python_module(argv)
+    if internal_module_result is not None:
+        return internal_module_result
 
     if argv and argv[0] == "offline":
         _force_line_buffered_stdio()

@@ -1467,7 +1467,7 @@ class PyNvPassthroughStream:
         while not self._stop.is_set():
             if done.wait(timeout=0.5):
                 waited = time.perf_counter() - wait_started
-                if waited >= 1.0:
+                if config.DEBUG_LOGS and waited >= 1.0:
                     log.warning(
                         "[PYNV][%d] reader async queue recovered after %.3fs chunks=%d bytes=%d",
                         self.sid,
@@ -1476,13 +1476,14 @@ class PyNvPassthroughStream:
                         bytes_read,
                     )
                 return bool(state["ok"])
-            log.warning(
-                "[PYNV][%d] reader waiting for async queue chunks=%d bytes=%d waited=%.3fs",
-                self.sid,
-                chunks,
-                bytes_read,
-                time.perf_counter() - wait_started,
-            )
+            if config.DEBUG_LOGS:
+                log.warning(
+                    "[PYNV][%d] reader waiting for async queue chunks=%d bytes=%d waited=%.3fs",
+                    self.sid,
+                    chunks,
+                    bytes_read,
+                    time.perf_counter() - wait_started,
+                )
         return False
 
     def _worker_loop(self) -> None:
