@@ -319,8 +319,8 @@ def select_backend(
     primaries = (color.color_primaries if color else "").lower()
     is_hdr = transfer in {"smpte2084", "arib-std-b67"}
 
-    if codec not in {"h264", "hevc", "vp9"}:
-        if codec in {"av1", "mpeg4", "msmpeg4v3"}:
+    if codec not in {"h264", "hevc", "vp9", "av1"}:
+        if codec in {"mpeg4", "msmpeg4v3"}:
             return BackendDecision("ffmpeg_fallback", f"codec {codec or 'unknown'} is not enabled for PyNv route")
         return BackendDecision("block", f"unsupported or unknown video codec: {codec or 'unknown'}")
     if not timing.is_cfr:
