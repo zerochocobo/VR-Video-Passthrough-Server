@@ -38,7 +38,7 @@ VR Video Passthrough Server の目標は、すべてのVR動画をパススル�
 
 - Windows 10 / 11
 - Python 3.12
-- リアルタイムパイプライン用の NVIDIA GPU
+- リアルタイムパイプライン用の NVIDIA GPU。目安として RTX 20 シリーズ以上を推奨します。正確な型番は NVIDIA 公式リストを確認してください: <https://developer.nvidia.com/cuda/gpus>。推奨 VRAM: リアルタイムサーバーと RVM オフライン生成は 6 GB 以上、MatAnyone2 / SAM3 オフラインワークフローは約 15 GB 以上。
 - FFmpeg / FFprobe
 
 ## クイックスタート

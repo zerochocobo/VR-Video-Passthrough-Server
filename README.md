@@ -38,7 +38,7 @@ This is the miracle of the AI era.
 
 - Windows 10 / 11
 - Python 3.12
-- NVIDIA GPU for the realtime pipeline
+- NVIDIA GPU for the realtime pipeline. Rough recommendation: RTX 20 series or newer. Check your exact model on NVIDIA's official list: <https://developer.nvidia.com/cuda/gpus>. Recommended VRAM: 6 GB or more for the realtime server and RVM offline generation, and about 15 GB or more for MatAnyone2 / SAM3 offline workflows.
 - FFmpeg / FFprobe
 
 ## Quick Start

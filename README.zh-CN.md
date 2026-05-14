@@ -38,7 +38,7 @@ VR视频透视服务器 的目标是让所有VR视频都可以透视，实现混
 
 - Windows 10 / 11
 - Python 3.12
-- NVIDIA GPU，用于实时处理链路
+- NVIDIA GPU，用于实时处理链路。粗略建议使用 RTX 20 系列及以上，具体型号请查询 NVIDIA 官方列表：<https://developer.nvidia.com/cuda/gpus>。推荐显存：实时服务器和 RVM 离线生成建议 6 GB 以上，MatAnyone2 / SAM3 离线流程建议约 15 GB 以上。
 - FFmpeg / FFprobe
 
 ## 快速启动
