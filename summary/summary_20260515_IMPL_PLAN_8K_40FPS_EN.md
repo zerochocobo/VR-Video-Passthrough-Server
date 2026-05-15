@@ -8,7 +8,40 @@ This document is the engineering follow-up to:
 - `prompt/HANDOVER_20260515.md` (feasibility research and reviewer notes)
 - `baseline/baseline_20260508_pynv_8k.txt` (the only existing 8K full-chain measurement)
 
-The plan is broken into six phases that mirror the reviewer's priority order. Each phase has explicit acceptance gates; do not start phase N+1 until phase N's gate passes.
+The plan is broken into one automation-preparation phase plus six implementation phases that mirror the reviewer's priority order. Each implementation phase has explicit acceptance gates; do not start phase N+1 until phase N's gate passes.
+
+---
+
+## Phase 0 — Automation harness prerequisites
+
+Before any performance work starts, remove the dependency on manual playback from a physical DLNA client. No acceptance gate in this plan should require the user to manually open a player, select a DLNA item, and observe playback. Physical-device tests remain optional compatibility soaks after automated gates pass.
+
+### Existing test code to reuse
+- `tools/pynv_fullchain_probe.py`: base offline full-chain probe for decode → matting → encode → mux timings.
+- `tools/pynv_decode_probe.py`: decode-only baseline and SimpleDecoder comparison point.
+- `tools/bench.py`: auxiliary local decode / pipeline / playback checks. It is useful for quick smoke tests, but it is not sufficient as the main 8K automation gate because it does not exercise DLNA Browse or the current live item selection path.
+- `tools/dlna_client_probe.py`: automated DLNA SOAP Browse + HTTP stream-pull simulator. It should prefer alpha-live by default and allow passthrough-live as an explicit option.
+
+### Required harness work before Phase 1
+1. Add a top-level orchestrator, proposed as `tools/auto_tune_8k.py`, that can run one phase at a time and write machine-readable results.
+2. Let the orchestrator start the PTMediaServer process in a subprocess with `PT_DEBUG_LOGS=1`, wait until `/description.xml` and `/control/cds` are reachable, then stop the server at the end of the run.
+3. Use `tools/dlna_client_probe.py` from the orchestrator to Browse the library, select the requested video, prefer the alpha-live item, GET the returned DIDL `<res>` URL, and read the stream for a fixed duration.
+4. Add a log parser for `debug_output/server.log` that extracts `[PYNV][sid] ... interval_fps=... stage_avg_ms decode=... composite=... sync=... encode=... mux=...`, `mux stdin write slow`, HTTP pacing warnings, selected mode, and stream session id.
+5. Extend `tools/pynv_fullchain_probe.py` with a `--pipeline=serial|staged` option and JSON output so Phase 4 can be gated offline before the live route is tested.
+6. Add or schedule the missing standalone probes: `tools/pynv_threaded_decode_probe.py` for ThreadedDecoder validation and `tools/trt_rvm_probe.py` for TensorRT EP validation.
+7. Write all outputs under `baseline/`, for example:
+   - `baseline/auto_tune_8k_phase1_YYYYMMDD_HHMMSS.json`
+   - `baseline/auto_tune_8k_phase1_YYYYMMDD_HHMMSS.md`
+   - captured server log excerpt and client probe JSON.
+
+### Phase 0 acceptance gate
+One command can run the Phase 1 measurement without user interaction:
+
+```powershell
+uv run python tools/auto_tune_8k.py phase1 --video <8k-file> --profile quest --prefer alpha --duration 60
+```
+
+The command must start the server, run the automated DLNA Browse and live HTTP pull, parse producer/client metrics, stop the server, and write a baseline report. If this gate is not ready, do not start Phase 1 measurements because they would still depend on manual testing.
 
 ---
 
@@ -35,12 +68,13 @@ Production target: ≤ 25 ms per frame at stride=1 → 40 fps.
 Probe shows 35.9 fps but the user reports ~30 fps in production. Before we restructure the pipeline, confirm whether the bottleneck is the producer or the HTTP delivery path.
 
 ### Steps
-1. Set `PT_DEBUG_LOGS=1` and play one 8K passthrough-live entry from a real DLNA client.
-2. From `debug_output/server.log`, extract the periodic `[PYNV][sid] frame N/M ... interval_fps=... stage_avg_ms decode=... composite=... sync=... encode=... mux=...` lines emitted at `_DIAG_INTERVAL`.
-3. Check three signals:
+1. Run `tools/auto_tune_8k.py phase1 --video <8k-file> --profile quest --prefer alpha --duration 60`.
+2. The orchestrator starts the server with `PT_DEBUG_LOGS=1`, waits for DLNA readiness, runs `tools/dlna_client_probe.py`, and saves both client JSON and server log excerpts under `baseline/`.
+3. From `debug_output/server.log`, automatically extract the periodic `[PYNV][sid] frame N/M ... interval_fps=... stage_avg_ms decode=... composite=... sync=... encode=... mux=...` lines emitted at `_DIAG_INTERVAL`.
+4. Check three signals:
    - `interval_fps` — actual producer throughput.
    - `mux_write` average and any `mux stdin write slow` warning (`pipeline/pynv_stream.py:1779-1787`).
-   - Compare to client-side observed playback rate.
+   - Compare to client-side first-byte time, bytes read, average bitrate, stalls/timeouts, and HTTP status from `dlna_client_probe.py`.
 
 ### Decision matrix
 - **interval_fps ≈ 35 and client ≈ 26** → HTTP send pacing or queue is the bottleneck. Mitigations:
@@ -51,7 +85,7 @@ Probe shows 35.9 fps but the user reports ~30 fps in production. Before we restr
 - **mux_write spikes > 100 ms** → FFmpeg mux subprocess is back-pressured; investigate downstream (TS muxer, slate/audio path) before touching encode.
 
 ### Acceptance gate
-A clear written attribution of the missing 5–10 fps (HTTP pacing, mux back-pressure, or genuine producer cap), recorded as a new probe note under `baseline/`.
+A clear written attribution of the missing 5–10 fps (HTTP pacing, mux back-pressure, or genuine producer cap), recorded as a generated probe note under `baseline/`. The report must be produced by the automation harness, not by manual player observation.
 
 ### Risk
 None — this phase is read-only.
@@ -137,7 +171,7 @@ With Phases 2 and 3 complete, the three hardware engines (NVDEC, CUDA SM/Tensor,
 
 ### Acceptance gate
 - New 8K full-chain probe (`tools/pynv_fullchain_probe.py --pipeline=staged`) reports steady fps ≥ 40 with `ALPHA_STRIDE=1`.
-- Live HTTP playback on Quest 3 at 8K shows `interval_fps ≥ 38` for ≥ 60 s with no `mux stdin write slow` warnings.
+- Automated live HTTP probe (`tools/auto_tune_8k.py phase4 --profile quest --prefer alpha --duration 60`) shows `interval_fps ≥ 38` for ≥ 60 s with no `mux stdin write slow` warnings, and the client-side pull reports sustained bytes/bitrate with no timeout or premature disconnect.
 - Subtitle overlay path (`_apply_subtitle_overlay`) still works; alpha-pack path still works.
 
 ### Risk
@@ -244,10 +278,11 @@ Default migration plan: ship Phase 3 + Phase 4 with `PT_PASSTHROUGH_PIPELINE_MOD
 
 ## Suggested order of work for the assigned developer
 
-1. **Day 1** — Phase 1 (read-only). One log review, one possible env tweak, write findings to `baseline/`.
-2. **Day 1–2** — Phase 2 probe. Standalone, no risk to production.
-3. **Day 2–3** — Phase 3. Ring buffer + delayed reuse. Heaviest correctness review needed here.
-4. **Day 3–5** — Phase 4. Pipeline split. Bulk of the win lives here.
-5. **Day 5+** — Phase 5 (graph) and Phase 6 (TRT) only after Phase 4 ships and is stable for at least a few sessions.
+1. **Day 0** — Phase 0 automation harness. Wire `auto_tune_8k.py`, server subprocess lifecycle, `dlna_client_probe.py`, log parsing, and baseline report generation.
+2. **Day 1** — Phase 1 automated diagnosis. Run the harness, try one possible env tweak if indicated, write generated findings to `baseline/`.
+3. **Day 1–2** — Phase 2 probe. Standalone, no risk to production.
+4. **Day 2–3** — Phase 3. Ring buffer + delayed reuse. Heaviest correctness review needed here.
+5. **Day 3–5** — Phase 4. Pipeline split. Bulk of the win lives here.
+6. **Day 5+** — Phase 5 (graph) and Phase 6 (TRT) only after Phase 4 ships and is stable for at least a few sessions.
 
 After each phase, append a results section to this document so the project keeps a single record of what worked.

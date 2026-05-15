@@ -8,7 +8,40 @@
 - `prompt/HANDOVER_20260515.md`（可行性研究 + reviewer 反馈）
 - `baseline/baseline_20260508_pynv_8k.txt`（目前唯一一份 8K 全链路实测）
 
-方案分为 6 个阶段，按 reviewer 给出的优先级排序。每个阶段都有明确的验收门槛；**前一阶段不通过禁止开始下一阶段**。
+方案分为 1 个自动化前置阶段和 6 个实施阶段，实施阶段按 reviewer 给出的优先级排序。每个实施阶段都有明确的验收门槛；**前一阶段不通过禁止开始下一阶段**。
+
+---
+
+## Phase 0 — 自动化测试前置准备
+
+在开始任何性能改造前，先消除对人工真实 DLNA 客户端播放的依赖。本方案中的验收门槛不再要求用户手动打开播放器、选择 DLNA 条目并观察播放；真实设备测试只作为自动化门槛通过后的兼容性 soak，不阻塞阶段推进。
+
+### 复用现有测试代码
+- `tools/pynv_fullchain_probe.py`：离线全链路 probe 基础，用于统计 decode → matting → encode → mux。
+- `tools/pynv_decode_probe.py`：纯解码基线，也是 SimpleDecoder 的对照点。
+- `tools/bench.py`：辅助做本地 decode / pipeline / playback 快速检查。它可以做 smoke test，但不能作为 8K 自动化主验收，因为它不覆盖 DLNA Browse 和当前 live 条目选择路径。
+- `tools/dlna_client_probe.py`：自动化 DLNA SOAP Browse + HTTP 拉流模拟器。默认应优先选择 alpha-live，passthrough-live 作为显式可选项。
+
+### Phase 1 前必须完成的测试框架改造
+1. 新增顶层编排脚本，建议命名为 `tools/auto_tune_8k.py`，支持按阶段运行并输出机器可读结果。
+2. 编排脚本负责用 `PT_DEBUG_LOGS=1` 子进程启动 PTMediaServer，等待 `/description.xml` 和 `/control/cds` 可访问，测试结束后停止服务。
+3. 编排脚本调用 `tools/dlna_client_probe.py` 浏览媒体库、定位指定视频、优先选择 alpha-live 条目、GET DIDL 返回的 `<res>` URL，并按固定时长读取流。
+4. 增加 `debug_output/server.log` 解析器，提取 `[PYNV][sid] ... interval_fps=... stage_avg_ms decode=... composite=... sync=... encode=... mux=...`、`mux stdin write slow`、HTTP pacing 警告、实际模式和 stream session id。
+5. 扩展 `tools/pynv_fullchain_probe.py`，增加 `--pipeline=serial|staged` 和 JSON 输出，让 Phase 4 可以先离线验收，再进入 live 路径。
+6. 新增或排期两个缺失的独立 probe：`tools/pynv_threaded_decode_probe.py` 用于验证 ThreadedDecoder，`tools/trt_rvm_probe.py` 用于验证 TensorRT EP。
+7. 所有输出写入 `baseline/`，例如：
+   - `baseline/auto_tune_8k_phase1_YYYYMMDD_HHMMSS.json`
+   - `baseline/auto_tune_8k_phase1_YYYYMMDD_HHMMSS.md`
+   - 截取后的 server log 和 client probe JSON。
+
+### Phase 0 验收门槛
+下面一条命令可以在没有用户交互的情况下完成 Phase 1 测量：
+
+```powershell
+uv run python tools/auto_tune_8k.py phase1 --video <8k-file> --profile quest --prefer alpha --duration 60
+```
+
+该命令必须自动启动服务、完成 DLNA Browse 和 live HTTP 拉流、解析生产端/客户端指标、停止服务，并写出 baseline 报告。如果这个门槛尚未完成，不应开始 Phase 1 测量，因为那仍然会依赖人工测试。
 
 ---
 
@@ -35,12 +68,13 @@
 Probe 是 35.9 fps，但用户反映生产只有 ~30 fps。在动流水线之前，先确认瓶颈到底是生产端还是 HTTP 投递端。
 
 ### 步骤
-1. `PT_DEBUG_LOGS=1` 启动服务器，从真实 DLNA 客户端播放一个 8K passthrough-live 条目。
-2. 在 `debug_output/server.log` 中找到周期日志：`[PYNV][sid] frame N/M ... interval_fps=... stage_avg_ms decode=... composite=... sync=... encode=... mux=...`（按 `_DIAG_INTERVAL` 输出）。
-3. 看三个信号：
+1. 运行 `tools/auto_tune_8k.py phase1 --video <8k-file> --profile quest --prefer alpha --duration 60`。
+2. 编排脚本用 `PT_DEBUG_LOGS=1` 启动服务，等待 DLNA 就绪，运行 `tools/dlna_client_probe.py`，并把 client JSON 与 server log 摘要保存到 `baseline/`。
+3. 从 `debug_output/server.log` 自动提取周期日志：`[PYNV][sid] frame N/M ... interval_fps=... stage_avg_ms decode=... composite=... sync=... encode=... mux=...`（按 `_DIAG_INTERVAL` 输出）。
+4. 看三个信号：
    - `interval_fps`：生产端真实吞吐。
    - `mux_write` 均值，以及是否触发 `mux stdin write slow` 告警（`pipeline/pynv_stream.py:1779-1787`）。
-   - 与客户端实际播放速率对比。
+   - 与 `dlna_client_probe.py` 记录的首字节时间、读取字节数、平均码率、stall/timeout 和 HTTP 状态对比。
 
 ### 决策矩阵
 - **interval_fps ≈ 35 且客户端 ≈ 26** → HTTP 发送端节流或队列是瓶颈。处置：
@@ -51,7 +85,7 @@ Probe 是 35.9 fps，但用户反映生产只有 ~30 fps。在动流水线之前
 - **mux_write 出现 > 100 ms 尖峰** → FFmpeg mux 子进程被反压；先查下游（TS muxer / slate / audio 路径）再动 encode。
 
 ### 验收门槛
-把"丢失的 5–10 fps 归因于（HTTP pacing / mux 反压 / 生产端封顶）"写成一段明确的结论，落到 `baseline/` 下一份新的 probe 笔记。
+把"丢失的 5–10 fps 归因于（HTTP pacing / mux 反压 / 生产端封顶）"写成一段明确的结论，落到 `baseline/` 下一份自动生成的 probe 笔记。该报告必须由自动化框架生成，不再依赖人工播放器观察。
 
 ### 风险
 无 —— 本阶段只读。
@@ -137,7 +171,7 @@ Phase 2、3 完成后，三种硬件引擎（NVDEC、CUDA SM/Tensor、NVENC）�
 
 ### 验收门槛
 - 新增 8K 全链路 probe（`tools/pynv_fullchain_probe.py --pipeline=staged`）`ALPHA_STRIDE=1` 稳态 ≥ 40 fps。
-- Quest 3 实机播 8K，`interval_fps ≥ 38` 持续 ≥ 60 s，且无 `mux stdin write slow` 告警。
+- 自动化 live HTTP probe（`tools/auto_tune_8k.py phase4 --profile quest --prefer alpha --duration 60`）显示 `interval_fps ≥ 38` 持续 ≥ 60 s，且无 `mux stdin write slow` 告警；客户端拉流侧持续收到数据/码率稳定，没有 timeout 或提前断开。
 - 字幕叠加路径（`_apply_subtitle_overlay`）仍正常；alpha-pack 路径仍正常。
 
 ### 风险
@@ -244,10 +278,11 @@ TensorRT EP 通常比 CUDA EP fp32 再快 1.5–2.5×，特别是 Turing（RTX 2
 
 ## 建议的开发节奏
 
-1. **Day 1** — Phase 1（只读）：一次日志 review，可能调一个 env，把结论写到 `baseline/`。
-2. **Day 1–2** — Phase 2 probe：独立脚本，不影响生产。
-3. **Day 2–3** — Phase 3：ring buffer + 延迟复用。**这阶段正确性 review 最重**。
-4. **Day 3–5** — Phase 4：流水线拆分。**主要收益在这。**
-5. **Day 5+** — Phase 5（graph）和 Phase 6（TRT），在 Phase 4 上线并稳定运行几次会话之后再做。
+1. **Day 0** — Phase 0 自动化框架：串起 `auto_tune_8k.py`、服务子进程生命周期、`dlna_client_probe.py`、日志解析和 baseline 报告生成。
+2. **Day 1** — Phase 1 自动化诊断：运行框架，根据结果尝试一个可能的 env 调整，把生成的结论写到 `baseline/`。
+3. **Day 1–2** — Phase 2 probe：独立脚本，不影响生产。
+4. **Day 2–3** — Phase 3：ring buffer + 延迟复用。**这阶段正确性 review 最重**。
+5. **Day 3–5** — Phase 4：流水线拆分。**主要收益在这。**
+6. **Day 5+** — Phase 5（graph）和 Phase 6（TRT），在 Phase 4 上线并稳定运行几次会话之后再做。
 
 每完成一个阶段，把结果追加到本文档末尾，让项目保留单一真实记录。
