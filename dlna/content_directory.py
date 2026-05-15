@@ -34,6 +34,7 @@ from dlna.profiles import passthrough_frame_rate
 from pipeline.ffmpeg_io import probe_cached
 from utils.bitrate_estimator import estimate_for_media
 from utils.logger import get
+from utils.media_index import IndexedChild, get_media_index
 from utils.video_metadata import probe_video_metadata, select_backend
 
 log = get("cds")
@@ -49,6 +50,9 @@ PYNV_OUTPUT_CODEC = "hevc"
 DLNA_FLAGS_BASE = "01700000000000000000000000000000"
 DLNA_FLAGS_TIME_SEEK = "41700000000000000000000000000000"
 DIDL_NS = "urn:schemas-upnp-org:metadata-1-0/DIDL-Lite/"
+
+_DIR_ITEMS_CACHE_MAX = 256
+_dir_items_cache: dict[tuple[str, str, str, int, int], list[dict]] = {}
 
 
 def _parse_bitrate(s: str) -> int:
@@ -204,36 +208,43 @@ def _uses_live_chapter_container(duration: float) -> bool:
 
 def _child_count(path: Path) -> int:
     try:
-        children = sorted(path.iterdir(), key=lambda p: (not p.is_dir(), p.name.lower()))
-    except OSError as e:
-        log.warning("list %s failed: %s", path, e)
+        return get_media_index().child_count(path)
+    except Exception as e:
+        log.warning("indexed child count %s failed: %s", path, e)
         return 0
-    count = 0
-    for child in children:
-        if child.is_dir():
-            count += 1
-        elif child.is_file() and child.suffix.lower() in VIDEO_EXTS:
-            count += _video_item_count(child)
-    return count
 
 
 def _video_items(path: Path, parent_id: str) -> list[dict]:
+    return _video_items_from_index(path, parent_id, None)
+
+
+def _video_items_from_index(path: Path, parent_id: str, child: IndexedChild | None) -> list[dict]:
     base = f"http://{LAN_IP}:{HTTP_PORT}"
     pt_bps = _parse_bitrate(PASSTHROUGH_BITRATE)
     rel = _rel_key(path)
     quoted = quote(rel)
-    size = path.stat().st_size
-    try:
-        info = probe_cached(path)
-        duration = info.duration
-        resolution = f"{info.width}x{info.height}"
-        meta = probe_video_metadata(path)
-        backend = select_backend(meta.timing, meta.codec, meta.color)
-    except Exception as e:
-        log.warning("probe %s failed: %s", rel, e)
+    size = child.size if child is not None else path.stat().st_size
+    if child is not None and child.video is not None:
+        duration = child.video.duration
+        resolution = child.video.resolution
+        backend_verdict = child.video.backend_verdict
+    else:
+        try:
+            info = probe_cached(path)
+            duration = info.duration
+            resolution = f"{info.width}x{info.height}"
+            meta = probe_video_metadata(path)
+            backend = select_backend(meta.timing, meta.codec, meta.color)
+            backend_verdict = backend.verdict
+        except Exception as e:
+            log.warning("probe %s failed: %s", rel, e)
+            duration = 0.0
+            resolution = ""
+            backend_verdict = ""
+
+    if child is not None and child.video is not None and child.video.probe_error:
         duration = 0.0
         resolution = ""
-        backend = None
 
     items: list[dict] = [
         {
@@ -255,7 +266,6 @@ def _video_items(path: Path, parent_id: str) -> list[dict]:
     if "passthrough" in path.name.lower():
         return items
 
-    backend_verdict = backend.verdict if backend is not None else ""
     estimate_codec = PYNV_OUTPUT_CODEC
     if duration > 0:
         pt_size, pt_bps_est, _ = estimate_for_media(path, duration, estimate_codec)
@@ -355,23 +365,36 @@ def _children_for_dir(directory: Path) -> list[dict]:
     parent_id = _folder_id(directory)
     items: list[dict] = []
     try:
-        children = sorted(directory.iterdir(), key=lambda p: (not p.is_dir(), p.name.lower()))
-    except OSError as e:
-        log.warning("list %s failed: %s", directory, e)
+        snapshot = get_media_index().list_directory(directory)
+    except Exception as e:
+        log.warning("index list %s failed: %s", directory, e)
         return items
-    for child in children:
-        if child.is_dir():
+    cache_key = (
+        snapshot.key,
+        snapshot.signature,
+        PASSTHROUGH_OUTPUT_MODE,
+        int(PASSTHROUGH_LIVE_CHAPTER_MAX_ITEMS),
+        int(PASSTHROUGH_LIVE_CHAPTER_MIN_INTERVAL_SEC),
+    )
+    cached = _dir_items_cache.get(cache_key)
+    if cached is not None:
+        return list(cached)
+    for child in snapshot.children:
+        if child.is_dir:
             items.append(
                 {
                     "container": True,
-                    "id": _folder_id(child),
+                    "id": _folder_id(child.path),
                     "parent_id": parent_id,
                     "title": child.name,
-                    "child_count": _child_count(child),
+                    "child_count": _child_count(child.path),
                 }
             )
-        elif child.is_file() and child.suffix.lower() in VIDEO_EXTS:
-            items.extend(_video_items(child, parent_id))
+        elif child.path.suffix.lower() in VIDEO_EXTS:
+            items.extend(_video_items_from_index(child.path, parent_id, child))
+    if len(_dir_items_cache) >= _DIR_ITEMS_CACHE_MAX:
+        _dir_items_cache.pop(next(iter(_dir_items_cache)))
+    _dir_items_cache[cache_key] = list(items)
     return items
 
 

@@ -392,6 +392,12 @@ RUNTIME_TMP_DIR: Path = Path(_env("RUNTIME_TMP_DIR", RUNTIME_CACHE_DIR / "tmp"))
 #   JSON cache of per-file bitrate estimates used by pseudo-VOD size math.
 BITRATE_ESTIMATES: Path = Path(_env("BITRATE_ESTIMATES", RUNTIME_CACHE_DIR / "bitrate_estimates.json")).resolve()
 
+# PT_LIBRARY_INDEX_DB:
+#   SQLite cache for DLNA directory listings and video metadata. Browse requests
+#   still check directory/file stat data so external file changes invalidate the
+#   affected rows without requiring a server restart.
+LIBRARY_INDEX_DB: Path = Path(_env("LIBRARY_INDEX_DB", RUNTIME_CACHE_DIR / "library_index.sqlite")).resolve()
+
 # Driver-facing cache variables. These remain overridable through the host
 # environment, but config.py now owns the canonical defaults.
 CUDA_CACHE_DISABLE = _env("CUDA_CACHE_DISABLE", "0")
