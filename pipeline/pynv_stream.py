@@ -187,6 +187,7 @@ class PyNvPassthroughStream:
         self._slate_audio_ready = threading.Event()
         self._slate_direct_ready = threading.Event()
         self._slate_audio_failed = threading.Event()
+        self._real_video_started = threading.Event()
         self._slate_audio_addr: tuple[str, int] | None = None
         self._slate_audio_cache_path: Path | None = None
         self.startup_error: str | None = None
@@ -582,7 +583,8 @@ class PyNvPassthroughStream:
     def _make_slate_nv12_gpu(self, width: int, height: int):
         import cupy as cp
 
-        y, u, v = _rgb_to_limited_yuv(config.COMPOSITE_BG_RGB)
+        slate_rgb = (0, 0, 0) if self.output_mode == "alpha" else config.COMPOSITE_BG_RGB
+        y, u, v = _rgb_to_limited_yuv(slate_rgb)
         frame = cp.empty((height + height // 2, width), dtype=cp.uint8)
         frame[:height, :].fill(y)
         uv = frame[height:, :].reshape(height // 2, width // 2, 2)
@@ -826,10 +828,21 @@ class PyNvPassthroughStream:
             conn.settimeout(0.25)
             direct_after = float(config.PASSTHROUGH_AUDIO_MPEGTS_SLATE_DIRECT_AFTER)
             direct_deadline = time.perf_counter() + direct_after if direct_after > 0.0 else time.perf_counter()
-            while not self._stop.is_set() and not self._slate_audio_ready.is_set() and not self._slate_audio_failed.is_set():
-                if time.perf_counter() >= direct_deadline:
+            audio_source_ready = False
+            waiting_real_video_logged = False
+            while not self._stop.is_set() and not self._slate_audio_failed.is_set():
+                if not audio_source_ready and self._slate_audio_ready.is_set():
+                    audio_source_ready = True
+                    log.info("[PYNV][%d] slate audio source ready; waiting for real video start", self.sid)
+                if not audio_source_ready and time.perf_counter() >= direct_deadline:
                     self._slate_direct_ready.set()
+                    audio_source_ready = True
+                    log.info("[PYNV][%d] slate audio direct deadline reached; waiting for real video start", self.sid)
+                if audio_source_ready and self._real_video_started.is_set():
                     break
+                if audio_source_ready and not waiting_real_video_logged:
+                    waiting_real_video_logged = True
+                    log.info("[PYNV][%d] slate audio keeps silence until first real video bitstream", self.sid)
                 data = silence_proc.stdout.read(4096)
                 if not data:
                     if silence_proc.poll() is not None:
@@ -850,9 +863,9 @@ class PyNvPassthroughStream:
                 except Exception:
                     pass
             silence_proc = None
-            cache_path = self._slate_audio_cache_path
             if self._stop.is_set() or self._slate_audio_failed.is_set():
                 return
+            cache_path = self._slate_audio_cache_path
             ffmpeg = shutil.which("ffmpeg") or "ffmpeg"
             if cache_path is not None:
                 log.info("[PYNV][%d] slate audio switching to cached AAC: %s", self.sid, cache_path.name)
@@ -1488,6 +1501,7 @@ class PyNvPassthroughStream:
 
     def _worker_loop(self) -> None:
         log.info("[PYNV][%d] worker start src=%s path=%s start=%.3f", self.sid, self.src.name, self.src, self.start_sec)
+        pending_nv12_slots: list[object] = []
         try:
             import PyNvVideoCodec as nvc
 
@@ -1690,6 +1704,7 @@ class PyNvPassthroughStream:
             max_sync = 0.0
             max_encode = 0.0
             max_mux = 0.0
+            max_pending_nv12_slots = max(0, int(config.PASSTHROUGH_NV12_RING_SLOTS) - 1)
             for i in range(target):
                 if self._stop.is_set():
                     break
@@ -1710,6 +1725,7 @@ class PyNvPassthroughStream:
                 t1 = time.perf_counter()
                 if self._stop.is_set():
                     break
+                nv12_slot = None
                 if alpha_packer is not None:
                     subtitle_overlay = self._subtitle_overlay_for_time(
                         subtitle_renderer,
@@ -1737,20 +1753,28 @@ class PyNvPassthroughStream:
                             before_pack=apply_alpha_subtitle,
                         )
                 elif isinstance(frame, GpuP016Frame):
+                    nv12_slot = self.matter.acquire_nv12_output_slot(info.height, info.width)
                     out_nv12, _ = self.matter.composite_green_gpu_p016_frame_to_gpu_nv12_profile(
                         frame,
                         shift_bits=config.PASSTHROUGH_PYNV_10BIT_SHIFT,
+                        out_slot=nv12_slot,
                     )
                 else:
-                    out_nv12, _ = self.matter.composite_green_gpu_nv12_frame_to_gpu_nv12_profile(frame)
+                    nv12_slot = self.matter.acquire_nv12_output_slot(info.height, info.width)
+                    out_nv12, _ = self.matter.composite_green_gpu_nv12_frame_to_gpu_nv12_profile(
+                        frame,
+                        out_slot=nv12_slot,
+                    )
                 t2 = time.perf_counter()
                 if self._stop.is_set():
+                    self.matter.release_nv12_output_slot(nv12_slot)
                     break
                 cuda_stream = getattr(matting_module, "_CUDA_STREAM", None)
                 if cuda_stream is not None:
                     cuda_stream.synchronize()
                 t3 = time.perf_counter()
                 if self._stop.is_set():
+                    self.matter.release_nv12_output_slot(nv12_slot)
                     break
                 if alpha_packer is None:
                     self._apply_subtitle_overlay(out_nv12, subtitle_renderer, out_idx / fps if fps > 0 else 0.0)
@@ -1762,7 +1786,17 @@ class PyNvPassthroughStream:
                         "[PYNV][%d] seek start: requested_sec=%.3f out_idx=%d src_idx=%d fps=%.3f source_fps=%.3f",
                         self.sid, self.start_sec, out_idx, src_idx, fps, source_fps,
                     )
-                bitstream = self._enc.Encode(app_frame, flags)
+                try:
+                    bitstream = self._enc.Encode(app_frame, flags)
+                except Exception:
+                    self.matter.release_nv12_output_slot(nv12_slot)
+                    raise
+                if nv12_slot is not None:
+                    pending_nv12_slots.append(nv12_slot)
+                    nv12_slot = None
+                    while len(pending_nv12_slots) > max_pending_nv12_slots:
+                        self.matter.release_nv12_output_slot(pending_nv12_slots.pop(0))
+                self.matter.release_nv12_output_slot(nv12_slot)
                 t4 = time.perf_counter()
                 if bitstream:
                     if self.frames_produced == 0:
@@ -1774,6 +1808,9 @@ class PyNvPassthroughStream:
                     try:
                         write_started = time.perf_counter()
                         mux_stdin.write(bitstream)
+                        if not self._real_video_started.is_set():
+                            self._real_video_started.set()
+                            log.info("[PYNV][%d] first real video bitstream written; slate audio may switch", self.sid)
                         write_elapsed = time.perf_counter() - write_started
                         if write_elapsed >= 1.0:
                             log.warning(
@@ -1866,6 +1903,8 @@ class PyNvPassthroughStream:
                     except (BrokenPipeError, OSError):
                         pass
                 log.info("[PYNV][%d] EndEncode done", self.sid)
+            while pending_nv12_slots:
+                self.matter.release_nv12_output_slot(pending_nv12_slots.pop(0))
         except Exception as e:
             if self._stop.is_set():
                 log.info("[PYNV][%d] worker stopped during close: %s", self.sid, e)
@@ -1874,6 +1913,8 @@ class PyNvPassthroughStream:
                 self.startup_error = str(e)
             log.error("[PYNV][%d] worker exception: %s\n%s", self.sid, e, traceback.format_exc(limit=8))
         finally:
+            while pending_nv12_slots:
+                self.matter.release_nv12_output_slot(pending_nv12_slots.pop(0))
             reader_started = self._reader is not None
             try:
                 stdin = self._video_mux.stdin if self._video_mux is not None else (self._mux.stdin if self._mux else None)
