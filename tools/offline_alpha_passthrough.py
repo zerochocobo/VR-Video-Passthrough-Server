@@ -1297,7 +1297,12 @@ class MatAnyone2OnnxEngine(OfflineMattingEngine):
 
         alpha = np.zeros((self.in_h, self.in_w * 2), dtype=np.float32)
         self._frame_index += 1
-        return self.matter._composite_nv12_to_nv12_gpu_using_uploaded_frame(alpha, h, w), None
+        # Alpha passthrough keeps the source image in no-person segments and
+        # writes an empty alpha layer instead of producing a green-screen frame.
+        t0 = time.perf_counter()
+        out = self.packer.pack_uploaded(alpha, h, w)
+        self.profile["alpha_pack"].append((time.perf_counter() - t0) * 1000)
+        return out, None
 
     def _bootstrap_mask(self, h: int, w: int, eye_idx: int) -> "np.ndarray":
         masks = self._load_masks()
@@ -1525,6 +1530,19 @@ def _object_count_from_infos(infos: list[dict]) -> int:
     return max((len(info.get("selected") or []) for info in infos), default=0)
 
 
+def _empty_sam3_mask(width: int, height: int, reason: str = ""):
+    import numpy as np
+
+    return np.zeros((height, width), dtype=np.bool_), {
+        "count": 0,
+        "selected": [],
+        "scores": [],
+        "area_ratios": [],
+        "union_area_ratio": 0.0,
+        "empty_reason": reason,
+    }
+
+
 def _planned_starts_from_sam3_records(
     records: list[dict],
     target: int,
@@ -1640,12 +1658,27 @@ def _precompute_sam3_segment_masks(args, src: Path, dec, source_fps: float, fps:
             sam_image, source_size = masker.prepare_image(image_rgb)
             image_out = masker.encode_prepared(None, sam_image)
             del sam_image
-            mask, info = masker.decode_encoded(
-                None,
-                image_out,
-                source_size,
-                out_size=(args._matanyone2_in_w, args._matanyone2_in_h),
-            )
+            try:
+                mask, info = masker.decode_encoded(
+                    None,
+                    image_out,
+                    source_size,
+                    out_size=(args._matanyone2_in_w, args._matanyone2_in_h),
+                )
+            except RuntimeError as exc:
+                message = str(exc)
+                if "SAM3 returned no masks" not in message and "SAM3 returned empty masks" not in message:
+                    raise
+                eye_name = "left" if eye_idx == 0 else "right"
+                print(
+                    f"[offline] SAM3 prepass warning: frame={start} eye={eye_name} "
+                    f"has no usable masks; treating this eye as inactive ({message})"
+                )
+                mask, info = _empty_sam3_mask(
+                    args._matanyone2_in_w,
+                    args._matanyone2_in_h,
+                    reason=message,
+                )
             infos.append(info)
             if debug_dir is not None:
                 eye_name = "left" if eye_idx == 0 else "right"

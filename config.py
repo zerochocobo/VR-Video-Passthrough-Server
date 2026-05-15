@@ -858,6 +858,12 @@ PASSTHROUGH_BUSY_WAIT_SEC = max(0.0, float(_env("PASSTHROUGH_BUSY_WAIT_SEC", 10)
 #   estimated length is risky and mostly kept for controlled client experiments.
 PASSTHROUGH_PAD_TO_LENGTH = _env("PASSTHROUGH_PAD_TO_LENGTH", "1") == "1"
 
+# PT_PASSTHROUGH_NV12_RING_SLOTS:
+#   GPU NV12 output slot count for passthrough compositing. Multiple slots let
+#   the stream hand distinct output buffers to NVENC instead of reusing one
+#   Matter-owned buffer every frame. Phase 3 default is 3.
+PASSTHROUGH_NV12_RING_SLOTS = max(1, int(_env("PASSTHROUGH_NV12_RING_SLOTS", 3)))
+
 # PT_USE_PYNV:
 #   1 routes eligible CFR SDR 8-bit sources to PyNv decode/matting/HEVC encode.
 #   0 forces the legacy FFmpeg fallback path.

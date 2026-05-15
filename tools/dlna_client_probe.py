@@ -108,8 +108,9 @@ def browse(base_url: str, object_id: str, timeout: float) -> list[BrowseNode]:
         timeout,
     )
     root = ET.fromstring(response)
-    escaped_didl = _text_of(root, "Result")
-    didl_text = html.unescape(escaped_didl)
+    # ElementTree already resolves the SOAP-level escaped DIDL text. Running a
+    # second html.unescape corrupts item URLs that contain query parameters.
+    didl_text = _text_of(root, "Result")
     didl = ET.fromstring(didl_text)
     nodes: list[BrowseNode] = []
     for elem in list(didl):

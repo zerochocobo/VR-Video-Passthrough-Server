@@ -120,7 +120,8 @@ class OfflineConvertTests(unittest.TestCase):
         cmd = convert._base_cmd(args, Path("input.mp4"), Path("out.mp4"))
         self.assertIn("--fps", cmd)
         self.assertNotIn("--input-size", cmd)
-        self.assertNotIn("--alpha-stride", cmd)
+        self.assertIn("--alpha-stride", cmd)
+        self.assertIn("3", cmd)
 
     def test_single_out_dir_uses_default_passthrough_name(self) -> None:
         root = Path("runtime_cache/test_offline_out_dir")

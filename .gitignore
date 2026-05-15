@@ -10,6 +10,7 @@ wheels/
 # Virtual environments
 .venv
 .claude
+.base
 uv
 set
 
