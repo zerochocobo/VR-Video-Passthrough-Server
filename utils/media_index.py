@@ -18,11 +18,12 @@ from pathlib import Path
 
 import config
 from utils.logger import get
+from utils.mkv_cues import MkvCuesInfo, probe_mkv_cues
 from utils.video_metadata import probe_video_metadata, select_backend
 
 log = get("media_index")
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 PROBE_ERROR_RETRY_SEC = 60.0
 SQLITE_TIMEOUT_SEC = 10.0
 LARGE_DIRECTORY_WARN_CHILDREN = 5000
@@ -46,6 +47,13 @@ class IndexedVideo:
     backend_verdict: str = ""
     backend_reason: str = ""
     probe_error: str = ""
+    mkv_cues_status: str = ""
+    mkv_cues_position: int = -1
+    mkv_cues_reason: str = ""
+
+    @property
+    def mkv_needs_fix(self) -> bool:
+        return self.mkv_cues_status in {"tail", "missing", "unknown"}
 
     @property
     def resolution(self) -> str:
@@ -183,6 +191,9 @@ class MediaIndex:
                 backend_verdict TEXT NOT NULL,
                 backend_reason TEXT NOT NULL,
                 probe_error TEXT NOT NULL,
+                mkv_cues_status TEXT NOT NULL DEFAULT '',
+                mkv_cues_position INTEGER NOT NULL DEFAULT -1,
+                mkv_cues_reason TEXT NOT NULL DEFAULT '',
                 probed_at REAL NOT NULL
             );
             CREATE TABLE IF NOT EXISTS directory_state (
@@ -204,14 +215,22 @@ class MediaIndex:
     def _migrate_schema(self, conn: sqlite3.Connection, from_version: int, to_version: int) -> None:
         """Migrate older cache schemas in place when possible.
 
-        The current production schema is version 1, so fresh databases and the
-        first deployed index do not need ALTER steps. Future schema additions
-        should add sequential branches here and keep destructive rebuilds as the
-        fallback for incompatible layouts.
+        Keep cache migrations additive so deployed libraries do not need to be
+        rebuilt for metadata fields that can be recomputed lazily.
         """
         if from_version <= 0:
             return
+        if from_version < 2 <= to_version:
+            columns = {str(row["name"]) for row in conn.execute("PRAGMA table_info(video_metadata)")}
+            if "mkv_cues_status" not in columns:
+                conn.execute("ALTER TABLE video_metadata ADD COLUMN mkv_cues_status TEXT NOT NULL DEFAULT ''")
+            if "mkv_cues_position" not in columns:
+                conn.execute("ALTER TABLE video_metadata ADD COLUMN mkv_cues_position INTEGER NOT NULL DEFAULT -1")
+            if "mkv_cues_reason" not in columns:
+                conn.execute("ALTER TABLE video_metadata ADD COLUMN mkv_cues_reason TEXT NOT NULL DEFAULT ''")
         if from_version == to_version:
+            return
+        if to_version <= 2:
             return
         raise MediaIndexSchemaError(f"no migration path from schema {from_version} to {to_version}")
 
@@ -250,6 +269,9 @@ class MediaIndex:
                 "backend_verdict",
                 "backend_reason",
                 "probe_error",
+                "mkv_cues_status",
+                "mkv_cues_position",
+                "mkv_cues_reason",
                 "probed_at",
             },
             "directory_state": {"path_key", "signature", "child_count", "scanned_at"},
@@ -394,6 +416,8 @@ class MediaIndex:
                 video = self._video_from_db(conn, child_key, size, mtime_ns)
                 if video is None:
                     return None
+                if child.suffix.lower() == ".mkv" and not video.mkv_cues_status:
+                    return None
             out.append(
                 IndexedChild(
                     path=child,
@@ -437,6 +461,9 @@ class MediaIndex:
             backend_verdict=str(row["backend_verdict"] or ""),
             backend_reason=str(row["backend_reason"] or ""),
             probe_error=probe_error,
+            mkv_cues_status=str(row["mkv_cues_status"] or ""),
+            mkv_cues_position=int(row["mkv_cues_position"] or -1),
+            mkv_cues_reason=str(row["mkv_cues_reason"] or ""),
         )
 
     def _video_for(
@@ -465,6 +492,7 @@ class MediaIndex:
         try:
             meta = probe_video_metadata(path)
             backend = select_backend(meta.timing, meta.codec, meta.color)
+            mkv_cues = probe_mkv_cues(path)
             video = IndexedVideo(
                 duration=float(meta.timing.duration),
                 width=int(meta.codec.width),
@@ -475,6 +503,9 @@ class MediaIndex:
                 backend_verdict=backend.verdict,
                 backend_reason=backend.reason,
                 probe_error="",
+                mkv_cues_status=mkv_cues.status,
+                mkv_cues_position=mkv_cues.position,
+                mkv_cues_reason=mkv_cues.reason,
             )
         except Exception as e:
             if self._scan_probe_failures < PROBE_FAILURE_LOG_LIMIT_PER_SCAN:
@@ -495,8 +526,9 @@ class MediaIndex:
             """
             INSERT OR REPLACE INTO video_metadata
             (path_key, size, mtime_ns, duration, width, height, fps, codec_name,
-             pix_fmt, backend_verdict, backend_reason, probe_error, probed_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             pix_fmt, backend_verdict, backend_reason, probe_error,
+             mkv_cues_status, mkv_cues_position, mkv_cues_reason, probed_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 key,
@@ -511,6 +543,9 @@ class MediaIndex:
                 video.backend_verdict,
                 video.backend_reason,
                 video.probe_error,
+                video.mkv_cues_status,
+                video.mkv_cues_position,
+                video.mkv_cues_reason,
                 now,
             ),
         )
@@ -530,10 +565,11 @@ class MediaIndex:
             """
             INSERT OR REPLACE INTO video_metadata
             (path_key, size, mtime_ns, duration, width, height, fps, codec_name,
-             pix_fmt, backend_verdict, backend_reason, probe_error, probed_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             pix_fmt, backend_verdict, backend_reason, probe_error,
+             mkv_cues_status, mkv_cues_position, mkv_cues_reason, probed_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
-            (key, size, mtime_ns, 0.0, 0, 0, 0.0, "", "", "", "", video.probe_error, now),
+            (key, size, mtime_ns, 0.0, 0, 0, 0.0, "", "", "", "", video.probe_error, "", -1, "", now),
         )
         return video
 
@@ -549,13 +585,65 @@ class MediaIndex:
                 if child.is_dir():
                     count += 1
                 elif child.is_file() and child.suffix.lower() in config.VIDEO_EXTS:
-                    if "passthrough" in child.name.lower() or config.PASSTHROUGH_OUTPUT_MODE == "none":
+                    if (
+                        "passthrough" in child.name.lower()
+                        or config.PASSTHROUGH_OUTPUT_MODE == "none"
+                        or self._hide_passthrough_for_path(child)
+                    ):
                         count += 1
                     else:
                         count += 3 if config.PASSTHROUGH_OUTPUT_MODE == "all" else 2
             except OSError:
                 continue
         return count
+
+    def _hide_passthrough_for_path(self, path: Path) -> bool:
+        if path.suffix.lower() != ".mkv":
+            return False
+        policy = config.PASSTHROUGH_MKV_LIVE_POLICY
+        if policy == "block":
+            return True
+        if policy == "allow":
+            return False
+        try:
+            st = path.stat()
+            key = _dir_key(path)
+            size = int(st.st_size)
+            mtime_ns = int(st.st_mtime_ns)
+        except (OSError, ValueError):
+            return False
+        with self._lock:
+            conn = self._connect()
+            cached = self._video_from_db(conn, key, size, mtime_ns)
+            if cached is not None and cached.mkv_cues_status:
+                return cached.mkv_needs_fix
+            info = probe_mkv_cues(path)
+            self._store_mkv_cues_info(conn, key, size, mtime_ns, info)
+            conn.commit()
+            return info.needs_fix
+
+    def _store_mkv_cues_info(
+        self,
+        conn: sqlite3.Connection,
+        key: str,
+        size: int,
+        mtime_ns: int,
+        info: MkvCuesInfo,
+    ) -> None:
+        row = conn.execute(
+            "SELECT path_key FROM video_metadata WHERE path_key=? AND size=? AND mtime_ns=?",
+            (key, size, mtime_ns),
+        ).fetchone()
+        if row is None:
+            return
+        conn.execute(
+            """
+            UPDATE video_metadata
+            SET mkv_cues_status=?, mkv_cues_position=?, mkv_cues_reason=?
+            WHERE path_key=? AND size=? AND mtime_ns=?
+            """,
+            (info.status, info.position, info.reason, key, size, mtime_ns),
+        )
 
 
 _INDEX = MediaIndex()

@@ -11,12 +11,14 @@ import itertools
 import re
 from dataclasses import dataclass
 from pathlib import Path
-from urllib.parse import unquote
+from urllib.parse import quote, unquote
 
 from fastapi import APIRouter, HTTPException, Header, Query, Request
 from fastapi.responses import FileResponse, Response, StreamingResponse
 
 from config import (
+    HTTP_PORT,
+    LAN_IP,
     PASSTHROUGH_CONTAINER,
     PASSTHROUGH_BUSY_WAIT_SEC,
     PASSTHROUGH_LIVE_ADAPTIVE_FPS,
@@ -37,11 +39,13 @@ from config import (
     PASSTHROUGH_FALLBACK_MAX_FPS,
     PASSTHROUGH_MAX_FPS,
     PASSTHROUGH_MAX_CONCURRENT,
+    PASSTHROUGH_MKV_LIVE_POLICY,
     PASSTHROUGH_PAD_TO_LENGTH,
     PASSTHROUGH_SEND_MIN_BPS,
     PASSTHROUGH_SEND_PACING_MULTIPLIER,
     PASSTHROUGH_SEND_REALTIME_PACING,
     PASSTHROUGH_SEEK_MODE,
+    DEBUG_LOGS,
     LIVE_REQUEST_HEADER_DUMP,
     MEDIA_LIBRARY,
     ROOT,
@@ -56,6 +60,8 @@ from pipeline.pynv_stream import PYNV_BACKEND_LABEL, PYNV_OUTPUT_CODEC, PyNvPass
 from pipeline.thumbnail import get_thumb
 from utils.bitrate_estimator import estimate_for_media, record_actual_bps
 from utils.logger import get
+from utils.mkv_cues import probe_mkv_cues
+from utils.subtitles import find_external_subtitles, is_subtitle_path, subtitle_mime
 from utils.video_metadata import probe_video_metadata, select_backend
 
 log = get("media")
@@ -179,6 +185,11 @@ class LiveSession:
     @property
     def output_fps(self) -> float:
         return float(getattr(self.stream, "output_fps", 0.0))
+
+    @property
+    def source_path(self) -> Path | None:
+        path = getattr(self.stream, "path", None)
+        return path if isinstance(path, Path) else None
 
     def _append_cache(self, chunk: bytes) -> None:
         self.total_bytes += len(chunk)
@@ -517,6 +528,57 @@ def _safe_video_path(name: str) -> Path:
     return p
 
 
+def _safe_subtitle_path(name: str) -> Path:
+    name = unquote(name)
+    p = MEDIA_LIBRARY.key_to_path(name)
+    if p is None:
+        raise HTTPException(403, "forbidden")
+    p = p.resolve()
+    if not MEDIA_LIBRARY.contains(p):
+        raise HTTPException(403, "forbidden")
+    if not p.is_file() or not is_subtitle_path(p):
+        raise HTTPException(404, "not found")
+    return p
+
+
+def _subtitle_headers_for_video(path: Path) -> dict[str, str]:
+    tracks = find_external_subtitles(path)
+    if not tracks:
+        return {}
+    try:
+        rel = MEDIA_LIBRARY.path_to_key(tracks[0].path)
+    except Exception:
+        return {}
+    url = f"http://{LAN_IP}:{HTTP_PORT}/subs/{quote(rel)}"
+    return {
+        "CaptionInfo.sec": url,
+        "getCaptionInfo.sec": "1",
+    }
+
+
+def _reject_unsafe_mkv_live_path(path: Path) -> None:
+    if path.suffix.lower() != ".mkv":
+        return
+    policy = PASSTHROUGH_MKV_LIVE_POLICY
+    if policy not in {"block", "head_cues", "allow"}:
+        policy = "block"
+    if policy == "allow":
+        return
+    if policy == "block":
+        log.warning("passthrough_live reject MKV by policy: path=%s", path.name)
+        raise HTTPException(409, "MKV live passthrough is disabled")
+    info = probe_mkv_cues(path)
+    if info.needs_fix:
+        log.warning(
+            "passthrough_live reject MKV without head Cues: path=%s status=%s position=%d reason=%s",
+            path.name,
+            info.status,
+            info.position,
+            info.reason,
+        )
+        raise HTTPException(409, "MKV needs remux before live passthrough")
+
+
 # ---- Raw MP4 Range serving ----
 _RANGE_RE = re.compile(r"bytes=(\d*)-(\d*)")
 _NPT_RE = re.compile(r"npt\s*=\s*([0-9:.]+)\s*-", re.IGNORECASE)
@@ -535,19 +597,151 @@ class ByteRange:
         return max(0, self.end - self.start + 1)
 
 
-@router.get("/media/{name:path}")
-async def media_get(name: str, range: str | None = Header(default=None)):
+def _parse_byte_range(value: str | None, size: int) -> ByteRange | None:
+    if not value:
+        return None
+    m = _RANGE_RE.match(value)
+    if not m:
+        raise HTTPException(416, "invalid range")
+    start = int(m.group(1)) if m.group(1) else 0
+    end = int(m.group(2)) if m.group(2) else size - 1
+    end = min(end, size - 1)
+    byte_range = ByteRange(start=start, end=end, total=size)
+    if start >= size or byte_range.length <= 0:
+        raise HTTPException(416, "range not satisfiable")
+    return byte_range
+
+
+def _file_range_response(path: Path, media_type: str, range_header: str | None, extra_headers: dict[str, str] | None = None) -> Response:
+    size = path.stat().st_size
+    headers = {
+        "Accept-Ranges": "bytes",
+        **(extra_headers or {}),
+    }
+    byte_range = _parse_byte_range(range_header, size)
+    if byte_range is None:
+        return FileResponse(path, media_type=media_type, headers=headers)
+
+    length = byte_range.length
+
+    def gen():
+        with open(path, "rb") as f:
+            f.seek(byte_range.start)
+            remaining = length
+            while remaining > 0:
+                chunk = f.read(min(64 * 1024, remaining))
+                if not chunk:
+                    break
+                remaining -= len(chunk)
+                yield chunk
+
+    headers.update(
+        {
+            "Content-Range": f"bytes {byte_range.start}-{byte_range.end}/{size}",
+            "Content-Length": str(length),
+            "Content-Type": media_type,
+        }
+    )
+    return StreamingResponse(gen(), status_code=206, headers=headers, media_type=media_type)
+
+
+@router.get("/subs/{name:path}")
+async def subtitle_get(name: str, range: str | None = Header(default=None)):
+    path = _safe_subtitle_path(name)
+    headers = {
+        "Content-Disposition": "inline",
+        "Access-Control-Allow-Origin": "*",
+    }
+    return _file_range_response(path, subtitle_mime(path), range, headers)
+
+
+@router.head("/subs/{name:path}")
+async def subtitle_head(name: str, range: str | None = Header(default=None)):
+    path = _safe_subtitle_path(name)
+    size = path.stat().st_size
+    headers = {
+        "Accept-Ranges": "bytes",
+        "Content-Disposition": "inline",
+        "Access-Control-Allow-Origin": "*",
+        "Content-Type": subtitle_mime(path),
+    }
+    byte_range = _parse_byte_range(range, size)
+    if byte_range is not None:
+        headers["Content-Range"] = f"bytes {byte_range.start}-{byte_range.end}/{size}"
+        headers["Content-Length"] = str(byte_range.length)
+        return Response(status_code=206, headers=headers)
+    headers["Content-Length"] = str(size)
+    return Response(status_code=200, headers=headers)
+
+
+@router.head("/media/{name:path}")
+async def media_head(name: str, range: str | None = Header(default=None)):
     path = _safe_video_path(name)
     size = path.stat().st_size
+    headers = {
+        "Accept-Ranges": "bytes",
+        "Content-Type": "video/mp4",
+        **_subtitle_headers_for_video(path),
+    }
+    byte_range = _parse_byte_range(range, size)
+    if byte_range is not None:
+        headers["Content-Range"] = f"bytes {byte_range.start}-{byte_range.end}/{size}"
+        headers["Content-Length"] = str(byte_range.length)
+        return Response(status_code=206, headers=headers)
+    headers["Content-Length"] = str(size)
+    return Response(status_code=200, headers=headers)
+
+
+@router.get("/media/{name:path}")
+async def media_get(
+    request: Request,
+    name: str,
+    range: str | None = Header(default=None),
+    user_agent: str | None = Header(default=None, alias="User-Agent"),
+    time_seek_range: str | None = Header(default=None, alias="TimeSeekRange.dlna.org"),
+    transfer_mode: str | None = Header(default=None, alias="transferMode.dlna.org"),
+    get_content_features: str | None = Header(default=None, alias="getcontentFeatures.dlna.org"),
+):
+    rid = next(_request_ids)
+    path = _safe_video_path(name)
+    size = path.stat().st_size
+    subtitle_headers = _subtitle_headers_for_video(path)
+    if DEBUG_LOGS:
+        log.info(
+            "media[%d] request: path=%s size=%d range=%r time_seek=%r transfer=%r getfeatures=%r ua=%r client=%s",
+            rid,
+            path.name,
+            size,
+            range,
+            time_seek_range,
+            transfer_mode,
+            get_content_features,
+            (user_agent or "")[:240],
+            request.client,
+        )
 
     if range:
         m = _RANGE_RE.match(range)
         if not m:
+            if DEBUG_LOGS:
+                log.info("media[%d] return 416 invalid range: %r path=%s", rid, range, path.name)
             raise HTTPException(416, "invalid range")
         start = int(m.group(1)) if m.group(1) else 0
         end = int(m.group(2)) if m.group(2) else size - 1
         end = min(end, size - 1)
         length = end - start + 1
+        if start >= size or length <= 0:
+            if DEBUG_LOGS:
+                log.info(
+                    "media[%d] return 416 unsatisfiable range=%r parsed=%d-%d/%d path=%s",
+                    rid,
+                    range,
+                    start,
+                    end,
+                    size,
+                    path.name,
+                )
+            raise HTTPException(416, "range not satisfiable")
 
         def gen():
             with open(path, "rb") as f:
@@ -565,10 +759,25 @@ async def media_get(name: str, range: str | None = Header(default=None)):
             "Accept-Ranges": "bytes",
             "Content-Length": str(length),
             "Content-Type": "video/mp4",
+            **subtitle_headers,
         }
+        if DEBUG_LOGS:
+            log.info(
+                "media[%d] response: status=206 path=%s range=%d-%d/%d length=%d open=%s suffix=%s",
+                rid,
+                path.name,
+                start,
+                end,
+                size,
+                length,
+                not bool(m.group(2)),
+                not bool(m.group(1)),
+            )
         return StreamingResponse(gen(), status_code=206, headers=headers, media_type="video/mp4")
 
-    return FileResponse(path, media_type="video/mp4", headers={"Accept-Ranges": "bytes"})
+    if DEBUG_LOGS:
+        log.info("media[%d] response: status=200 path=%s size=%d full-file", rid, path.name, size)
+    return FileResponse(path, media_type="video/mp4", headers={"Accept-Ranges": "bytes", **subtitle_headers})
 
 
 def _parse_npt_seconds(value: str | None) -> float | None:
@@ -1003,6 +1212,7 @@ async def passthrough_live_get(
 ):
     rid = next(_request_ids)
     path = _safe_video_path(name)
+    _reject_unsafe_mkv_live_path(path)
     info = probe_cached(path)
     requested_t = t
     npt_t = _parse_npt_seconds(time_seek_range)

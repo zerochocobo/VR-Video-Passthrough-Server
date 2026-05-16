@@ -26,6 +26,7 @@ from config import (
     ALPHA_STRIDE,
     CUDA_CUDNN_CONV_ALGO_SEARCH,
     CUDA_SHARED_STREAM,
+    DEBUG_LOGS,
     FAST_UV_ALPHA,
     GREEN_BGR,
     MATTING_DEVICE,
@@ -37,6 +38,7 @@ from config import (
     MATTING_WARMUP_RUNS,
     MODEL_PATH,
     ONNX_PROVIDERS,
+    PASSTHROUGH_NV12_RING_SLOTS,
     RVM_DOWNSAMPLE_RATIO,
     RVM_IOBINDING,
     SPLIT_NV12_COMPOSITE,
@@ -801,6 +803,11 @@ class MattingTiming(NamedTuple):
     composite_ms: float
 
 
+class Nv12OutputSlot(NamedTuple):
+    index: int
+    buffer: object
+
+
 def _filter_available_providers(wanted: list[str]) -> list[str]:
     available = set(ort.get_available_providers())
     out = [p.strip() for p in wanted if p.strip() in available]
@@ -874,6 +881,10 @@ class Matter:
         self._g_frame = None
         self._g_alpha = None
         self._g_out = None
+        self._nv12_slots: list[object] = []
+        self._nv12_slot_shape: tuple[int, int] | None = None
+        self._nv12_slot_in_use: list[bool] = []
+        self._nv12_next_slot = 0
         self._g_chw = None
         self._p016_to_nv12_kernel = None
         self._h_chw = None
@@ -1185,6 +1196,38 @@ class Matter:
         if self._g_out is None or self._g_out.shape != shape:
             self._g_out = cp.empty(shape, dtype=cp.uint8)
         return self._g_out
+
+    def _reset_nv12_slots(self, shape: tuple[int, int]) -> None:
+        self._nv12_slots = []
+        self._nv12_slot_in_use = []
+        self._nv12_next_slot = 0
+        self._nv12_slot_shape = shape
+
+    def acquire_nv12_output_slot(self, h: int, w: int) -> Nv12OutputSlot:
+        """Return an exclusive GPU NV12 output slot for one composite/encode handoff."""
+        cp = _cp
+        if cp is None:
+            raise RuntimeError("NV12 output slots require CuPy")
+        shape = (h * 3 // 2, w)
+        count = max(1, int(PASSTHROUGH_NV12_RING_SLOTS))
+        if self._nv12_slot_shape != shape or len(self._nv12_slots) != count:
+            self._reset_nv12_slots(shape)
+            self._nv12_slots = [cp.empty(shape, dtype=cp.uint8) for _ in range(count)]
+            self._nv12_slot_in_use = [False] * count
+        for offset in range(count):
+            idx = (self._nv12_next_slot + offset) % count
+            if not self._nv12_slot_in_use[idx]:
+                self._nv12_slot_in_use[idx] = True
+                self._nv12_next_slot = (idx + 1) % count
+                return Nv12OutputSlot(idx, self._nv12_slots[idx])
+        raise RuntimeError(f"no free NV12 output slot: count={count} shape={shape}")
+
+    def release_nv12_output_slot(self, slot: Nv12OutputSlot | int | None) -> None:
+        if slot is None:
+            return
+        idx = int(slot.index if isinstance(slot, Nv12OutputSlot) else slot)
+        if 0 <= idx < len(self._nv12_slot_in_use):
+            self._nv12_slot_in_use[idx] = False
 
     def _gpu_preprocess_one(self, src_x0: int, src_w: int,
                              out_w: int, out_h: int,
@@ -2006,6 +2049,7 @@ class Matter:
     def composite_green_gpu_nv12_frame_to_gpu_nv12_profile(
         self,
         frame_gpu_nv12,
+        out_slot: Nv12OutputSlot | None = None,
     ):
         """Experimental PyNv path: GPU NV12 planes -> matting -> GPU NV12 output."""
         import time as _time
@@ -2021,7 +2065,12 @@ class Matter:
             t_up1 = _time.perf_counter()
             a_small, timing, _ = self._alpha_low_res_gpu_temporal(h, w, use_nv12=True)
             t0 = _time.perf_counter()
-            out = self._composite_nv12_to_nv12_gpu_using_uploaded_frame(a_small, h, w)
+            out = self._composite_nv12_to_nv12_gpu_using_uploaded_frame(
+                a_small,
+                h,
+                w,
+                out=out_slot.buffer if out_slot is not None else None,
+            )
             t1 = _time.perf_counter()
         return out, MattingTiming(
             timing.preprocess_ms,
@@ -2034,6 +2083,7 @@ class Matter:
         self,
         frame_gpu_p016,
         shift_bits: int = 8,
+        out_slot: Nv12OutputSlot | None = None,
     ):
         """Experimental PyNv path: GPU P016/P010 planes -> NV12 -> matting -> GPU NV12 output."""
         import time as _time
@@ -2055,7 +2105,12 @@ class Matter:
             t_up1 = _time.perf_counter()
             a_small, timing, _ = self._alpha_low_res_gpu_temporal(h, w, use_nv12=True)
             t0 = _time.perf_counter()
-            out = self._composite_nv12_to_nv12_gpu_using_uploaded_frame(a_small, h, w)
+            out = self._composite_nv12_to_nv12_gpu_using_uploaded_frame(
+                a_small,
+                h,
+                w,
+                out=out_slot.buffer if out_slot is not None else None,
+            )
             t1 = _time.perf_counter()
         return out, MattingTiming(
             timing.preprocess_ms,
@@ -2064,9 +2119,18 @@ class Matter:
             (t1 - t0) * 1000 + (t_up1 - t_up0) * 1000,
         )
 
-    def _composite_nv12_to_nv12_gpu_using_uploaded_frame(self, a_small: np.ndarray, h: int, w: int):
+    def _composite_nv12_to_nv12_gpu_using_uploaded_frame(
+        self,
+        a_small: np.ndarray,
+        h: int,
+        w: int,
+        out=None,
+    ):
+        import time as _time
+
         cp = _cp
         ah, aw = a_small.shape[:2]
+        debug = bool(DEBUG_LOGS)
 
         if hasattr(a_small, "data") and hasattr(a_small.data, "ptr"):
             alpha_dev = a_small.astype(cp.float32, copy=False)
@@ -2080,12 +2144,22 @@ class Matter:
                 a_small = np.ascontiguousarray(a_small)
             self._g_alpha.set(a_small)
             alpha_dev = self._g_alpha
-        out_nv12 = self._ensure_dev_nv12_out(h, w)
+        out_nv12 = out if out is not None else self._ensure_dev_nv12_out(h, w)
+        if debug:
+            log.info(
+                "[DIAG] nv12->nv12 gpu composite begin: frame=%dx%d alpha=%s out=%s split=%s",
+                w,
+                h,
+                getattr(alpha_dev, "shape", None),
+                getattr(out_nv12, "shape", None),
+                SPLIT_NV12_COMPOSITE,
+            )
 
         gY, gU, gV = self._green_yuv()
         block = (16, 16, 1)
         grid = ((w + block[0] - 1) // block[0], (h + block[1] - 1) // block[1], 1)
         if SPLIT_NV12_COMPOSITE:
+            t_kernel = _time.perf_counter()
             _composite_nv12_y_kernel(
                 grid, block,
                 (
@@ -2097,7 +2171,10 @@ class Matter:
                     out_nv12,
                 ),
             )
+            if debug:
+                log.info("[DIAG] nv12->nv12 y kernel returned in %.3fms", (_time.perf_counter() - t_kernel) * 1000.0)
             uv_grid = (((w >> 1) + block[0] - 1) // block[0], ((h >> 1) + block[1] - 1) // block[1], 1)
+            t_kernel = _time.perf_counter()
             _composite_nv12_uv_kernel(
                 uv_grid, block,
                 (
@@ -2110,7 +2187,10 @@ class Matter:
                     out_nv12,
                 ),
             )
+            if debug:
+                log.info("[DIAG] nv12->nv12 uv kernel returned in %.3fms", (_time.perf_counter() - t_kernel) * 1000.0)
         else:
+            t_kernel = _time.perf_counter()
             _composite_nv12_to_nv12_kernel(
                 grid, block,
                 (
@@ -2123,6 +2203,8 @@ class Matter:
                     out_nv12,
                 ),
             )
+            if debug:
+                log.info("[DIAG] nv12->nv12 mono kernel returned in %.3fms", (_time.perf_counter() - t_kernel) * 1000.0)
         return out_nv12
 
     @staticmethod

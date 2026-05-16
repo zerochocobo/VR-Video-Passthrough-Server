@@ -23,6 +23,7 @@ from config import (
     PASSTHROUGH_BITRATE,
     PASSTHROUGH_LIVE_CHAPTER_MAX_ITEMS,
     PASSTHROUGH_LIVE_CHAPTER_MIN_INTERVAL_SEC,
+    PASSTHROUGH_MKV_LIVE_POLICY,
     PASSTHROUGH_OUTPUT_MODE,
     PASSTHROUGH_SEEK_MODE,
     PASSTHROUGH_SUFFIX,
@@ -35,6 +36,7 @@ from pipeline.ffmpeg_io import probe_cached
 from utils.bitrate_estimator import estimate_for_media
 from utils.logger import get
 from utils.media_index import IndexedChild, get_media_index
+from utils.subtitles import SubtitleTrack, find_external_subtitles
 from utils.video_metadata import probe_video_metadata, select_backend
 
 log = get("cds")
@@ -146,10 +148,27 @@ def _parent_id_for_dir(path: Path) -> str:
     return _folder_id(parent)
 
 
-def _video_item_count(path: Path) -> int:
-    if "passthrough" in path.name.lower() or PASSTHROUGH_OUTPUT_MODE == "none":
+def _video_item_count(path: Path, child: IndexedChild | None = None) -> int:
+    if (
+        "passthrough" in path.name.lower()
+        or PASSTHROUGH_OUTPUT_MODE == "none"
+        or _hide_passthrough_for_path(path, child)
+    ):
         return 1
     return 3 if PASSTHROUGH_OUTPUT_MODE == "all" else 2
+
+
+def _marked_original_title(path: Path, child: IndexedChild | None = None) -> str:
+    return path.stem
+
+
+def _hide_passthrough_for_path(path: Path, child: IndexedChild | None) -> bool:
+    if path.suffix.lower() == ".mkv" and PASSTHROUGH_MKV_LIVE_POLICY == "block":
+        return True
+    video = child.video if child is not None else None
+    if path.suffix.lower() == ".mkv" and PASSTHROUGH_MKV_LIVE_POLICY == "head_cues":
+        return bool(video is None or video.mkv_needs_fix)
+    return bool(video is not None and video.mkv_needs_fix)
 
 
 def _passthrough_modes() -> tuple[str, ...]:
@@ -160,6 +179,16 @@ def _passthrough_modes() -> tuple[str, ...]:
     if PASSTHROUGH_OUTPUT_MODE == "alpha":
         return ("alpha",)
     return ("green",)
+
+
+def _subtitle_item(track: SubtitleTrack) -> dict:
+    rel = _rel_key(track.path)
+    return {
+        "url": f"http://{LAN_IP}:{HTTP_PORT}/subs/{quote(rel)}",
+        "lang": track.lang,
+        "type": track.kind,
+        "mime": track.mime,
+    }
 
 
 def _passthrough_virtual_title(path: Path, mode: str) -> str:
@@ -250,7 +279,7 @@ def _video_items_from_index(path: Path, parent_id: str, child: IndexedChild | No
         {
             "id": f"v_{rel}",
             "parent_id": parent_id,
-            "title": path.stem,
+            "title": _marked_original_title(path, child),
             "url": f"{base}/media/{quoted}",
             "thumb": f"{base}/thumb/{quoted}",
             "size": size,
@@ -261,9 +290,10 @@ def _video_items_from_index(path: Path, parent_id: str, child: IndexedChild | No
             "dlna_pn": "AVC_MP4_HP_HD_AAC",
             "frame_rate": None,
             "passthrough": False,
+            "subtitles": [_subtitle_item(track) for track in find_external_subtitles(path)],
         }
     ]
-    if "passthrough" in path.name.lower():
+    if "passthrough" in path.name.lower() or _hide_passthrough_for_path(path, child):
         return items
 
     estimate_codec = PYNV_OUTPUT_CODEC
@@ -423,7 +453,8 @@ def _didl_for(items: list[dict]) -> str:
         f'xmlns="{DIDL_NS}" '
         'xmlns:dc="http://purl.org/dc/elements/1.1/" '
         'xmlns:upnp="urn:schemas-upnp-org:metadata-1-0/upnp/" '
-        'xmlns:dlna="urn:schemas-dlna-org:metadata-1-0/">'
+        'xmlns:dlna="urn:schemas-dlna-org:metadata-1-0/" '
+        'xmlns:sec="http://www.sec.co.kr/">'
     ]
     for it in items:
         title = html.escape(it["title"])
@@ -480,12 +511,24 @@ def _didl_for(items: list[dict]) -> str:
         attrs.append(f'protocolInfo="{proto}"')
         res_attrs = " ".join(attrs)
 
+        subtitle_xml = []
+        for sub in it.get("subtitles", []):
+            sub_url = html.escape(sub["url"])
+            sub_mime = html.escape(sub["mime"])
+            sub_type = html.escape(sub["type"])
+            lang = str(sub.get("lang") or "")
+            lang_attr = f' xml:lang="{html.escape(lang)}"' if lang else ""
+            subtitle_xml.append(f'<res protocolInfo="http-get:*:{sub_mime}:*"{lang_attr}>{sub_url}</res>')
+            subtitle_xml.append(f'<sec:CaptionInfoEx sec:type="{sub_type}">{sub_url}</sec:CaptionInfoEx>')
+            subtitle_xml.append(f'<sec:CaptionInfo sec:type="{sub_type}">{sub_url}</sec:CaptionInfo>')
+
         out.append(
             f'<item id="{html.escape(it["id"])}" parentID="{parent_id}" restricted="1">'
             f"<dc:title>{title}</dc:title>"
             f"<upnp:class>object.item.videoItem</upnp:class>"
             f'<upnp:albumArtURI dlna:profileID="JPEG_TN">{thumb}</upnp:albumArtURI>'
             f"<res {res_attrs}>{url}</res>"
+            f"{''.join(subtitle_xml)}"
             f"</item>"
         )
     out.append("</DIDL-Lite>")

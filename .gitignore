@@ -13,9 +13,11 @@ wheels/
 .base
 uv
 set
+NVENC
 
 #other big Files
 *.mp4
+*.mkv
 *.pt
 *.aac
 *.ass
@@ -36,4 +38,3 @@ runtime_cache/
 reference/
 baseline/
 
-VR_Video_Passthrough_Server_compare/

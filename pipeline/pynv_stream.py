@@ -15,6 +15,7 @@ import queue
 import shutil
 import socket
 import subprocess
+import sys
 import threading
 import traceback
 import time
@@ -52,8 +53,13 @@ _preflight_ok: dict[str, float] = {}
 _stream_ids = itertools.count(1)
 _audio_cache_locks: dict[str, threading.Lock] = {}
 _audio_cache_locks_guard = threading.Lock()
+_pynv_runtime_tainted = threading.Event()
 _SUBTITLE_BLEND_Y_KERNEL = None
 _SUBTITLE_BLEND_UV_KERNEL = None
+
+
+def pynv_runtime_tainted() -> bool:
+    return _pynv_runtime_tainted.is_set()
 
 
 def _rgb_to_limited_yuv(rgb: tuple[int, int, int]) -> tuple[int, int, int]:
@@ -62,6 +68,28 @@ def _rgb_to_limited_yuv(rgb: tuple[int, int, int]) -> tuple[int, int, int]:
     u = 128.0 + (-37.945 * r - 74.494 * g + 112.439 * b) / 256.0
     v = 128.0 + (112.439 * r - 94.154 * g - 18.285 * b) / 256.0
     return tuple(max(0, min(255, int(round(x)))) for x in (y, u, v))
+
+
+def _format_mib(value: int) -> float:
+    return float(value) / (1024.0 * 1024.0)
+
+
+def _cupy_vram_snapshot() -> tuple[int, int, int, int, int] | None:
+    try:
+        import cupy as cp
+
+        free_bytes, total_bytes = cp.cuda.runtime.memGetInfo()
+        pool = cp.get_default_memory_pool()
+        pinned_pool = cp.get_default_pinned_memory_pool()
+        return (
+            int(total_bytes) - int(free_bytes),
+            int(total_bytes),
+            int(pool.used_bytes()),
+            int(pool.total_bytes()),
+            int(pinned_pool.n_free_blocks()),
+        )
+    except Exception:
+        return None
 
 
 def _mpegts_flags() -> str:
@@ -159,6 +187,7 @@ class PyNvPassthroughStream:
         output_mode: str | None = None,
     ):
         self.src = Path(src).resolve()
+        self.path = self.src
         self.sid = next(_stream_ids)
         self.start_sec = max(0.0, float(start_sec))
         self.matter = matter
@@ -191,6 +220,33 @@ class PyNvPassthroughStream:
         self._slate_audio_addr: tuple[str, int] | None = None
         self._slate_audio_cache_path: Path | None = None
         self.startup_error: str | None = None
+
+    def _log_vram(self, label: str) -> None:
+        if not config.DEBUG_LOGS:
+            return
+        snapshot = _cupy_vram_snapshot()
+        if snapshot is None:
+            log.info("[PYNV][%d] VRAM %s: unavailable", self.sid, label)
+            return
+        used, total, pool_used, pool_total, pinned_free = snapshot
+        log.info(
+            "[PYNV][%d] VRAM %s: used=%.1f/%.1fMiB cupy_pool=%.1f/%.1fMiB pinned_free_blocks=%d",
+            self.sid,
+            label,
+            _format_mib(used),
+            _format_mib(total),
+            _format_mib(pool_used),
+            _format_mib(pool_total),
+            pinned_free,
+        )
+
+    def _log_thread_stack(self, thread: threading.Thread) -> None:
+        frame = sys._current_frames().get(thread.ident) if thread.ident is not None else None
+        if frame is None:
+            log.warning("[PYNV][%d] stuck thread stack unavailable: %s", self.sid, thread.name)
+            return
+        stack = "".join(traceback.format_stack(frame, limit=16))
+        log.warning("[PYNV][%d] stuck thread stack name=%s\n%s", self.sid, thread.name, stack)
 
     @staticmethod
     def preflight(src: Path, metadata: VideoProbeMetadata | None = None) -> None:
@@ -1501,6 +1557,7 @@ class PyNvPassthroughStream:
 
     def _worker_loop(self) -> None:
         log.info("[PYNV][%d] worker start src=%s path=%s start=%.3f", self.sid, self.src.name, self.src, self.start_sec)
+        self._log_vram("worker_start")
         pending_nv12_slots: list[object] = []
         try:
             import PyNvVideoCodec as nvc
@@ -1508,6 +1565,7 @@ class PyNvPassthroughStream:
             codec_meta = self.metadata.codec if self.metadata is not None else None
             bit_depth = int(codec_meta.bit_depth if codec_meta and codec_meta.bit_depth > 0 else 8)
             self._dec = PyNvSimpleDecoder(self.src, bit_depth=bit_depth)
+            self._log_vram("decoder_created")
             info = self._dec.info
             timing = self.metadata.timing if self.metadata is not None else probe_timing_metadata(self.src)
             source_fps = float(timing.source_fps or info.fps or 30.0)
@@ -1585,6 +1643,7 @@ class PyNvPassthroughStream:
                 bitrate_estimate.source,
                 config.PASSTHROUGH_HEVC_BITRATE,
             )
+            self._log_vram("encoder_created")
             if bit_depth > 8:
                 log.info(
                     "[PYNV][%d] experimental 10-bit path active: source_bit_depth=%d p016_shift=%d output=NV12/8-bit",
@@ -1811,6 +1870,7 @@ class PyNvPassthroughStream:
                         if not self._real_video_started.is_set():
                             self._real_video_started.set()
                             log.info("[PYNV][%d] first real video bitstream written; slate audio may switch", self.sid)
+                            self._log_vram("first_real_video_bitstream")
                         write_elapsed = time.perf_counter() - write_started
                         if write_elapsed >= 1.0:
                             log.warning(
@@ -1915,6 +1975,7 @@ class PyNvPassthroughStream:
         finally:
             while pending_nv12_slots:
                 self.matter.release_nv12_output_slot(pending_nv12_slots.pop(0))
+            self._enc = None
             reader_started = self._reader is not None
             try:
                 stdin = self._video_mux.stdin if self._video_mux is not None else (self._mux.stdin if self._mux else None)
@@ -1925,6 +1986,11 @@ class PyNvPassthroughStream:
                 pass
             if not reader_started:
                 self._post_sentinel()
+            try:
+                gc.collect()
+            except Exception:
+                pass
+            self._log_vram("worker_done")
             log.info("[PYNV][%d] worker done frames=%d bytes_emitted=%d reader_started=%s", self.sid, self.frames_produced, self.bytes_emitted, reader_started)
 
     def _post_sentinel(self) -> None:
@@ -1979,6 +2045,7 @@ class PyNvPassthroughStream:
         self._closed = True
         self._stop.set()
         log.info("[PYNV][%d] close begin bytes=%d frames=%d", self.sid, self.bytes_emitted, self.frames_produced)
+        self._log_vram("close_begin")
         for proc in (self._video_mux, self._mux):
             if not proc:
                 continue
@@ -2003,12 +2070,33 @@ class PyNvPassthroughStream:
                 except Exception:
                     pass
         current = threading.current_thread()
+        worker_alive_after_first_join = False
         for thread in (self._worker, self._reader, self._stderr_reader):
             if thread and thread.is_alive() and thread is not current:
                 log.info("[PYNV][%d] close: waiting thread name=%s", self.sid, thread.name)
-                thread.join(timeout=_THREAD_JOIN_TIMEOUT)
+                timeout = (
+                    config.PASSTHROUGH_CLOSE_WORKER_TIMEOUT_SEC
+                    if thread is self._worker
+                    else _THREAD_JOIN_TIMEOUT
+                )
+                thread.join(timeout=timeout)
+                if thread is self._worker and thread.is_alive():
+                    worker_alive_after_first_join = True
+                    log.info(
+                        "[PYNV][%d] close: worker still alive after %.1fs, stopping decoder",
+                        self.sid,
+                        timeout,
+                    )
         self._enc = None
-        if self._dec:
+        if worker_alive_after_first_join:
+            if self._dec:
+                self._dec = None
+            self._log_vram("worker_join_timeout_decoder_detached")
+            log.warning(
+                "[PYNV][%d] close: worker did not stop after first join; decoder stop is skipped because SimpleDecoder.stop() is not reliable",
+                self.sid,
+            )
+        elif self._dec:
             dec = self._dec
             self._dec = None
             sid = self.sid
@@ -2024,6 +2112,7 @@ class PyNvPassthroughStream:
             dec_thread = threading.Thread(target=_stop_decoder, name=f"pynv-dec-stop-{sid}", daemon=True)
             dec_thread.start()
             dec_thread.join(timeout=_THREAD_JOIN_TIMEOUT)
+            self._log_vram("decoder_stop_joined")
         try:
             gc.collect()
         except Exception:
@@ -2031,4 +2120,13 @@ class PyNvPassthroughStream:
         for thread in (self._reader, self._stderr_reader, self._worker):
             if thread and thread.is_alive():
                 log.info("[PYNV][%d] close: thread still alive name=%s", self.sid, thread.name)
+                self._log_vram(f"thread_still_alive:{thread.name}")
+                self._log_thread_stack(thread)
+                if thread is self._worker:
+                    _pynv_runtime_tainted.set()
+                    log.error(
+                        "[PYNV][%d] PyNv runtime marked tainted because worker did not stop; restart the server before continuing alpha passthrough",
+                        self.sid,
+                    )
+        self._log_vram("close_done")
         log.info("[PYNV][%d] close done", self.sid)

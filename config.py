@@ -830,6 +830,15 @@ PASSTHROUGH_LIVE_CHAPTER_MAX_ITEMS = max(1, int(_env("PASSTHROUGH_LIVE_CHAPTER_M
 #   the short-video threshold when only one useful chapter would be generated.
 PASSTHROUGH_LIVE_CHAPTER_MIN_INTERVAL_SEC = max(1, int(_env("PASSTHROUGH_LIVE_CHAPTER_MIN_INTERVAL_SEC", 180)))
 
+# PT_PASSTHROUGH_MKV_LIVE_POLICY:
+#   MKV is risky for the current PyNv random-index live path. Files with Cues
+#   near the head are allowed for diagnostics; files with missing/tail Cues are
+#   hidden/rejected because PyNv SimpleDecoder[index] can block in native code.
+#     block     - hide/reject all MKV live passthrough.
+#     head_cues - allow only MKV whose Cues are detected near the file head.
+#     allow     - allow MKV live passthrough for diagnostics.
+PASSTHROUGH_MKV_LIVE_POLICY = _env("PASSTHROUGH_MKV_LIVE_POLICY", "block").lower()
+
 # PT_PASSTHROUGH_DLNA_PN or PT_DLNA_PN:
 #   Override DLNA.ORG_PN for passthrough resources. Leave empty for automatic
 #   selection in dlna/profiles.py. Use only for target-client compatibility.
@@ -863,6 +872,15 @@ PASSTHROUGH_PAD_TO_LENGTH = _env("PASSTHROUGH_PAD_TO_LENGTH", "1") == "1"
 #   the stream hand distinct output buffers to NVENC instead of reusing one
 #   Matter-owned buffer every frame. Phase 3 default is 3.
 PASSTHROUGH_NV12_RING_SLOTS = max(1, int(_env("PASSTHROUGH_NV12_RING_SLOTS", 3)))
+
+# PT_PASSTHROUGH_CLOSE_WORKER_TIMEOUT_SEC:
+#   Maximum time to wait for a PyNv passthrough worker to exit during close.
+#   If it is still inside native decoder code after this, the stream attempts
+#   decoder stop and logs the stuck thread for diagnostics.
+PASSTHROUGH_CLOSE_WORKER_TIMEOUT_SEC = max(
+    0.1,
+    float(_env("PASSTHROUGH_CLOSE_WORKER_TIMEOUT_SEC", 3.0)),
+)
 
 # PT_USE_PYNV:
 #   1 routes eligible CFR SDR 8-bit sources to PyNv decode/matting/HEVC encode.

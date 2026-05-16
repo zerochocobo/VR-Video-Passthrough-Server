@@ -75,6 +75,7 @@ class Settings:
     def server_env(self) -> dict[str, str]:
         env = {
             "PT_VIDEO_DIR": "|".join(self.video_dirs()),
+            "PT_UI_LANGUAGE": str(self.data.get("language") or system_language()),
             "PT_PASSTHROUGH_OUTPUT_MODE": self.passthrough_mode(),
             "PT_COMPOSITE_BG_RGB": str(self.data.get("background_color") or "00FF00"),
             "PT_ALPHA_STRIDE": str(_setting_value(self.data, "alpha_stride", 3)),
