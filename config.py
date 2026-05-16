@@ -225,8 +225,9 @@ PASSTHROUGH_LIVE_DEFAULT_PROFILE = _env("PASSTHROUGH_LIVE_DEFAULT_PROFILE", "vlc
 
 # ---- Matting and startup warmup ----
 # PT_MODEL_PATH:
-#   ONNX matting model path. Current recommended production model is RVM
-#   MobileNetV3 fp32. Typical value: models\rvm_mobilenetv3_fp32.onnx.
+#   ONNX matting model path. Realtime production defaults to RVM MobileNetV3
+#   FP32 for stable output. Override with models\rvm_mobilenetv3_fp16.onnx only
+#   when explicitly benchmarking FP16.
 MODEL_PATH: Path = Path(_env("MODEL_PATH", ROOT / "models" / "rvm_mobilenetv3_fp32.onnx")).resolve()
 
 # PT_MATTING_DEVICE:
@@ -266,8 +267,8 @@ RVM_DOWNSAMPLE_RATIO = float(_env("RVM_DOWNSAMPLE_RATIO", 0.5))
 
 # PT_ALPHA_STRIDE:
 #   Reuse the previous alpha mask for N-1 frames and recompute every Nth frame.
-#   Higher values improve throughput at the cost of temporal fidelity.
-ALPHA_STRIDE = max(1, int(_env("ALPHA_STRIDE", 3)))
+#   Production default 1 recomputes every frame for temporal fidelity.
+ALPHA_STRIDE = max(1, int(_env("ALPHA_STRIDE", 1)))
 
 # PT_ALPHA_MODE:
 #   Alpha reuse strategy.
@@ -359,6 +360,29 @@ ONNX_PROVIDERS: list[str] = _env(
     "ONNX_PROVIDERS",
     "CUDAExecutionProvider,CPUExecutionProvider",
 ).split(",")
+
+# PT_ONNX_TRT_ENGINE_CACHE_ENABLE / PATH:
+#   Optional TensorRT EP settings when PT_ONNX_PROVIDERS includes
+#   TensorrtExecutionProvider. Keep disabled unless explicitly A/B testing TRT
+#   because the first engine build can take significant startup time.
+ONNX_TRT_ENGINE_CACHE_ENABLE = _env("ONNX_TRT_ENGINE_CACHE_ENABLE", "1") == "1"
+ONNX_TRT_ENGINE_CACHE_PATH: Path = Path(
+    _env("ONNX_TRT_ENGINE_CACHE_PATH", ROOT / "runtime_cache" / "trt_engines")
+).resolve()
+ONNX_TRT_FP16_ENABLE = _env("ONNX_TRT_FP16_ENABLE", "1") == "1"
+ONNX_TRT_CUDA_GRAPH_ENABLE = _env("ONNX_TRT_CUDA_GRAPH_ENABLE", "1") == "1"
+
+# PT_PASSTHROUGH_PYNV_SYNC_PROBE:
+#   1 enables extra CUDA synchronizations inside the PyNv green matting path to
+#   attribute the normal outer sync wait to upload, RVM/ORT, or composite. This
+#   is a diagnostic mode and intentionally changes timing.
+PASSTHROUGH_PYNV_SYNC_PROBE = _env("PASSTHROUGH_PYNV_SYNC_PROBE", "0") == "1"
+
+# PT_PASSTHROUGH_RVM_BYPASS_ALPHA:
+#   Diagnostic only. 1 bypasses RVM inference on the PyNv/CuPy green path and
+#   uses an all-foreground alpha mask. This isolates decode/composite/encode
+#   throughput and must not be used as a production visual mode.
+PASSTHROUGH_RVM_BYPASS_ALPHA = _env("PASSTHROUGH_RVM_BYPASS_ALPHA", "0") == "1"
 
 # PT_RUNTIME_CACHE_DIR:
 #   Root directory for all runtime-generated caches and warmup markers.
@@ -457,6 +481,25 @@ PASSTHROUGH_HEVC_SOURCE_MAX_MULTIPLIER = float(_env("PASSTHROUGH_HEVC_SOURCE_MAX
 #   PyNv HEVC B-frame count. 0 minimizes latency and mux/seek complexity. Higher
 #   values may improve compression but are not the current realtime default.
 PASSTHROUGH_HEVC_BF = _env("PASSTHROUGH_HEVC_BF", "0")
+
+# PT_PASSTHROUGH_PYNV_PRESET:
+#   PyNvVideoCodec NVENC preset. P1 is the fastest SDK 10+ preset and is required
+#   for 8K realtime headroom; lowercase p1 is not accepted by PyNv 2.1.0.
+PASSTHROUGH_PYNV_PRESET = _env("PASSTHROUGH_PYNV_PRESET", "P1")
+
+# PT_PASSTHROUGH_PYNV_TUNING_INFO:
+#   PyNvVideoCodec tuning_info string. ultra_low_latency matches the live
+#   streaming path and avoids the slow default/high-quality encoder settings.
+PASSTHROUGH_PYNV_TUNING_INFO = _env("PASSTHROUGH_PYNV_TUNING_INFO", "ultra_low_latency")
+
+# PT_PASSTHROUGH_PYNV_RC:
+#   PyNvVideoCodec rate-control mode. cbr keeps bitrate predictable for live
+#   MPEG-TS delivery. Leave empty to let PyNv choose its default.
+PASSTHROUGH_PYNV_RC = _env("PASSTHROUGH_PYNV_RC", "cbr")
+
+# PT_PASSTHROUGH_PYNV_IDR_PERIOD:
+#   Optional PyNv idrperiod override. Empty keeps PyNv default/GOP behavior.
+PASSTHROUGH_PYNV_IDR_PERIOD = _env("PASSTHROUGH_PYNV_IDR_PERIOD", "")
 
 # PT_PASSTHROUGH_GOP or PT_GOP:
 #   GOP/keyframe interval in output frames. With 30fps, 60 means one keyframe
@@ -683,6 +726,36 @@ PASSTHROUGH_PYNV_10BIT = _env("PASSTHROUGH_PYNV_10BIT", "1") == "1"
 #   testing if decoded values appear LSB-aligned.
 PASSTHROUGH_PYNV_10BIT_SHIFT = int(_env("PASSTHROUGH_PYNV_10BIT_SHIFT", 8))
 
+# PT_PASSTHROUGH_PYNV_DECODER:
+#   Decoder used by the production PyNv live worker.
+#     threaded_serial - sequential ThreadedDecoder pull with CFR source-frame
+#                       dropping inside the existing serial worker.
+#     simple          - legacy SimpleDecoder[index] random access.
+PASSTHROUGH_PYNV_DECODER = _env("PASSTHROUGH_PYNV_DECODER", "simple").lower()
+
+# PT_PASSTHROUGH_ALPHA_ALLOW_THREADED_DECODER:
+#   Diagnostic only. Alpha passthrough has shown red/gray alpha flicker with
+#   ThreadedDecoder on some sources. Keep alpha on SimpleDecoder by default;
+#   set to 1 only when explicitly testing threaded alpha.
+PASSTHROUGH_ALPHA_ALLOW_THREADED_DECODER = _env("PASSTHROUGH_ALPHA_ALLOW_THREADED_DECODER", "0") == "1"
+
+# PT_PASSTHROUGH_PYNV_THREADED_BATCH_SIZE / BUFFER_SIZE:
+#   ThreadedDecoder tuning for the serial production reader. Returned frames
+#   must still be consumed before the next get_batch_frames() call.
+PASSTHROUGH_PYNV_THREADED_BATCH_SIZE = max(1, int(_env("PASSTHROUGH_PYNV_THREADED_BATCH_SIZE", 1)))
+PASSTHROUGH_PYNV_THREADED_BUFFER_SIZE = max(1, int(_env("PASSTHROUGH_PYNV_THREADED_BUFFER_SIZE", 2)))
+
+# PT_PASSTHROUGH_PYNV_WORKER_MODE:
+#   serial    - existing single worker loop.
+#   two_stage - experimental green-only overlap: decode+matting in one worker,
+#               encode+mux in another. ThreadedDecoder frames never cross the
+#               worker boundary; only Matter-owned NV12 slots are handed off.
+PASSTHROUGH_PYNV_WORKER_MODE = _env("PASSTHROUGH_PYNV_WORKER_MODE", "serial").lower()
+
+# PT_PASSTHROUGH_NV12_SLOT_WAIT_SEC:
+#   Maximum wait for a Matter NV12 output slot in staged/overlapped workers.
+PASSTHROUGH_NV12_SLOT_WAIT_SEC = max(0.0, float(_env("PASSTHROUGH_NV12_SLOT_WAIT_SEC", 5.0)))
+
 # PT_PASSTHROUGH_LIVE_VLC_PSEUDO_VOD:
 #   1 returns VLC/LibVLC/MoonVR live requests as 206 Partial Content with a
 #   synthetic Content-Range. Do not send Content-Length for generated live
@@ -706,6 +779,13 @@ PASSTHROUGH_LIVE_LAVF_POLICY = _env("PASSTHROUGH_LIVE_LAVF_POLICY", "reject").lo
 #   even though server output was continuous.
 PASSTHROUGH_MPEGTS_COLOR_RANGE = _env("PASSTHROUGH_MPEGTS_COLOR_RANGE", "tv").lower()
 
+# PT_PASSTHROUGH_MAX_FPS:
+#   Output/processing FPS cap. 0 keeps source FPS. Positive values cap output
+#   frames, encoder/mux FPS, and live producer pacing. Set 30 explicitly for
+#   client-compatibility diagnostics; the default keeps the source frame rate
+#   unthrottled.
+PASSTHROUGH_MAX_FPS = float(_env("PASSTHROUGH_MAX_FPS", 0))
+
 # PT_PASSTHROUGH_REALTIME_PACING:
 #   Backward-compatible alias for PT_PASSTHROUGH_SEND_REALTIME_PACING.
 #
@@ -714,11 +794,14 @@ PASSTHROUGH_MPEGTS_COLOR_RANGE = _env("PASSTHROUGH_MPEGTS_COLOR_RANGE", "tv").lo
 #   not flooded by a faster-than-realtime producer.
 #
 # PT_PASSTHROUGH_PRODUCER_REALTIME_PACING:
-#   1 paces the PyNv worker itself to output FPS. Default 0 keeps the GPU
-#   producer unthrottled so logs show real processing headroom above 30fps.
+#   1 paces the PyNv worker itself to output FPS. A positive
+#   PT_PASSTHROUGH_MAX_FPS also enables producer pacing so UI FPS caps limit the
+#   actual live output rate, not only timestamps.
 _REALTIME_PACING_DEFAULT = _env("PASSTHROUGH_REALTIME_PACING", "1")
 PASSTHROUGH_SEND_REALTIME_PACING = _env("PASSTHROUGH_SEND_REALTIME_PACING", _REALTIME_PACING_DEFAULT) == "1"
-PASSTHROUGH_PRODUCER_REALTIME_PACING = _env("PASSTHROUGH_PRODUCER_REALTIME_PACING", "0") == "1"
+PASSTHROUGH_PRODUCER_REALTIME_PACING = (
+    _env("PASSTHROUGH_PRODUCER_REALTIME_PACING", "1" if PASSTHROUGH_MAX_FPS > 0 else "0") == "1"
+)
 
 # PT_PASSTHROUGH_SEND_PACING_MULTIPLIER:
 #   Multiplier applied to estimated live output bitrate for HTTP send pacing.
@@ -732,11 +815,6 @@ PASSTHROUGH_SEND_PACING_MULTIPLIER = max(
 # PT_PASSTHROUGH_SEND_MIN_BPS:
 #   Lower bound for paced live HTTP delivery.
 PASSTHROUGH_SEND_MIN_BPS = max(1, int(_env("PASSTHROUGH_SEND_MIN_BPS", 100_000_000)))
-
-# PT_PASSTHROUGH_MAX_FPS:
-#   Output/processing FPS cap. 0 keeps source FPS. Positive values cap output
-#   frames and encoder/mux FPS. Current real-device profile uses 30.
-PASSTHROUGH_MAX_FPS = float(_env("PASSTHROUGH_MAX_FPS", 30))
 
 # PT_DEBUG_LOGS:
 #   0: suppress very frequent diagnostic/progress logs in server.log.

@@ -253,8 +253,8 @@ def pull_stream(label: str, url: str, headers: dict[str, str], duration: float, 
         with urlopen(req, timeout=timeout) as resp:
             status = int(resp.status)
             response_headers = {key: value for key, value in resp.headers.items()}
-            deadline = time.perf_counter() + duration
-            while time.perf_counter() < deadline:
+            deadline: float | None = None
+            while deadline is None or time.perf_counter() < deadline:
                 try:
                     chunk = resp.read(chunk_size)
                 except socket.timeout:
@@ -263,7 +263,9 @@ def pull_stream(label: str, url: str, headers: dict[str, str], duration: float, 
                 if not chunk:
                     break
                 if first_byte is None:
-                    first_byte = time.perf_counter() - started
+                    now = time.perf_counter()
+                    first_byte = now - started
+                    deadline = now + duration
                 total += len(chunk)
     except HTTPError as e:
         status = int(e.code)

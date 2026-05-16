@@ -66,7 +66,7 @@ MatAnyone2 官方仓库：
 示例：
 
 ```powershell
-python tools\offline_passthrough.py "VR\VR108\urvrsp-566\4k2.me@urvrsp00566_1_8k.mp4" --duration 10 --out debug_output\offline_test.mp4
+python tools\offline_passthrough.py "VR\VR108\xxxx.mp4" --duration 10 --out debug_output\offline_test.mp4
 ```
 
 ## MatAnyone2 ONNX 转换风险

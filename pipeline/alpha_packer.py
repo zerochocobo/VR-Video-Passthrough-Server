@@ -173,6 +173,62 @@ class AlphaPacker:
         return false;
     }
 
+    __device__ bool alpha_layout_source(
+        int x, int y,
+        int out_w, int out_h,
+        int alpha_w, int alpha_h,
+        int* src_ax,
+        int* src_ay
+    ) {
+        int half_w = alpha_w >> 1;
+        int half_h = alpha_h >> 1;
+        int quarter_w = alpha_w >> 2;
+        int right2_x = alpha_w - quarter_w;
+        int x_topleft = (out_w >> 1) - (half_w >> 1);
+        int y_bottomleft = out_h - half_h;
+        int x2_topleft = out_w - quarter_w;
+        int y2_topleft = out_h - half_h;
+        *src_ax = -1;
+        *src_ay = -1;
+
+        if (x >= x_topleft && x < x_topleft + half_w && y >= y_bottomleft && y < y_bottomleft + half_h) {
+            *src_ax = x - x_topleft;
+            *src_ay = y - y_bottomleft;
+        } else if (x >= x_topleft && x < x_topleft + half_w && y >= 0 && y < half_h) {
+            *src_ax = x - x_topleft;
+            *src_ay = y + half_h;
+        } else if (x >= x2_topleft && x < x2_topleft + quarter_w && y >= y2_topleft && y < y2_topleft + half_h) {
+            *src_ax = (x - x2_topleft) + half_w;
+            *src_ay = y - y2_topleft;
+        } else if (x >= 0 && x < quarter_w && y >= y_bottomleft && y < y_bottomleft + half_h) {
+            *src_ax = x + right2_x;
+            *src_ay = y - y_bottomleft;
+        } else if (x >= x2_topleft && x < x2_topleft + half_w && y >= 0 && y < half_h) {
+            *src_ax = (x - x2_topleft) + half_w;
+            *src_ay = y + half_h;
+        } else if (x >= 0 && x < quarter_w && y >= 0 && y < half_h) {
+            *src_ax = x + right2_x;
+            *src_ay = y + half_h;
+        }
+        return *src_ax >= 0 && *src_ay >= 0;
+    }
+
+    __device__ unsigned char alpha_layout_mask_at(
+        const unsigned char* __restrict__ fisheye_alpha,
+        int x, int y,
+        int out_w, int out_h,
+        int alpha_w, int alpha_h
+    ) {
+        int src_ax = -1;
+        int src_ay = -1;
+        if (!alpha_layout_source(x, y, out_w, out_h, alpha_w, alpha_h, &src_ax, &src_ay)) {
+            return 0;
+        }
+        int fisheye_x = src_ax * out_w / alpha_w;
+        int fisheye_y = src_ay * out_h / alpha_h;
+        return fisheye_alpha[fisheye_y * out_w + fisheye_x];
+    }
+
     extern "C" __global__
     void project_fisheye_nv12_alpha(
         const unsigned char* __restrict__ src_nv12,
@@ -275,38 +331,10 @@ class AlphaPacker:
         int y = blockIdx.y * blockDim.y + threadIdx.y;
         if (x >= out_w || y >= out_h) return;
 
-        int half_w = alpha_w >> 1;
-        int half_h = alpha_h >> 1;
-        int quarter_w = alpha_w >> 2;
-        int right2_x = alpha_w - quarter_w;
-        int x_topleft = (out_w >> 1) - (half_w >> 1);
-        int y_bottomleft = out_h - half_h;
-        int x2_topleft = out_w - quarter_w;
-        int y2_topleft = out_h - half_h;
         int src_ax = -1;
         int src_ay = -1;
 
-        if (x >= x_topleft && x < x_topleft + half_w && y >= y_bottomleft && y < y_bottomleft + half_h) {
-            src_ax = x - x_topleft;
-            src_ay = y - y_bottomleft;
-        } else if (x >= x_topleft && x < x_topleft + half_w && y >= 0 && y < half_h) {
-            src_ax = x - x_topleft;
-            src_ay = y + half_h;
-        } else if (x >= x2_topleft && x < x2_topleft + quarter_w && y >= y2_topleft && y < y2_topleft + half_h) {
-            src_ax = (x - x2_topleft) + half_w;
-            src_ay = y - y2_topleft;
-        } else if (x >= 0 && x < quarter_w && y >= y_bottomleft && y < y_bottomleft + half_h) {
-            src_ax = (x - 0) + right2_x;
-            src_ay = y - y_bottomleft;
-        } else if (x >= x2_topleft && x < x2_topleft + half_w && y >= 0 && y < half_h) {
-            src_ax = (x - x2_topleft) + half_w;
-            src_ay = y + half_h;
-        } else if (x >= 0 && x < quarter_w && y >= 0 && y < half_h) {
-            src_ax = (x - 0) + right2_x;
-            src_ay = y + half_h;
-        }
-
-        if (src_ax >= 0 && src_ay >= 0) {
+        if (alpha_layout_source(x, y, out_w, out_h, alpha_w, alpha_h, &src_ax, &src_ay)) {
             int fisheye_x = src_ax * out_w / alpha_w;
             int fisheye_y = src_ay * out_h / alpha_h;
             unsigned char mask = fisheye_alpha[fisheye_y * out_w + fisheye_x];
@@ -319,6 +347,14 @@ class AlphaPacker:
             rgb_to_yuv_limited((float)mask, 0.f, 0.f, &yv, &uv_u, &uv_v);
             out_nv12[y * out_w + x] = yv;
             if (((x | y) & 1) == 0) {
+                unsigned char m01 = (x + 1 < out_w) ? alpha_layout_mask_at(fisheye_alpha, x + 1, y, out_w, out_h, alpha_w, alpha_h) : 0;
+                unsigned char m10 = (y + 1 < out_h) ? alpha_layout_mask_at(fisheye_alpha, x, y + 1, out_w, out_h, alpha_w, alpha_h) : 0;
+                unsigned char m11 = (x + 1 < out_w && y + 1 < out_h) ? alpha_layout_mask_at(fisheye_alpha, x + 1, y + 1, out_w, out_h, alpha_w, alpha_h) : 0;
+                unsigned char uv_mask = mask;
+                if (m01 > uv_mask) uv_mask = m01;
+                if (m10 > uv_mask) uv_mask = m10;
+                if (m11 > uv_mask) uv_mask = m11;
+                rgb_to_yuv_limited((float)uv_mask, 0.f, 0.f, &yv, &uv_u, &uv_v);
                 int uv_idx = out_w * out_h + (y >> 1) * out_w + x;
                 out_nv12[uv_idx] = uv_u;
                 out_nv12[uv_idx + 1] = uv_v;
@@ -327,15 +363,27 @@ class AlphaPacker:
     }
     """
 
-    def __init__(self, matter) -> None:
+    def __init__(
+        self,
+        matter,
+        scale: float = PACK_SCALE,
+        blocks_x: int = 3,
+        blocks_y: int = 2,
+        radius_scale: float = FISHEYE_RADIUS_SCALE,
+        alpha_cutoff: float | None = None,
+        alpha_hard_edge: bool | None = None,
+        alpha_contrast: float | None = None,
+    ) -> None:
         import cupy as cp
 
         self.matter = matter
-        self.scale = PACK_SCALE
-        self.radius_scale = FISHEYE_RADIUS_SCALE
-        self.alpha_cutoff = config.ALPHA_CUTOFF
-        self.alpha_hard_edge = config.ALPHA_HARD_EDGE
-        self.alpha_contrast = config.ALPHA_CONTRAST
+        self.scale = float(scale)
+        self.blocks_x = int(blocks_x)
+        self.blocks_y = int(blocks_y)
+        self.radius_scale = float(radius_scale)
+        self.alpha_cutoff = config.ALPHA_CUTOFF if alpha_cutoff is None else float(alpha_cutoff)
+        self.alpha_hard_edge = config.ALPHA_HARD_EDGE if alpha_hard_edge is None else bool(alpha_hard_edge)
+        self.alpha_contrast = config.ALPHA_CONTRAST if alpha_contrast is None else float(alpha_contrast)
         self._cp = cp
         self._project_kernel = cp.RawKernel(self._KERNEL_SRC, "project_fisheye_nv12_alpha")
         self._overlay_kernel = cp.RawKernel(self._KERNEL_SRC, "overlay_alpha_packer_layout")
@@ -443,9 +491,20 @@ class AlphaPacker:
         )
         return out_nv12
 
-    def pack_gpu_nv12_frame(self, frame, before_pack=None, subtitle_overlay=None):
-        h, w = int(frame.height), int(frame.width)
-        self.matter.upload_nv12_planes_gpu(frame.y.as_cupy(), frame.uv.as_cupy(), h, w)
+    def pack_gpu_nv12_frame(
+        self,
+        frame,
+        before_pack=None,
+        subtitle_overlay=None,
+        out_h: int | None = None,
+        out_w: int | None = None,
+        use_config_scale: bool = True,
+    ):
+        src_h, src_w = int(frame.height), int(frame.width)
+        w, h = self.matter.pynv_scaled_size(src_w, src_h) if use_config_scale else (src_w, src_h)
+        if out_w is not None and out_h is not None:
+            w, h = int(out_w), int(out_h)
+        self.matter.upload_nv12_planes_gpu_scaled(frame.y.as_cupy(), frame.uv.as_cupy(), src_h, src_w, h, w)
         alpha, timing, _ = self.matter._alpha_low_res_gpu(h, w, use_nv12=True)
         if before_pack is not None:
             result = before_pack(self.matter._g_frame)
@@ -453,11 +512,25 @@ class AlphaPacker:
                 subtitle_overlay = result
         return self.pack_uploaded(alpha, h, w, subtitle_overlay=subtitle_overlay), timing
 
-    def pack_gpu_p016_frame(self, frame, shift_bits: int = 8, before_pack=None, subtitle_overlay=None):
-        h, w = int(frame.height), int(frame.width)
-        self.matter.upload_p016_planes_as_nv12_gpu(
+    def pack_gpu_p016_frame(
+        self,
+        frame,
+        shift_bits: int = 8,
+        before_pack=None,
+        subtitle_overlay=None,
+        out_h: int | None = None,
+        out_w: int | None = None,
+        use_config_scale: bool = True,
+    ):
+        src_h, src_w = int(frame.height), int(frame.width)
+        w, h = self.matter.pynv_scaled_size(src_w, src_h) if use_config_scale else (src_w, src_h)
+        if out_w is not None and out_h is not None:
+            w, h = int(out_w), int(out_h)
+        self.matter.upload_p016_planes_as_nv12_gpu_scaled(
             frame.y.as_cupy(),
             frame.uv.as_cupy(),
+            src_h,
+            src_w,
             h,
             w,
             shift_bits=shift_bits,

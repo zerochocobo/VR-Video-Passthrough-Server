@@ -25,7 +25,7 @@ from typing import AsyncIterator
 import config
 from pipeline import matting as matting_module
 from pipeline.matting import Matter
-from pipeline.pynv_io import GpuNv12AppFrame, GpuP016Frame, PyNvSimpleDecoder
+from pipeline.pynv_io import GpuNv12AppFrame, GpuP016Frame, PyNvSimpleDecoder, PyNvThreadedSerialDecoder
 from pipeline.subtitles import SubtitleRenderer, find_subtitle_for_video
 from utils.logger import get
 from utils.cache_key import fingerprint, stat_key
@@ -56,6 +56,25 @@ _audio_cache_locks_guard = threading.Lock()
 _pynv_runtime_tainted = threading.Event()
 _SUBTITLE_BLEND_Y_KERNEL = None
 _SUBTITLE_BLEND_UV_KERNEL = None
+
+
+def _pynv_encoder_kwargs(*, bitrate: str, fps: str) -> dict[str, str]:
+    kwargs = {
+        "codec": PYNV_OUTPUT_CODEC,
+        "bitrate": str(bitrate),
+        "fps": str(fps),
+        "gop": str(config.PASSTHROUGH_GOP),
+        "bf": str(config.PASSTHROUGH_HEVC_BF),
+    }
+    if config.PASSTHROUGH_PYNV_PRESET:
+        kwargs["preset"] = str(config.PASSTHROUGH_PYNV_PRESET)
+    if config.PASSTHROUGH_PYNV_TUNING_INFO:
+        kwargs["tuning_info"] = str(config.PASSTHROUGH_PYNV_TUNING_INFO)
+    if config.PASSTHROUGH_PYNV_RC:
+        kwargs["rc"] = str(config.PASSTHROUGH_PYNV_RC)
+    if config.PASSTHROUGH_PYNV_IDR_PERIOD:
+        kwargs["idrperiod"] = str(config.PASSTHROUGH_PYNV_IDR_PERIOD)
+    return kwargs
 
 
 def pynv_runtime_tainted() -> bool:
@@ -210,7 +229,7 @@ class PyNvPassthroughStream:
         self._worker: threading.Thread | None = None
         self._mux: subprocess.Popen | None = None
         self._video_mux: subprocess.Popen | None = None
-        self._dec: PyNvSimpleDecoder | None = None
+        self._dec: PyNvSimpleDecoder | PyNvThreadedSerialDecoder | None = None
         self._enc = None
         self._slate_audio_thread: threading.Thread | None = None
         self._slate_audio_ready = threading.Event()
@@ -288,17 +307,7 @@ class PyNvPassthroughStream:
             width = int(width or dec.info.width)
             height = int(height or dec.info.height)
             fps = float(fps or dec.info.fps or 30.0)
-            enc = nvc.CreateEncoder(
-                width,
-                height,
-                "NV12",
-                False,
-                codec=PYNV_OUTPUT_CODEC,
-                bitrate=bitrate,
-                fps=f"{fps:.6f}",
-                gop=str(config.PASSTHROUGH_GOP),
-                bf=str(config.PASSTHROUGH_HEVC_BF),
-            )
+            enc = nvc.CreateEncoder(width, height, "NV12", False, **_pynv_encoder_kwargs(bitrate=bitrate, fps=f"{fps:.6f}"))
             try:
                 end = getattr(enc, "EndEncode", None)
                 if callable(end):
@@ -1564,25 +1573,68 @@ class PyNvPassthroughStream:
 
             codec_meta = self.metadata.codec if self.metadata is not None else None
             bit_depth = int(codec_meta.bit_depth if codec_meta and codec_meta.bit_depth > 0 else 8)
-            self._dec = PyNvSimpleDecoder(self.src, bit_depth=bit_depth)
-            self._log_vram("decoder_created")
-            info = self._dec.info
+            meta_dec = PyNvSimpleDecoder(self.src, bit_depth=bit_depth)
+            self._log_vram("decoder_metadata_created")
+            info = meta_dec.info
+            dec_len = len(meta_dec)
             timing = self.metadata.timing if self.metadata is not None else probe_timing_metadata(self.src)
             source_fps = float(timing.source_fps or info.fps or 30.0)
             fps_cap = config.PASSTHROUGH_MAX_FPS if self.max_fps is None else float(self.max_fps)
             fps = float(timing.effective_fps(fps_cap))
+            producer_pacing = bool(config.PASSTHROUGH_PRODUCER_REALTIME_PACING or fps_cap > 0)
+            out_w, out_h = self.matter.pynv_scaled_size(info.width, info.height)
             self.output_fps = fps
             if not timing.is_cfr:
+                meta_dec.stop()
                 raise RuntimeError("PyNv production stream requires strong CFR source")
             start_out = int(round(self.start_sec * fps))
             target = max(0, int((timing.duration or info.duration or 0.0) * fps) - start_out)
-            max_target = int((len(self._dec) - 1) * fps / source_fps) + 1 if source_fps > 0 else len(self._dec)
+            max_target = int((dec_len - 1) * fps / source_fps) + 1 if source_fps > 0 else dec_len
             target = min(target, max(1, max_target))
+            initial_src_idx = min(dec_len - 1, cfr_source_index(start_out, source_fps, fps))
+            decoder_mode = config.PASSTHROUGH_PYNV_DECODER
+            if (
+                self.output_mode == "alpha"
+                and decoder_mode == "threaded_serial"
+                and not config.PASSTHROUGH_ALPHA_ALLOW_THREADED_DECODER
+            ):
+                log.warning(
+                    "[PYNV][%d] alpha output uses decoder=simple; "
+                    "threaded_serial is disabled for alpha by PT_PASSTHROUGH_ALPHA_ALLOW_THREADED_DECODER=0",
+                    self.sid,
+                )
+                decoder_mode = "simple"
+            alpha_threaded_owned_copy = self.output_mode == "alpha" and decoder_mode == "threaded_serial"
+            if decoder_mode == "threaded_serial":
+                meta_dec.stop()
+                self._dec = PyNvThreadedSerialDecoder(
+                    self.src,
+                    bit_depth=bit_depth,
+                    start_frame=initial_src_idx,
+                    batch_size=config.PASSTHROUGH_PYNV_THREADED_BATCH_SIZE,
+                    buffer_size=config.PASSTHROUGH_PYNV_THREADED_BUFFER_SIZE,
+                    info=info,
+                    num_frames=dec_len,
+                )
+                log.info(
+                    "[PYNV][%d] decoder created mode=threaded_serial start_frame=%d batch=%d buffer=%d",
+                    self.sid,
+                    initial_src_idx,
+                    config.PASSTHROUGH_PYNV_THREADED_BATCH_SIZE,
+                    config.PASSTHROUGH_PYNV_THREADED_BUFFER_SIZE,
+                )
+            elif decoder_mode == "simple":
+                self._dec = meta_dec
+                log.info("[PYNV][%d] decoder created mode=simple", self.sid)
+            else:
+                meta_dec.stop()
+                raise RuntimeError(f"unknown PT_PASSTHROUGH_PYNV_DECODER={decoder_mode!r}")
+            self._log_vram("decoder_created")
             if self.metadata is not None:
                 codec_meta = self.metadata.codec
                 color_meta = self.metadata.color
                 log.info(
-                    "[PYNV][%d] source meta: codec=%s profile=%s pix_fmt=%s bit_depth=%d level=%s size=%dx%d source_fps=%.3f output_fps=%.3f fps_cap=%.3f duration=%.3f frames=%d color=%s/%s/%s/%s container=%s output_mode=%s",
+                    "[PYNV][%d] source meta: codec=%s profile=%s pix_fmt=%s bit_depth=%d level=%s size=%dx%d process_size=%dx%d source_fps=%.3f output_fps=%.3f fps_cap=%.3f duration=%.3f frames=%d color=%s/%s/%s/%s container=%s output_mode=%s",
                     self.sid,
                     codec_meta.codec_name,
                     codec_meta.profile,
@@ -1591,17 +1643,58 @@ class PyNvPassthroughStream:
                     codec_meta.level,
                     info.width,
                     info.height,
+                    out_w,
+                    out_h,
                     source_fps,
                     fps,
                     fps_cap,
                     timing.duration or info.duration or 0.0,
-                    len(self._dec),
+                    dec_len,
                     color_meta.color_range,
                     color_meta.color_space,
                     color_meta.color_transfer,
                     color_meta.color_primaries,
                     self.container,
                     self.output_mode,
+                )
+            log.info(
+                "[PYNV][%d] runtime config: alpha_stride=%d alpha_mode=%s model=%s "
+                "decoder=%s worker_mode=%s output_codec=%s producer_realtime_pacing=%s "
+                "send_realtime_pacing=%s max_fps=%.3f output_fps=%.3f rvm_bypass_alpha=%s "
+                "nv12_slots=%d",
+                self.sid,
+                config.ALPHA_STRIDE,
+                config.ALPHA_MODE,
+                config.MODEL_PATH,
+                decoder_mode,
+                config.PASSTHROUGH_PYNV_WORKER_MODE,
+                PYNV_OUTPUT_CODEC,
+                producer_pacing,
+                config.PASSTHROUGH_SEND_REALTIME_PACING,
+                fps_cap,
+                fps,
+                config.PASSTHROUGH_RVM_BYPASS_ALPHA,
+                config.PASSTHROUGH_NV12_RING_SLOTS,
+            )
+            if alpha_threaded_owned_copy:
+                log.info(
+                    "[PYNV][%d] alpha decoder detail: effective_decoder=%s batch=%d buffer=%d owned_copy=%s allow_threaded=%s",
+                    self.sid,
+                    decoder_mode,
+                    config.PASSTHROUGH_PYNV_THREADED_BATCH_SIZE,
+                    config.PASSTHROUGH_PYNV_THREADED_BUFFER_SIZE,
+                    alpha_threaded_owned_copy,
+                    config.PASSTHROUGH_ALPHA_ALLOW_THREADED_DECODER,
+                )
+            elif self.output_mode == "alpha":
+                log.info(
+                    "[PYNV][%d] alpha decoder detail: effective_decoder=%s batch=%d buffer=%d owned_copy=%s allow_threaded=%s",
+                    self.sid,
+                    decoder_mode,
+                    config.PASSTHROUGH_PYNV_THREADED_BATCH_SIZE,
+                    config.PASSTHROUGH_PYNV_THREADED_BUFFER_SIZE,
+                    alpha_threaded_owned_copy,
+                    config.PASSTHROUGH_ALPHA_ALLOW_THREADED_DECODER,
                 )
             subtitle_renderer: SubtitleRenderer | None = None
             log.info(
@@ -1613,7 +1706,7 @@ class PyNvPassthroughStream:
             subtitle_path = find_subtitle_for_video(self.src)
             if subtitle_path is not None:
                 try:
-                    subtitle_renderer = SubtitleRenderer(subtitle_path, info.width, info.height)
+                    subtitle_renderer = SubtitleRenderer(subtitle_path, out_w, out_h)
                     if not subtitle_renderer.enabled:
                         subtitle_renderer = None
                 except Exception as e:
@@ -1621,25 +1714,18 @@ class PyNvPassthroughStream:
                     log.warning("[PYNV][%d] subtitle load failed: %s error=%s", self.sid, subtitle_path.name, e)
             bitrate_estimate = effective_default_bitrate(self.src, PYNV_BACKEND_LABEL)
             bitrate = str(bitrate_estimate.bps)
-            self._enc = nvc.CreateEncoder(
-                info.width,
-                info.height,
-                "NV12",
-                False,
-                codec=PYNV_OUTPUT_CODEC,
-                bitrate=bitrate,
-                fps=f"{fps:.6f}",
-                gop=str(config.PASSTHROUGH_GOP),
-                bf=str(config.PASSTHROUGH_HEVC_BF),
-            )
+            enc_kwargs = _pynv_encoder_kwargs(bitrate=bitrate, fps=f"{fps:.6f}")
+            self._enc = nvc.CreateEncoder(out_w, out_h, "NV12", False, **enc_kwargs)
             log.info(
-                "[PYNV][%d] encoder created %dx%d fps=%.3f target=%d bitrate=%s source=%s configured=%s",
+                "[PYNV][%d] encoder created %dx%d source=%dx%d fps=%.3f target=%d kwargs=%s source_bitrate=%s configured_bitrate=%s",
                 self.sid,
+                out_w,
+                out_h,
                 info.width,
                 info.height,
                 fps,
                 target,
-                bitrate,
+                enc_kwargs,
                 bitrate_estimate.source,
                 config.PASSTHROUGH_HEVC_BITRATE,
             )
@@ -1691,7 +1777,7 @@ class PyNvPassthroughStream:
                 and not self._slate_direct_ready.is_set()
             ):
                 slate_alloc_start = time.perf_counter()
-                slate_nv12 = self._make_slate_nv12_gpu(info.width, info.height)
+                slate_nv12 = self._make_slate_nv12_gpu(out_w, out_h)
                 log.info(
                     "[PYNV][%d] slate video begin: waiting for audio cache alloc=%.3fs",
                     self.sid,
@@ -1709,7 +1795,7 @@ class PyNvPassthroughStream:
                     if slate_frames == 0:
                         flags = int(nvc.NV_ENC_PIC_FLAGS.FORCEIDR) | int(nvc.NV_ENC_PIC_FLAGS.OUTPUT_SPSPPS)
                     encode_start = time.perf_counter()
-                    bitstream = self._enc.Encode(GpuNv12AppFrame(slate_nv12, info.width, info.height), flags)
+                    bitstream = self._enc.Encode(GpuNv12AppFrame(slate_nv12, out_w, out_h), flags)
                     if slate_frames == 0:
                         log.info(
                             "[PYNV][%d] slate first encode: bytes=%d elapsed=%.3fs",
@@ -1749,6 +1835,29 @@ class PyNvPassthroughStream:
                         log.info("[PYNV][%d] slate audio stopped during stream close", self.sid)
                         return
                     raise RuntimeError("slate audio cache build failed")
+            if config.PASSTHROUGH_PYNV_WORKER_MODE == "two_stage" and alpha_packer is None:
+                self._worker_loop_two_stage_green(
+                    nvc=nvc,
+                    info=info,
+                    source_fps=source_fps,
+                    fps=fps,
+                    start_out=start_out,
+                    target=target,
+                    out_w=out_w,
+                    out_h=out_h,
+                    subtitle_renderer=subtitle_renderer,
+                    pending_nv12_slots=pending_nv12_slots,
+                    producer_pacing=producer_pacing,
+                )
+                return
+            if config.PASSTHROUGH_PYNV_WORKER_MODE not in ("serial", "two_stage"):
+                raise RuntimeError(f"unknown PT_PASSTHROUGH_PYNV_WORKER_MODE={config.PASSTHROUGH_PYNV_WORKER_MODE!r}")
+            if config.PASSTHROUGH_PYNV_WORKER_MODE == "two_stage":
+                log.info(
+                    "[PYNV][%d] worker mode two_stage requested but output_mode=%s is not green; using serial",
+                    self.sid,
+                    self.output_mode,
+                )
             last_src_idx = -1
             t_start = time.perf_counter()
             interval_start = t_start
@@ -1758,16 +1867,22 @@ class PyNvPassthroughStream:
             sum_sync = 0.0
             sum_encode = 0.0
             sum_mux = 0.0
+            sum_mat_pre = 0.0
+            sum_mat_ort = 0.0
+            sum_mat_kernel = 0.0
             max_decode = 0.0
             max_composite = 0.0
             max_sync = 0.0
             max_encode = 0.0
             max_mux = 0.0
+            max_mat_pre = 0.0
+            max_mat_ort = 0.0
+            max_mat_kernel = 0.0
             max_pending_nv12_slots = max(0, int(config.PASSTHROUGH_NV12_RING_SLOTS) - 1)
             for i in range(target):
                 if self._stop.is_set():
                     break
-                if config.PASSTHROUGH_PRODUCER_REALTIME_PACING and self.container == "mpegts" and fps > 0:
+                if producer_pacing and self.container == "mpegts" and fps > 0:
                     due = t_start + (i / fps)
                     now = time.perf_counter()
                     if due > now:
@@ -1786,6 +1901,8 @@ class PyNvPassthroughStream:
                     break
                 nv12_slot = None
                 if alpha_packer is not None:
+                    if alpha_threaded_owned_copy:
+                        frame = frame.owned_copy()
                     subtitle_overlay = self._subtitle_overlay_for_time(
                         subtitle_renderer,
                         out_idx / fps if fps > 0 else 0.0,
@@ -1801,27 +1918,35 @@ class PyNvPassthroughStream:
                         )
 
                     if isinstance(frame, GpuP016Frame):
-                        out_nv12, _ = alpha_packer.pack_gpu_p016_frame(
+                        out_nv12, timing = alpha_packer.pack_gpu_p016_frame(
                             frame,
                             shift_bits=config.PASSTHROUGH_PYNV_10BIT_SHIFT,
                             before_pack=apply_alpha_subtitle,
+                            out_h=out_h,
+                            out_w=out_w,
                         )
                     else:
-                        out_nv12, _ = alpha_packer.pack_gpu_nv12_frame(
+                        out_nv12, timing = alpha_packer.pack_gpu_nv12_frame(
                             frame,
                             before_pack=apply_alpha_subtitle,
+                            out_h=out_h,
+                            out_w=out_w,
                         )
                 elif isinstance(frame, GpuP016Frame):
-                    nv12_slot = self.matter.acquire_nv12_output_slot(info.height, info.width)
-                    out_nv12, _ = self.matter.composite_green_gpu_p016_frame_to_gpu_nv12_profile(
+                    nv12_slot = self.matter.acquire_nv12_output_slot(out_h, out_w)
+                    out_nv12, timing = self.matter.composite_green_gpu_p016_frame_to_gpu_nv12_profile(
                         frame,
                         shift_bits=config.PASSTHROUGH_PYNV_10BIT_SHIFT,
+                        out_h=out_h,
+                        out_w=out_w,
                         out_slot=nv12_slot,
                     )
                 else:
-                    nv12_slot = self.matter.acquire_nv12_output_slot(info.height, info.width)
-                    out_nv12, _ = self.matter.composite_green_gpu_nv12_frame_to_gpu_nv12_profile(
+                    nv12_slot = self.matter.acquire_nv12_output_slot(out_h, out_w)
+                    out_nv12, timing = self.matter.composite_green_gpu_nv12_frame_to_gpu_nv12_profile(
                         frame,
+                        out_h=out_h,
+                        out_w=out_w,
                         out_slot=nv12_slot,
                     )
                 t2 = time.perf_counter()
@@ -1837,7 +1962,7 @@ class PyNvPassthroughStream:
                     break
                 if alpha_packer is None:
                     self._apply_subtitle_overlay(out_nv12, subtitle_renderer, out_idx / fps if fps > 0 else 0.0)
-                app_frame = GpuNv12AppFrame(out_nv12, info.width, info.height)
+                app_frame = GpuNv12AppFrame(out_nv12, out_w, out_h)
                 flags = 0
                 if i == 0:
                     flags = int(nvc.NV_ENC_PIC_FLAGS.FORCEIDR) | int(nvc.NV_ENC_PIC_FLAGS.OUTPUT_SPSPPS)
@@ -1897,18 +2022,27 @@ class PyNvPassthroughStream:
                 sum_sync += dt_sync
                 sum_encode += dt_encode
                 sum_mux += dt_mux
+                mat_pre = float(getattr(timing, "preprocess_ms", 0.0)) / 1000.0
+                mat_ort = float(getattr(timing, "ort_ms", 0.0)) / 1000.0
+                mat_kernel = float(getattr(timing, "composite_ms", 0.0)) / 1000.0
+                sum_mat_pre += mat_pre
+                sum_mat_ort += mat_ort
+                sum_mat_kernel += mat_kernel
                 max_decode = max(max_decode, dt_decode)
                 max_composite = max(max_composite, dt_composite)
                 max_sync = max(max_sync, dt_sync)
                 max_encode = max(max_encode, dt_encode)
                 max_mux = max(max_mux, dt_mux)
+                max_mat_pre = max(max_mat_pre, mat_pre)
+                max_mat_ort = max(max_mat_ort, mat_ort)
+                max_mat_kernel = max(max_mat_kernel, mat_kernel)
                 self.frames_produced = i + 1
                 if config.DEBUG_LOGS and self.frames_produced % _DIAG_INTERVAL == 0:
                     elapsed = max(0.001, time.perf_counter() - t_start)
                     interval_elapsed = max(0.001, time.perf_counter() - interval_start)
                     interval_frames = _DIAG_INTERVAL
                     log.info(
-                        "[PYNV][%d] frame %d/%d fps=%.2f interval_fps=%.2f src_idx=%d bytes=%d out_bps=%.1fM stage_avg_ms decode=%.2f composite=%.2f sync=%.2f encode=%.2f mux=%.2f stage_max_ms decode=%.2f composite=%.2f sync=%.2f encode=%.2f mux=%.2f",
+                        "[PYNV][%d] frame %d/%d fps=%.2f interval_fps=%.2f src_idx=%d bytes=%d out_bps=%.1fM stage_avg_ms decode=%.2f composite=%.2f sync=%.2f encode=%.2f mux=%.2f mat_avg_ms pre=%.2f ort=%.2f kernel=%.2f stage_max_ms decode=%.2f composite=%.2f sync=%.2f encode=%.2f mux=%.2f mat_max_ms pre=%.2f ort=%.2f kernel=%.2f",
                         self.sid,
                         self.frames_produced,
                         target,
@@ -1922,11 +2056,17 @@ class PyNvPassthroughStream:
                         (sum_sync / interval_frames) * 1000.0,
                         (sum_encode / interval_frames) * 1000.0,
                         (sum_mux / interval_frames) * 1000.0,
+                        (sum_mat_pre / interval_frames) * 1000.0,
+                        (sum_mat_ort / interval_frames) * 1000.0,
+                        (sum_mat_kernel / interval_frames) * 1000.0,
                         max_decode * 1000.0,
                         max_composite * 1000.0,
                         max_sync * 1000.0,
                         max_encode * 1000.0,
                         max_mux * 1000.0,
+                        max_mat_pre * 1000.0,
+                        max_mat_ort * 1000.0,
+                        max_mat_kernel * 1000.0,
                     )
                     interval_start = time.perf_counter()
                     interval_bytes = 0
@@ -1935,11 +2075,17 @@ class PyNvPassthroughStream:
                     sum_sync = 0.0
                     sum_encode = 0.0
                     sum_mux = 0.0
+                    sum_mat_pre = 0.0
+                    sum_mat_ort = 0.0
+                    sum_mat_kernel = 0.0
                     max_decode = 0.0
                     max_composite = 0.0
                     max_sync = 0.0
                     max_encode = 0.0
                     max_mux = 0.0
+                    max_mat_pre = 0.0
+                    max_mat_ort = 0.0
+                    max_mat_kernel = 0.0
             if not self._stop.is_set():
                 log.info("[PYNV][%d] EndEncode begin frames=%d", self.sid, self.frames_produced)
                 tail = self._enc.EndEncode()
@@ -1992,6 +2138,251 @@ class PyNvPassthroughStream:
                 pass
             self._log_vram("worker_done")
             log.info("[PYNV][%d] worker done frames=%d bytes_emitted=%d reader_started=%s", self.sid, self.frames_produced, self.bytes_emitted, reader_started)
+
+    def _worker_loop_two_stage_green(
+        self,
+        *,
+        nvc,
+        info,
+        source_fps: float,
+        fps: float,
+        start_out: int,
+        target: int,
+        out_w: int,
+        out_h: int,
+        subtitle_renderer: SubtitleRenderer | None,
+        pending_nv12_slots: list[object],
+        producer_pacing: bool,
+    ) -> None:
+        log.info("[PYNV][%d] worker mode=two_stage green begin target=%d", self.sid, target)
+        encode_q: queue.Queue = queue.Queue(maxsize=max(1, int(config.PASSTHROUGH_NV12_RING_SLOTS)))
+        sentinel = object()
+        errors: list[str] = []
+        max_pending_nv12_slots = max(0, int(config.PASSTHROUGH_NV12_RING_SLOTS) - 1)
+        t_start = time.perf_counter()
+        interval_start = t_start
+        interval_bytes = 0
+        sum_decode = 0.0
+        sum_composite = 0.0
+        sum_sync = 0.0
+        sum_encode = 0.0
+        sum_mux = 0.0
+        max_decode = 0.0
+        max_composite = 0.0
+        max_sync = 0.0
+        max_encode = 0.0
+        max_mux = 0.0
+
+        def put_or_stop(item) -> bool:
+            while not self._stop.is_set():
+                try:
+                    encode_q.put(item, timeout=0.05)
+                    return True
+                except queue.Full:
+                    continue
+            return False
+
+        def force_put_sentinel() -> None:
+            while True:
+                try:
+                    encode_q.put(sentinel, timeout=0.05)
+                    return
+                except queue.Full:
+                    if self._stop.is_set():
+                        try:
+                            old = encode_q.get_nowait()
+                            if old is not sentinel and isinstance(old, tuple) and len(old) >= 4:
+                                self.matter.release_nv12_output_slot(old[3])
+                        except queue.Empty:
+                            pass
+
+        def matting_worker() -> None:
+            last_src_idx = -1
+            try:
+                assert self._dec is not None
+                for i in range(target):
+                    if self._stop.is_set():
+                        break
+                    out_idx = start_out + i
+                    src_idx = min(len(self._dec) - 1, cfr_source_index(out_idx, source_fps, fps))
+                    if src_idx <= last_src_idx:
+                        src_idx = min(len(self._dec) - 1, last_src_idx + 1)
+                    last_src_idx = src_idx
+                    t0 = time.perf_counter()
+                    frame = self._dec.frame_at(src_idx)
+                    t1 = time.perf_counter()
+                    slot = None
+                    try:
+                        slot = self.matter.acquire_nv12_output_slot(
+                            out_h,
+                            out_w,
+                            timeout=config.PASSTHROUGH_NV12_SLOT_WAIT_SEC,
+                        )
+                        if isinstance(frame, GpuP016Frame):
+                            out_nv12, _ = self.matter.composite_green_gpu_p016_frame_to_gpu_nv12_profile(
+                                frame,
+                                shift_bits=config.PASSTHROUGH_PYNV_10BIT_SHIFT,
+                                out_h=out_h,
+                                out_w=out_w,
+                                out_slot=slot,
+                            )
+                        else:
+                            out_nv12, _ = self.matter.composite_green_gpu_nv12_frame_to_gpu_nv12_profile(
+                                frame,
+                                out_h=out_h,
+                                out_w=out_w,
+                                out_slot=slot,
+                            )
+                        t2 = time.perf_counter()
+                        cuda_stream = getattr(matting_module, "_CUDA_STREAM", None)
+                        if cuda_stream is not None:
+                            cuda_stream.synchronize()
+                        t3 = time.perf_counter()
+                        self._apply_subtitle_overlay(out_nv12, subtitle_renderer, out_idx / fps if fps > 0 else 0.0)
+                        app_frame = GpuNv12AppFrame(out_nv12, out_w, out_h)
+                        if not put_or_stop((i, src_idx, app_frame, slot, t0, t1, t2, t3)):
+                            self.matter.release_nv12_output_slot(slot)
+                            slot = None
+                            break
+                        slot = None
+                    except Exception:
+                        self.matter.release_nv12_output_slot(slot)
+                        raise
+            except Exception as e:
+                errors.append(f"matting: {e}\n{traceback.format_exc(limit=8)}")
+                self._stop.set()
+            finally:
+                force_put_sentinel()
+
+        worker = threading.Thread(target=matting_worker, name=f"pynv-two-stage-matting-{self.sid}", daemon=True)
+        worker.start()
+        last_src_idx = -1
+        try:
+            while not self._stop.is_set():
+                item = encode_q.get()
+                if item is sentinel:
+                    break
+                i, src_idx, app_frame, slot, t0, t1, t2, t3 = item
+                if producer_pacing and self.container == "mpegts" and fps > 0:
+                    due = t_start + (i / fps)
+                    now = time.perf_counter()
+                    if due > now:
+                        self._stop.wait(due - now)
+                        if self._stop.is_set():
+                            self.matter.release_nv12_output_slot(slot)
+                            break
+                last_src_idx = src_idx
+                flags = 0
+                if i == 0:
+                    flags = int(nvc.NV_ENC_PIC_FLAGS.FORCEIDR) | int(nvc.NV_ENC_PIC_FLAGS.OUTPUT_SPSPPS)
+                    log.info(
+                        "[PYNV][%d] seek start: requested_sec=%.3f out_idx=%d src_idx=%d fps=%.3f source_fps=%.3f",
+                        self.sid, self.start_sec, start_out + i, src_idx, fps, source_fps,
+                    )
+                try:
+                    bitstream = self._enc.Encode(app_frame, flags)
+                except Exception:
+                    self.matter.release_nv12_output_slot(slot)
+                    raise
+                pending_nv12_slots.append(slot)
+                while len(pending_nv12_slots) > max_pending_nv12_slots:
+                    self.matter.release_nv12_output_slot(pending_nv12_slots.pop(0))
+                t4 = time.perf_counter()
+                if bitstream:
+                    if self.frames_produced == 0:
+                        log.info("[PYNV][%d] first bitstream len=%d", self.sid, len(bitstream))
+                    mux_stdin = self._video_mux.stdin if self._video_mux is not None else self._mux.stdin
+                    if self._stop.is_set() or not mux_stdin or mux_stdin.closed:
+                        log.info("[PYNV][%d] mux stdin closed before write at frame=%d", self.sid, i + 1)
+                        break
+                    try:
+                        write_started = time.perf_counter()
+                        mux_stdin.write(bitstream)
+                        if not self._real_video_started.is_set():
+                            self._real_video_started.set()
+                            log.info("[PYNV][%d] first real video bitstream written; slate audio may switch", self.sid)
+                            self._log_vram("first_real_video_bitstream")
+                        write_elapsed = time.perf_counter() - write_started
+                        if write_elapsed >= 1.0:
+                            log.warning(
+                                "[PYNV][%d] mux stdin write slow: frame=%d len=%d elapsed=%.3fs video_rc=%s final_rc=%s",
+                                self.sid,
+                                i + 1,
+                                len(bitstream),
+                                write_elapsed,
+                                self._video_mux.poll() if self._video_mux is not None else None,
+                                self._mux.poll() if self._mux is not None else None,
+                            )
+                    except (BrokenPipeError, OSError, ValueError) as e:
+                        log.info("[PYNV][%d] mux stdin write stopped at frame=%d: %s", self.sid, i + 1, e)
+                        break
+                t5 = time.perf_counter()
+                sum_decode += t1 - t0
+                sum_composite += t2 - t1
+                sum_sync += t3 - t2
+                sum_encode += t4 - t3
+                sum_mux += t5 - t4
+                max_decode = max(max_decode, t1 - t0)
+                max_composite = max(max_composite, t2 - t1)
+                max_sync = max(max_sync, t3 - t2)
+                max_encode = max(max_encode, t4 - t3)
+                max_mux = max(max_mux, t5 - t4)
+                if bitstream:
+                    interval_bytes += len(bitstream)
+                self.frames_produced = i + 1
+                if config.DEBUG_LOGS and self.frames_produced % _DIAG_INTERVAL == 0:
+                    elapsed = max(0.001, time.perf_counter() - t_start)
+                    interval_elapsed = max(0.001, time.perf_counter() - interval_start)
+                    interval_frames = _DIAG_INTERVAL
+                    log.info(
+                        "[PYNV][%d] frame %d/%d fps=%.2f interval_fps=%.2f src_idx=%d bytes=%d out_bps=%.1fM stage_avg_ms decode=%.2f composite=%.2f sync=%.2f encode=%.2f mux=%.2f mat_avg_ms pre=%.2f ort=%.2f kernel=%.2f stage_max_ms decode=%.2f composite=%.2f sync=%.2f encode=%.2f mux=%.2f mat_max_ms pre=%.2f ort=%.2f kernel=%.2f",
+                        self.sid,
+                        self.frames_produced,
+                        target,
+                        self.frames_produced / elapsed,
+                        interval_frames / interval_elapsed,
+                        last_src_idx,
+                        self.bytes_emitted,
+                        (interval_bytes * 8.0 / interval_elapsed) / 1_000_000.0,
+                        (sum_decode / interval_frames) * 1000.0,
+                        (sum_composite / interval_frames) * 1000.0,
+                        (sum_sync / interval_frames) * 1000.0,
+                        (sum_encode / interval_frames) * 1000.0,
+                        (sum_mux / interval_frames) * 1000.0,
+                        (sum_mat_pre / interval_frames) * 1000.0,
+                        (sum_mat_ort / interval_frames) * 1000.0,
+                        (sum_mat_kernel / interval_frames) * 1000.0,
+                        max_decode * 1000.0,
+                        max_composite * 1000.0,
+                        max_sync * 1000.0,
+                        max_encode * 1000.0,
+                        max_mux * 1000.0,
+                        max_mat_pre * 1000.0,
+                        max_mat_ort * 1000.0,
+                        max_mat_kernel * 1000.0,
+                    )
+                    interval_start = time.perf_counter()
+                    interval_bytes = 0
+                    sum_decode = sum_composite = sum_sync = sum_encode = sum_mux = 0.0
+                    max_decode = max_composite = max_sync = max_encode = max_mux = 0.0
+        finally:
+            if worker.is_alive():
+                self._stop.set()
+                worker.join(timeout=2.0)
+        if errors:
+            raise RuntimeError(errors[0])
+        if not self._stop.is_set():
+            log.info("[PYNV][%d] EndEncode begin frames=%d", self.sid, self.frames_produced)
+            tail = self._enc.EndEncode()
+            if tail:
+                mux_stdin = self._video_mux.stdin if self._video_mux is not None else self._mux.stdin
+                if mux_stdin:
+                    mux_stdin.write(tail)
+                log.info("[PYNV][%d] EndEncode tail len=%d", self.sid, len(tail))
+            log.info("[PYNV][%d] EndEncode done", self.sid)
+        while pending_nv12_slots:
+            self.matter.release_nv12_output_slot(pending_nv12_slots.pop(0))
+        log.info("[PYNV][%d] worker mode=two_stage green done frames=%d", self.sid, self.frames_produced)
 
     def _post_sentinel(self) -> None:
         if self._queue is None or self._loop is None or self._loop.is_closed():
@@ -2093,7 +2484,7 @@ class PyNvPassthroughStream:
                 self._dec = None
             self._log_vram("worker_join_timeout_decoder_detached")
             log.warning(
-                "[PYNV][%d] close: worker did not stop after first join; decoder stop is skipped because SimpleDecoder.stop() is not reliable",
+                "[PYNV][%d] close: worker did not stop after first join; decoder stop is skipped because native decoder stop is not reliable after a stuck worker",
                 self.sid,
             )
         elif self._dec:

@@ -364,13 +364,20 @@ class RvmOfflineEngine(OfflineMattingEngine):
     def composite_nv12(self, frame):
         from pipeline.pynv_io import GpuP016Frame
 
+        h, w = int(frame.height), int(frame.width)
         if isinstance(frame, GpuP016Frame):
             out, timing = self.matter.composite_green_gpu_p016_frame_to_gpu_nv12_profile(
                 frame,
                 shift_bits=int(config.PASSTHROUGH_PYNV_10BIT_SHIFT),
+                out_h=h,
+                out_w=w,
             )
         else:
-            out, timing = self.matter.composite_green_gpu_nv12_frame_to_gpu_nv12_profile(frame)
+            out, timing = self.matter.composite_green_gpu_nv12_frame_to_gpu_nv12_profile(
+                frame,
+                out_h=h,
+                out_w=w,
+            )
         self.profile["preprocess"].append(timing.preprocess_ms)
         self.profile["ort"].append(timing.ort_ms)
         self.profile["composite"].append(timing.composite_ms)
@@ -1557,7 +1564,7 @@ def main() -> int:
     parser.add_argument("--bufsize-multiplier", type=float, default=2.0, help="NVENC VBV buffer multiplier over target bitrate")
     parser.add_argument("--rc", default="vbr", choices=["vbr", "vbr_hq", "cbr"], help="PyNv NVENC rate-control mode")
     parser.add_argument("--cq", type=int, default=18, help="PyNv NVENC CQ value; set -1 to omit")
-    parser.add_argument("--preset", default="P7", help="PyNv NVENC preset, e.g. P1..P7; default P7 for offline quality")
+    parser.add_argument("--preset", default=config.PASSTHROUGH_PYNV_PRESET, help="PyNv NVENC preset, e.g. P1..P7")
     parser.add_argument("--realtime-encoder-args", action="store_true",
                         help="diagnostic: pass only bitrate/fps/gop/bf to PyNv encoder like realtime live mode")
     parser.add_argument("--codec", default="hevc", choices=["hevc", "h265", "h264"])
@@ -1588,7 +1595,7 @@ def main() -> int:
     if args.alpha_stride > 0:
         config.ALPHA_STRIDE = int(args.alpha_stride)
     config.MATTING_SBS_BATCH = bool(args.sbs_batch)
-    from pipeline.pynv_io import GpuNv12AppFrame, PyNvSimpleDecoder
+    from pipeline.pynv_io import GpuNv12AppFrame, PyNvSimpleDecoder, PyNvThreadedSerialDecoder
 
     src = _resolve_video(args.video)
     out = Path(args.out) if args.out else _default_out(src)
@@ -1597,8 +1604,25 @@ def main() -> int:
     out.parent.mkdir(parents=True, exist_ok=True)
 
     meta = probe_video_metadata(src)
-    dec = PyNvSimpleDecoder(src, bit_depth=int(meta.codec.bit_depth or 8))
+    decoder_mode = config.PASSTHROUGH_PYNV_DECODER
+    if decoder_mode == "threaded_serial":
+        dec = PyNvThreadedSerialDecoder(
+            src,
+            bit_depth=int(meta.codec.bit_depth or 8),
+            batch_size=config.PASSTHROUGH_PYNV_THREADED_BATCH_SIZE,
+            buffer_size=config.PASSTHROUGH_PYNV_THREADED_BUFFER_SIZE,
+        )
+    elif decoder_mode == "simple":
+        dec = PyNvSimpleDecoder(src, bit_depth=int(meta.codec.bit_depth or 8))
+    else:
+        raise RuntimeError(f"unknown PT_PASSTHROUGH_PYNV_DECODER={decoder_mode!r}")
     info = dec.info
+    print(
+        f"[offline] decoder={decoder_mode} "
+        f"batch={config.PASSTHROUGH_PYNV_THREADED_BATCH_SIZE} "
+        f"buffer={config.PASSTHROUGH_PYNV_THREADED_BUFFER_SIZE}",
+        flush=True,
+    )
     timing = probe_timing_metadata(src)
     source_fps = float(timing.source_fps or info.fps or 30.0)
     fps = float(timing.effective_fps(float(args.fps or 0.0)))
@@ -1629,14 +1653,15 @@ def main() -> int:
         dec.stop()
         return 0
     engine = _make_engine(args)
+    enc_w, enc_h = info.width, info.height
     if isinstance(engine, MatAnyone2OnnxEngine):
         engine.set_segment_plan(segment_starts)
         for segment_start, masks in sam3_masks.items():
             engine.set_segment_masks(segment_start, masks)
 
     enc = nvc.CreateEncoder(
-        info.width,
-        info.height,
+        enc_w,
+        enc_h,
         "NV12",
         False,
         codec=args.codec,
@@ -1682,7 +1707,7 @@ def main() -> int:
             tm1 = time.perf_counter()
             if args.sync_profile:
                 t_sync_after_mat.append(_cuda_sync_ms(args.device_sync_profile))
-            app_frame = GpuNv12AppFrame(out_nv12, info.width, info.height)
+            app_frame = GpuNv12AppFrame(out_nv12, enc_w, enc_h)
             flags = 0
             if i == 0:
                 flags = int(nvc.NV_ENC_PIC_FLAGS.FORCEIDR) | int(nvc.NV_ENC_PIC_FLAGS.OUTPUT_SPSPPS)

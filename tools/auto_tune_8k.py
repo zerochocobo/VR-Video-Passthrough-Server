@@ -24,6 +24,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import config  # noqa: E402
 from tools import dlna_client_probe  # noqa: E402
+from ui.services.process_helpers import base_environment  # noqa: E402
 
 
 PYNV_RE = re.compile(
@@ -32,8 +33,10 @@ PYNV_RE = re.compile(
     r"src_idx=(?P<src_idx>\d+) bytes=(?P<bytes>\d+) out_bps=(?P<out_bps_mbps>[\d.]+)M "
     r"stage_avg_ms decode=(?P<avg_decode>[\d.]+) composite=(?P<avg_composite>[\d.]+) "
     r"sync=(?P<avg_sync>[\d.]+) encode=(?P<avg_encode>[\d.]+) mux=(?P<avg_mux>[\d.]+) "
+    r"(?:mat_avg_ms pre=(?P<avg_mat_pre>[\d.]+) ort=(?P<avg_mat_ort>[\d.]+) kernel=(?P<avg_mat_kernel>[\d.]+) )?"
     r"stage_max_ms decode=(?P<max_decode>[\d.]+) composite=(?P<max_composite>[\d.]+) "
     r"sync=(?P<max_sync>[\d.]+) encode=(?P<max_encode>[\d.]+) mux=(?P<max_mux>[\d.]+)"
+    r"(?: mat_max_ms pre=(?P<max_mat_pre>[\d.]+) ort=(?P<max_mat_ort>[\d.]+) kernel=(?P<max_mat_kernel>[\d.]+))?"
 )
 SLOW_MUX_RE = re.compile(
     r"\[PYNV\]\[(?P<sid>\d+)\] mux stdin write slow: frame=(?P<frame>\d+) "
@@ -107,9 +110,19 @@ def _assert_process_alive(proc: subprocess.Popen[str]) -> None:
 
 
 def _start_server(args: argparse.Namespace, video: Path, base_url: str) -> subprocess.Popen[str]:
-    env = os.environ.copy()
+    env = base_environment()
+    for item in args.server_env:
+        if "=" not in item:
+            raise ValueError(f"--server-env must be KEY=VALUE, got {item!r}")
+        key, value = item.split("=", 1)
+        key = key.strip()
+        if not key:
+            raise ValueError(f"--server-env key is empty: {item!r}")
+        env[key] = value
     env["PT_DEBUG_LOGS"] = "1"
     env["PT_HTTP_PORT"] = str(args.port)
+    env.setdefault("PT_CUDNN_BIN", r"C:\Program Files\NVIDIA\CUDNN\v9.22\bin\12.9\x64")
+    env = base_environment(env)
     env.setdefault("PT_STARTUP_GPU_WARMUP", "1")
     env.setdefault("PT_PASSTHROUGH_OUTPUT_MODE", "all" if args.prefer == "alpha" else "green")
     if args.video_dir:
@@ -205,6 +218,9 @@ def _run_client_probe(args: argparse.Namespace, video: Path, base_url: str, out_
 def _numbers(match: re.Match[str]) -> dict[str, float | int]:
     row: dict[str, float | int] = {}
     for key, value in match.groupdict().items():
+        if value is None:
+            row[key] = 0.0
+            continue
         if key in {"sid", "frame", "target", "src_idx", "bytes", "len"}:
             row[key] = int(value)
         else:
@@ -279,6 +295,7 @@ def _report_markdown(args: argparse.Namespace, data: dict[str, Any]) -> str:
             f"- Video: `{data['video']}`",
             f"- Profile/prefer: `{args.profile}` / `{args.prefer}`",
             f"- Duration: {args.duration:.1f}s",
+            f"- Server env overrides: `{args.server_env}`",
             f"- Attribution: `{data['attribution']}`",
             "",
             "## Client Pull",
@@ -295,6 +312,7 @@ def _report_markdown(args: argparse.Namespace, data: dict[str, Any]) -> str:
             f"- Latest interval FPS: `{latest.get('interval_fps', 0)}`",
             f"- Average interval FPS: `{float(log_metrics.get('average_interval_fps') or 0.0):.2f}`",
             f"- Latest stage avg ms: decode `{latest.get('avg_decode', 0)}`, composite `{latest.get('avg_composite', 0)}`, sync `{latest.get('avg_sync', 0)}`, encode `{latest.get('avg_encode', 0)}`, mux `{latest.get('avg_mux', 0)}`",
+            f"- Latest mat avg ms: pre `{latest.get('avg_mat_pre', 0)}`, ort `{latest.get('avg_mat_ort', 0)}`, kernel `{latest.get('avg_mat_kernel', 0)}`",
             f"- Slow mux warnings: `{len(slow_mux)}`",
             f"- Pacing/stall/timeout lines: `{len(pacing)}`",
             "",
@@ -354,6 +372,7 @@ def run(args: argparse.Namespace) -> int:
         "profile": args.profile,
         "prefer": args.prefer,
         "duration_sec": args.duration,
+        "server_env": args.server_env,
         "error": error,
         "server_run": asdict(server_run) if server_run is not None else None,
         "client_returncode": client_result.returncode if client_result is not None else None,
@@ -400,6 +419,12 @@ def main() -> int:
     parser.add_argument("--header", action="append", default=[])
     parser.add_argument("--duplicate-startup", type=int, default=0)
     parser.add_argument("--with-lavf-side-probes", action="store_true")
+    parser.add_argument(
+        "--server-env",
+        action="append",
+        default=[],
+        help="extra environment override for the spawned server, as KEY=VALUE",
+    )
     args = parser.parse_args()
     return run(args)
 

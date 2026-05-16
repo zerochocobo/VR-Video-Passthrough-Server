@@ -1,11 +1,9 @@
 ﻿from __future__ import annotations
 
-from pathlib import Path
-
 from PySide6.QtCore import QObject, QProcess, QProcessEnvironment, Signal
 
 from ui.log_sanitizer import clean_log_text
-from ui.services.process_helpers import ROOT, offline_command
+from ui.services.process_helpers import ROOT, base_environment, offline_command
 
 
 class OfflineProcess(QObject):
@@ -22,12 +20,14 @@ class OfflineProcess(QObject):
     def is_running(self) -> bool:
         return self.process.state() != QProcess.NotRunning
 
-    def start(self, args: list[str]) -> None:
+    def start(self, args: list[str], extra_env: dict[str, str] | None = None) -> None:
         if self.is_running():
             return
         self.process.setWorkingDirectory(str(ROOT))
         env = QProcessEnvironment.systemEnvironment()
-        env.insert("PYTHONUNBUFFERED", "1")
+        merged_env = base_environment({"PYTHONUNBUFFERED": "1", **(extra_env or {})})
+        for key, value in merged_env.items():
+            env.insert(str(key), str(value))
         self.process.setProcessEnvironment(env)
         program, base_args = offline_command()
         self.process.start(program, [*base_args, *args])

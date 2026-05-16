@@ -40,8 +40,67 @@ class ContentDirectoryModeTests(unittest.TestCase):
         with patch.object(cds, "PASSTHROUGH_OUTPUT_MODE", "all"):
             self.assertEqual(cds._passthrough_live_prefix("green"), "pl_")
             self.assertEqual(cds._passthrough_live_prefix("alpha"), "pla_")
+            self.assertEqual(cds._passthrough_live_item_prefix("green"), "lg_")
+            self.assertEqual(cds._passthrough_live_item_prefix("alpha"), "la_")
             self.assertEqual(cds._passthrough_live_query("green"), "mode=green")
             self.assertEqual(cds._passthrough_live_query("alpha"), "mode=alpha")
+
+    def test_short_live_items_keep_distinct_modes(self) -> None:
+        child = SimpleNamespace(
+            size=1024,
+            video=SimpleNamespace(
+                duration=60.0,
+                resolution="3840x2160",
+                backend_verdict="pynv_hevc",
+                probe_error="",
+                mkv_needs_fix=False,
+            ),
+        )
+        with (
+            patch.object(cds, "_rel_key", return_value="movie.mp4"),
+            patch.object(cds, "PASSTHROUGH_OUTPUT_MODE", "all"),
+            patch.object(cds, "_uses_live_chapter_container", return_value=False),
+            patch.object(cds, "estimate_for_media", return_value=(0, 20_000_000, None)),
+        ):
+            items = cds._video_items_from_index(Path("movie.mp4"), "0", child)
+
+        passthrough = [item for item in items if item.get("passthrough")]
+        self.assertEqual([item["id"] for item in passthrough], ["lg_movie.mp4", "la_movie.mp4"])
+        self.assertIn("mode=green", passthrough[0]["url"])
+        self.assertIn("mode=alpha", passthrough[1]["url"])
+        self.assertEqual([item["passthrough_mode"] for item in passthrough], ["green", "alpha"])
+
+    def test_short_live_metadata_keeps_alpha_mode(self) -> None:
+        source = Path("movie.mp4")
+        child = SimpleNamespace(
+            size=1024,
+            video=SimpleNamespace(
+                duration=60.0,
+                resolution="3840x2160",
+                backend_verdict="pynv_hevc",
+                probe_error="",
+                mkv_needs_fix=False,
+            ),
+        )
+        info = SimpleNamespace(duration=60.0, width=3840, height=2160)
+        with (
+            patch.object(cds, "_rel_key", return_value="movie.mp4"),
+            patch.object(cds, "PASSTHROUGH_OUTPUT_MODE", "all"),
+            patch.object(cds, "_uses_live_chapter_container", return_value=False),
+            patch.object(cds, "probe_cached", return_value=info),
+            patch.object(cds, "estimate_for_media", return_value=(0, 20_000_000, None)),
+            patch.object(cds, "find_external_subtitles", return_value=[]),
+        ):
+            didl = cds._metadata_didl_for_item(
+                [
+                    item for item in cds._video_items_from_index(source, "0", child)
+                    if item.get("passthrough") and item.get("passthrough_mode") == "alpha"
+                ][0]
+            )
+
+        self.assertIn("la_movie.mp4", didl)
+        self.assertIn("mode=alpha", didl)
+        self.assertNotIn("mode=green", didl)
 
     def test_alpha_virtual_title_uses_file_name(self) -> None:
         self.assertEqual(cds._passthrough_virtual_title(Path("movie.mp4"), "alpha"), "movie_FISHEYE180_alpha_live")

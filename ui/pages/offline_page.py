@@ -24,6 +24,7 @@ from PySide6.QtWidgets import (
 from ui.log_limits import UI_LOG_MAX_BLOCKS
 from ui.log_sanitizer import clean_log_text
 from ui.page_icons import BACK_ICON_SIZE, back_icon
+from ui.settings import quality_speed_preset, quality_speed_value
 
 
 OFFLINE_LABEL_WIDTH = 132
@@ -87,7 +88,7 @@ def _fit_combo(combo: QComboBox) -> QComboBox:
 
 
 class OfflinePage(QWidget):
-    def __init__(self, i18n, process) -> None:
+    def __init__(self, i18n, settings, process) -> None:
         super().__init__()
         self.setObjectName("OfflinePage")
         self.setStyleSheet(
@@ -97,6 +98,7 @@ class OfflinePage(QWidget):
             "QWidget#OfflinePage QLabel#OfflinePageTitle { font-size: 14pt; font-weight: 700; }"
         )
         self.i18n = i18n
+        self.settings = settings
         self.process = process
         self.title_label = QLabel()
         self.title_label.setObjectName("OfflinePageTitle")
@@ -158,11 +160,13 @@ class OfflinePage(QWidget):
         combo.addItem("", 0.0)
         return combo
 
-    def _skip_frames_combo(self) -> QComboBox:
+    def _quality_speed_combo(self) -> QComboBox:
         combo = _fit_combo(QComboBox())
-        combo.addItem("", 0)
-        combo.addItem("", 1)
-        combo.addItem("", 2)
+        for value in ("ultrafast", "medium", "veryslow"):
+            combo.addItem("", value)
+        idx = combo.findData(quality_speed_value(self.settings.data.get("offline_quality_speed"), "medium"))
+        combo.setCurrentIndex(max(0, idx))
+        combo.currentIndexChanged.connect(self._save_quality_speed)
         return combo
 
     def _performance_row(self, combo: QComboBox) -> QHBoxLayout:
@@ -204,7 +208,7 @@ class OfflinePage(QWidget):
         self.single_mode = self._mode_combo()
         self.single_engine = self._engine_combo()
         self.single_matanyone_help = _help_button()
-        self.single_skip_frames = self._skip_frames_combo()
+        self.single_quality_speed = self._quality_speed_combo()
         self.single_skip = QCheckBox()
         self.single_skip.setChecked(True)
         self.start_single.clicked.connect(self.run_single)
@@ -237,7 +241,7 @@ class OfflinePage(QWidget):
         single_engine_row.addStretch(1)
         grid.addLayout(single_engine_row, 3, 1)
         grid.addWidget(self.single_labels["performance"], 4, 0)
-        grid.addLayout(self._performance_row(self.single_skip_frames), 4, 1)
+        grid.addLayout(self._performance_row(self.single_quality_speed), 4, 1)
         grid.addWidget(self.single_labels["time"], 5, 0)
         grid.addLayout(self._time_row(), 5, 1)
         grid.addWidget(self.single_skip, 6, 1)
@@ -253,7 +257,7 @@ class OfflinePage(QWidget):
         self.batch_mode = self._mode_combo()
         self.batch_engine = self._engine_combo()
         self.batch_matanyone_help = _help_button()
-        self.batch_skip_frames = self._skip_frames_combo()
+        self.batch_quality_speed = self._quality_speed_combo()
         self.batch_recursive = QCheckBox()
         self.batch_recursive.setChecked(True)
         self.batch_skip = QCheckBox()
@@ -283,7 +287,7 @@ class OfflinePage(QWidget):
         batch_engine_row.addStretch(1)
         grid.addLayout(batch_engine_row, 2, 1)
         grid.addWidget(self.batch_labels["performance"], 3, 0)
-        grid.addLayout(self._performance_row(self.batch_skip_frames), 3, 1)
+        grid.addLayout(self._performance_row(self.batch_quality_speed), 3, 1)
         grid.addWidget(self.batch_recursive, 4, 1)
         grid.addWidget(self.batch_skip, 5, 1)
         grid.addLayout(actions, 6, 1)
@@ -343,6 +347,30 @@ class OfflinePage(QWidget):
             self.i18n.t("offline.matanyone_help_msg"),
         )
 
+    def _save_quality_speed(self) -> None:
+        sender = self.sender()
+        if isinstance(sender, QComboBox):
+            value = quality_speed_value(sender.currentData(), "medium")
+            self.settings.data["offline_quality_speed"] = value
+            for combo in (getattr(self, "single_quality_speed", None), getattr(self, "batch_quality_speed", None)):
+                if isinstance(combo, QComboBox) and combo is not sender:
+                    idx = combo.findData(value)
+                    if idx >= 0 and combo.currentIndex() != idx:
+                        combo.blockSignals(True)
+                        combo.setCurrentIndex(idx)
+                        combo.blockSignals(False)
+            self.settings.save()
+
+    def sync_from_settings(self) -> None:
+        value = quality_speed_value(self.settings.data.get("offline_quality_speed"), "medium")
+        for combo in (getattr(self, "single_quality_speed", None), getattr(self, "batch_quality_speed", None)):
+            if isinstance(combo, QComboBox):
+                idx = combo.findData(value)
+                if idx >= 0 and combo.currentIndex() != idx:
+                    combo.blockSignals(True)
+                    combo.setCurrentIndex(idx)
+                    combo.blockSignals(False)
+
     def run_single(self) -> None:
         args = [
             "single",
@@ -356,13 +384,16 @@ class OfflinePage(QWidget):
             "--duration",
             str(self._duration_seconds()),
             "--skip-frames",
-            str(self.single_skip_frames.currentData()),
+            "0",
         ]
         if self.single_out_dir.text().strip():
             args.extend(["--out-dir", self.single_out_dir.text().strip()])
         if self.single_skip.isChecked():
             args.append("--skip-existing")
-        self.process.start(args)
+        self.settings.save()
+        env = self.settings.server_env()
+        env["PT_PASSTHROUGH_PYNV_PRESET"] = quality_speed_preset(self.settings.data.get("offline_quality_speed"), "medium")
+        self.process.start(args, env)
 
     def run_batch(self) -> None:
         args = [
@@ -373,12 +404,15 @@ class OfflinePage(QWidget):
             "--engine",
             self.batch_engine.currentData(),
             "--skip-frames",
-            str(self.batch_skip_frames.currentData()),
+            "0",
         ]
         args.append("--recursive" if self.batch_recursive.isChecked() else "--no-recursive")
         if self.batch_skip.isChecked():
             args.append("--skip-existing")
-        self.process.start(args)
+        self.settings.save()
+        env = self.settings.server_env()
+        env["PT_PASSTHROUGH_PYNV_PRESET"] = quality_speed_preset(self.settings.data.get("offline_quality_speed"), "medium")
+        self.process.start(args, env)
 
     def set_running(self, running: bool) -> None:
         self.start_single.setEnabled(not running)
@@ -430,7 +464,7 @@ class OfflinePage(QWidget):
             self.single_duration.setItemText(index, self.i18n.t(key))
         self.single_custom_minutes_label.setText(self.i18n.t("offline.minutes"))
         for label in self.performance_skip_labels:
-            label.setText(self.i18n.t("offline.frame_skip"))
-        for combo in (self.single_skip_frames, self.batch_skip_frames):
-            for index, key in enumerate(("offline.skip_none", "offline.skip_1", "offline.skip_2")):
+            label.setText(self.i18n.t("performance.quality_speed"))
+        for combo in (self.single_quality_speed, self.batch_quality_speed):
+            for index, key in enumerate(("quality_speed.ultrafast", "quality_speed.medium", "quality_speed.veryslow")):
                 combo.setItemText(index, self.i18n.t(key))

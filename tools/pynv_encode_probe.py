@@ -2,8 +2,8 @@
 Step 1.1 PyNvVideoCodec encoder probe.
 
 This probe does not touch the production server. It creates synthetic NV12
-frames on the GPU, encodes them with PyNvVideoCodec/NVENC, writes a raw H.264
-Annex-B stream, and optionally asks ffprobe to parse the result.
+frames, encodes them with PyNvVideoCodec/NVENC, writes a raw Annex-B stream,
+and optionally asks ffprobe to parse the result.
 """
 from __future__ import annotations
 
@@ -30,15 +30,16 @@ def _make_nv12_frame(width: int, height: int, frame_idx: int):
     return frame
 
 
-def _ffprobe(path: Path, width: int, height: int, fps: int) -> str:
+def _ffprobe(path: Path, width: int, height: int, fps: int, codec: str) -> str:
     ffprobe = shutil.which("ffprobe") or "ffprobe"
+    input_format = "hevc" if codec.lower() in {"hevc", "h265"} else "h264"
     cmd = [
         ffprobe,
         "-hide_banner",
         "-v",
         "error",
         "-f",
-        "h264",
+        input_format,
         "-framerate",
         str(fps),
         "-video_size",
@@ -64,10 +65,22 @@ def main() -> int:
     parser.add_argument("--gop", type=int, default=60)
     parser.add_argument("--codec", default="h264")
     parser.add_argument("--preset", default="")
+    parser.add_argument(
+        "--enc-opt",
+        action="append",
+        default=[],
+        metavar="KEY=VALUE",
+        help="extra PyNv CreateEncoder option; may be repeated",
+    )
     parser.add_argument("--bf", type=int, default=0)
     parser.add_argument("--out", default="")
     parser.add_argument("--force-idr-first", action="store_true")
     parser.add_argument("--cpu-input", action="store_true", help="use PyNv CPU input buffer mode")
+    parser.add_argument(
+        "--reuse-gpu-frame",
+        action="store_true",
+        help="create one GPU NV12 frame once and encode the same buffer repeatedly",
+    )
     args = parser.parse_args()
 
     import PyNvVideoCodec as nvc
@@ -86,6 +99,14 @@ def main() -> int:
     }
     if args.preset:
         enc_kwargs["preset"] = args.preset
+    for item in args.enc_opt:
+        if "=" not in item:
+            raise SystemExit(f"--enc-opt must be KEY=VALUE, got {item!r}")
+        key, value = item.split("=", 1)
+        key = key.strip()
+        if not key:
+            raise SystemExit(f"--enc-opt key is empty in {item!r}")
+        enc_kwargs[key] = value.strip()
 
     print(f"[pynv-enc] create encoder {args.width}x{args.height} kwargs={enc_kwargs}")
     enc = nvc.CreateEncoder(args.width, args.height, "NV12", bool(args.cpu_input), **enc_kwargs)
@@ -93,10 +114,21 @@ def main() -> int:
     packets = 0
     packet_sizes: list[int] = []
     t0 = time.perf_counter()
+    reusable_frame = None
+    if args.reuse_gpu_frame:
+        if args.cpu_input:
+            raise SystemExit("--reuse-gpu-frame cannot be combined with --cpu-input")
+        import cupy as cp
+
+        reusable_frame = GpuNv12AppFrame(cp.asarray(_make_nv12_frame(args.width, args.height, 0)), args.width, args.height)
+
     with out.open("wb") as f:
         for i in range(max(1, args.frames)):
-            frame = _make_nv12_frame(args.width, args.height, i)
-            if not args.cpu_input:
+            if reusable_frame is not None:
+                frame = reusable_frame
+            else:
+                frame = _make_nv12_frame(args.width, args.height, i)
+            if not args.cpu_input and reusable_frame is None:
                 import cupy as cp
 
                 frame = GpuNv12AppFrame(cp.asarray(frame), args.width, args.height)
@@ -121,7 +153,7 @@ def main() -> int:
     if packet_sizes:
         print(f"[pynv-enc] packet_min={min(packet_sizes)} packet_max={max(packet_sizes)} packet_avg={sum(packet_sizes) / len(packet_sizes):.1f}")
     print("[ffprobe]")
-    print(_ffprobe(out, args.width, args.height, args.fps))
+    print(_ffprobe(out, args.width, args.height, args.fps, args.codec))
     return 0
 
 

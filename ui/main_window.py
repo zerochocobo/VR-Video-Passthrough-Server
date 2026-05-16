@@ -39,7 +39,7 @@ class MainWindow(QMainWindow):
         self.offline_process = OfflineProcess()
         self.stack = CurrentPageStackedWidget()
         self.home = HomePage(self.i18n, self.settings, self.metadata.display_version)
-        self.offline = OfflinePage(self.i18n, self.offline_process)
+        self.offline = OfflinePage(self.i18n, self.settings, self.offline_process)
         self.subtitle = SubtitlePage(self.i18n, self.settings)
         self.stack.addWidget(self.home)
         self.stack.addWidget(self.offline)
@@ -146,6 +146,7 @@ class MainWindow(QMainWindow):
 
     def _page_changed(self, index: int) -> None:
         if self.stack.widget(index) is self.home:
+            self.home.sync_from_settings()
             self.home._adjust_window()
             return
         self.setMinimumWidth(0)
@@ -155,6 +156,7 @@ class MainWindow(QMainWindow):
         if self.stack.widget(index) is self.subtitle:
             self.resize(SUBTITLE_PAGE_WIDTH, SUBTITLE_PAGE_HEIGHT)
         elif self.stack.widget(index) is self.offline:
+            self.offline.sync_from_settings()
             self.resize(OFFLINE_PAGE_WIDTH, OFFLINE_PAGE_HEIGHT)
 
     def _offline_state_changed(self, running: bool) -> None:

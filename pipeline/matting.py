@@ -37,8 +37,15 @@ from config import (
     MATTING_SPLIT_SBS,
     MATTING_WARMUP_RUNS,
     MODEL_PATH,
+    ONNX_TRT_CUDA_GRAPH_ENABLE,
+    ONNX_TRT_ENGINE_CACHE_ENABLE,
+    ONNX_TRT_ENGINE_CACHE_PATH,
+    ONNX_TRT_FP16_ENABLE,
     ONNX_PROVIDERS,
+    PASSTHROUGH_RVM_BYPASS_ALPHA,
+    PASSTHROUGH_PYNV_SYNC_PROBE,
     PASSTHROUGH_NV12_RING_SLOTS,
+    DECODE_MAX_SIDE,
     RVM_DOWNSAMPLE_RATIO,
     RVM_IOBINDING,
     SPLIT_NV12_COMPOSITE,
@@ -809,10 +816,12 @@ class Nv12OutputSlot(NamedTuple):
 
 
 def _filter_available_providers(wanted: list[str]) -> list[str]:
-    available = set(ort.get_available_providers())
+    available_list = ort.get_available_providers()
+    available = set(available_list)
     out = [p.strip() for p in wanted if p.strip() in available]
     if not out:
         out = ["CPUExecutionProvider"]
+    log.info("[DIAG] ONNX providers wanted=%s available=%s selected=%s", wanted, available_list, out)
     return out
 
 
@@ -827,11 +836,17 @@ def _onnx_tensor_dtype(type_name: str):
 def _provider_config(providers: list[str]):
     configured = []
     for provider in providers:
-        if (
-            provider == "CUDAExecutionProvider"
-            and _CUDA_STREAM is not None
-            and CUDA_SHARED_STREAM
-        ):
+        if provider == "TensorrtExecutionProvider":
+            trt_options = {
+                "trt_fp16_enable": "1" if ONNX_TRT_FP16_ENABLE else "0",
+                "trt_engine_cache_enable": "1" if ONNX_TRT_ENGINE_CACHE_ENABLE else "0",
+                "trt_cuda_graph_enable": "1" if ONNX_TRT_CUDA_GRAPH_ENABLE else "0",
+            }
+            if ONNX_TRT_ENGINE_CACHE_ENABLE:
+                ONNX_TRT_ENGINE_CACHE_PATH.mkdir(parents=True, exist_ok=True)
+                trt_options["trt_engine_cache_path"] = str(ONNX_TRT_ENGINE_CACHE_PATH)
+            configured.append((provider, trt_options))
+        elif provider == "CUDAExecutionProvider" and _CUDA_STREAM is not None and CUDA_SHARED_STREAM:
             cuda_options = {
                 "user_compute_stream": str(int(_CUDA_STREAM.ptr)),
                 "do_copy_in_default_stream": "0",
@@ -880,11 +895,13 @@ class Matter:
         self._cached_alpha_ort_shape = ""
         self._g_frame = None
         self._g_alpha = None
+        self._g_bypass_alpha = None
         self._g_out = None
         self._nv12_slots: list[object] = []
         self._nv12_slot_shape: tuple[int, int] | None = None
         self._nv12_slot_in_use: list[bool] = []
         self._nv12_next_slot = 0
+        self._nv12_slot_cond = threading.Condition()
         self._g_chw = None
         self._p016_to_nv12_kernel = None
         self._h_chw = None
@@ -893,6 +910,7 @@ class Matter:
         self._h_out_mem = None
         self._h_out_nv12 = None
         self._h_out_nv12_mem = None
+        self._sync_probe_count = 0
         if not load_model:
             print("[matting] utility mode: ONNX matting model not loaded", file=sys.stderr)
             return
@@ -984,6 +1002,10 @@ class Matter:
         self._cached_alpha_shape = None
         self._cached_alpha_ort_shape = ""
         self._temporal_frame_idx = 0
+        with self._nv12_slot_cond:
+            for i in range(len(self._nv12_slot_in_use)):
+                self._nv12_slot_in_use[i] = False
+            self._nv12_slot_cond.notify_all()
 
     @staticmethod
     def _detect_batch2_support(shape: list) -> bool:
@@ -1101,6 +1123,105 @@ class Matter:
         self._g_frame[:h, :] = y_dev.reshape(h, w)
         self._g_frame[h:, :] = uv_dev.reshape(h // 2, w)
 
+    def pynv_scaled_size(self, w: int, h: int) -> tuple[int, int]:
+        """Return the PyNv post-decode GPU processing size for PT_DECODE_MAX_SIDE."""
+        max_side = int(DECODE_MAX_SIDE or 0)
+        w = max(2, int(w))
+        h = max(2, int(h))
+        if max_side <= 0 or max(w, h) <= max_side:
+            return w & ~1, h & ~1
+        if w >= h:
+            out_w = max_side
+            out_h = int(round(h * max_side / w))
+        else:
+            out_h = max_side
+            out_w = int(round(w * max_side / h))
+        return max(2, out_w & ~1), max(2, out_h & ~1)
+
+    def _ensure_nv12_resize_kernel(self):
+        cp = _cp
+        if getattr(self, "_nv12_resize_kernel", None) is None:
+            self._nv12_resize_kernel = cp.RawKernel(r"""
+            extern "C" __global__
+            void resize_nv12_to_nv12(
+                const unsigned char* y_src,
+                const unsigned char* uv_src,
+                unsigned char* dst,
+                int src_w,
+                int src_h,
+                int dst_w,
+                int dst_h,
+                int y_stride,
+                int uv_stride)
+            {
+                int x = blockIdx.x * blockDim.x + threadIdx.x;
+                int y = blockIdx.y * blockDim.y + threadIdx.y;
+                if (x >= dst_w || y >= dst_h) return;
+
+                float sx = ((float)x + 0.5f) * (float)src_w / (float)dst_w - 0.5f;
+                float sy = ((float)y + 0.5f) * (float)src_h / (float)dst_h - 0.5f;
+                int x0 = (int)floorf(sx); if (x0 < 0) x0 = 0; if (x0 > src_w - 1) x0 = src_w - 1;
+                int y0 = (int)floorf(sy); if (y0 < 0) y0 = 0; if (y0 > src_h - 1) y0 = src_h - 1;
+                int x1 = x0 + 1; if (x1 > src_w - 1) x1 = src_w - 1;
+                int y1 = y0 + 1; if (y1 > src_h - 1) y1 = src_h - 1;
+                float dx = sx - floorf(sx); if (dx < 0.f) dx = 0.f; if (dx > 1.f) dx = 1.f;
+                float dy = sy - floorf(sy); if (dy < 0.f) dy = 0.f; if (dy > 1.f) dy = 1.f;
+                float v00 = (float)y_src[y0 * y_stride + x0];
+                float v01 = (float)y_src[y0 * y_stride + x1];
+                float v10 = (float)y_src[y1 * y_stride + x0];
+                float v11 = (float)y_src[y1 * y_stride + x1];
+                float yf = (1.f - dy) * ((1.f - dx) * v00 + dx * v01)
+                         +        dy  * ((1.f - dx) * v10 + dx * v11);
+                dst[y * dst_w + x] = (unsigned char)(yf + 0.5f);
+
+                if (((x | y) & 1) == 0) {
+                    int ux = ((int)floorf(sx)) & ~1;
+                    int uy = ((int)floorf(sy)) >> 1;
+                    if (ux < 0) ux = 0;
+                    if (ux > src_w - 2) ux = src_w - 2;
+                    if (uy < 0) uy = 0;
+                    int max_uy = (src_h >> 1) - 1;
+                    if (uy > max_uy) uy = max_uy;
+                    int src_i = uy * uv_stride + ux;
+                    int dst_i = dst_w * dst_h + (y >> 1) * dst_w + x;
+                    dst[dst_i] = uv_src[src_i];
+                    dst[dst_i + 1] = uv_src[src_i + 1];
+                }
+            }
+            """, "resize_nv12_to_nv12")
+        return self._nv12_resize_kernel
+
+    def upload_nv12_planes_gpu_scaled(self, y_dev, uv_dev, src_h: int, src_w: int, out_h: int, out_w: int) -> None:
+        cp = _cp
+        src_h, src_w = int(src_h), int(src_w)
+        out_h, out_w = int(out_h), int(out_w)
+        if out_h == src_h and out_w == src_w:
+            self.upload_nv12_planes_gpu(y_dev, uv_dev, src_h, src_w)
+            return
+        shape = (out_h * 3 // 2, out_w)
+        if self._g_frame is None or self._g_frame.shape != shape:
+            self._g_frame = cp.empty(shape, dtype=cp.uint8)
+            self._g_out = cp.empty((out_h, out_w, 3), dtype=cp.uint8)
+        y_stride = int(y_dev.strides[0]) if y_dev.strides else int(src_w)
+        uv_stride = int(uv_dev.strides[0]) if uv_dev.strides else int(src_w)
+        block = (32, 8, 1)
+        grid = ((out_w + block[0] - 1) // block[0], (out_h + block[1] - 1) // block[1], 1)
+        self._ensure_nv12_resize_kernel()(
+            grid,
+            block,
+            (
+                y_dev,
+                uv_dev,
+                self._g_frame,
+                np.int32(src_w),
+                np.int32(src_h),
+                np.int32(out_w),
+                np.int32(out_h),
+                np.int32(y_stride),
+                np.int32(uv_stride),
+            ),
+        )
+
     def _ensure_p016_to_nv12_kernel(self):
         cp = _cp
         if self._p016_to_nv12_kernel is None:
@@ -1162,6 +1283,103 @@ class Matter:
             ),
         )
 
+    def _ensure_p016_resize_to_nv12_kernel(self):
+        cp = _cp
+        if getattr(self, "_p016_resize_to_nv12_kernel", None) is None:
+            self._p016_resize_to_nv12_kernel = cp.RawKernel(r"""
+            extern "C" __global__
+            void resize_p016_to_nv12(
+                const unsigned short* y_src,
+                const unsigned short* uv_src,
+                unsigned char* dst,
+                int src_w,
+                int src_h,
+                int dst_w,
+                int dst_h,
+                int y_stride_elems,
+                int uv_stride_elems,
+                int shift_bits)
+            {
+                int x = blockIdx.x * blockDim.x + threadIdx.x;
+                int y = blockIdx.y * blockDim.y + threadIdx.y;
+                if (x >= dst_w || y >= dst_h) return;
+
+                float sx = ((float)x + 0.5f) * (float)src_w / (float)dst_w - 0.5f;
+                float sy = ((float)y + 0.5f) * (float)src_h / (float)dst_h - 0.5f;
+                int x0 = (int)floorf(sx); if (x0 < 0) x0 = 0; if (x0 > src_w - 1) x0 = src_w - 1;
+                int y0 = (int)floorf(sy); if (y0 < 0) y0 = 0; if (y0 > src_h - 1) y0 = src_h - 1;
+                int x1 = x0 + 1; if (x1 > src_w - 1) x1 = src_w - 1;
+                int y1 = y0 + 1; if (y1 > src_h - 1) y1 = src_h - 1;
+                float dx = sx - floorf(sx); if (dx < 0.f) dx = 0.f; if (dx > 1.f) dx = 1.f;
+                float dy = sy - floorf(sy); if (dy < 0.f) dy = 0.f; if (dy > 1.f) dy = 1.f;
+                float v00 = (float)(y_src[y0 * y_stride_elems + x0] >> shift_bits);
+                float v01 = (float)(y_src[y0 * y_stride_elems + x1] >> shift_bits);
+                float v10 = (float)(y_src[y1 * y_stride_elems + x0] >> shift_bits);
+                float v11 = (float)(y_src[y1 * y_stride_elems + x1] >> shift_bits);
+                float yf = (1.f - dy) * ((1.f - dx) * v00 + dx * v01)
+                         +        dy  * ((1.f - dx) * v10 + dx * v11);
+                dst[y * dst_w + x] = (unsigned char)(yf + 0.5f);
+
+                if (((x | y) & 1) == 0) {
+                    int ux = ((int)floorf(sx)) & ~1;
+                    int uy = ((int)floorf(sy)) >> 1;
+                    if (ux < 0) ux = 0;
+                    if (ux > src_w - 2) ux = src_w - 2;
+                    if (uy < 0) uy = 0;
+                    int max_uy = (src_h >> 1) - 1;
+                    if (uy > max_uy) uy = max_uy;
+                    int src_i = uy * uv_stride_elems + ux;
+                    int dst_i = dst_w * dst_h + (y >> 1) * dst_w + x;
+                    dst[dst_i] = (unsigned char)(uv_src[src_i] >> shift_bits);
+                    dst[dst_i + 1] = (unsigned char)(uv_src[src_i + 1] >> shift_bits);
+                }
+            }
+            """, "resize_p016_to_nv12")
+        return self._p016_resize_to_nv12_kernel
+
+    def upload_p016_planes_as_nv12_gpu_scaled(
+        self,
+        y_dev,
+        uv_dev,
+        src_h: int,
+        src_w: int,
+        out_h: int,
+        out_w: int,
+        shift_bits: int = 8,
+    ) -> None:
+        cp = _cp
+        src_h, src_w = int(src_h), int(src_w)
+        out_h, out_w = int(out_h), int(out_w)
+        if out_h == src_h and out_w == src_w:
+            self.upload_p016_planes_as_nv12_gpu(y_dev, uv_dev, src_h, src_w, shift_bits=shift_bits)
+            return
+        shape = (out_h * 3 // 2, out_w)
+        if self._g_frame is None or self._g_frame.shape != shape:
+            self._g_frame = cp.empty(shape, dtype=cp.uint8)
+            self._g_out = cp.empty((out_h, out_w, 3), dtype=cp.uint8)
+        y_stride_bytes = int(y_dev.strides[0]) if y_dev.strides else int(src_w * y_dev.dtype.itemsize)
+        uv_stride_bytes = int(uv_dev.strides[0]) if uv_dev.strides else int(src_w * uv_dev.dtype.itemsize)
+        y_stride_elems = y_stride_bytes // y_dev.dtype.itemsize
+        uv_stride_elems = uv_stride_bytes // uv_dev.dtype.itemsize
+        block = (32, 8, 1)
+        grid = ((out_w + block[0] - 1) // block[0], (out_h + block[1] - 1) // block[1], 1)
+        self._ensure_p016_resize_to_nv12_kernel()(
+            grid,
+            block,
+            (
+                y_dev,
+                uv_dev,
+                self._g_frame,
+                np.int32(src_w),
+                np.int32(src_h),
+                np.int32(out_w),
+                np.int32(out_h),
+                np.int32(y_stride_elems),
+                np.int32(uv_stride_elems),
+                np.int32(shift_bits),
+            ),
+        )
+
     def composite_green_gpu_nv12_frame_to_nv12_profile(
         self,
         frame_gpu_nv12,
@@ -1203,31 +1421,44 @@ class Matter:
         self._nv12_next_slot = 0
         self._nv12_slot_shape = shape
 
-    def acquire_nv12_output_slot(self, h: int, w: int) -> Nv12OutputSlot:
+    def acquire_nv12_output_slot(self, h: int, w: int, timeout: float | None = None) -> Nv12OutputSlot:
         """Return an exclusive GPU NV12 output slot for one composite/encode handoff."""
+        import time as _time
+
         cp = _cp
         if cp is None:
             raise RuntimeError("NV12 output slots require CuPy")
         shape = (h * 3 // 2, w)
         count = max(1, int(PASSTHROUGH_NV12_RING_SLOTS))
-        if self._nv12_slot_shape != shape or len(self._nv12_slots) != count:
-            self._reset_nv12_slots(shape)
-            self._nv12_slots = [cp.empty(shape, dtype=cp.uint8) for _ in range(count)]
-            self._nv12_slot_in_use = [False] * count
-        for offset in range(count):
-            idx = (self._nv12_next_slot + offset) % count
-            if not self._nv12_slot_in_use[idx]:
-                self._nv12_slot_in_use[idx] = True
-                self._nv12_next_slot = (idx + 1) % count
-                return Nv12OutputSlot(idx, self._nv12_slots[idx])
-        raise RuntimeError(f"no free NV12 output slot: count={count} shape={shape}")
+        deadline = None if timeout is None else _time.perf_counter() + max(0.0, float(timeout))
+        with self._nv12_slot_cond:
+            if self._nv12_slot_shape != shape or len(self._nv12_slots) != count:
+                self._reset_nv12_slots(shape)
+                self._nv12_slots = [cp.empty(shape, dtype=cp.uint8) for _ in range(count)]
+                self._nv12_slot_in_use = [False] * count
+                self._nv12_slot_cond.notify_all()
+            while True:
+                for offset in range(count):
+                    idx = (self._nv12_next_slot + offset) % count
+                    if not self._nv12_slot_in_use[idx]:
+                        self._nv12_slot_in_use[idx] = True
+                        self._nv12_next_slot = (idx + 1) % count
+                        return Nv12OutputSlot(idx, self._nv12_slots[idx])
+                if timeout is None:
+                    raise RuntimeError(f"no free NV12 output slot: count={count} shape={shape}")
+                remaining = deadline - _time.perf_counter() if deadline is not None else 0.0
+                if remaining <= 0:
+                    raise TimeoutError(f"timed out waiting for NV12 output slot: count={count} shape={shape}")
+                self._nv12_slot_cond.wait(min(remaining, 0.05))
 
     def release_nv12_output_slot(self, slot: Nv12OutputSlot | int | None) -> None:
         if slot is None:
             return
         idx = int(slot.index if isinstance(slot, Nv12OutputSlot) else slot)
-        if 0 <= idx < len(self._nv12_slot_in_use):
-            self._nv12_slot_in_use[idx] = False
+        with self._nv12_slot_cond:
+            if 0 <= idx < len(self._nv12_slot_in_use):
+                self._nv12_slot_in_use[idx] = False
+                self._nv12_slot_cond.notify()
 
     def _gpu_preprocess_one(self, src_x0: int, src_w: int,
                              out_w: int, out_h: int,
@@ -1695,6 +1926,32 @@ class Matter:
     def _alpha_low_res_gpu_temporal(self, h: int, w: int, use_nv12: bool = False) -> tuple[np.ndarray, MattingTiming, str]:
         """Reuse the latest low-res alpha for skipped frames when PT_ALPHA_STRIDE > 1."""
         cache_key = (h, w, MATTING_INPUT_SIZE, 1 if MATTING_SPLIT_SBS and w >= 2 * h else 0, 1 if use_nv12 else 0)
+        if PASSTHROUGH_RVM_BYPASS_ALPHA:
+            cp = _cp
+            if MATTING_SPLIT_SBS and w >= 2 * h:
+                half = w // 2
+                out_w, out_h = self._matting_size_for(half, h)
+                shape = (out_h, out_w * 2)
+                ort_shape = f"(2,3,{out_h},{out_w}):bypass_all_ones"
+            else:
+                out_w, out_h = self._matting_size_for(w, h)
+                shape = (out_h, out_w)
+                ort_shape = f"(1,3,{out_h},{out_w}):bypass_all_ones"
+            if self._g_bypass_alpha is None or self._g_bypass_alpha.shape != shape:
+                self._g_bypass_alpha = cp.ones(shape, dtype=cp.float32)
+            self._call_count += 1
+            self._last_ort_shape = ort_shape
+            if self._call_count == 1 or self._call_count % 100 == 0:
+                log.info(
+                    "[DIAG] alpha #%d bypass: frame=%dx%d alpha_shape=%s use_nv12=%s",
+                    self._call_count,
+                    w,
+                    h,
+                    shape,
+                    use_nv12,
+                )
+            return self._g_bypass_alpha, MattingTiming(0.0, 0.0, 0.0, 0.0), ort_shape
+
         infer = (
             ALPHA_STRIDE <= 1
             or self._cached_alpha_small is None
@@ -2049,6 +2306,8 @@ class Matter:
     def composite_green_gpu_nv12_frame_to_gpu_nv12_profile(
         self,
         frame_gpu_nv12,
+        out_h: int | None = None,
+        out_w: int | None = None,
         out_slot: Nv12OutputSlot | None = None,
     ):
         """Experimental PyNv path: GPU NV12 planes -> matting -> GPU NV12 output."""
@@ -2056,14 +2315,23 @@ class Matter:
 
         if not _GPU_OK:
             raise RuntimeError("GPU NV12 frame path requires CuPy/GPU composite")
-        h, w = int(frame_gpu_nv12.height), int(frame_gpu_nv12.width)
+        src_h, src_w = int(frame_gpu_nv12.height), int(frame_gpu_nv12.width)
+        w, h = self.pynv_scaled_size(src_w, src_h)
+        if out_w is not None and out_h is not None:
+            w, h = int(out_w), int(out_h)
         stream = _CUDA_STREAM
         ctx = stream if stream is not None else nullcontext()
         with ctx:
             t_up0 = _time.perf_counter()
-            self.upload_nv12_planes_gpu(frame_gpu_nv12.y.as_cupy(), frame_gpu_nv12.uv.as_cupy(), h, w)
+            self.upload_nv12_planes_gpu_scaled(frame_gpu_nv12.y.as_cupy(), frame_gpu_nv12.uv.as_cupy(), src_h, src_w, h, w)
+            if PASSTHROUGH_PYNV_SYNC_PROBE and stream is not None:
+                stream.synchronize()
             t_up1 = _time.perf_counter()
             a_small, timing, _ = self._alpha_low_res_gpu_temporal(h, w, use_nv12=True)
+            t_alpha_done = _time.perf_counter()
+            if PASSTHROUGH_PYNV_SYNC_PROBE and stream is not None:
+                stream.synchronize()
+            t_alpha_sync = _time.perf_counter()
             t0 = _time.perf_counter()
             out = self._composite_nv12_to_nv12_gpu_using_uploaded_frame(
                 a_small,
@@ -2071,10 +2339,27 @@ class Matter:
                 w,
                 out=out_slot.buffer if out_slot is not None else None,
             )
+            if PASSTHROUGH_PYNV_SYNC_PROBE and stream is not None:
+                stream.synchronize()
             t1 = _time.perf_counter()
+        if PASSTHROUGH_PYNV_SYNC_PROBE:
+            self._sync_probe_count += 1
+            if self._sync_probe_count == 1 or self._sync_probe_count % 30 == 0:
+                log.info(
+                    "[DIAG] pynv sync probe nv12 frame=%d upload_sync=%.2fms alpha_call=%.2fms "
+                    "alpha_tail_sync=%.2fms composite_sync=%.2fms mat_timing pre=%.2fms ort=%.2fms kernel=%.2fms",
+                    self._sync_probe_count,
+                    (t_up1 - t_up0) * 1000.0,
+                    (t_alpha_done - t_up1) * 1000.0,
+                    (t_alpha_sync - t_alpha_done) * 1000.0,
+                    (t1 - t0) * 1000.0,
+                    timing.preprocess_ms,
+                    timing.ort_ms,
+                    timing.composite_ms,
+                )
         return out, MattingTiming(
             timing.preprocess_ms,
-            timing.ort_ms,
+            timing.ort_ms + ((t_alpha_sync - t_alpha_done) * 1000.0 if PASSTHROUGH_PYNV_SYNC_PROBE else 0.0),
             0.0,
             (t1 - t0) * 1000 + (t_up1 - t_up0) * 1000,
         )
@@ -2083,6 +2368,8 @@ class Matter:
         self,
         frame_gpu_p016,
         shift_bits: int = 8,
+        out_h: int | None = None,
+        out_w: int | None = None,
         out_slot: Nv12OutputSlot | None = None,
     ):
         """Experimental PyNv path: GPU P016/P010 planes -> NV12 -> matting -> GPU NV12 output."""
@@ -2090,20 +2377,31 @@ class Matter:
 
         if not _GPU_OK:
             raise RuntimeError("GPU P016 frame path requires CuPy/GPU composite")
-        h, w = int(frame_gpu_p016.height), int(frame_gpu_p016.width)
+        src_h, src_w = int(frame_gpu_p016.height), int(frame_gpu_p016.width)
+        w, h = self.pynv_scaled_size(src_w, src_h)
+        if out_w is not None and out_h is not None:
+            w, h = int(out_w), int(out_h)
         stream = _CUDA_STREAM
         ctx = stream if stream is not None else nullcontext()
         with ctx:
             t_up0 = _time.perf_counter()
-            self.upload_p016_planes_as_nv12_gpu(
+            self.upload_p016_planes_as_nv12_gpu_scaled(
                 frame_gpu_p016.y.as_cupy(),
                 frame_gpu_p016.uv.as_cupy(),
+                src_h,
+                src_w,
                 h,
                 w,
                 shift_bits=shift_bits,
             )
+            if PASSTHROUGH_PYNV_SYNC_PROBE and stream is not None:
+                stream.synchronize()
             t_up1 = _time.perf_counter()
             a_small, timing, _ = self._alpha_low_res_gpu_temporal(h, w, use_nv12=True)
+            t_alpha_done = _time.perf_counter()
+            if PASSTHROUGH_PYNV_SYNC_PROBE and stream is not None:
+                stream.synchronize()
+            t_alpha_sync = _time.perf_counter()
             t0 = _time.perf_counter()
             out = self._composite_nv12_to_nv12_gpu_using_uploaded_frame(
                 a_small,
@@ -2111,10 +2409,27 @@ class Matter:
                 w,
                 out=out_slot.buffer if out_slot is not None else None,
             )
+            if PASSTHROUGH_PYNV_SYNC_PROBE and stream is not None:
+                stream.synchronize()
             t1 = _time.perf_counter()
+        if PASSTHROUGH_PYNV_SYNC_PROBE:
+            self._sync_probe_count += 1
+            if self._sync_probe_count == 1 or self._sync_probe_count % 30 == 0:
+                log.info(
+                    "[DIAG] pynv sync probe p016 frame=%d upload_sync=%.2fms alpha_call=%.2fms "
+                    "alpha_tail_sync=%.2fms composite_sync=%.2fms mat_timing pre=%.2fms ort=%.2fms kernel=%.2fms",
+                    self._sync_probe_count,
+                    (t_up1 - t_up0) * 1000.0,
+                    (t_alpha_done - t_up1) * 1000.0,
+                    (t_alpha_sync - t_alpha_done) * 1000.0,
+                    (t1 - t0) * 1000.0,
+                    timing.preprocess_ms,
+                    timing.ort_ms,
+                    timing.composite_ms,
+                )
         return out, MattingTiming(
             timing.preprocess_ms,
-            timing.ort_ms,
+            timing.ort_ms + ((t_alpha_sync - t_alpha_done) * 1000.0 if PASSTHROUGH_PYNV_SYNC_PROBE else 0.0),
             0.0,
             (t1 - t0) * 1000 + (t_up1 - t_up0) * 1000,
         )
@@ -2145,16 +2460,6 @@ class Matter:
             self._g_alpha.set(a_small)
             alpha_dev = self._g_alpha
         out_nv12 = out if out is not None else self._ensure_dev_nv12_out(h, w)
-        if debug:
-            log.info(
-                "[DIAG] nv12->nv12 gpu composite begin: frame=%dx%d alpha=%s out=%s split=%s",
-                w,
-                h,
-                getattr(alpha_dev, "shape", None),
-                getattr(out_nv12, "shape", None),
-                SPLIT_NV12_COMPOSITE,
-            )
-
         gY, gU, gV = self._green_yuv()
         block = (16, 16, 1)
         grid = ((w + block[0] - 1) // block[0], (h + block[1] - 1) // block[1], 1)

@@ -48,6 +48,8 @@ LIVE_PREFIX = "pl_"
 LEGACY_LIVE_PREFIX = "pl:"
 ALPHA_LIVE_PREFIX = "pla_"
 LEGACY_ALPHA_LIVE_PREFIX = "pla:"
+LIVE_ITEM_PREFIX = "lg_"
+ALPHA_LIVE_ITEM_PREFIX = "la_"
 PYNV_OUTPUT_CODEC = "hevc"
 DLNA_FLAGS_BASE = "01700000000000000000000000000000"
 DLNA_FLAGS_TIME_SEEK = "41700000000000000000000000000000"
@@ -118,7 +120,12 @@ def _id_to_dir(object_id: str) -> Path | None:
 def _id_to_live(object_id: str) -> tuple[Path, str] | None:
     mode = "green"
     prefix = LIVE_PREFIX
-    if object_id.startswith(ALPHA_LIVE_PREFIX):
+    if object_id.startswith(ALPHA_LIVE_ITEM_PREFIX):
+        mode = "alpha"
+        prefix = ALPHA_LIVE_ITEM_PREFIX
+    elif object_id.startswith(LIVE_ITEM_PREFIX):
+        prefix = LIVE_ITEM_PREFIX
+    elif object_id.startswith(ALPHA_LIVE_PREFIX):
         mode = "alpha"
         prefix = ALPHA_LIVE_PREFIX
     elif object_id.startswith(LEGACY_ALPHA_LIVE_PREFIX):
@@ -199,6 +206,10 @@ def _passthrough_virtual_title(path: Path, mode: str) -> str:
 
 def _passthrough_live_prefix(mode: str) -> str:
     return ALPHA_LIVE_PREFIX if mode == "alpha" else LIVE_PREFIX
+
+
+def _passthrough_live_item_prefix(mode: str) -> str:
+    return ALPHA_LIVE_ITEM_PREFIX if mode == "alpha" else LIVE_ITEM_PREFIX
 
 
 def _passthrough_live_query(mode: str) -> str:
@@ -321,7 +332,7 @@ def _video_items_from_index(path: Path, parent_id: str, child: IndexedChild | No
         else:
             items.append(
                 {
-                    "id": f"l{suffix[0]}_{rel}",
+                    "id": f"{_passthrough_live_item_prefix(mode)}{rel}",
                     "parent_id": parent_id,
                     "title": _passthrough_virtual_title(path, mode),
                     "url": f"{base}/passthrough_live/{quoted}" + (f"?{query}" if query else ""),
@@ -334,6 +345,7 @@ def _video_items_from_index(path: Path, parent_id: str, child: IndexedChild | No
                     "dlna_pn": "HEVC_TS_NA_ISO",
                     "frame_rate": passthrough_frame_rate(),
                     "passthrough": True,
+                    "passthrough_mode": mode,
                     "op": "10",
                     "ci": "1",
                     "flags": DLNA_FLAGS_TIME_SEEK,
@@ -382,6 +394,7 @@ def _live_chapter_items(path: Path, mode: str) -> list[dict]:
                 "dlna_pn": "HEVC_TS_NA_ISO",
                 "frame_rate": passthrough_frame_rate(),
                 "passthrough": True,
+                "passthrough_mode": mode,
                 "op": "10",
                 "ci": "1",
                 "flags": DLNA_FLAGS_TIME_SEEK,
@@ -536,6 +549,10 @@ def _didl_for(items: list[dict]) -> str:
     return "".join(out)
 
 
+def _metadata_didl_for_item(item: dict) -> str:
+    return _didl_for([item])
+
+
 _SOAP_RE = re.compile(r"<([\w:]+)>([\s\S]*?)</\1>")
 _MAX_SOAP_BODY_BYTES = 1024 * 1024
 _UNSAFE_XML_RE = re.compile(r"<!\s*(?:DOCTYPE|ENTITY)\b", re.IGNORECASE)
@@ -651,7 +668,19 @@ def handle_soap(soap_action: str, body: bytes) -> tuple[bytes, int]:
         if flag == "BrowseMetadata":
             if live is not None:
                 live_path, live_mode = live
-                didl = _metadata_didl_for_live(live_path, live_mode)
+                try:
+                    info = probe_cached(live_path)
+                    duration = info.duration
+                except Exception:
+                    duration = 0.0
+                if _uses_live_chapter_container(duration):
+                    didl = _metadata_didl_for_live(live_path, live_mode)
+                else:
+                    live_items = [
+                        item for item in _video_items(live_path, _folder_id(live_path.parent))
+                        if item.get("passthrough") and item.get("passthrough_mode") == live_mode
+                    ]
+                    didl = _metadata_didl_for_item(live_items[0]) if live_items else _didl_for([])
             else:
                 didl = _metadata_didl_for_dir(directory or _root())
             return _wrap_soap(

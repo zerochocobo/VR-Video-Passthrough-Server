@@ -135,6 +135,17 @@ def main() -> int:
     parser.add_argument("--bitrate", default="20000000")
     parser.add_argument("--gop", type=int, default=60)
     parser.add_argument("--codec", default="h264", choices=["h264", "hevc", "h265"])
+    parser.add_argument("--preset", default="")
+    parser.add_argument("--tuning-info", default="")
+    parser.add_argument("--rc", default="")
+    parser.add_argument("--idrperiod", default="")
+    parser.add_argument(
+        "--enc-opt",
+        action="append",
+        default=[],
+        metavar="KEY=VALUE",
+        help="extra PyNv CreateEncoder option; may be repeated",
+    )
     parser.add_argument("--out", default="")
     parser.add_argument("--progress", type=int, default=30)
     args = parser.parse_args()
@@ -160,17 +171,30 @@ def main() -> int:
         out = (config.ROOT / out).resolve()
     out.parent.mkdir(parents=True, exist_ok=True)
 
-    enc = nvc.CreateEncoder(
-        info.width,
-        info.height,
-        "NV12",
-        False,
-        codec=args.codec,
-        bitrate=str(args.bitrate),
-        fps=f"{fps:.6f}",
-        gop=str(args.gop),
-        bf="0",
-    )
+    enc_kwargs = {
+        "codec": args.codec,
+        "bitrate": str(args.bitrate),
+        "fps": f"{fps:.6f}",
+        "gop": str(args.gop),
+        "bf": "0",
+    }
+    if args.preset:
+        enc_kwargs["preset"] = args.preset
+    if args.tuning_info:
+        enc_kwargs["tuning_info"] = args.tuning_info
+    if args.rc:
+        enc_kwargs["rc"] = args.rc
+    if args.idrperiod:
+        enc_kwargs["idrperiod"] = args.idrperiod
+    for item in args.enc_opt:
+        if "=" not in item:
+            raise SystemExit(f"--enc-opt must be KEY=VALUE, got {item!r}")
+        key, value = item.split("=", 1)
+        key = key.strip()
+        if not key:
+            raise SystemExit(f"--enc-opt key is empty in {item!r}")
+        enc_kwargs[key] = value.strip()
+    enc = nvc.CreateEncoder(info.width, info.height, "NV12", False, **enc_kwargs)
     cmd, mux = _open_muxer(out, fps, src, args.codec)
     assert mux.stdin is not None
     print(
@@ -178,6 +202,7 @@ def main() -> int:
         f"source_fps={source_fps:.6f} cap_fps={cap_fps:.6f} effective_fps={fps:.6f} "
         f"is_cfr={timing.is_cfr} fps_diff={timing.fps_diff_ratio:.6f} target={target}"
     )
+    print(f"[pynv-trans] encoder kwargs={enc_kwargs}")
     if not timing.is_cfr:
         print("[pynv-trans] WARNING: source is not strong CFR; PyNv raw-H264 mux path will synthesize CFR timestamps.")
     print(f"[pynv-trans] delay={args.delay} copy_out={args.copy_out} mux={' '.join(cmd)}")

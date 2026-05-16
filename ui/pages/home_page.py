@@ -26,7 +26,7 @@ from ui.log_limits import UI_LOG_MAX_BLOCKS
 from ui.log_sanitizer import clean_log_text
 from ui.player_support import load_player_support
 from ui.resources import SWITCH_OFF_IMAGE_PATH, SWITCH_ON_IMAGE_PATH
-from ui.settings import ROOT as UI_ROOT
+from ui.settings import ROOT as UI_ROOT, quality_speed_value
 
 
 SWITCH_OFF_IMAGE = SWITCH_OFF_IMAGE_PATH.as_posix()
@@ -432,21 +432,21 @@ class HomePage(QWidget):
         performance_content_layout = QVBoxLayout(self.performance_content)
         performance_content_layout.setContentsMargins(10, 8, 10, 8)
         performance_content_layout.setSpacing(4)
-        self.performance_mask_skip_label = QLabel()
+        self.performance_quality_label = QLabel()
         self.performance_fps_label = QLabel()
         self.performance_output_size_label = QLabel()
-        self.performance_mask_skip = QComboBox()
-        self.performance_mask_skip.addItem("", 1)
-        self.performance_mask_skip.addItem("", 2)
-        self.performance_mask_skip.addItem("", 3)
-        self.performance_mask_skip.setFixedWidth(120)
-        idx = self.performance_mask_skip.findData(_int_setting(settings.data.get("alpha_stride"), 3))
-        self.performance_mask_skip.setCurrentIndex(max(0, idx))
+        self.performance_quality = QComboBox()
+        for value in ("ultrafast", "medium"):
+            self.performance_quality.addItem("", value)
+        self.performance_quality.setFixedWidth(140)
+        idx = self.performance_quality.findData(quality_speed_value(settings.data.get("quality_speed")))
+        self.performance_quality.setCurrentIndex(max(0, idx))
         self.performance_fps = QComboBox()
-        for value in (20, 30, 40):
+        self.performance_fps.addItem("", 0)
+        for value in (20, 30, 40, 60):
             self.performance_fps.addItem(str(value), value)
         self.performance_fps.setFixedWidth(120)
-        idx = self.performance_fps.findData(_int_setting(settings.data.get("passthrough_max_fps"), 30))
+        idx = self.performance_fps.findData(_int_setting(settings.data.get("passthrough_max_fps"), 0))
         self.performance_fps.setCurrentIndex(max(0, idx))
         self.performance_output_size = QComboBox()
         self.performance_output_size.addItem("", 0)
@@ -455,13 +455,13 @@ class HomePage(QWidget):
         self.performance_output_size.setFixedWidth(150)
         idx = self.performance_output_size.findData(_int_setting(settings.data.get("decode_max_side"), 4096))
         self.performance_output_size.setCurrentIndex(max(0, idx))
-        mask_skip_row_widget = QWidget()
-        mask_skip_row_widget.setFixedHeight(CONFIG_ROW_HEIGHT)
-        mask_skip_row = QHBoxLayout(mask_skip_row_widget)
-        mask_skip_row.setContentsMargins(0, 0, 0, 0)
-        mask_skip_row.addWidget(self.performance_mask_skip_label)
-        mask_skip_row.addWidget(self.performance_mask_skip)
-        mask_skip_row.addStretch(1)
+        memory_row_widget = QWidget()
+        memory_row_widget.setFixedHeight(CONFIG_ROW_HEIGHT)
+        memory_row = QHBoxLayout(memory_row_widget)
+        memory_row.setContentsMargins(0, 0, 0, 0)
+        memory_row.addWidget(self.performance_quality_label)
+        memory_row.addWidget(self.performance_quality)
+        memory_row.addStretch(1)
         fps_row_widget = QWidget()
         fps_row_widget.setFixedHeight(CONFIG_ROW_HEIGHT)
         fps_row = QHBoxLayout(fps_row_widget)
@@ -476,7 +476,7 @@ class HomePage(QWidget):
         output_size_row.addWidget(self.performance_output_size_label)
         output_size_row.addWidget(self.performance_output_size)
         output_size_row.addStretch(1)
-        performance_content_layout.addWidget(mask_skip_row_widget)
+        performance_content_layout.addWidget(memory_row_widget)
         performance_content_layout.addWidget(fps_row_widget)
         performance_content_layout.addWidget(output_size_row_widget)
         performance_layout.addWidget(self.performance_header)
@@ -488,7 +488,7 @@ class HomePage(QWidget):
             self.alpha_mode_label,
             self.subtitle_enable_label,
             self.log_toggle_label,
-            self.performance_mask_skip_label,
+            self.performance_quality_label,
             self.performance_fps_label,
             self.performance_output_size_label,
         ):
@@ -537,7 +537,7 @@ class HomePage(QWidget):
         self.alpha_mode.toggled.connect(self._save)
         self.bg_color.currentIndexChanged.connect(self._save)
         self.subtitle_enable.toggled.connect(self._save)
-        self.performance_mask_skip.currentIndexChanged.connect(self._save)
+        self.performance_quality.currentIndexChanged.connect(self._save)
         self.performance_fps.currentIndexChanged.connect(self._save)
         self.performance_output_size.currentIndexChanged.connect(self._save)
         self.config_header.toggled.connect(self._toggle_quick_config)
@@ -554,11 +554,20 @@ class HomePage(QWidget):
         self.settings.data["mode_green"] = self.green_mode.isChecked()
         self.settings.data["mode_alpha"] = self.alpha_mode.isChecked()
         self.settings.data["background_color"] = self.bg_color.currentData()
-        self.settings.data["alpha_stride"] = self.performance_mask_skip.currentData()
+        self.settings.data["quality_speed"] = self.performance_quality.currentData()
+        self.settings.data["alpha_stride"] = 1
         self.settings.data["passthrough_max_fps"] = self.performance_fps.currentData()
         self.settings.data["decode_max_side"] = self.performance_output_size.currentData()
         self.settings.data["subtitle_enable"] = self.subtitle_enable.isChecked()
         self.settings.save()
+
+    def sync_from_settings(self) -> None:
+        value = quality_speed_value(self.settings.data.get("quality_speed"))
+        idx = self.performance_quality.findData(value)
+        if idx >= 0 and self.performance_quality.currentIndex() != idx:
+            self.performance_quality.blockSignals(True)
+            self.performance_quality.setCurrentIndex(idx)
+            self.performance_quality.blockSignals(False)
 
     def manage_video_dirs(self) -> None:
         dialog = VideoDirsDialog(self.i18n, self.settings.video_dirs(), self)
@@ -667,7 +676,7 @@ class HomePage(QWidget):
             self.alpha_mode_label,
             self.subtitle_enable_label,
             self.log_toggle_label,
-            self.performance_mask_skip_label,
+            self.performance_quality_label,
             self.performance_fps_label,
             self.performance_output_size_label,
         )
@@ -699,11 +708,12 @@ class HomePage(QWidget):
         self.log_toggle_label.setText(self.i18n.t("log.show"))
         self.debug_toggle.setText("")
         self.debug_toggle_label.setText(self.i18n.t("log.debug"))
-        self.performance_mask_skip_label.setText(self.i18n.t("offline.frame_skip"))
+        self.performance_quality_label.setText(self.i18n.t("performance.quality_speed"))
         self.performance_fps_label.setText(self.i18n.t("performance.output_fps"))
         self.performance_output_size_label.setText(self.i18n.t("performance.output_size"))
-        for i, key in enumerate(("offline.skip_none", "offline.skip_1", "offline.skip_2")):
-            self.performance_mask_skip.setItemText(i, self.i18n.t(key))
+        self.performance_fps.setItemText(0, self.i18n.t("performance.output_fps_unlimited"))
+        for i, key in enumerate(("quality_speed.ultrafast", "quality_speed.medium")):
+            self.performance_quality.setItemText(i, self.i18n.t(key))
         self.performance_output_size.setItemText(0, self.i18n.t("performance.output_size_original"))
         self.performance_output_size.setItemText(1, self.i18n.t("performance.output_size_4k"))
         self.performance_output_size.setItemText(2, self.i18n.t("performance.output_size_8k"))

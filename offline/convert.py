@@ -37,9 +37,9 @@ ENGINE_TAGS = {
 RVM_DEFAULT_ARGS = {
     "input_size": 1024,
     "skip_frames": 0,
-    "fps": 30.0,
+    "fps": 0.0,
     "bitrate": "live",
-    "preset": "P5",
+    "preset": config.PASSTHROUGH_PYNV_PRESET,
     "cq": -1,
 }
 
@@ -145,6 +145,15 @@ def _run_one(args: argparse.Namespace, src: Path) -> int:
     print("[offline] run: " + subprocess.list2cmdline(cmd), flush=True)
     env = dict(os.environ)
     env["PYTHONUNBUFFERED"] = "1"
+    print(
+        "[offline] env: "
+        f"decoder={env.get('PT_PASSTHROUGH_PYNV_DECODER', '')} "
+        f"batch={env.get('PT_PASSTHROUGH_PYNV_THREADED_BATCH_SIZE', '')} "
+        f"buffer={env.get('PT_PASSTHROUGH_PYNV_THREADED_BUFFER_SIZE', '')} "
+        f"preset={env.get('PT_PASSTHROUGH_PYNV_PRESET', '')} "
+        f"model={env.get('PT_MODEL_PATH', '')}",
+        flush=True,
+    )
     return subprocess.run(cmd, env=env).returncode
 
 

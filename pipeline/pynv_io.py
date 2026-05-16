@@ -42,6 +42,10 @@ class CudaPlane:
             readonly=bool(data[1]),
         )
 
+    @classmethod
+    def from_cupy_array(cls, arr: Any) -> "CudaPlane":
+        return cls.from_view(arr, arr)
+
     @property
     def nbytes(self) -> int:
         if not self.shape:
@@ -126,6 +130,40 @@ class GpuNv12Frame:
             pts=int(frame.getPTS()),
         )
 
+    def owned_copy(self) -> "GpuNv12Frame":
+        """Copy PyNv-owned planes into CuPy-owned GPU memory.
+
+        ThreadedDecoder batch frames are only valid for a narrow lifetime. The
+        alpha path runs several CUDA/ORT steps from one decoded frame, so it
+        must not keep reading PyNv-managed batch memory after the handoff.
+        """
+        import cupy as cp
+
+        h, w = int(self.height), int(self.width)
+        if tuple(self.y.shape[:2]) != (h, w):
+            raise RuntimeError(f"unexpected NV12 Y plane shape: frame={w}x{h} y_shape={self.y.shape}")
+        uv_shape = tuple(self.uv.shape)
+        if uv_shape not in {(h // 2, w), (h // 2, w // 2, 2)}:
+            raise RuntimeError(f"unexpected NV12 UV plane shape: frame={w}x{h} uv_shape={self.uv.shape}")
+        # ThreadedDecoder writes on an internal PyNv/NVDEC stream that is not
+        # exposed to CuPy. Make the decoded planes visible before copying them
+        # into memory owned by this process.
+        cp.cuda.Device().synchronize()
+        y_src = self.y.as_cupy(cp.uint8).reshape(h, w)
+        uv_src = self.uv.as_cupy(cp.uint8).reshape(h // 2, w)
+        y = cp.ascontiguousarray(y_src)
+        uv = cp.ascontiguousarray(uv_src)
+        cp.cuda.get_current_stream().synchronize()
+        owner = (y, uv)
+        return GpuNv12Frame(
+            owner=owner,
+            y=CudaPlane.from_cupy_array(y),
+            uv=CudaPlane.from_cupy_array(uv),
+            width=w,
+            height=h,
+            pts=self.pts,
+        )
+
 
 @dataclass(frozen=True)
 class GpuP016Frame:
@@ -154,6 +192,33 @@ class GpuP016Frame:
             width=width,
             height=height,
             pts=int(frame.getPTS()),
+        )
+
+    def owned_copy(self) -> "GpuP016Frame":
+        """Copy PyNv-owned 16-bit planes into CuPy-owned GPU memory."""
+        import cupy as cp
+
+        h, w = int(self.height), int(self.width)
+        if tuple(self.y.shape[:2]) != (h, w):
+            raise RuntimeError(f"unexpected P016 Y plane shape: frame={w}x{h} y_shape={self.y.shape}")
+        uv_shape = tuple(self.uv.shape)
+        if uv_shape not in {(h // 2, w), (h // 2, w // 2, 2)}:
+            raise RuntimeError(f"unexpected P016 UV plane shape: frame={w}x{h} uv_shape={self.uv.shape}")
+        # See GpuNv12Frame.owned_copy(): PyNv's decode stream is not exposed.
+        cp.cuda.Device().synchronize()
+        y_src = self.y.as_cupy(cp.uint16).reshape(h, w)
+        uv_src = self.uv.as_cupy(cp.uint16).reshape(h // 2, w)
+        y = cp.ascontiguousarray(y_src)
+        uv = cp.ascontiguousarray(uv_src)
+        cp.cuda.get_current_stream().synchronize()
+        owner = (y, uv)
+        return GpuP016Frame(
+            owner=owner,
+            y=CudaPlane.from_cupy_array(y),
+            uv=CudaPlane.from_cupy_array(uv),
+            width=w,
+            height=h,
+            pts=self.pts,
         )
 
 
@@ -213,6 +278,101 @@ class PyNvSimpleDecoder:
                 # PyNvVideoCodec 2.1.0 exposes SimpleDecoder.stop() in Python,
                 # but the wrapped native object does not implement stop().
                 pass
+
+
+class PyNvThreadedSerialDecoder:
+    """Sequential ThreadedDecoder wrapper for monotonic source-frame access.
+
+    PyNv ThreadedDecoder frames are only valid until the next get_batch_frames()
+    call. This wrapper never queues decoded frames across threads; callers must
+    finish consuming the returned frame before calling frame_at() again.
+    """
+
+    def __init__(
+        self,
+        src: Path,
+        gpu_id: int = 0,
+        bit_depth: int = 8,
+        start_frame: int = 0,
+        batch_size: int = 8,
+        buffer_size: int = 32,
+        info: PyNvVideoInfo | None = None,
+        num_frames: int | None = None,
+    ):
+        import PyNvVideoCodec as nvc
+
+        self.src = Path(src).resolve()
+        self.gpu_id = int(gpu_id)
+        self.bit_depth = int(bit_depth or 8)
+        self.batch_size = max(1, int(batch_size))
+        self.buffer_size = max(1, int(buffer_size))
+        self.start_frame = max(0, int(start_frame))
+        self.info = info
+        self._len = int(num_frames) if num_frames is not None else 0
+        if self.info is None or self._len <= 0:
+            probe = PyNvSimpleDecoder(self.src, gpu_id=self.gpu_id, bit_depth=self.bit_depth)
+            try:
+                self.info = probe.info
+                self._len = len(probe)
+            finally:
+                probe.stop()
+        self._decoder = nvc.ThreadedDecoder(
+            str(self.src),
+            self.buffer_size,
+            gpu_id=self.gpu_id,
+            use_device_memory=True,
+            output_color_type=nvc.OutputColorType.NATIVE,
+            start_frame=self.start_frame,
+        )
+        self._batch: list[Any] = []
+        self._batch_pos = 0
+        self._batch_start_idx = self.start_frame
+        self._next_source_idx = self.start_frame
+        self._ended = False
+
+    def __len__(self) -> int:
+        return self._len
+
+    def frame_at(self, index: int) -> GpuNv12Frame | GpuP016Frame:
+        if self._ended:
+            raise RuntimeError("ThreadedDecoder has already ended")
+        target = int(index)
+        if target < self._next_source_idx:
+            raise ValueError(
+                f"Threaded serial decoder only supports monotonic access: "
+                f"target={target} next_source_idx={self._next_source_idx}"
+            )
+        while True:
+            if self._batch_pos >= len(self._batch):
+                self._batch = []
+                self._batch_pos = 0
+                self._batch_start_idx = self._next_source_idx
+                batch = self._decoder.get_batch_frames(self.batch_size)
+                if not batch:
+                    raise RuntimeError(f"ThreadedDecoder returned no frames at source_idx={self._next_source_idx}")
+                self._batch = list(batch)
+            current = self._batch_start_idx + self._batch_pos
+            raw = self._batch[self._batch_pos]
+            self._batch_pos += 1
+            self._next_source_idx = current + 1
+            if current < target:
+                continue
+            if current > target:
+                raise RuntimeError(f"ThreadedDecoder skipped target frame: target={target} current={current}")
+            assert self.info is not None
+            if self.bit_depth > 8:
+                return GpuP016Frame.from_decoded_frame(raw, self.info.width, self.info.height)
+            return GpuNv12Frame.from_decoded_frame(raw, self.info.width, self.info.height)
+
+    def stop(self) -> None:
+        if self._ended:
+            return
+        self._batch = []
+        self._batch_pos = 0
+        end = getattr(self._decoder, "end", None)
+        if callable(end):
+            end()
+        self._ended = True
 
 
 class CudaArrayView:
