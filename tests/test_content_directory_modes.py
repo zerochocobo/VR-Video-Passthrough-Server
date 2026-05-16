@@ -153,6 +153,40 @@ class ContentDirectoryModeTests(unittest.TestCase):
         self.assertIn("<sec:CaptionInfoEx sec:type=\"srt\">http://127.0.0.1:8200/subs/movie.zh.srt</sec:CaptionInfoEx>", didl)
         self.assertIn("<sec:CaptionInfo sec:type=\"srt\">http://127.0.0.1:8200/subs/movie.zh.srt</sec:CaptionInfo>", didl)
 
+    def test_directory_cache_key_includes_subtitle_toggle(self) -> None:
+        child = SimpleNamespace(is_dir=False, path=Path("movie.mp4"))
+        snapshot = SimpleNamespace(key="root", signature="sig", children=[child])
+        video_item = {
+            "id": "v_movie.mp4",
+            "parent_id": "0",
+            "title": "movie",
+            "url": "http://127.0.0.1:8200/media/movie.mp4",
+            "thumb": "http://127.0.0.1:8200/thumb/movie.mp4",
+            "size": 1,
+            "duration": 1.0,
+            "resolution": "",
+            "bitrate": 1,
+            "mime": "video/mp4",
+            "dlna_pn": "AVC_MP4_HP_HD_AAC",
+            "frame_rate": None,
+            "passthrough": False,
+            "subtitles": [],
+        }
+        with (
+            patch.object(cds, "get_media_index") as get_index,
+            patch.object(cds, "_folder_id", return_value="0"),
+            patch.object(cds, "_video_items_from_index", side_effect=[[dict(video_item, title="off")], [dict(video_item, title="on")]]),
+            patch.object(cds, "subtitle_output_enabled", side_effect=[False, True]),
+        ):
+            get_index.return_value.list_directory.return_value = snapshot
+            cds._dir_items_cache.clear()
+            off_items = cds._children_for_dir(Path("."))
+            on_items = cds._children_for_dir(Path("."))
+
+        self.assertEqual(off_items[0]["title"], "off")
+        self.assertEqual(on_items[0]["title"], "on")
+        cds._dir_items_cache.clear()
+
     def test_legacy_colon_folder_id_still_resolves(self) -> None:
         roots = build_media_roots([Path(r"D:\VR")])
         library = MediaLibrary(roots)

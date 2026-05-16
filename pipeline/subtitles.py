@@ -16,6 +16,7 @@ from PIL import Image, ImageDraw, ImageFont
 
 import config
 from utils.logger import get
+from utils.subtitles import subtitle_output_enabled
 
 log = get("subtitles")
 
@@ -44,7 +45,7 @@ class SubtitleLine:
 
 
 def find_subtitle_for_video(video_path: Path) -> Path | None:
-    if not config.SUBTITLE_ENABLE:
+    if not subtitle_output_enabled():
         return None
     seen: set[Path] = set()
     tried: list[Path] = []

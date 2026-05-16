@@ -36,7 +36,7 @@ from pipeline.ffmpeg_io import probe_cached
 from utils.bitrate_estimator import estimate_for_media
 from utils.logger import get
 from utils.media_index import IndexedChild, get_media_index
-from utils.subtitles import SubtitleTrack, find_external_subtitles
+from utils.subtitles import SubtitleTrack, find_external_subtitles, subtitle_output_enabled
 from utils.video_metadata import probe_video_metadata, select_backend
 
 log = get("cds")
@@ -403,6 +403,7 @@ def _children_for_dir(directory: Path) -> list[dict]:
         snapshot.key,
         snapshot.signature,
         PASSTHROUGH_OUTPUT_MODE,
+        int(subtitle_output_enabled()),
         int(PASSTHROUGH_LIVE_CHAPTER_MAX_ITEMS),
         int(PASSTHROUGH_LIVE_CHAPTER_MIN_INTERVAL_SEC),
     )

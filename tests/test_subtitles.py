@@ -6,7 +6,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from media_library import MediaLibrary, build_media_roots
-from utils.subtitles import find_external_subtitles, subtitle_mime
+from utils.subtitles import find_external_subtitles, subtitle_mime, subtitle_output_enabled
 
 
 class SubtitleDiscoveryTests(unittest.TestCase):
@@ -20,7 +20,11 @@ class SubtitleDiscoveryTests(unittest.TestCase):
             (root / "movie.srt").write_text("three", encoding="utf-8")
             library = MediaLibrary(build_media_roots([root]))
 
-            with patch("utils.subtitles.config.MEDIA_LIBRARY", library):
+            with (
+                patch("utils.subtitles.config.MEDIA_LIBRARY", library),
+                patch("utils.subtitles.config.ROOT", root),
+                patch("utils.subtitles.config.SUBTITLE_ENABLE", True),
+            ):
                 tracks = find_external_subtitles(video)
 
         self.assertEqual([track.path.name for track in tracks], ["movie.srt", "movie.zh.ass", "movie.eng.srt"])
@@ -37,11 +41,25 @@ class SubtitleDiscoveryTests(unittest.TestCase):
 
             with (
                 patch("utils.subtitles.config.MEDIA_LIBRARY", library),
+                patch("utils.subtitles.config.ROOT", root),
                 patch("utils.subtitles.config.SUBTITLE_ENABLE", False),
             ):
                 tracks = find_external_subtitles(video)
 
         self.assertEqual(tracks, [])
+
+    def test_runtime_ui_setting_overrides_startup_config(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            settings = root / "runtime_cache" / "ui_settings.json"
+            settings.parent.mkdir()
+            settings.write_text('{"subtitle_enable": false}', encoding="utf-8-sig")
+
+            with (
+                patch("utils.subtitles.config.ROOT", root),
+                patch("utils.subtitles.config.SUBTITLE_ENABLE", True),
+            ):
+                self.assertFalse(subtitle_output_enabled())
 
     def test_subtitle_mime_defaults(self) -> None:
         self.assertEqual(subtitle_mime(Path("movie.srt")), "application/x-subrip")

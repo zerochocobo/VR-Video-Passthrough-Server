@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import json
 from pathlib import Path
 
 import config
@@ -34,6 +35,18 @@ def is_subtitle_path(path: Path) -> bool:
     return path.suffix.lower() in SUBTITLE_MIME_BY_SUFFIX
 
 
+def subtitle_output_enabled() -> bool:
+    settings_path = config.ROOT / "runtime_cache" / "ui_settings.json"
+    if settings_path.exists():
+        try:
+            data = json.loads(settings_path.read_text(encoding="utf-8-sig"))
+            if isinstance(data, dict) and "subtitle_enable" in data:
+                return bool(data.get("subtitle_enable"))
+        except Exception:
+            pass
+    return bool(config.SUBTITLE_ENABLE)
+
+
 def _infer_lang(video_stem: str, subtitle_stem: str) -> str:
     prefix = f"{video_stem}."
     if subtitle_stem.casefold().startswith(prefix.casefold()):
@@ -53,7 +66,7 @@ def _lang_rank(lang: str) -> tuple[int, str]:
 
 
 def find_external_subtitles(video_path: Path) -> list[SubtitleTrack]:
-    if not config.SUBTITLE_ENABLE:
+    if not subtitle_output_enabled():
         return []
     if video_path.suffix.lower() not in {".mp4", ".m4v"}:
         return []
