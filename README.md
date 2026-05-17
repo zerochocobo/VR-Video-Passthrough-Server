@@ -29,7 +29,7 @@ This is the miracle of the AI era.
 - Aggressive VRAM-aware pipeline tuning aimed at keeping realtime output smooth, including 8K-class source playback targets where the hardware can sustain them
 
 
-| ![MainWindow](assets/soft_mainwindow_cn.png) |
+| ![MainWindow](assets/soft_mainwindow_en.png) |
 
 
 ## Passthrough Output Examples
