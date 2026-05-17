@@ -25,7 +25,8 @@ import numpy as np  # noqa: E402
 import config  # noqa: E402
 from utils.bitrate_estimator import effective_default_bitrate, parse_bitrate, source_video_bitrate  # noqa: E402
 from utils.gpu_runtime_cache import configure_gpu_runtime_cache  # noqa: E402
-from utils.video_metadata import cfr_source_index, probe_color_metadata, probe_timing_metadata, probe_video_metadata  # noqa: E402
+from utils.subprocess_hidden import hidden_subprocess_kwargs  # noqa: E402
+from utils.video_metadata import cfr_source_index, probe_color_metadata, probe_timing_metadata, probe_video_metadata, select_backend  # noqa: E402
 
 GPU_CACHE_ENV = configure_gpu_runtime_cache()
 
@@ -323,6 +324,7 @@ def _nvidia_mem_stats() -> tuple[int, int]:
             ],
             text=True,
             stderr=subprocess.DEVNULL,
+            **hidden_subprocess_kwargs(),
         )
         first = out.strip().splitlines()[0]
         used, total = [int(x.strip()) for x in first.split(",")[:2]]
@@ -371,7 +373,7 @@ def _alpha_packer_from_args(matter, args) -> "AlphaPacker":
     )
 
 
-from pipeline.alpha_packer import AlphaPacker
+from pipeline.alpha_packer import AlphaPacker, alpha_output_size, is_sbs_vr_size
 
 
 class RvmOfflineEngine(OfflineMattingEngine):
@@ -1633,7 +1635,13 @@ def main() -> int:
     if args.alpha_stride > 0:
         config.ALPHA_STRIDE = int(args.alpha_stride)
     config.MATTING_SBS_BATCH = bool(args.sbs_batch)
-    from pipeline.pynv_io import GpuNv12AppFrame, PyNvSimpleDecoder, PyNvThreadedSerialDecoder
+    from pipeline.pynv_io import (
+        FfmpegNv12SequentialDecoder,
+        GpuNv12AppFrame,
+        PyNvSimpleDecoder,
+        PyNvThreadedSerialDecoder,
+        cuda_device_summary,
+    )
 
     src = _resolve_video(args.video)
     out = Path(args.out) if args.out else _default_out(src)
@@ -1647,7 +1655,19 @@ def main() -> int:
         video_only_out = out.with_name(f"{out.stem}._video_only{suffix}")
 
     meta = probe_video_metadata(src)
+    print(
+        f"[offline-alpha] input codec={meta.codec.codec_name} profile={meta.codec.profile} "
+        f"pix_fmt={meta.codec.pix_fmt} bit_depth={meta.codec.bit_depth} "
+        f"size={meta.codec.width}x{meta.codec.height}",
+        flush=True,
+    )
+    print(f"[offline-alpha] cuda {cuda_device_summary(0)}", flush=True)
+    backend_decision = select_backend(meta.timing, meta.codec, meta.color)
     decoder_mode = config.PASSTHROUGH_PYNV_DECODER
+    if backend_decision.verdict == "ffmpeg_fallback":
+        decoder_mode = "ffmpeg_fallback"
+    elif backend_decision.verdict == "block":
+        raise RuntimeError(f"unsupported offline source: {backend_decision.reason}")
     if decoder_mode == "threaded_serial" and not config.PASSTHROUGH_ALPHA_ALLOW_THREADED_DECODER:
         print(
             "[offline-alpha] decoder=threaded_serial requested; using decoder=simple because "
@@ -1656,23 +1676,39 @@ def main() -> int:
         )
         decoder_mode = "simple"
     alpha_threaded_owned_copy = decoder_mode == "threaded_serial"
-    if decoder_mode == "threaded_serial":
-        dec = PyNvThreadedSerialDecoder(
-            src,
-            bit_depth=int(meta.codec.bit_depth or 8),
-            batch_size=config.PASSTHROUGH_PYNV_THREADED_BATCH_SIZE,
-            buffer_size=config.PASSTHROUGH_PYNV_THREADED_BUFFER_SIZE,
-        )
-    elif decoder_mode == "simple":
-        dec = PyNvSimpleDecoder(src, bit_depth=int(meta.codec.bit_depth or 8))
-    else:
-        raise RuntimeError(f"unknown PT_PASSTHROUGH_PYNV_DECODER={decoder_mode!r}")
+    try:
+        if decoder_mode == "ffmpeg_fallback":
+            dec = FfmpegNv12SequentialDecoder(src)
+        elif decoder_mode == "threaded_serial":
+            dec = PyNvThreadedSerialDecoder(
+                src,
+                bit_depth=int(meta.codec.bit_depth or 8),
+                batch_size=config.PASSTHROUGH_PYNV_THREADED_BATCH_SIZE,
+                buffer_size=config.PASSTHROUGH_PYNV_THREADED_BUFFER_SIZE,
+            )
+        elif decoder_mode == "simple":
+            dec = PyNvSimpleDecoder(src, bit_depth=int(meta.codec.bit_depth or 8))
+        else:
+            raise RuntimeError(f"unknown PT_PASSTHROUGH_PYNV_DECODER={decoder_mode!r}")
+    except Exception as exc:
+        text = str(exc)
+        if "MBCount not supported" in text:
+            print(
+                "[offline-alpha] ERROR: PyNvVideoCodec/NVDEC rejected this video on the selected CUDA device. "
+                "This usually means gpu_id=0 is not the expected RTX GPU, the NVIDIA driver/video stack is "
+                "reporting the wrong decode capability, or the source codec/profile exceeds NVDEC support.",
+                flush=True,
+            )
+            print(f"[offline-alpha] ERROR detail: {text}", flush=True)
+            return 3
+        raise
     info = dec.info
     print(
         f"[offline-alpha] decoder={decoder_mode} "
         f"batch={config.PASSTHROUGH_PYNV_THREADED_BATCH_SIZE} "
         f"buffer={config.PASSTHROUGH_PYNV_THREADED_BUFFER_SIZE} "
-        f"owned_copy={alpha_threaded_owned_copy}",
+        f"owned_copy={alpha_threaded_owned_copy} "
+        f"backend_reason={backend_decision.reason}",
         flush=True,
     )
     timing = probe_timing_metadata(src)
@@ -1705,7 +1741,8 @@ def main() -> int:
         dec.stop()
         return 0
     engine = _make_engine(args)
-    enc_w, enc_h = info.width, info.height
+    enc_w, enc_h = alpha_output_size(info.width, info.height)
+    projection_mode = "sbs_half_equirect" if is_sbs_vr_size(info.width, info.height) or not config.ALPHA_2D_ENABLE else "flat2d"
     if isinstance(engine, MatAnyone2OnnxEngine):
         engine.set_segment_plan(segment_starts)
         for segment_start, masks in sam3_masks.items():
@@ -1726,13 +1763,21 @@ def main() -> int:
     assert mux.stdin is not None
     print(
         f"[offline-alpha] src={src} out={final_out} engine={args.engine} {info.width}x{info.height} "
+        f"output={enc_w}x{enc_h} "
         f"source_fps={source_fps:.6f} output_fps={fps:.6f} target={target} audio={args.audio} "
         f"bitrate={target_bps} maxbitrate={max_bps} vbvbufsize={buf_bps} rc={args.rc} cq={args.cq} preset={args.preset}"
     )
-    print(
-        f"[offline-alpha] projection=sbs half-equirect 180 -> fisheye sbs "
-        f"radius_scale={args.fisheye_radius_scale:g}"
-    )
+    if projection_mode == "flat2d":
+        print(
+            f"[offline-alpha] projection=flat2d -> stereo fisheye sbs "
+            f"fov={config.ALPHA_2D_FOV:g} disparity={config.ALPHA_2D_DISPARITY_PX:g}px "
+            f"radius_scale={args.fisheye_radius_scale:g}"
+        )
+    else:
+        print(
+            f"[offline-alpha] projection=sbs half-equirect 180 -> fisheye sbs "
+            f"radius_scale={args.fisheye_radius_scale:g}"
+        )
     print(
         f"[offline-alpha] packing=DeoVR-style red-channel alpha blocks "
         f"scale={args.alpha_pack_scale:g} layout=alpha-packer-6block"

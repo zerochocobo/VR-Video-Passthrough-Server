@@ -392,6 +392,7 @@ class OfflinePage(QWidget):
             args.append("--skip-existing")
         self.settings.save()
         env = self.settings.server_env()
+        env["PT_DECODE_MAX_SIDE"] = "0"
         env["PT_PASSTHROUGH_PYNV_PRESET"] = quality_speed_preset(self.settings.data.get("offline_quality_speed"), "medium")
         self.process.start(args, env)
 
@@ -411,6 +412,7 @@ class OfflinePage(QWidget):
             args.append("--skip-existing")
         self.settings.save()
         env = self.settings.server_env()
+        env["PT_DECODE_MAX_SIDE"] = "0"
         env["PT_PASSTHROUGH_PYNV_PRESET"] = quality_speed_preset(self.settings.data.get("offline_quality_speed"), "medium")
         self.process.start(args, env)
 

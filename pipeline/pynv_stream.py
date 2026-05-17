@@ -1583,6 +1583,17 @@ class PyNvPassthroughStream:
             fps = float(timing.effective_fps(fps_cap))
             producer_pacing = bool(config.PASSTHROUGH_PRODUCER_REALTIME_PACING or fps_cap > 0)
             out_w, out_h = self.matter.pynv_scaled_size(info.width, info.height)
+            alpha_projection_mode = ""
+            alpha_process_w, alpha_process_h = out_w, out_h
+            if self.output_mode == "alpha":
+                from pipeline.alpha_packer import alpha_output_size, is_sbs_vr_size
+
+                alpha_projection_mode = (
+                    "sbs_half_equirect"
+                    if is_sbs_vr_size(alpha_process_w, alpha_process_h) or not config.ALPHA_2D_ENABLE
+                    else "flat2d"
+                )
+                out_w, out_h = alpha_output_size(alpha_process_w, alpha_process_h)
             self.output_fps = fps
             if not timing.is_cfr:
                 meta_dec.stop()
@@ -1764,10 +1775,17 @@ class PyNvPassthroughStream:
 
                 alpha_packer = AlphaPacker(self.matter)
                 log.info(
-                    "[PYNV][%d] alpha passthrough active: projection=sbs half-equirect 180 -> fisheye sbs scale=%.3f radius=%.3f layout=alpha-packer-6block",
+                    "[PYNV][%d] alpha passthrough active: projection=%s process=%dx%d output=%dx%d scale=%.3f radius=%.3f layout=alpha-packer-6block flat2d_fov=%.1f flat2d_disparity=%.1fpx",
                     self.sid,
+                    alpha_projection_mode or alpha_packer.projection_mode(alpha_process_w, alpha_process_h),
+                    alpha_process_w,
+                    alpha_process_h,
+                    out_w,
+                    out_h,
                     alpha_packer.scale,
                     alpha_packer.radius_scale,
+                    config.ALPHA_2D_FOV,
+                    config.ALPHA_2D_DISPARITY_PX,
                 )
             slate_nv12 = None
             slate_frames = 0

@@ -11,6 +11,7 @@
   "dialog.warning": "確認",
   "dialog.stop_server_first": "GPUリソースの競合を避けるため、先にサーバーを停止してください。",
   "dialog.stop_offline_first": "GPUリソースの競合を避けるため、先にオフライン処理を停止してください。",
+  "dialog.unsupported_gpu": "未対応のGPUです：{gpu}（compute capability {cc}）。NVIDIA RTX 20シリーズ以降のGPUが必要です（compute capability 7.5以上）。",
   "group.quick_config_short": "クイック設定",
   "group.quick_config": "クイック設定（変更後はサーバー再起動で反映）",
   "language.system": "システムに従う",

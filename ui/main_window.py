@@ -2,8 +2,6 @@
 
 import json
 import os
-import subprocess
-import shutil
 import threading
 import urllib.request
 from pathlib import Path
@@ -26,63 +24,15 @@ from ui.settings import ROOT as UI_ROOT, Settings
 from ui.styles import font_for_language
 from ui.widgets.current_page_stack import CurrentPageStackedWidget
 from ui.widgets.startup_overlay import StartupOverlay
+from utils.gpu_requirements import (
+    detect_nvidia_gpu_requirement,
+)
 
 
 SUPPORTED_LANGUAGES = ("zh_CN", "en_US", "ja_JP")
 QT_MAX_WIDGET_SIZE = 16777215
 OFFLINE_PAGE_WIDTH = 600
 OFFLINE_PAGE_HEIGHT = 600
-MIN_NVIDIA_COMPUTE_CAPABILITY = 7.5
-
-
-def _parse_compute_capability(value: str) -> float | None:
-    text = str(value or "").strip().lower().replace("sm_", "")
-    if not text:
-        return None
-    try:
-        return float(text)
-    except ValueError:
-        return None
-
-
-def _detect_nvidia_gpu_support() -> tuple[bool, str, str] | None:
-    nvidia_smi = shutil.which("nvidia-smi")
-    if not nvidia_smi:
-        for root in (os.environ.get("SystemRoot"), os.environ.get("WINDIR")):
-            if not root:
-                continue
-            system32_smi = Path(root) / "System32" / "nvidia-smi.exe"
-            if system32_smi.exists():
-                nvidia_smi = str(system32_smi)
-                break
-    if not nvidia_smi:
-        return None
-    try:
-        out = subprocess.check_output(
-            [
-                nvidia_smi,
-                "--query-gpu=name,compute_cap",
-                "--format=csv,noheader",
-            ],
-            stderr=subprocess.DEVNULL,
-            text=True,
-            timeout=5,
-        )
-    except Exception:
-        return None
-    candidates: list[tuple[float, str, str]] = []
-    for line in out.splitlines():
-        parts = [part.strip() for part in line.split(",")]
-        if len(parts) < 2:
-            continue
-        cc = _parse_compute_capability(parts[-1])
-        if cc is None:
-            continue
-        candidates.append((cc, parts[0], parts[-1]))
-    if not candidates:
-        return None
-    cc, name, cc_text = max(candidates, key=lambda item: item[0])
-    return cc >= MIN_NVIDIA_COMPUTE_CAPABILITY, name, cc_text
 
 
 class MainWindow(QMainWindow):
@@ -200,6 +150,17 @@ class MainWindow(QMainWindow):
             return
         if self.offline_process.is_running():
             QMessageBox.warning(self, self.i18n.t("dialog.warning"), self.i18n.t("dialog.stop_offline_first"))
+            return
+        gpu_support = detect_nvidia_gpu_requirement()
+        if gpu_support.detected and not gpu_support.supported:
+            QMessageBox.critical(
+                self,
+                self.i18n.t("startup.title_failed"),
+                self.i18n.t("dialog.unsupported_gpu").format(
+                    gpu=gpu_support.name,
+                    cc=gpu_support.compute_capability,
+                ),
+            )
             return
         self.settings.save()
         env = self.settings.server_env()

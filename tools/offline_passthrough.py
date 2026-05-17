@@ -25,7 +25,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import config  # noqa: E402
 from utils.bitrate_estimator import effective_default_bitrate, parse_bitrate, source_video_bitrate  # noqa: E402
 from utils.gpu_runtime_cache import configure_gpu_runtime_cache  # noqa: E402
-from utils.video_metadata import cfr_source_index, probe_color_metadata, probe_timing_metadata, probe_video_metadata  # noqa: E402
+from utils.subprocess_hidden import hidden_subprocess_kwargs  # noqa: E402
+from utils.video_metadata import cfr_source_index, probe_color_metadata, probe_timing_metadata, probe_video_metadata, select_backend  # noqa: E402
 
 GPU_CACHE_ENV = configure_gpu_runtime_cache()
 
@@ -293,6 +294,7 @@ def _nvidia_mem_stats() -> tuple[int, int]:
             ],
             text=True,
             stderr=subprocess.DEVNULL,
+            **hidden_subprocess_kwargs(),
         )
         first = out.strip().splitlines()[0]
         used, total = [int(x.strip()) for x in first.split(",")[:2]]
@@ -1595,7 +1597,13 @@ def main() -> int:
     if args.alpha_stride > 0:
         config.ALPHA_STRIDE = int(args.alpha_stride)
     config.MATTING_SBS_BATCH = bool(args.sbs_batch)
-    from pipeline.pynv_io import GpuNv12AppFrame, PyNvSimpleDecoder, PyNvThreadedSerialDecoder
+    from pipeline.pynv_io import (
+        FfmpegNv12SequentialDecoder,
+        GpuNv12AppFrame,
+        PyNvSimpleDecoder,
+        PyNvThreadedSerialDecoder,
+        cuda_device_summary,
+    )
 
     src = _resolve_video(args.video)
     out = Path(args.out) if args.out else _default_out(src)
@@ -1604,23 +1612,51 @@ def main() -> int:
     out.parent.mkdir(parents=True, exist_ok=True)
 
     meta = probe_video_metadata(src)
+    print(
+        f"[offline] input codec={meta.codec.codec_name} profile={meta.codec.profile} "
+        f"pix_fmt={meta.codec.pix_fmt} bit_depth={meta.codec.bit_depth} "
+        f"size={meta.codec.width}x{meta.codec.height}",
+        flush=True,
+    )
+    print(f"[offline] cuda {cuda_device_summary(0)}", flush=True)
+    backend_decision = select_backend(meta.timing, meta.codec, meta.color)
     decoder_mode = config.PASSTHROUGH_PYNV_DECODER
-    if decoder_mode == "threaded_serial":
-        dec = PyNvThreadedSerialDecoder(
-            src,
-            bit_depth=int(meta.codec.bit_depth or 8),
-            batch_size=config.PASSTHROUGH_PYNV_THREADED_BATCH_SIZE,
-            buffer_size=config.PASSTHROUGH_PYNV_THREADED_BUFFER_SIZE,
-        )
-    elif decoder_mode == "simple":
-        dec = PyNvSimpleDecoder(src, bit_depth=int(meta.codec.bit_depth or 8))
-    else:
-        raise RuntimeError(f"unknown PT_PASSTHROUGH_PYNV_DECODER={decoder_mode!r}")
+    if backend_decision.verdict == "ffmpeg_fallback":
+        decoder_mode = "ffmpeg_fallback"
+    elif backend_decision.verdict == "block":
+        raise RuntimeError(f"unsupported offline source: {backend_decision.reason}")
+    try:
+        if decoder_mode == "ffmpeg_fallback":
+            dec = FfmpegNv12SequentialDecoder(src)
+        elif decoder_mode == "threaded_serial":
+            dec = PyNvThreadedSerialDecoder(
+                src,
+                bit_depth=int(meta.codec.bit_depth or 8),
+                batch_size=config.PASSTHROUGH_PYNV_THREADED_BATCH_SIZE,
+                buffer_size=config.PASSTHROUGH_PYNV_THREADED_BUFFER_SIZE,
+            )
+        elif decoder_mode == "simple":
+            dec = PyNvSimpleDecoder(src, bit_depth=int(meta.codec.bit_depth or 8))
+        else:
+            raise RuntimeError(f"unknown PT_PASSTHROUGH_PYNV_DECODER={decoder_mode!r}")
+    except Exception as exc:
+        text = str(exc)
+        if "MBCount not supported" in text:
+            print(
+                "[offline] ERROR: PyNvVideoCodec/NVDEC rejected this video on the selected CUDA device. "
+                "This usually means gpu_id=0 is not the expected RTX GPU, the NVIDIA driver/video stack is "
+                "reporting the wrong decode capability, or the source codec/profile exceeds NVDEC support.",
+                flush=True,
+            )
+            print(f"[offline] ERROR detail: {text}", flush=True)
+            return 3
+        raise
     info = dec.info
     print(
         f"[offline] decoder={decoder_mode} "
         f"batch={config.PASSTHROUGH_PYNV_THREADED_BATCH_SIZE} "
-        f"buffer={config.PASSTHROUGH_PYNV_THREADED_BUFFER_SIZE}",
+        f"buffer={config.PASSTHROUGH_PYNV_THREADED_BUFFER_SIZE} "
+        f"backend_reason={backend_decision.reason}",
         flush=True,
     )
     timing = probe_timing_metadata(src)

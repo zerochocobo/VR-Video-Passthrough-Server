@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import Iterable
 
 import config
+from utils.subprocess_hidden import hidden_subprocess_kwargs
 
 
 RUNTIME_CACHE_DIR = config.RUNTIME_CACHE_DIR
@@ -203,6 +204,7 @@ def _driver_version() -> str:
             stderr=subprocess.DEVNULL,
             text=True,
             timeout=5,
+            **hidden_subprocess_kwargs(),
         )
         return out.splitlines()[0].strip()
     except Exception:

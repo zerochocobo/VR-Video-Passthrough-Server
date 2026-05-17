@@ -30,6 +30,11 @@ class OfflineProcess(QObject):
             env.insert(str(key), str(value))
         self.process.setProcessEnvironment(env)
         program, base_args = offline_command()
+        self.output.emit(
+            "[offline] GPU runtime initialization may take a while on first use. "
+            "If this is the first offline run after installation or a driver/model update, "
+            "the window can stay quiet for 1-3 minutes while CUDA/ONNX Runtime caches are built.\n"
+        )
         self.process.start(program, [*base_args, *args])
         self.state_changed.emit(True)
 

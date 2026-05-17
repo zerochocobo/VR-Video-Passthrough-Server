@@ -6,6 +6,8 @@ This file lists implemented user-facing and technically relevant changes. Entrie
 
 ### 2026-05-17
 
+- **v0.1.0-beta.1 officially released for public beta testing.**
+- **v0.1.0-beta.2 Patches and Additions**
 - Replaced the previous realtime/offline VRAM profile UI with Quality / Speed presets.
 - Set realtime Quality / Speed default to `P1` / ultrafast.
 - Added separate offline Quality / Speed settings with offline default `P4` / medium and optional `P7` / veryslow.
@@ -16,6 +18,16 @@ This file lists implemented user-facing and technically relevant changes. Entrie
 - Added distinct short-video DLNA ids/metadata for green and alpha live virtual files.
 - Added `GET /runtime_status` and a centered main status-bar indicator for current FPS and VRAM usage.
 - Added a server start/stop pending-state guard to prevent rapid repeated start/stop clicks.
+- Added offline GPU warmup notices and startup prediction logs for first-run offline conversions.
+- Added hidden-window handling for all `nvidia-smi` probes used by UI, diagnostics, runtime status, warmup, and offline tools.
+- Added shared NVIDIA compute capability checks and hard gates for realtime startup and offline conversion.
+- Added offline source-codec preflight plus an FFmpeg NV12 decode fallback for non-PyNv sources such as MPEG-4 Visual / `mp4v-20`.
+- Added a dedicated 4XVR live playback profile so AVPro/ExoPlayer reconnects can reuse managed live sessions.
+- Added flat 2D alpha passthrough: non-SBS 2D videos are projected into stereo fisheye SBS output with configurable FOV and disparity.
+- Updated flat 2D alpha output sizing so each fisheye eye scales by `180 / PT_ALPHA_2D_FOV`, preserving visible detail for the configured FOV.
+- Updated realtime and offline alpha paths to create encoders at the computed alpha output size before processing starts.
+- Fixed the main UI runtime status URL crash caused by a missing `os` import.
+- Added explicit DLNA passthrough mode/version query parameters and alpha-aware resolution metadata for green/alpha virtual files.
 
 ### 2026-05-16
 
@@ -45,6 +57,7 @@ This file lists implemented user-facing and technically relevant changes. Entrie
 
 ### 2026-05-13
 
+- **v0.1.0-alpha.1 officially released for limited public beta testing.**
 - Added the cold-start startup overlay for long first GPU warmup.
 - Added startup status polling on the local status port.
 - Added one-click diagnostic report copying from the startup overlay.
@@ -124,6 +137,9 @@ This file lists implemented user-facing and technically relevant changes. Entrie
 
 ### 2026-05-17
 
+- **v0.1.0-beta.1正式发布公测**
+- **v0.1.0-beta.2修补和新增功能**
+
 - 将实时/离线界面的“显存占用”配置替换为“画质速度”预设。
 - 实时模式默认画质速度设为 `P1` / 极速。
 - 新增离线独立画质速度设置，离线默认 `P4` / 均衡，并提供 `P7` / 高画质。
@@ -134,6 +150,16 @@ This file lists implemented user-facing and technically relevant changes. Entrie
 - 为短视频 DLNA 绿幕/alpha live 虚拟文件增加独立 id 和元数据。
 - 新增 `GET /runtime_status`，并在主窗口状态栏中间显示当前 FPS 和显存占用。
 - 新增服务器启动/停止 pending 状态，避免快速重复点击导致 start/stop 交错。
+- 为首次离线生成增加 GPU warmup 提示和启动预测日志。
+- 为 UI、诊断、运行状态、warmup 和离线工具中的 `nvidia-smi` 调用统一增加隐藏窗口处理。
+- 新增共享的 NVIDIA 计算能力检测，并在实时启动和离线转换中加入硬性拦截。
+- 新增离线源编码预检，并为 MPEG-4 Visual / `mp4v-20` 等非 PyNv 源增加 FFmpeg NV12 解码 fallback。
+- 新增 4XVR live 播放配置，使 AVPro/ExoPlayer 的重连可以复用托管 live session。
+- 新增普通 2D 视频 alpha 直通：非 SBS 2D 视频会投影为双眼鱼眼 SBS 输出，并支持 FOV 和视差配置。
+- 更新 2D alpha 输出尺寸规则，单眼鱼眼尺寸按 `180 / PT_ALPHA_2D_FOV` 放大，保留配置 FOV 下的可见细节。
+- 实时和离线 alpha 路径现在会在处理开始前按计算后的 alpha 输出尺寸创建编码器。
+- 修复主 UI 运行状态 URL 因缺少 `os` import 导致的崩溃。
+- 为 DLNA 绿幕/alpha 虚拟文件增加显式模式/版本 query，并补齐 alpha 输出解析度元数据。
 
 ### 2026-05-16
 
@@ -163,6 +189,7 @@ This file lists implemented user-facing and technically relevant changes. Entrie
 
 ### 2026-05-13
 
+- **v0.1.0-alpha.1正式发布小范围公测**
 - 新增首次 GPU warmup 长等待场景的启动遮罩。
 - 新增本地状态端口的启动状态轮询。
 - 新增启动遮罩中的一键复制诊断报告功能。

@@ -294,6 +294,21 @@ ALPHA_HARD_EDGE = _env("ALPHA_HARD_EDGE", "0") == "1"
 #   Values like 1.5-3.0 steepen soft edges while retaining some antialiasing.
 ALPHA_CONTRAST = max(0.01, float(_env("ALPHA_CONTRAST", 1.0)))
 
+# PT_ALPHA_2D_ENABLE:
+#   1 lets alpha passthrough convert non-SBS / non-2:1 flat videos into a
+#   stereo fisheye SBS output. Existing SBS VR sources keep the original path.
+ALPHA_2D_ENABLE = _env("ALPHA_2D_ENABLE", "1") == "1"
+
+# PT_ALPHA_2D_FOV:
+#   Field of view in degrees used when projecting a flat 2D video plane into
+#   each fisheye eye. 90 keeps the plane natural and avoids excessive zoom.
+ALPHA_2D_FOV = max(1.0, min(179.0, float(_env("ALPHA_2D_FOV", 80.0))))
+
+# PT_ALPHA_2D_DISPARITY_PX:
+#   Stereo offset for flat 2D alpha passthrough. The left eye image is shifted
+#   right by half this value and the right eye image is shifted left by half.
+ALPHA_2D_DISPARITY_PX = float(_env("ALPHA_2D_DISPARITY_PX", 10.0))
+
 # PT_RVM_IOBINDING:
 #   1 enables ORT IOBinding for the RVM path. This usually reduces copies and
 #   improves GPU throughput.

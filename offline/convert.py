@@ -18,9 +18,13 @@ if __package__ in (None, ""):
         sys.path.insert(0, str(project_root))
 
 import config
+from utils.gpu_requirements import detect_nvidia_gpu_requirement, unsupported_gpu_message
+from utils.subprocess_hidden import hidden_subprocess_kwargs
+from utils.video_metadata import probe_video_metadata, select_backend
 
 ROOT = config.ROOT
 VIDEO_EXTS = {".mp4", ".mkv", ".mov", ".m4v"}
+_WARMUP_NOTICE_PRINTED = False
 
 ENGINES = {
     "rvm_fast": ("rvm", ROOT / "models" / "rvm_mobilenetv3_fp32.onnx"),
@@ -131,7 +135,56 @@ def _base_cmd(args: argparse.Namespace, src: Path, out: Path) -> list[str]:
     return cmd
 
 
+def _print_warmup_notice() -> None:
+    global _WARMUP_NOTICE_PRINTED
+    if _WARMUP_NOTICE_PRINTED:
+        return
+    _WARMUP_NOTICE_PRINTED = True
+    try:
+        from utils.gpu_runtime_cache import predict_warmup_state
+
+        prediction = predict_warmup_state()
+        state = "cold" if prediction.cold else "cache-hit"
+        print(
+            "[offline] gpu warmup: "
+            f"state={state} reason={prediction.reason} eta={prediction.estimate_sec:.0f}s "
+            f"gpu={prediction.gpu_name or 'unknown'} cc={prediction.compute_capability or 'unknown'} "
+            f"ort={prediction.onnxruntime_version or 'unknown'}",
+            flush=True,
+        )
+        if prediction.cold:
+            print(
+                "[offline] gpu warmup: first offline run can appear idle while CUDA/CuPy/ONNX Runtime "
+                "load libraries and build caches. Please wait for the first [matting] or [offline-*] "
+                "progress line.",
+                flush=True,
+            )
+    except Exception as exc:
+        print(
+            "[offline] gpu warmup: checking cache state failed; first offline run may still take "
+            f"1-3 minutes before progress appears ({type(exc).__name__}: {exc})",
+            flush=True,
+        )
+
+
 def _run_one(args: argparse.Namespace, src: Path) -> int:
+    gpu_requirement = detect_nvidia_gpu_requirement()
+    if gpu_requirement.detected and not gpu_requirement.supported:
+        print(f"[offline] ERROR: {unsupported_gpu_message(gpu_requirement)}", flush=True)
+        return 3
+    meta = probe_video_metadata(src)
+    decision = select_backend(meta.timing, meta.codec, meta.color)
+    if decision.verdict == "block":
+        print(
+            "[offline] ERROR: unsupported source video. "
+            f"input codec={meta.codec.codec_name or 'unknown'} "
+            f"profile={meta.codec.profile or 'unknown'} "
+            f"pix_fmt={meta.codec.pix_fmt or 'unknown'} "
+            f"size={meta.codec.width}x{meta.codec.height}; "
+            f"reason={decision.reason}",
+            flush=True,
+        )
+        return 4
     default_out = _single_out(src, args) if getattr(args, "command", "") == "single" else _default_out(src, args.mode)
     if getattr(args, "out_dir", ""):
         out = Path(args.out_dir).resolve() / default_out.name
@@ -143,6 +196,7 @@ def _run_one(args: argparse.Namespace, src: Path) -> int:
     out.parent.mkdir(parents=True, exist_ok=True)
     cmd = _base_cmd(args, src, out)
     print("[offline] run: " + subprocess.list2cmdline(cmd), flush=True)
+    _print_warmup_notice()
     env = dict(os.environ)
     env["PYTHONUNBUFFERED"] = "1"
     print(
@@ -166,6 +220,7 @@ def _gpu_vram_gb() -> float:
             [exe, "--query-gpu=memory.total", "--format=csv,noheader,nounits"],
             text=True,
             stderr=subprocess.DEVNULL,
+            **hidden_subprocess_kwargs(),
         )
         first = out.strip().splitlines()[0]
         return float(first.strip()) / 1024.0

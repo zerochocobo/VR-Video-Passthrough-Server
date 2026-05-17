@@ -63,6 +63,7 @@ from pipeline.pynv_stream import PYNV_BACKEND_LABEL, PYNV_OUTPUT_CODEC, PyNvPass
 from pipeline.thumbnail import get_thumb
 from utils.bitrate_estimator import estimate_for_media, record_actual_bps
 from utils.logger import get
+from utils.subprocess_hidden import hidden_subprocess_kwargs
 from utils.mkv_cues import probe_mkv_cues
 from utils.subtitles import find_external_subtitles, is_subtitle_path, subtitle_mime
 from utils.video_metadata import probe_video_metadata, select_backend
@@ -492,6 +493,7 @@ def _query_vram_mib() -> tuple[float, float] | None:
             stderr=subprocess.DEVNULL,
             text=True,
             timeout=2,
+            **hidden_subprocess_kwargs(),
         )
     except Exception:
         return None
@@ -1157,6 +1159,8 @@ def _live_response_profile(user_agent: str) -> str:
     ua = user_agent.lower()
     if "nplayer" in ua:
         return "nplayer"
+    if "avpromobilevideo" in ua or "exoplayerlib" in ua:
+        return "4xvr"
     if "libmpv" in ua or "skybox" in ua:
         return "libmpv"
     if "dalvik/" in ua and "quest" in ua:
@@ -1373,7 +1377,7 @@ async def passthrough_live_get(
     live_max_fps = _live_adaptive_max_fps(path, live_meta)
     live_profile = _live_response_profile(user_agent)
     is_nplayer = _is_nplayer_client(user_agent)
-    use_managed_live_session = live_profile in {"libmpv", "quest_dalvik"} or is_nplayer
+    use_managed_live_session = live_profile in {"4xvr", "libmpv", "quest_dalvik"} or is_nplayer
     live_total = _estimated_passthrough_size(path, max(0.0, info.duration - t), PYNV_OUTPUT_CODEC)
     live_send_bps = _estimated_passthrough_bps(path, PYNV_OUTPUT_CODEC)
     live_send_pacing = PASSTHROUGH_SEND_REALTIME_PACING and live_profile != "libmpv"
@@ -1390,7 +1394,7 @@ async def passthrough_live_get(
             rid, range_header, live_byte_range, live_total,
         )
     if (
-        live_profile not in {"libmpv", "quest_dalvik"}
+        live_profile not in {"4xvr", "libmpv", "quest_dalvik"}
         and not is_nplayer
         and range_header
         and not _is_zero_open_range(range_header, live_byte_range)
@@ -1505,7 +1509,7 @@ async def passthrough_live_get(
         slot_token,
         who=f"live:{path.name}@{t:.2f}s",
         owner=owner,
-        allow_same_owner_preempt=is_nplayer or live_profile == "quest_dalvik",
+        allow_same_owner_preempt=is_nplayer or live_profile in {"4xvr", "quest_dalvik"},
     )
     if preempted is False:
         await _clear_live_starting(live_key, live_starting_at)

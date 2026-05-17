@@ -23,6 +23,8 @@ import sys
 from pathlib import Path
 from typing import Any
 
+from utils.subprocess_hidden import hidden_subprocess_kwargs
+
 
 def _safe(text: Any) -> str:
     if text is None:
@@ -51,6 +53,7 @@ def _nvidia_smi_summary() -> str:
             stderr=subprocess.DEVNULL,
             text=True,
             timeout=5,
+            **hidden_subprocess_kwargs(),
         )
         return out.strip()
     except FileNotFoundError:

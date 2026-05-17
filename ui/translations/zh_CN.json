@@ -11,6 +11,7 @@
   "dialog.warning": "提示",
   "dialog.stop_server_first": "请先停止服务器，避免显卡资源冲突",
   "dialog.stop_offline_first": "请先停止离线任务，避免显卡资源冲突",
+  "dialog.unsupported_gpu": "当前显卡不符合要求：{gpu}（计算能力 {cc}）。本软件需要 NVIDIA RTX 20 系列或更新显卡（计算能力 7.5 以上）。",
   "group.quick_config_short": "快速配置",
   "group.quick_config": "快速配置（修改后重启服务器生效）",
   "language.system": "跟随系统",

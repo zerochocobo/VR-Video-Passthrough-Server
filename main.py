@@ -19,6 +19,12 @@ from utils.gpu_runtime_cache import (
     predict_warmup_state,
     warmup_gpu_runtime_cache,
 )
+from utils.gpu_requirements import (
+    MIN_NVIDIA_COMPUTE_CAPABILITY,
+    parse_compute_capability,
+    unsupported_gpu_message,
+    GpuRequirementResult,
+)
 from utils.logger import get, setup
 from utils.startup_status import (
     reset_startup_progress,
@@ -169,6 +175,37 @@ def main(argv: list[str] | None = None) -> int:
                 prediction.compute_capability,
                 prediction.onnxruntime_version,
             )
+            cc = parse_compute_capability(prediction.compute_capability)
+            if cc is not None and cc < MIN_NVIDIA_COMPUTE_CAPABILITY:
+                message = unsupported_gpu_message(
+                    GpuRequirementResult(
+                        detected=True,
+                        supported=False,
+                        name=prediction.gpu_name,
+                        compute_capability=prediction.compute_capability,
+                    )
+                )
+                set_startup_phase(
+                    "failed",
+                    message,
+                    step="gpu_requirement",
+                    step_index=0,
+                    step_total=4,
+                    progress=0.0,
+                    eta_sec=0.0,
+                    cold=prediction.cold,
+                    is_known_slow=prediction.is_known_slow,
+                    gpu_name=prediction.gpu_name,
+                    compute_capability=prediction.compute_capability,
+                    driver_version=prediction.driver_version,
+                    onnxruntime_version=prediction.onnxruntime_version,
+                    reason="unsupported_gpu",
+                    detail=message,
+                )
+                log.error(message)
+                time.sleep(0.8)
+                stop_startup_status_server()
+                return 1
         except Exception as e:
             log.warning("warmup prediction failed (non-fatal): %s", e)
             set_startup_phase("warming", "GPU runtime warmup")

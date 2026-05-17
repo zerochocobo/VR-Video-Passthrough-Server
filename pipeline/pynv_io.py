@@ -12,6 +12,31 @@ from pathlib import Path
 from typing import Any
 
 
+def cuda_device_summary(gpu_id: int = 0) -> str:
+    """Return a compact CUDA device summary for diagnostics."""
+    try:
+        import cupy as cp
+
+        gpu = int(gpu_id)
+        props = cp.cuda.runtime.getDeviceProperties(gpu)
+        name = props.get("name", b"")
+        if isinstance(name, bytes):
+            name = name.decode("utf-8", "replace")
+        major = int(props.get("major", 0))
+        minor = int(props.get("minor", 0))
+        with cp.cuda.Device(gpu):
+            free_bytes, total_bytes = cp.cuda.runtime.memGetInfo()
+        driver = cp.cuda.runtime.driverGetVersion()
+        runtime = cp.cuda.runtime.runtimeGetVersion()
+        return (
+            f"gpu_id={gpu} name={name} cc={major}.{minor} "
+            f"vram={total_bytes / (1024 ** 3):.1f}GB free={free_bytes / (1024 ** 3):.1f}GB "
+            f"driver={driver} runtime={runtime}"
+        )
+    except Exception as exc:
+        return f"gpu_id={gpu_id} unavailable: {type(exc).__name__}: {exc}"
+
+
 @dataclass(frozen=True)
 class CudaPlane:
     """A CUDA Array Interface plane owned by a PyNvVideoCodec DecodedFrame."""
@@ -372,6 +397,89 @@ class PyNvThreadedSerialDecoder:
         end = getattr(self._decoder, "end", None)
         if callable(end):
             end()
+        self._ended = True
+
+
+class FfmpegNv12SequentialDecoder:
+    """Sequential FFmpeg raw-NV12 decoder that uploads frames to GPU memory.
+
+    This is a compatibility fallback for source codecs that PyNv/NVDEC rejects
+    at high resolution, such as MPEG-4 Visual. It preserves the downstream
+    GPU matting/composite/PyNv encode path, but decode itself goes through
+    FFmpeg and a host-to-device upload.
+    """
+
+    def __init__(
+        self,
+        src: Path,
+        start_sec: float = 0.0,
+        max_fps: float | None = None,
+    ):
+        import config
+
+        config.DECODE_MAX_SIDE = 0
+        config.DECODE_PIX_FMT = "nv12"
+        from pipeline.ffmpeg_io import DecoderProcess, probe
+
+        self.src = Path(src).resolve()
+        self.start_sec = max(0.0, float(start_sec or 0.0))
+        self._probe_info = probe(self.src)
+        self._decoder = DecoderProcess(self.src, self.start_sec, self._probe_info, max_fps=max_fps)
+        self.info = PyNvVideoInfo(
+            width=int(self._decoder.out_info.width),
+            height=int(self._decoder.out_info.height),
+            fps=float(self._decoder.out_info.fps),
+            duration=max(0.0, float(self._decoder.out_info.duration) - self.start_sec),
+            codec_name=str(self._probe_info.codec_name),
+            bitrate=0.0,
+            num_frames=int(max(1, round(max(0.0, float(self._probe_info.duration) - self.start_sec) * self._decoder.out_info.fps))),
+        )
+        self._next_index = 0
+        self._ended = False
+
+    def __len__(self) -> int:
+        return self.info.num_frames
+
+    def frame_at(self, index: int) -> GpuNv12Frame:
+        import numpy as np
+        import cupy as cp
+
+        if self._ended:
+            raise RuntimeError("FFmpeg decoder has already ended")
+        target = int(index)
+        if target < self._next_index:
+            raise ValueError(
+                f"FFmpeg sequential decoder only supports monotonic access: "
+                f"target={target} next_index={self._next_index}"
+            )
+        raw = None
+        while self._next_index <= target:
+            raw = self._decoder.read_frame()
+            if raw is None:
+                raise RuntimeError(f"FFmpeg decoder ended before frame {target}")
+            self._next_index += 1
+        assert raw is not None
+        h, w = int(self.info.height), int(self.info.width)
+        arr = np.frombuffer(raw, dtype=np.uint8).reshape(h + h // 2, w)
+        nv12 = cp.asarray(arr)
+        y = nv12[:h, :]
+        uv = nv12[h:, :]
+        owner = nv12
+        return GpuNv12Frame(
+            owner=owner,
+            y=CudaPlane.from_cupy_array(y),
+            uv=CudaPlane.from_cupy_array(uv),
+            width=w,
+            height=h,
+            pts=target,
+        )
+
+    def stop(self) -> None:
+        if self._ended:
+            return
+        close = getattr(self._decoder, "close", None)
+        if callable(close):
+            close()
         self._ended = True
 
 

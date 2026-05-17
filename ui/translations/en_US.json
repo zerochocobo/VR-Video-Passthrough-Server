@@ -11,6 +11,7 @@
   "dialog.warning": "Warning",
   "dialog.stop_server_first": "Please stop the server first to avoid GPU resource conflicts.",
   "dialog.stop_offline_first": "Please stop the offline task first to avoid GPU resource conflicts.",
+  "dialog.unsupported_gpu": "Unsupported GPU: {gpu} (compute capability {cc}). NVIDIA RTX 20 series or newer is required (compute capability 7.5 or higher).",
   "group.quick_config_short": "Quick Settings",
   "group.quick_config": "Quick Settings (restart server to apply changes)",
   "language.system": "Follow system",

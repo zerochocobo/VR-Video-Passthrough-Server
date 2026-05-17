@@ -32,6 +32,7 @@ from config import (
     VIDEO_EXTS,
 )
 from dlna.profiles import passthrough_frame_rate
+from pipeline.alpha_packer import alpha_output_size
 from pipeline.ffmpeg_io import probe_cached
 from utils.bitrate_estimator import estimate_for_media
 from utils.logger import get
@@ -56,7 +57,9 @@ DLNA_FLAGS_TIME_SEEK = "41700000000000000000000000000000"
 DIDL_NS = "urn:schemas-upnp-org:metadata-1-0/DIDL-Lite/"
 
 _DIR_ITEMS_CACHE_MAX = 256
-_dir_items_cache: dict[tuple[str, str, str, int, int], list[dict]] = {}
+_DIDL_SCHEMA_VERSION = 3
+_SYSTEM_UPDATE_ID = _DIDL_SCHEMA_VERSION
+_dir_items_cache: dict[tuple, list[dict]] = {}
 
 
 def _parse_bitrate(s: str) -> int:
@@ -213,9 +216,21 @@ def _passthrough_live_item_prefix(mode: str) -> str:
 
 
 def _passthrough_live_query(mode: str) -> str:
-    if PASSTHROUGH_OUTPUT_MODE == "all":
-        return f"mode={mode}"
-    return ""
+    version = f"ptv={_DIDL_SCHEMA_VERSION}"
+    if mode in {"green", "alpha"}:
+        return f"mode={mode}&{version}"
+    return version
+
+
+def _resolution_str(width: int, height: int) -> str:
+    return f"{int(width)}x{int(height)}" if int(width) > 0 and int(height) > 0 else ""
+
+
+def _passthrough_resolution(width: int, height: int, mode: str) -> str:
+    if mode == "alpha" and width > 0 and height > 0:
+        out_w, out_h = alpha_output_size(width, height)
+        return _resolution_str(out_w, out_h)
+    return _resolution_str(width, height)
 
 
 def _live_chapter_offsets(duration: float) -> list[int]:
@@ -266,19 +281,25 @@ def _video_items_from_index(path: Path, parent_id: str, child: IndexedChild | No
     size = child.size if child is not None else path.stat().st_size
     if child is not None and child.video is not None:
         duration = child.video.duration
-        resolution = child.video.resolution
+        width = int(child.video.width)
+        height = int(child.video.height)
+        resolution = _resolution_str(width, height)
         backend_verdict = child.video.backend_verdict
     else:
         try:
             info = probe_cached(path)
             duration = info.duration
-            resolution = f"{info.width}x{info.height}"
+            width = int(info.width)
+            height = int(info.height)
+            resolution = _resolution_str(width, height)
             meta = probe_video_metadata(path)
             backend = select_backend(meta.timing, meta.codec, meta.color)
             backend_verdict = backend.verdict
         except Exception as e:
             log.warning("probe %s failed: %s", rel, e)
             duration = 0.0
+            width = 0
+            height = 0
             resolution = ""
             backend_verdict = ""
 
@@ -339,7 +360,7 @@ def _video_items_from_index(path: Path, parent_id: str, child: IndexedChild | No
                     "thumb": f"{base}/thumb/{quoted}",
                     "size": 0,
                     "duration": duration,
-                    "resolution": resolution,
+                    "resolution": _passthrough_resolution(width, height, mode),
                     "bitrate": pt_bps_est,
                     "mime": "video/MP2T",
                     "dlna_pn": "HEVC_TS_NA_ISO",
@@ -363,19 +384,21 @@ def _live_chapter_items(path: Path, mode: str) -> list[dict]:
     try:
         info = probe_cached(path)
         duration = info.duration
-        resolution = f"{info.width}x{info.height}"
+        width = int(info.width)
+        height = int(info.height)
     except Exception as e:
         log.warning("probe live chapters %s failed: %s", rel, e)
         duration = 0.0
-        resolution = ""
+        width = 0
+        height = 0
     pt_bps = _parse_bitrate(PASSTHROUGH_BITRATE)
     if duration > 0:
         _, pt_bps_est, _ = estimate_for_media(path, duration, PYNV_OUTPUT_CODEC)
     else:
         pt_bps_est = pt_bps
     items: list[dict] = []
-    suffix = "alpha" if mode == "alpha" else "green"
     virtual_title = _passthrough_virtual_title(path, mode)
+    suffix = "alpha" if mode == "alpha" else "green"
     for offset in _live_chapter_offsets(duration):
         title = f"{_fmt_title_time(offset)}_{virtual_title}"
         remain = max(0.0, duration - float(offset)) if duration > 0 else 0.0
@@ -388,7 +411,7 @@ def _live_chapter_items(path: Path, mode: str) -> list[dict]:
                 "thumb": f"{base}/thumb/{quoted}",
                 "size": 0,
                 "duration": remain,
-                "resolution": resolution,
+                "resolution": _passthrough_resolution(width, height, mode),
                 "bitrate": pt_bps_est,
                 "mime": "video/MP2T",
                 "dlna_pn": "HEVC_TS_NA_ISO",
@@ -419,6 +442,7 @@ def _children_for_dir(directory: Path) -> list[dict]:
         int(subtitle_output_enabled()),
         int(PASSTHROUGH_LIVE_CHAPTER_MAX_ITEMS),
         int(PASSTHROUGH_LIVE_CHAPTER_MIN_INTERVAL_SEC),
+        _DIDL_SCHEMA_VERSION,
     )
     cached = _dir_items_cache.get(cache_key)
     if cached is not None:
@@ -688,7 +712,7 @@ def handle_soap(soap_action: str, body: bytes) -> tuple[bytes, int]:
                 f"<Result>{html.escape(didl)}</Result>"
                 f"<NumberReturned>1</NumberReturned>"
                 f"<TotalMatches>1</TotalMatches>"
-                f"<UpdateID>1</UpdateID>",
+                f"<UpdateID>{_SYSTEM_UPDATE_ID}</UpdateID>",
             ), 200
 
         end = start + count if count > 0 else len(all_items)
@@ -698,7 +722,7 @@ def handle_soap(soap_action: str, body: bytes) -> tuple[bytes, int]:
             f"<Result>{html.escape(didl)}</Result>"
             f"<NumberReturned>{len(page)}</NumberReturned>"
             f"<TotalMatches>{len(all_items)}</TotalMatches>"
-            f"<UpdateID>1</UpdateID>"
+            f"<UpdateID>{_SYSTEM_UPDATE_ID}</UpdateID>"
         )
         return _wrap_soap("Browse", body_xml), 200
 
@@ -707,7 +731,7 @@ def handle_soap(soap_action: str, body: bytes) -> tuple[bytes, int]:
     if action == "GetSortCapabilities":
         return _wrap_soap("GetSortCapabilities", "<SortCaps></SortCaps>"), 200
     if action == "GetSystemUpdateID":
-        return _wrap_soap("GetSystemUpdateID", "<Id>1</Id>"), 200
+        return _wrap_soap("GetSystemUpdateID", f"<Id>{_SYSTEM_UPDATE_ID}</Id>"), 200
 
     fault = (
         '<?xml version="1.0" encoding="utf-8"?>'

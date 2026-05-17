@@ -6,12 +6,32 @@ alpha mask is packed into the visible frame using the six-block layout.
 """
 from __future__ import annotations
 
+import math
+
 import numpy as np
 
 import config
 
 PACK_SCALE = 0.4
 FISHEYE_RADIUS_SCALE = 1.0
+
+
+def is_sbs_vr_size(w: int, h: int) -> bool:
+    return int(w) > 0 and int(h) > 0 and int(w) >= 2 * int(h)
+
+
+def alpha_output_size(src_w: int, src_h: int) -> tuple[int, int]:
+    """Return alpha passthrough output size for an already-scaled source frame."""
+    src_w = max(2, int(src_w) & ~1)
+    src_h = max(2, int(src_h) & ~1)
+    if is_sbs_vr_size(src_w, src_h) or not config.ALPHA_2D_ENABLE:
+        return src_w, src_h
+    fov = max(1.0, min(179.0, float(config.ALPHA_2D_FOV)))
+    eye = int(math.ceil(max(src_w, src_h) * 180.0 / fov))
+    if eye & 1:
+        eye += 1
+    eye = max(2, eye)
+    return eye * 2, eye
 
 
 class AlphaPacker:
@@ -97,6 +117,62 @@ class AlphaPacker:
         u = u < 0.f ? 0.f : (u > (float)(eye_w - 1) ? (float)(eye_w - 1) : u);
         v = v < 0.f ? 0.f : (v > (float)(out_h - 1) ? (float)(out_h - 1) : v);
         *src_x = u + (float)(eye * eye_w);
+        *src_y = v;
+        return true;
+    }
+
+    __device__ bool fisheye_to_flat_2d(
+        int x, int y,
+        int out_w, int out_h,
+        int src_w, int src_h,
+        float radius_scale,
+        float fov_rad,
+        float disparity_px,
+        float* src_x,
+        float* src_y
+    ) {
+        int eye_w = out_w >> 1;
+        int eye = x >= eye_w ? 1 : 0;
+        float lx = (float)(x - eye * eye_w) + 0.5f;
+        float ly = (float)y + 0.5f;
+        float cx = (float)eye_w * 0.5f;
+        float cy = (float)out_h * 0.5f;
+        float radius = fminf((float)eye_w, (float)out_h) * 0.5f * radius_scale;
+        float nx = (lx - cx) / radius;
+        float ny = (ly - cy) / radius;
+        float rr = sqrtf(nx * nx + ny * ny);
+        if (rr > 1.f) {
+            return false;
+        }
+
+        float theta = rr * 1.5707963267948966f;
+        float az = atan2f(-ny, nx);
+        float sin_t = sinf(theta);
+        float dir_x = sin_t * cosf(az);
+        float dir_y = sin_t * sinf(az);
+        float dir_z = cosf(theta);
+        if (dir_z <= 1.0e-6f) {
+            return false;
+        }
+
+        float plane_scale = tanf(fov_rad * 0.5f);
+        float px = dir_x / dir_z / plane_scale;
+        float py = -dir_y / dir_z / plane_scale;
+        if (px < -1.f || px > 1.f || py < -1.f || py > 1.f) {
+            return false;
+        }
+
+        float canvas = (float)(src_w > src_h ? src_w : src_h);
+        float x0 = (canvas - (float)src_w) * 0.5f;
+        float y0 = (canvas - (float)src_h) * 0.5f;
+        float u = (px * 0.5f + 0.5f) * canvas - x0;
+        float v = (py * 0.5f + 0.5f) * canvas - y0;
+        float eye_shift = eye == 0 ? (disparity_px * 0.5f) : (-disparity_px * 0.5f);
+        u -= eye_shift;
+        if (u < 0.f || u > (float)(src_w - 1) || v < 0.f || v > (float)(src_h - 1)) {
+            return false;
+        }
+        *src_x = u;
         *src_y = v;
         return true;
     }
@@ -273,6 +349,54 @@ class AlphaPacker:
     }
 
     extern "C" __global__
+    void project_flat2d_fisheye_nv12_alpha(
+        const unsigned char* __restrict__ src_nv12,
+        const float* __restrict__ alpha_lr,
+        int src_w, int src_h,
+        int out_w, int out_h,
+        int aw, int ah,
+        float radius_scale,
+        float fov_rad,
+        float disparity_px,
+        float alpha_cutoff, int alpha_hard_edge, float alpha_contrast,
+        unsigned char* __restrict__ out_nv12,
+        unsigned char* __restrict__ fisheye_alpha
+    ) {
+        int x = blockIdx.x * blockDim.x + threadIdx.x;
+        int y = blockIdx.y * blockDim.y + threadIdx.y;
+        if (x >= out_w || y >= out_h) return;
+
+        int y_idx = y * out_w + x;
+        float src_x = 0.f;
+        float src_y = 0.f;
+        bool inside = fisheye_to_flat_2d(
+            x, y, out_w, out_h, src_w, src_h, radius_scale, fov_rad, disparity_px, &src_x, &src_y
+        );
+        unsigned char yv = inside ? sample_y_bilinear(src_nv12, src_w, src_h, src_x, src_y) : (unsigned char)16;
+        unsigned char uv_u = 128;
+        unsigned char uv_v = 128;
+        if (inside) {
+            sample_uv_nearest(src_nv12, src_w, src_h, src_x, src_y, &uv_u, &uv_v);
+        }
+        out_nv12[y_idx] = yv;
+
+        float a = 0.f;
+        if (inside) {
+            a = adjust_alpha(
+                sample_alpha_lr(alpha_lr, aw, ah, src_w, src_h, (int)src_x, (int)src_y),
+                alpha_cutoff, alpha_hard_edge, alpha_contrast
+            );
+        }
+        fisheye_alpha[y_idx] = (unsigned char)(a * 255.f + 0.5f);
+
+        if (((x | y) & 1) == 0) {
+            int uv_idx = out_w * out_h + (y >> 1) * out_w + x;
+            out_nv12[uv_idx] = uv_u;
+            out_nv12[uv_idx + 1] = uv_v;
+        }
+    }
+
+    extern "C" __global__
     void blend_projected_overlay_to_fisheye(
         unsigned char* __restrict__ out_nv12,
         unsigned char* __restrict__ fisheye_alpha,
@@ -386,11 +510,20 @@ class AlphaPacker:
         self.alpha_contrast = config.ALPHA_CONTRAST if alpha_contrast is None else float(alpha_contrast)
         self._cp = cp
         self._project_kernel = cp.RawKernel(self._KERNEL_SRC, "project_fisheye_nv12_alpha")
+        self._project_flat2d_kernel = cp.RawKernel(self._KERNEL_SRC, "project_flat2d_fisheye_nv12_alpha")
         self._overlay_kernel = cp.RawKernel(self._KERNEL_SRC, "overlay_alpha_packer_layout")
         self._blend_projected_overlay_kernel = cp.RawKernel(self._KERNEL_SRC, "blend_projected_overlay_to_fisheye")
         self._g_alpha = None
         self._g_fisheye_alpha = None
         self._g_overlay = None
+
+    def output_size(self, src_w: int, src_h: int) -> tuple[int, int]:
+        return alpha_output_size(src_w, src_h)
+
+    def projection_mode(self, src_w: int, src_h: int) -> str:
+        if is_sbs_vr_size(src_w, src_h) or not config.ALPHA_2D_ENABLE:
+            return "sbs_half_equirect"
+        return "flat2d"
 
     def _blend_one_projected_subtitle(self, out_nv12, h: int, w: int, alpha_w: int, alpha_h: int, subtitle_overlay) -> None:
         cp = self._cp
@@ -432,7 +565,7 @@ class AlphaPacker:
         for overlay in overlays:
             self._blend_one_projected_subtitle(out_nv12, h, w, alpha_w, alpha_h, overlay)
 
-    def pack_uploaded(self, alpha, h: int, w: int, subtitle_overlay=None):
+    def pack_uploaded(self, alpha, h: int, w: int, subtitle_overlay=None, out_h: int | None = None, out_w: int | None = None):
         cp = self._cp
         if hasattr(alpha, "data") and hasattr(alpha.data, "ptr"):
             alpha_dev = alpha.astype(cp.float32, copy=False)
@@ -446,44 +579,73 @@ class AlphaPacker:
             self._g_alpha.set(alpha)
             alpha_dev = self._g_alpha
 
-        alpha_w = max(4, int(round(w * self.scale)) & ~3)
-        alpha_h = max(2, int(round(h * self.scale)) & ~1)
-        if alpha_w > w or alpha_h > h:
-            raise RuntimeError(f"alpha pack does not fit: frame={w}x{h} alpha={alpha_w}x{alpha_h}")
+        src_h = int(h)
+        src_w = int(w)
+        if out_w is None or out_h is None:
+            out_w, out_h = self.output_size(src_w, src_h)
+        out_w, out_h = int(out_w), int(out_h)
+        alpha_w = max(4, int(round(out_w * self.scale)) & ~3)
+        alpha_h = max(2, int(round(out_h * self.scale)) & ~1)
+        if alpha_w > out_w or alpha_h > out_h:
+            raise RuntimeError(f"alpha pack does not fit: frame={out_w}x{out_h} alpha={alpha_w}x{alpha_h}")
 
-        out_nv12 = self.matter._ensure_dev_nv12_out(h, w)
-        if self._g_fisheye_alpha is None or self._g_fisheye_alpha.shape != (h, w):
-            self._g_fisheye_alpha = cp.empty((h, w), dtype=cp.uint8)
+        out_nv12 = self.matter._ensure_dev_nv12_out(out_h, out_w)
+        if self._g_fisheye_alpha is None or self._g_fisheye_alpha.shape != (out_h, out_w):
+            self._g_fisheye_alpha = cp.empty((out_h, out_w), dtype=cp.uint8)
 
         ah, aw = alpha_dev.shape[:2]
         block = (16, 16, 1)
-        grid = ((w + block[0] - 1) // block[0], (h + block[1] - 1) // block[1], 1)
-        self._project_kernel(
-            grid,
-            block,
-            (
-                self.matter._g_frame,
-                alpha_dev,
-                np.int32(w),
-                np.int32(h),
-                np.int32(aw),
-                np.int32(ah),
-                np.float32(self.radius_scale),
-                np.float32(self.alpha_cutoff),
-                np.int32(1 if self.alpha_hard_edge else 0),
-                np.float32(self.alpha_contrast),
-                out_nv12,
-                self._g_fisheye_alpha,
-            ),
-        )
-        self._blend_projected_subtitles(out_nv12, h, w, alpha_w, alpha_h, subtitle_overlay)
+        grid = ((out_w + block[0] - 1) // block[0], (out_h + block[1] - 1) // block[1], 1)
+        if self.projection_mode(src_w, src_h) == "flat2d":
+            self._project_flat2d_kernel(
+                grid,
+                block,
+                (
+                    self.matter._g_frame,
+                    alpha_dev,
+                    np.int32(src_w),
+                    np.int32(src_h),
+                    np.int32(out_w),
+                    np.int32(out_h),
+                    np.int32(aw),
+                    np.int32(ah),
+                    np.float32(self.radius_scale),
+                    np.float32(np.deg2rad(config.ALPHA_2D_FOV)),
+                    np.float32(config.ALPHA_2D_DISPARITY_PX),
+                    np.float32(self.alpha_cutoff),
+                    np.int32(1 if self.alpha_hard_edge else 0),
+                    np.float32(self.alpha_contrast),
+                    out_nv12,
+                    self._g_fisheye_alpha,
+                ),
+            )
+        else:
+            self._project_kernel(
+                grid,
+                block,
+                (
+                    self.matter._g_frame,
+                    alpha_dev,
+                    np.int32(out_w),
+                    np.int32(out_h),
+                    np.int32(aw),
+                    np.int32(ah),
+                    np.float32(self.radius_scale),
+                    np.float32(self.alpha_cutoff),
+                    np.int32(1 if self.alpha_hard_edge else 0),
+                    np.float32(self.alpha_contrast),
+                    out_nv12,
+                    self._g_fisheye_alpha,
+                ),
+            )
+        self._blend_projected_subtitles(out_nv12, out_h, out_w, alpha_w, alpha_h, subtitle_overlay)
         self._overlay_kernel(
             grid,
             block,
             (
                 self._g_fisheye_alpha,
-                np.int32(w),
-                np.int32(h),
+                np.int32(out_w),
+                np.int32(out_h),
                 np.int32(alpha_w),
                 np.int32(alpha_h),
                 out_nv12,
@@ -503,14 +665,16 @@ class AlphaPacker:
         src_h, src_w = int(frame.height), int(frame.width)
         w, h = self.matter.pynv_scaled_size(src_w, src_h) if use_config_scale else (src_w, src_h)
         if out_w is not None and out_h is not None:
-            w, h = int(out_w), int(out_h)
+            pack_w, pack_h = int(out_w), int(out_h)
+        else:
+            pack_w, pack_h = self.output_size(w, h)
         self.matter.upload_nv12_planes_gpu_scaled(frame.y.as_cupy(), frame.uv.as_cupy(), src_h, src_w, h, w)
         alpha, timing, _ = self.matter._alpha_low_res_gpu(h, w, use_nv12=True)
         if before_pack is not None:
             result = before_pack(self.matter._g_frame)
             if result is not None:
                 subtitle_overlay = result
-        return self.pack_uploaded(alpha, h, w, subtitle_overlay=subtitle_overlay), timing
+        return self.pack_uploaded(alpha, h, w, subtitle_overlay=subtitle_overlay, out_h=pack_h, out_w=pack_w), timing
 
     def pack_gpu_p016_frame(
         self,
@@ -525,7 +689,9 @@ class AlphaPacker:
         src_h, src_w = int(frame.height), int(frame.width)
         w, h = self.matter.pynv_scaled_size(src_w, src_h) if use_config_scale else (src_w, src_h)
         if out_w is not None and out_h is not None:
-            w, h = int(out_w), int(out_h)
+            pack_w, pack_h = int(out_w), int(out_h)
+        else:
+            pack_w, pack_h = self.output_size(w, h)
         self.matter.upload_p016_planes_as_nv12_gpu_scaled(
             frame.y.as_cupy(),
             frame.uv.as_cupy(),
@@ -540,4 +706,4 @@ class AlphaPacker:
             result = before_pack(self.matter._g_frame)
             if result is not None:
                 subtitle_overlay = result
-        return self.pack_uploaded(alpha, h, w, subtitle_overlay=subtitle_overlay), timing
+        return self.pack_uploaded(alpha, h, w, subtitle_overlay=subtitle_overlay, out_h=pack_h, out_w=pack_w), timing
