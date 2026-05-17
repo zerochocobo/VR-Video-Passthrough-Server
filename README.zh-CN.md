@@ -58,6 +58,42 @@ uv run python main.py
 uv run python -m ui.app
 ```
 
+## 端口与防火墙
+
+软件启动实时服务器时会占用以下网络端口：
+
+| 用途 | 协议 / 端口 | 说明 |
+| --- | --- | --- |
+| HTTP 媒体服务 | TCP 8200 | 提供 DLNA 设备描述、媒体目录、缩略图、原始视频和实时透视视频流。可通过环境变量 `PT_HTTP_PORT` 修改。 |
+| SSDP / UPnP 发现 | UDP 1900 | 用于让 VR 播放器在局域网内发现本机 DLNA 服务器。 |
+| 启动状态 | TCP 8299（仅本机） | UI 启动过程中读取 GPU warmup / 启动状态使用。默认只给本机 UI 使用，可通过 `PT_STARTUP_STATUS_PORT` 修改。 |
+
+首次启动时，程序会尝试自动添加 Windows 防火墙入站规则：
+
+- `PTServer HTTP Private`：允许专用网络上的 TCP 8200 入站。
+- `PTServer SSDP Private`：允许专用网络上的 UDP 1900 入站。
+
+如果 Windows 弹出 UAC / 防火墙确认窗口，请选择允许。建议只允许“专用网络”，不要暴露到公用网络。
+
+如果误点了拒绝，或播放器无法发现服务器，可以手动添加规则。以管理员身份打开 PowerShell 或命令提示符，执行：
+
+```powershell
+netsh advfirewall firewall add rule name="PTServer HTTP Private" dir=in action=allow protocol=TCP localport=8200 profile=private edge=no enable=yes
+netsh advfirewall firewall add rule name="PTServer SSDP Private" dir=in action=allow protocol=UDP localport=1900 profile=private edge=no enable=yes
+```
+
+如果你修改了 `PT_HTTP_PORT`，请把第一条命令中的 `8200` 换成实际端口。UDP 1900 是 UPnP/SSDP 标准发现端口，通常不需要修改。
+
+也可以通过 Windows 图形界面设置：
+
+1. 打开“Windows 安全中心” -> “防火墙和网络保护” -> “高级设置”。
+2. 进入“入站规则”，新建规则。
+3. 规则类型选择“端口”。
+4. 分别添加 `TCP 8200` 和 `UDP 1900`。
+5. 操作选择“允许连接”。
+6. 配置文件建议只勾选“专用”。
+7. 名称可填写 `PTServer HTTP Private` 和 `PTServer SSDP Private`。
+
 ## 支持的 VR 视频播放器
 
 基于 Meta Quest 3 设备测试。

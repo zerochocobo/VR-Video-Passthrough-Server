@@ -58,6 +58,42 @@ uv run python main.py
 uv run python -m ui.app
 ```
 
+## ポートとファイアウォール
+
+リアルタイムサーバーを起動すると、次のネットワークポートを使用します。
+
+| 用途 | プロトコル / ポート | 説明 |
+| --- | --- | --- |
+| HTTP メディアサービス | TCP 8200 | DLNA デバイス記述、メディアカタログ、サムネイル、元動画、リアルタイム passthrough ストリームを提供します。`PT_HTTP_PORT` で変更できます。 |
+| SSDP / UPnP 検出 | UDP 1900 | LAN 内の VR プレイヤーがこの DLNA サーバーを検出するために使用します。 |
+| 起動ステータス | TCP 8299（ローカルホストのみ） | デスクトップ UI が GPU warmup / 起動状態を読むために使用します。デフォルトではローカル UI 用です。`PT_STARTUP_STATUS_PORT` で変更できます。 |
+
+初回起動時、アプリケーションは次の Windows ファイアウォール受信規則を自動追加しようとします。
+
+- `PTServer HTTP Private`: プライベートネットワーク上の TCP 8200 受信を許可します。
+- `PTServer SSDP Private`: プライベートネットワーク上の UDP 1900 受信を許可します。
+
+Windows が UAC / ファイアウォール確認を表示した場合は、許可してください。通常の家庭内 LAN 利用では「プライベートネットワーク」のみ許可し、パブリックネットワークには公開しないことを推奨します。
+
+誤って拒否した場合、または VR プレイヤーがサーバーを検出できない場合は、手動で規則を追加できます。PowerShell またはコマンドプロンプトを管理者として開き、次を実行してください。
+
+```powershell
+netsh advfirewall firewall add rule name="PTServer HTTP Private" dir=in action=allow protocol=TCP localport=8200 profile=private edge=no enable=yes
+netsh advfirewall firewall add rule name="PTServer SSDP Private" dir=in action=allow protocol=UDP localport=1900 profile=private edge=no enable=yes
+```
+
+`PT_HTTP_PORT` を変更した場合は、1 行目の `8200` を実際のポートに置き換えてください。UDP 1900 は UPnP/SSDP の標準検出ポートなので、通常は変更不要です。
+
+Windows の GUI から設定することもできます。
+
+1. 「Windows セキュリティ」 -> 「ファイアウォールとネットワーク保護」 -> 「詳細設定」を開きます。
+2. 「受信の規則」に入り、新しい規則を作成します。
+3. 規則の種類は「ポート」を選択します。
+4. `TCP 8200` と `UDP 1900` を別々の規則として追加します。
+5. 操作は「接続を許可する」を選択します。
+6. 可能であればプロファイルは「プライベート」のみ選択します。
+7. 規則名は `PTServer HTTP Private` と `PTServer SSDP Private` にします。
+
 ## 対応 VR 動画プレイヤー
 
 Meta Quest 3 でテストしています。

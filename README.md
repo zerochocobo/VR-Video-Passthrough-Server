@@ -59,6 +59,42 @@ Launch the desktop UI:
 uv run python -m ui.app
 ```
 
+## Ports and Firewall
+
+When the realtime server starts, it uses the following network ports:
+
+| Purpose | Protocol / Port | Description |
+| --- | --- | --- |
+| HTTP media service | TCP 8200 | Serves the DLNA device description, media catalog, thumbnails, source videos, and realtime passthrough streams. You can change it with `PT_HTTP_PORT`. |
+| SSDP / UPnP discovery | UDP 1900 | Lets VR players discover the local DLNA server on your LAN. |
+| Startup status | TCP 8299 (localhost only) | Used by the desktop UI to read GPU warmup / startup status. It is intended for local UI use only by default. You can change it with `PT_STARTUP_STATUS_PORT`. |
+
+On first startup, the application tries to add these Windows Firewall inbound rules automatically:
+
+- `PTServer HTTP Private`: allows inbound TCP 8200 on private networks.
+- `PTServer SSDP Private`: allows inbound UDP 1900 on private networks.
+
+If Windows shows a UAC / firewall confirmation prompt, allow it. For normal home LAN usage, allow private networks only; do not expose the server on public networks.
+
+If you accidentally denied the prompt, or if your VR player cannot discover the server, add the rules manually. Open PowerShell or Command Prompt as Administrator and run:
+
+```powershell
+netsh advfirewall firewall add rule name="PTServer HTTP Private" dir=in action=allow protocol=TCP localport=8200 profile=private edge=no enable=yes
+netsh advfirewall firewall add rule name="PTServer SSDP Private" dir=in action=allow protocol=UDP localport=1900 profile=private edge=no enable=yes
+```
+
+If you changed `PT_HTTP_PORT`, replace `8200` in the first command with your actual port. UDP 1900 is the standard UPnP/SSDP discovery port and normally should not be changed.
+
+You can also configure this from the Windows UI:
+
+1. Open "Windows Security" -> "Firewall & network protection" -> "Advanced settings".
+2. Go to "Inbound Rules" and create a new rule.
+3. Choose "Port" as the rule type.
+4. Add `TCP 8200` and `UDP 1900` as separate rules.
+5. Choose "Allow the connection".
+6. Select the "Private" profile only when possible.
+7. Name the rules `PTServer HTTP Private` and `PTServer SSDP Private`.
+
 ## Supported VR Players
 
 Tested on Meta Quest 3.
