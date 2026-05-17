@@ -4,7 +4,7 @@
 
 VR视频透视服务器 的目标是让所有VR视频都可以透视，实现混合现实(MR)。
 
-![VR视频透视服务器概览](resources/intro_cn_s.png)
+![VR视频透视服务器概览](assets/intro_cn_s.png)
 
 它是以 Windows 为主要运行平台的 VR DLNA 本地媒体服务器，兼顾桌面控制和离线生成流程。它通过 DLNA/UPnP 暴露本地视频库，并支持实时透视流输出，可在绿幕合成和 Alpha 直通之间切换，同时支持实时字幕嵌入。VR视频透视服务器 主要面向 VR180 半等柱体投影（half-equirectangular）视频源。
 
@@ -28,11 +28,16 @@ VR视频透视服务器 的目标是让所有VR视频都可以透视，实现混
 - 字幕预览与字幕样式配置
 - 面向 8K 级源视频的显存与吞吐优化，尽量保持硬件可承受范围内的实时 30fps 输出
 
+
+| ![主界面](assets\soft_mainwindow_cn.png) |
+
+
 ## 透视视频效果图
 
 | Alpha Passthrough | 绿幕 Passthrough |
 | --- | --- |
-| ![Alpha Passthrough 效果图](resources/sample_alpha.jpg) | ![绿幕 Passthrough 效果图](resources/sample_green.jpg) |
+| ![Alpha Passthrough 效果图](assets/sample_alpha.jpg) | ![绿幕 Passthrough 效果图](assets/sample_green.jpg) |
+| ![截图](assets\passthrough_screenshot.jpg) |
 
 ## 运行要求
 

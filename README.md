@@ -4,7 +4,7 @@ English | [中文](README.zh-CN.md) | [日本語](README.ja-JP.md)
 
 VR Video Passthrough Server aims to make every VR video passthrough-capable, enabling mixed reality (MR).
 
-![VR Video Passthrough Server overview](resources/intro_en_s.png)
+![VR Video Passthrough Server overview](assets/intro_en_s.png)
 
 It is a Windows-first VR DLNA local media server for desktop control and offline generation workflows. It exposes a local video library over DLNA/UPnP and supports realtime passthrough stream output, with switching between green-screen compositing and Alpha passthrough, as well as realtime subtitle embedding. VR Video Passthrough Server is primarily designed for VR180 half-equirectangular video sources.
 
@@ -28,11 +28,17 @@ This is the miracle of the AI era.
 - Subtitle preview and style configuration
 - Aggressive VRAM-aware pipeline tuning aimed at keeping realtime output smooth, including 8K-class source playback targets where the hardware can sustain them
 
+
+| ![MainWindow](assets\soft_mainwindow_cn.png) |
+
+
 ## Passthrough Output Examples
 
 | Alpha Passthrough | Green-screen Passthrough |
 | --- | --- |
-| ![Alpha Passthrough example](resources/sample_alpha.jpg) | ![Green-screen Passthrough example](resources/sample_green.jpg) |
+| ![Alpha Passthrough example](assets/sample_alpha.jpg) | ![Green-screen Passthrough example](assets/sample_green.jpg) |
+| ![Screenshot](assets\passthrough_screenshot.jpg) |
+
 
 ## Requirements
 

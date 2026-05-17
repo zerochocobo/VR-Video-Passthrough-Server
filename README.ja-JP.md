@@ -4,7 +4,7 @@
 
 VR Video Passthrough Server の目標は、すべてのVR動画をパススルー対応にし、複合現実（MR）を実現することです。
 
-![VR Video Passthrough Server 概要](resources/intro_en_s.png)
+![VR Video Passthrough Server 概要](assets/intro_jp_s.png)
 
 これは Windows を主な実行環境とする VR DLNA ローカルメディアサーバーで、デスクトップ操作とオフライン生成ワークフローに対応しています。DLNA/UPnP 経由でローカル動画ライブラリを公開し、リアルタイムのパススルーストリーム出力をサポートします。グリーンスクリーン合成と Alpha パススルーを切り替えられ、リアルタイム字幕埋め込みにも対応しています。VR Video Passthrough Server は主に VR180 half-equirectangular 動画ソース向けに設計されています。
 
@@ -28,11 +28,16 @@ VR Video Passthrough Server の目標は、すべてのVR動画をパススル�
 - 字幕プレビューと字幕スタイル設定
 - ハードウェアが維持できる範囲で 8K クラスのソース再生を目指す、VRAM を意識した積極的なパイプライン調整
 
+
+| ![MainWindow](assets\soft_mainwindow_jp.png) |
+
+
 ## パススルー出力例
 
 | Alpha Passthrough | グリーンスクリーン Passthrough |
 | --- | --- |
-| ![Alpha Passthrough の例](resources/sample_alpha.jpg) | ![グリーンスクリーン Passthrough の例](resources/sample_green.jpg) |
+| ![Alpha Passthrough の例](assets/sample_alpha.jpg) | ![グリーンスクリーン Passthrough の例](assets/sample_green.jpg) |
+| ![Screenshot](assets\passthrough_screenshot.jpg) |
 
 ## 動作要件
 
