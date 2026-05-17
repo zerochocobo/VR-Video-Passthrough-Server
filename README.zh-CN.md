@@ -77,6 +77,12 @@ uv run python -m ui.app
 - Alpha 模式下虚拟条目标题为 `Alpha Passthrough`
 - UI 配置与后台运行配置分离保存
 
+## 网盘整合包
+
+ [【夸克网盘】](https://pan.quark.cn/s/573eb1709e18?pwd=T3bS)
+ [【百度网盘】](https://pan.baidu.com/s/1uHFVFjKwlaXVxrYQ0_qcnQ?pwd=1234)
+
+
 ## 项目结构
 
 ```text
