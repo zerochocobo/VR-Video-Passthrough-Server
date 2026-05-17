@@ -29,7 +29,7 @@ VR视频透视服务器 的目标是让所有VR视频都可以透视，实现混
 - 面向 8K 级源视频的显存与吞吐优化，尽量保持硬件可承受范围内的实时 30fps 输出
 
 
-| ![主界面](assets\soft_mainwindow_cn.png) |
+| ![主界面](assets/soft_mainwindow_cn.png) |
 
 
 ## 透视视频效果图
@@ -37,7 +37,7 @@ VR视频透视服务器 的目标是让所有VR视频都可以透视，实现混
 | Alpha Passthrough | 绿幕 Passthrough |
 | --- | --- |
 | ![Alpha Passthrough 效果图](assets/sample_alpha.jpg) | ![绿幕 Passthrough 效果图](assets/sample_green.jpg) |
-| ![截图](assets\passthrough_screenshot.jpg) |
+| ![截图](assets/passthrough_screenshot.jpg) |
 
 ## 运行要求
 

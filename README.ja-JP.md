@@ -29,7 +29,7 @@ VR Video Passthrough Server の目標は、すべてのVR動画をパススル�
 - ハードウェアが維持できる範囲で 8K クラスのソース再生を目指す、VRAM を意識した積極的なパイプライン調整
 
 
-| ![MainWindow](assets\soft_mainwindow_jp.png) |
+| ![MainWindow](assets/soft_mainwindow_jp.png) |
 
 
 ## パススルー出力例
@@ -37,7 +37,7 @@ VR Video Passthrough Server の目標は、すべてのVR動画をパススル�
 | Alpha Passthrough | グリーンスクリーン Passthrough |
 | --- | --- |
 | ![Alpha Passthrough の例](assets/sample_alpha.jpg) | ![グリーンスクリーン Passthrough の例](assets/sample_green.jpg) |
-| ![Screenshot](assets\passthrough_screenshot.jpg) |
+| ![Screenshot](assets/passthrough_screenshot.jpg) |
 
 ## 動作要件
 
