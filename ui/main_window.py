@@ -1,7 +1,14 @@
 ﻿from __future__ import annotations
 
+import json
+import os
+import subprocess
+import shutil
+import threading
+import urllib.request
 from pathlib import Path
 
+from PySide6.QtCore import Qt, QTimer, Signal
 from PySide6.QtGui import QFont
 from PySide6.QtWidgets import QLabel, QMainWindow, QMessageBox, QWidget
 
@@ -25,9 +32,62 @@ SUPPORTED_LANGUAGES = ("zh_CN", "en_US", "ja_JP")
 QT_MAX_WIDGET_SIZE = 16777215
 OFFLINE_PAGE_WIDTH = 600
 OFFLINE_PAGE_HEIGHT = 600
+MIN_NVIDIA_COMPUTE_CAPABILITY = 7.5
+
+
+def _parse_compute_capability(value: str) -> float | None:
+    text = str(value or "").strip().lower().replace("sm_", "")
+    if not text:
+        return None
+    try:
+        return float(text)
+    except ValueError:
+        return None
+
+
+def _detect_nvidia_gpu_support() -> tuple[bool, str, str] | None:
+    nvidia_smi = shutil.which("nvidia-smi")
+    if not nvidia_smi:
+        for root in (os.environ.get("SystemRoot"), os.environ.get("WINDIR")):
+            if not root:
+                continue
+            system32_smi = Path(root) / "System32" / "nvidia-smi.exe"
+            if system32_smi.exists():
+                nvidia_smi = str(system32_smi)
+                break
+    if not nvidia_smi:
+        return None
+    try:
+        out = subprocess.check_output(
+            [
+                nvidia_smi,
+                "--query-gpu=name,compute_cap",
+                "--format=csv,noheader",
+            ],
+            stderr=subprocess.DEVNULL,
+            text=True,
+            timeout=5,
+        )
+    except Exception:
+        return None
+    candidates: list[tuple[float, str, str]] = []
+    for line in out.splitlines():
+        parts = [part.strip() for part in line.split(",")]
+        if len(parts) < 2:
+            continue
+        cc = _parse_compute_capability(parts[-1])
+        if cc is None:
+            continue
+        candidates.append((cc, parts[0], parts[-1]))
+    if not candidates:
+        return None
+    cc, name, cc_text = max(candidates, key=lambda item: item[0])
+    return cc >= MIN_NVIDIA_COMPUTE_CAPABILITY, name, cc_text
 
 
 class MainWindow(QMainWindow):
+    runtime_status_received = Signal(dict)
+
     def __init__(self) -> None:
         super().__init__()
         self.settings = Settings()
@@ -48,12 +108,17 @@ class MainWindow(QMainWindow):
         self.version_label = QLabel(self.metadata.display_version)
         self.version_label.setObjectName("VersionStatus")
         self.version_label.setStyleSheet("QLabel#VersionStatus { font-size: 9pt; }")
+        self.runtime_status_label = QLabel("")
+        self.runtime_status_label.setObjectName("RuntimeStatus")
+        self.runtime_status_label.setStyleSheet("QLabel#RuntimeStatus { font-size: 9pt; }")
+        self.runtime_status_label.setAlignment(Qt.AlignCenter)
         self.home.language.setFixedHeight(22)
         self.home.language.setStyleSheet("QComboBox { font-size: 9pt; padding: 0 6px; }")
         self.status_left_spacer = QWidget()
         self.status_left_spacer.setFixedWidth(20)
         self.statusBar().addWidget(self.status_left_spacer)
         self.statusBar().addWidget(self.home.language)
+        self.statusBar().addWidget(self.runtime_status_label, 1)
         self.statusBar().addPermanentWidget(self.version_label)
         self.home.server_button.clicked.connect(self.toggle_server)
         self.home.offline_button.clicked.connect(self.open_offline)
@@ -72,6 +137,12 @@ class MainWindow(QMainWindow):
         self.status_poller = StartupStatusPoller(port=STATUS_DEFAULT_PORT, parent=self)
         self.status_poller.updated.connect(self._on_startup_status)
         self.status_poller.finished.connect(self._on_startup_finished)
+        self.runtime_status_timer = QTimer(self)
+        self.runtime_status_timer.setInterval(1500)
+        self.runtime_status_timer.timeout.connect(self._poll_runtime_status)
+        self.runtime_status_received.connect(self._apply_runtime_status)
+        self._runtime_status_pending = False
+        self._server_action_pending: str | None = None
         self._sync_language_combo()
         self.retranslate()
         app_font = QFont()
@@ -121,7 +192,10 @@ class MainWindow(QMainWindow):
         self.subtitle.retranslate()
 
     def toggle_server(self) -> None:
+        if self._server_action_pending is not None:
+            return
         if self.server.is_running():
+            self._set_server_action_pending("stopping")
             self.server.stop()
             return
         if self.offline_process.is_running():
@@ -131,6 +205,7 @@ class MainWindow(QMainWindow):
         env = self.settings.server_env()
         env["PT_DEBUG_LOGS"] = "1" if self.home.debug_toggle.isChecked() else "0"
         self.home.clear_log()
+        self._set_server_action_pending("starting")
         self.server.start(env)
         # Show the startup overlay so non-technical users see a friendly
         # progress dialog while the server warms up the GPU (potentially
@@ -193,6 +268,7 @@ class MainWindow(QMainWindow):
         if self.startup_overlay is None:
             return
         if phase == "listening":
+            self._set_server_action_pending(None)
             # The server has bound the DLNA HTTP port and is truly ready to
             # serve clients. Brief "done" flash so the user sees a confirmation
             # before the overlay disappears.
@@ -202,6 +278,7 @@ class MainWindow(QMainWindow):
             self.startup_overlay.apply_status(merged)
             self.startup_overlay.close()
         elif phase == "failed":
+            self._set_server_action_pending(None)
             # Keep overlay visible so the user can read the failure and copy a
             # report. The server process exits on its own. Merge into the
             # last seen status so that step/cold/gpu_name/reason emitted by
@@ -216,6 +293,7 @@ class MainWindow(QMainWindow):
         # User explicitly aborted the long wait. Stop both the poller and the
         # server process so resources are released cleanly.
         self.status_poller.stop()
+        self._set_server_action_pending("stopping")
         self.server.stop()
         if self.startup_overlay is not None:
             self.startup_overlay.close()
@@ -269,9 +347,18 @@ class MainWindow(QMainWindow):
         self.status_poller.stop()
         self.startup_overlay.apply_status(merged)
         self.startup_overlay.close()
+        self._set_server_action_pending(None)
 
     def _server_state_changed(self, running: bool) -> None:
+        if running:
+            self.runtime_status_timer.start()
+            self._poll_runtime_status()
+        else:
+            self.runtime_status_timer.stop()
+            self._runtime_status_pending = False
+            self.runtime_status_label.clear()
         if not running:
+            self._set_server_action_pending(None)
             self.status_poller.stop()
             if self.startup_overlay is not None and self.startup_overlay.isVisible():
                 last = self.startup_overlay.last_status() or {}
@@ -299,3 +386,54 @@ class MainWindow(QMainWindow):
                     if not merged.get("detail"):
                         merged["detail"] = "server process exited before warmup completed"
                     self.startup_overlay.apply_status(merged)
+
+    def _set_server_action_pending(self, action: str | None) -> None:
+        self._server_action_pending = action
+        self.home.server_button.setEnabled(action is None)
+
+    def _runtime_status_url(self) -> str:
+        port = str(os.environ.get("PT_HTTP_PORT") or "8200").strip() or "8200"
+        return f"http://127.0.0.1:{port}/runtime_status"
+
+    def _poll_runtime_status(self) -> None:
+        if self._runtime_status_pending or not self.server.is_running():
+            return
+        self._runtime_status_pending = True
+        url = self._runtime_status_url()
+
+        def worker() -> None:
+            payload: dict
+            try:
+                with urllib.request.urlopen(url, timeout=0.7) as response:
+                    raw = response.read(8192)
+                payload = json.loads(raw.decode("utf-8", errors="replace"))
+            except Exception:
+                payload = {"ok": False}
+            self.runtime_status_received.emit(payload)
+
+        threading.Thread(target=worker, name="runtime-status-poll", daemon=True).start()
+
+    def _apply_runtime_status(self, status: dict) -> None:
+        self._runtime_status_pending = False
+        if not self.server.is_running():
+            self.runtime_status_label.clear()
+            return
+        if not status.get("ok"):
+            self.runtime_status_label.clear()
+            return
+        used = status.get("vram_used_mib")
+        total = status.get("vram_total_mib")
+        active = bool(status.get("active"))
+        parts: list[str] = []
+        if active:
+            produced_fps = float(status.get("produced_fps") or 0.0)
+            output_fps = float(status.get("output_fps") or 0.0)
+            fps = produced_fps if produced_fps > 0 else output_fps
+            if fps > 0:
+                parts.append(f"FPS {fps:.1f}")
+        if used is not None and total is not None:
+            try:
+                parts.append(f"{self.i18n.t('status.vram')} {float(used):.0f}/{float(total):.0f} MB")
+            except (TypeError, ValueError):
+                pass
+        self.runtime_status_label.setText(" | ".join(parts))

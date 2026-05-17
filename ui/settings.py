@@ -23,7 +23,7 @@ DEFAULTS = {
     "alpha_stride": 1,
     "quality_speed": "ultrafast",
     "offline_quality_speed": "medium",
-    "passthrough_max_fps": 0,
+    "passthrough_max_fps": 30,
     "decode_max_side": 4096,
     "subtitle_enable": True,
     "subtitle_mode": "auto",
@@ -39,6 +39,7 @@ DEFAULTS = {
     "subtitle_color": "",
     "subtitle_outline_color": "000000",
     "subtitle_v360": True,
+    "defaults_migrated_20260517_fps_size": True,
 }
 
 
@@ -82,6 +83,14 @@ class Settings:
                     if "quality_speed" in loaded and "offline_quality_speed" not in loaded:
                         self.data["offline_quality_speed"] = quality_speed_value(loaded.get("quality_speed"), "medium")
                         self.data["quality_speed"] = DEFAULTS["quality_speed"]
+                    if not loaded.get("defaults_migrated_20260517_fps_size"):
+                        if int(loaded.get("passthrough_max_fps", 0) or 0) == 0:
+                            self.data["passthrough_max_fps"] = DEFAULTS["passthrough_max_fps"]
+                        if int(loaded.get("decode_max_side", DEFAULTS["decode_max_side"]) or 0) == 0:
+                            self.data["decode_max_side"] = DEFAULTS["decode_max_side"]
+                        self.data["defaults_migrated_20260517_fps_size"] = True
+                    elif "passthrough_max_fps" not in loaded:
+                        self.data["passthrough_max_fps"] = DEFAULTS["passthrough_max_fps"]
             except Exception:
                 pass
 

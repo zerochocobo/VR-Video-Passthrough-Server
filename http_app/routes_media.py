@@ -8,7 +8,10 @@ from __future__ import annotations
 
 import asyncio
 import itertools
+import os
 import re
+import shutil
+import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import quote, unquote
@@ -75,6 +78,7 @@ _request_ids = itertools.count(1)
 # ffmpeg pipes, and concurrent access to the shared Matter/ONNX session.
 _active_lock = asyncio.Lock()
 _active_streams: dict[object, tuple[str, str]] = {}
+_active_started: dict[object, float] = {}
 _probe_cache_lock = asyncio.Lock()
 _probe_cache: dict[str, bytes] = {}
 _thumb_lock = asyncio.Lock()
@@ -461,6 +465,104 @@ def _can_preempt_owner(active_owner: tuple, new_owner: tuple) -> bool:
     return False
 
 
+def _nvidia_smi_path() -> str | None:
+    exe = shutil.which("nvidia-smi")
+    if exe:
+        return exe
+    for root in (os.environ.get("SystemRoot"), os.environ.get("WINDIR")):
+        if not root:
+            continue
+        system32 = Path(root) / "System32" / "nvidia-smi.exe"
+        if system32.exists():
+            return str(system32)
+    return None
+
+
+def _query_vram_mib() -> tuple[float, float] | None:
+    exe = _nvidia_smi_path()
+    if not exe:
+        return None
+    try:
+        out = subprocess.check_output(
+            [
+                exe,
+                "--query-gpu=memory.used,memory.total",
+                "--format=csv,noheader,nounits",
+            ],
+            stderr=subprocess.DEVNULL,
+            text=True,
+            timeout=2,
+        )
+    except Exception:
+        return None
+    best: tuple[float, float] | None = None
+    for line in out.splitlines():
+        parts = [part.strip() for part in line.split(",")]
+        if len(parts) < 2:
+            continue
+        try:
+            used = float(parts[0])
+            total = float(parts[1])
+        except ValueError:
+            continue
+        if best is None or used > best[0]:
+            best = (used, total)
+    return best
+
+
+def _runtime_stream_info(stream: object, started_at: float | None, now: float) -> dict:
+    inner = getattr(stream, "stream", stream)
+    frames = int(getattr(stream, "frames_produced", getattr(inner, "frames_produced", 0)) or 0)
+    output_fps = float(getattr(stream, "output_fps", getattr(inner, "output_fps", 0.0)) or 0.0)
+    bytes_emitted = int(getattr(stream, "bytes_emitted", getattr(inner, "bytes_emitted", 0)) or 0)
+    source = getattr(stream, "source_path", None)
+    if source is None:
+        source = getattr(inner, "path", getattr(inner, "src", None))
+    elapsed = max(0.0, now - started_at) if started_at is not None else 0.0
+    produced_fps = frames / elapsed if elapsed > 0.25 and frames > 0 else 0.0
+    return {
+        "active": True,
+        "source": str(source) if source else "",
+        "source_name": Path(source).name if source else "",
+        "output_fps": output_fps,
+        "produced_fps": produced_fps,
+        "frames": frames,
+        "bytes": bytes_emitted,
+        "elapsed_sec": elapsed,
+    }
+
+
+@router.get("/runtime_status")
+async def runtime_status():
+    now = asyncio.get_running_loop().time()
+    async with _active_lock:
+        active_items = [(stream, _active_started.get(stream)) for stream in _active_streams.keys()]
+    stream_info = None
+    for stream, started_at in active_items:
+        stream_info = _runtime_stream_info(stream, started_at, now)
+        if stream_info["frames"] > 0 or stream_info["source"]:
+            break
+    vram = await asyncio.to_thread(_query_vram_mib)
+    status = {
+        "ok": True,
+        "active": stream_info is not None,
+        "source": "",
+        "source_name": "",
+        "output_fps": 0.0,
+        "produced_fps": 0.0,
+        "frames": 0,
+        "bytes": 0,
+        "elapsed_sec": 0.0,
+        "vram_used_mib": None,
+        "vram_total_mib": None,
+    }
+    if stream_info is not None:
+        status.update(stream_info)
+    if vram is not None:
+        status["vram_used_mib"], status["vram_total_mib"] = vram
+    return status
+
+
 async def _take_active_slot(
     new_stream: object,
     who: str,
@@ -474,12 +576,15 @@ async def _take_active_slot(
         async with _active_lock:
             if len(_active_streams) < PASSTHROUGH_MAX_CONCURRENT:
                 _active_streams[new_stream] = owner
+                _active_started[new_stream] = asyncio.get_running_loop().time()
                 return None
             if allow_same_owner_preempt:
                 for active_stream, active_owner in list(_active_streams.items()):
                     if _can_preempt_owner(active_owner, owner):
                         del _active_streams[active_stream]
+                        _active_started.pop(active_stream, None)
                         _active_streams[new_stream] = owner
+                        _active_started[new_stream] = asyncio.get_running_loop().time()
                         log.info("passthrough preempt previous range: %s owner=%s", who, owner)
                         return active_stream
             active = len(_active_streams)
@@ -501,6 +606,7 @@ async def _take_active_slot(
 async def _release_active_slot(stream: object) -> None:
     async with _active_lock:
         removed = _active_streams.pop(stream, None)
+        _active_started.pop(stream, None)
         if removed is not None:
             log.info("passthrough active slot released: active=%d owner=%s", len(_active_streams), removed)
 
@@ -508,9 +614,11 @@ async def _release_active_slot(stream: object) -> None:
 async def _replace_active_slot(old_stream: object, new_stream: object) -> bool:
     async with _active_lock:
         owner = _active_streams.pop(old_stream, None)
+        started_at = _active_started.pop(old_stream, None)
         if owner is None:
             return False
         _active_streams[new_stream] = owner
+        _active_started[new_stream] = started_at or asyncio.get_running_loop().time()
         return True
 
 

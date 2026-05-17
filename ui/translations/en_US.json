@@ -138,8 +138,7 @@
   "startup.hide_details": "Hide details",
   "startup.copy_report": "Copy hardware report",
   "startup.report_copied": "Copied to clipboard",
-  "startup.cancel": "Cancel"
-,
+  "startup.cancel": "Cancel",
   "button.close": "Close",
   "subtitle.style_config": "Style Settings",
   "player_support.window_title": "Player Support",
@@ -152,11 +151,9 @@
   "player_support.notes": "Notes",
   "player_support.supported": "Supported",
   "player_support.official_site": "Official site",
-  "player_support.install_notes": "Installation notes"
-,
+  "player_support.install_notes": "Installation notes",
   "offline.matanyone_help_title": "MatAnyone2 Model Setup",
-  "offline.matanyone_help_msg": "Check the instructions in the models folder, then download the SAM3 model and MatAnyone2 model."
-,
+  "offline.matanyone_help_msg": "Check the instructions in the models folder, then download the SAM3 model and MatAnyone2 model.",
   "group.performance_config_short": "Performance Settings",
   "group.performance_config": "Performance Settings (restart server to apply changes)",
   "performance.quality_speed": "Quality / Speed",
@@ -164,9 +161,10 @@
   "quality_speed.medium": "medium P4",
   "quality_speed.veryslow": "veryslow P7",
   "performance.output_fps": "Output FPS",
-  "performance.output_fps_unlimited": "Unlimited",
+  "performance.output_fps_unlimited": "Unlimited (for test)",
   "performance.output_size": "Output size",
   "performance.output_size_original": "Same as source",
   "performance.output_size_4k": "4096 (4K)",
-  "performance.output_size_8k": "8192 (8K)"
+  "performance.output_size_8k": "8192 (8K)",
+  "status.vram": "VRAM"
 }

@@ -39,7 +39,7 @@ class SettingsTests(unittest.TestCase):
         env = s.server_env()
         self.assertNotIn("PT_SUBTITLE_COLOR", env)
         self.assertEqual(env["PT_COMPOSITE_BG_RGB"], "00FF00")
-        self.assertEqual(env["PT_ALPHA_STRIDE"], "3")
+        self.assertEqual(env["PT_ALPHA_STRIDE"], "1")
         self.assertEqual(env["PT_PASSTHROUGH_MAX_FPS"], "30")
         self.assertEqual(env["PT_DECODE_MAX_SIDE"], "4096")
 

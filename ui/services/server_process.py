@@ -15,6 +15,7 @@ class ServerProcess(QObject):
         self.process = QProcess()
         self.process.readyReadStandardOutput.connect(self._read_stdout)
         self.process.readyReadStandardError.connect(self._read_stderr)
+        self.process.errorOccurred.connect(self._error_occurred)
         self.process.finished.connect(self._finished)
 
     def is_running(self) -> bool:
@@ -47,6 +48,11 @@ class ServerProcess(QObject):
         data = clean_log_text(bytes(self.process.readAllStandardError()).decode("utf-8", "replace"))
         if data:
             self.output.emit(data)
+
+    def _error_occurred(self, error) -> None:
+        self.output.emit(f"Server process error: {error}\n")
+        if not self.is_running():
+            self.state_changed.emit(False)
 
     def _finished(self) -> None:
         self.state_changed.emit(False)

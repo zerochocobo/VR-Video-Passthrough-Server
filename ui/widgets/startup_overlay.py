@@ -144,13 +144,17 @@ class StartupOverlay(QDialog):
     def reset(self) -> None:
         self._last_status = None
         self._base_message = self.i18n.t("startup.connecting")
+        self.title_label.setText(self.i18n.t("startup.title_starting"))
         self.message_label.setText(self._base_message)
         self.eta_label.setText("")
         self.progress.setRange(0, 1000)
         self.progress.setValue(0)
+        self.hint_label.setText("")
         self.hint_label.setVisible(False)
         self.details_text.setVisible(False)
         self.details_text.clear()
+        self.toggle_details_btn.setText(self.i18n.t("startup.show_details"))
+        self.copy_report_btn.setText(self.i18n.t("startup.copy_report"))
         self.toggle_details_btn.setChecked(False)
         self._ellipsis_timer.start()
 

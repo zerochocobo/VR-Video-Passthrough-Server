@@ -138,8 +138,7 @@
   "startup.hide_details": "詳細を隠す",
   "startup.copy_report": "ハードウェアレポートをコピー",
   "startup.report_copied": "クリップボードにコピーしました",
-  "startup.cancel": "キャンセル"
-,
+  "startup.cancel": "キャンセル",
   "button.close": "閉じる",
   "subtitle.style_config": "スタイル設定",
   "player_support.window_title": "プレイヤー対応状況",
@@ -152,11 +151,9 @@
   "player_support.notes": "備考",
   "player_support.supported": "対応",
   "player_support.official_site": "公式サイト",
-  "player_support.install_notes": "インストール説明"
-,
+  "player_support.install_notes": "インストール説明",
   "offline.matanyone_help_title": "MatAnyone2 モデル設定",
-  "offline.matanyone_help_msg": "models フォルダー内の説明ファイルを確認し、SAM3 モデルと MatAnyone2 モデルをダウンロードしてください。"
-,
+  "offline.matanyone_help_msg": "models フォルダー内の説明ファイルを確認し、SAM3 モデルと MatAnyone2 モデルをダウンロードしてください。",
   "group.performance_config_short": "パフォーマンス設定",
   "group.performance_config": "パフォーマンス設定（変更後はサーバー再起動で反映）",
   "performance.quality_speed": "画質 / 速度",
@@ -164,9 +161,10 @@
   "quality_speed.medium": "標準 P4",
   "quality_speed.veryslow": "高画質 P7",
   "performance.output_fps": "出力FPS",
-  "performance.output_fps_unlimited": "無制限",
+  "performance.output_fps_unlimited": "無制限(テスト用)",
   "performance.output_size": "出力サイズ",
   "performance.output_size_original": "元動画と同じ",
   "performance.output_size_4k": "4096（4K）",
-  "performance.output_size_8k": "8192（8K）"
+  "performance.output_size_8k": "8192（8K）",
+  "status.vram": "VRAM"
 }
