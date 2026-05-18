@@ -27,12 +27,14 @@ from config import (
     PASSTHROUGH_OUTPUT_MODE,
     PASSTHROUGH_SEEK_MODE,
     PASSTHROUGH_SUFFIX,
+    ALPHA_2D_ENABLE,
+    ALPHA_2D_PROJECTION,
     MEDIA_LIBRARY,
     VIDEO_DIR,
     VIDEO_EXTS,
 )
 from dlna.profiles import passthrough_frame_rate
-from pipeline.alpha_packer import alpha_output_size
+from pipeline.alpha_packer import alpha_output_size, is_sbs_vr_size
 from pipeline.ffmpeg_io import probe_cached
 from utils.bitrate_estimator import estimate_for_media
 from utils.logger import get
@@ -201,9 +203,21 @@ def _subtitle_item(track: SubtitleTrack) -> dict:
     }
 
 
-def _passthrough_virtual_title(path: Path, mode: str) -> str:
+def _alpha_virtual_suffix(width: int = 0, height: int = 0) -> str:
+    if (
+        ALPHA_2D_ENABLE
+        and str(ALPHA_2D_PROJECTION).lower() == "flat3d"
+        and int(width) > 0
+        and int(height) > 0
+        and not is_sbs_vr_size(int(width), int(height))
+    ):
+        return "3D_alpha"
+    return "FISHEYE_alpha"
+
+
+def _passthrough_virtual_title(path: Path, mode: str, width: int = 0, height: int = 0) -> str:
     if mode == "alpha":
-        return f"{path.stem}_FISHEYE180_alpha_live"
+        return f"{path.stem}_{_alpha_virtual_suffix(width, height)}_live"
     return f"{path.stem}{PASSTHROUGH_SUFFIX}_live"
 
 
@@ -224,6 +238,13 @@ def _passthrough_live_query(mode: str) -> str:
 
 def _resolution_str(width: int, height: int) -> str:
     return f"{int(width)}x{int(height)}" if int(width) > 0 and int(height) > 0 else ""
+
+
+def _parse_resolution(value: str) -> tuple[int, int]:
+    match = re.search(r"(\d+)\s*x\s*(\d+)", str(value or ""), re.IGNORECASE)
+    if not match:
+        return 0, 0
+    return int(match.group(1)), int(match.group(2))
 
 
 def _passthrough_resolution(width: int, height: int, mode: str) -> str:
@@ -281,8 +302,10 @@ def _video_items_from_index(path: Path, parent_id: str, child: IndexedChild | No
     size = child.size if child is not None else path.stat().st_size
     if child is not None and child.video is not None:
         duration = child.video.duration
-        width = int(child.video.width)
-        height = int(child.video.height)
+        width = int(getattr(child.video, "width", 0) or 0)
+        height = int(getattr(child.video, "height", 0) or 0)
+        if width <= 0 or height <= 0:
+            width, height = _parse_resolution(getattr(child.video, "resolution", ""))
         resolution = _resolution_str(width, height)
         backend_verdict = child.video.backend_verdict
     else:
@@ -346,7 +369,7 @@ def _video_items_from_index(path: Path, parent_id: str, child: IndexedChild | No
                     "container": True,
                     "id": live_id,
                     "parent_id": parent_id,
-                    "title": _passthrough_virtual_title(path, mode),
+                    "title": _passthrough_virtual_title(path, mode, width, height),
                     "child_count": len(_live_chapter_offsets(duration)),
                 }
             )
@@ -355,7 +378,7 @@ def _video_items_from_index(path: Path, parent_id: str, child: IndexedChild | No
                 {
                     "id": f"{_passthrough_live_item_prefix(mode)}{rel}",
                     "parent_id": parent_id,
-                    "title": _passthrough_virtual_title(path, mode),
+                    "title": _passthrough_virtual_title(path, mode, width, height),
                     "url": f"{base}/passthrough_live/{quoted}" + (f"?{query}" if query else ""),
                     "thumb": f"{base}/thumb/{quoted}",
                     "size": 0,
@@ -397,7 +420,7 @@ def _live_chapter_items(path: Path, mode: str) -> list[dict]:
     else:
         pt_bps_est = pt_bps
     items: list[dict] = []
-    virtual_title = _passthrough_virtual_title(path, mode)
+    virtual_title = _passthrough_virtual_title(path, mode, width, height)
     suffix = "alpha" if mode == "alpha" else "green"
     for offset in _live_chapter_offsets(duration):
         title = f"{_fmt_title_time(offset)}_{virtual_title}"
@@ -653,8 +676,12 @@ def _metadata_didl_for_live(path: Path, mode: str) -> str:
     try:
         info = probe_cached(path)
         duration = info.duration
+        width = int(info.width)
+        height = int(info.height)
     except Exception:
         duration = 0.0
+        width = 0
+        height = 0
     return (
         f'<DIDL-Lite xmlns="{DIDL_NS}" '
         'xmlns:dc="http://purl.org/dc/elements/1.1/" '
@@ -662,7 +689,7 @@ def _metadata_didl_for_live(path: Path, mode: str) -> str:
         f'<container id="{html.escape(live_id)}" '
         f'parentID="{html.escape(_folder_id(path.parent))}" '
         f'childCount="{len(_live_chapter_offsets(duration))}" restricted="1">'
-        f"<dc:title>{html.escape(_passthrough_virtual_title(path, mode))}</dc:title>"
+        f"<dc:title>{html.escape(_passthrough_virtual_title(path, mode, width, height))}</dc:title>"
         "<upnp:class>object.container.storageFolder</upnp:class>"
         "</container></DIDL-Lite>"
     )

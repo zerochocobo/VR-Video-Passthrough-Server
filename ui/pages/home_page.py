@@ -6,15 +6,19 @@ from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
     QDialog,
+    QDialogButtonBox,
     QHBoxLayout,
     QHeaderView,
     QLabel,
     QAbstractItemView,
     QPushButton,
+    QRadioButton,
     QSizePolicy,
+    QSlider,
     QTableWidget,
     QTableWidgetItem,
     QTextEdit,
+    QButtonGroup,
     QToolButton,
     QVBoxLayout,
     QWidget,
@@ -226,6 +230,79 @@ class PlayerSupportDialog(QDialog):
         return self.i18n.t("player_support.supported") if supported else "-"
 
 
+class Alpha2DSettingsDialog(QDialog):
+    def __init__(self, i18n, settings, parent=None) -> None:
+        super().__init__(parent)
+        self.i18n = i18n
+        self.settings = settings
+        self.setModal(True)
+        self.setWindowTitle(self.i18n.t("alpha2d.dialog_title"))
+
+        projection = str(settings.data.get("alpha_2d_projection") or "fisheye").lower()
+        if projection not in {"fisheye", "flat3d"}:
+            projection = "fisheye"
+
+        self.fisheye_radio = QRadioButton(self.i18n.t("alpha2d.projection_fisheye"))
+        self.flat3d_radio = QRadioButton(self.i18n.t("alpha2d.projection_flat3d"))
+        self.projection_group = QButtonGroup(self)
+        self.projection_group.addButton(self.fisheye_radio)
+        self.projection_group.addButton(self.flat3d_radio)
+        self.fisheye_radio.setChecked(projection == "fisheye")
+        self.flat3d_radio.setChecked(projection == "flat3d")
+
+        projection_label = QLabel(self.i18n.t("alpha2d.projection"))
+        projection_row = QHBoxLayout()
+        projection_row.addWidget(projection_label)
+        projection_row.addWidget(self.fisheye_radio)
+        projection_row.addWidget(self.flat3d_radio)
+        projection_row.addStretch(1)
+
+        try:
+            distance = int(round(float(settings.data.get("alpha_2d_distance_m") or 4.0)))
+        except (TypeError, ValueError):
+            distance = 4
+        distance = max(1, min(10, distance))
+        self.distance_value = QLabel()
+        self.distance_slider = QSlider(Qt.Orientation.Horizontal)
+        self.distance_slider.setRange(1, 10)
+        self.distance_slider.setSingleStep(1)
+        self.distance_slider.setPageStep(1)
+        self.distance_slider.setTickPosition(QSlider.TickPosition.TicksBelow)
+        self.distance_slider.setTickInterval(1)
+        self.distance_slider.setValue(distance)
+        self.distance_slider.valueChanged.connect(self._update_distance_label)
+
+        distance_label = QLabel(self.i18n.t("alpha2d.distance"))
+        distance_row = QHBoxLayout()
+        distance_row.addWidget(distance_label)
+        distance_row.addWidget(self.distance_slider, 1)
+        distance_row.addWidget(self.distance_value)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel)
+        buttons.button(QDialogButtonBox.StandardButton.Save).setText(self.i18n.t("button.save"))
+        buttons.button(QDialogButtonBox.StandardButton.Cancel).setText(self.i18n.t("button.cancel"))
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(16, 14, 16, 14)
+        layout.setSpacing(12)
+        layout.addLayout(projection_row)
+        layout.addLayout(distance_row)
+        layout.addWidget(buttons)
+        self._update_distance_label(distance)
+        self.resize(360, 150)
+
+    def _update_distance_label(self, value: int) -> None:
+        self.distance_value.setText(f"{int(value)}m")
+
+    def selected_projection(self) -> str:
+        return "flat3d" if self.flat3d_radio.isChecked() else "fisheye"
+
+    def selected_distance_m(self) -> float:
+        return float(self.distance_slider.value())
+
+
 class HomePage(QWidget):
     def __init__(self, i18n, settings, display_version: str = "") -> None:
         super().__init__()
@@ -274,6 +351,9 @@ class HomePage(QWidget):
         _apply_switch_style(self.alpha_mode)
         self.green_mode_label = QLabel()
         self.alpha_mode_label = QLabel()
+        self.alpha_2d_button = QPushButton()
+        self.alpha_2d_button.setFixedWidth(94)
+        _retain_size_when_hidden(self.alpha_2d_button)
         self.video_dirs_title = QLabel()
         self.green_mode.setChecked(bool(settings.data.get("mode_green")))
         self.alpha_mode.setChecked(bool(settings.data.get("mode_alpha")))
@@ -387,6 +467,7 @@ class HomePage(QWidget):
         alpha_row.addWidget(self.alpha_mode_label)
         alpha_row.addWidget(self.alpha_mode)
         alpha_row.addStretch(1)
+        alpha_row.addWidget(self.alpha_2d_button)
         subtitle_row_widget = QWidget()
         subtitle_row_widget.setFixedHeight(CONFIG_ROW_HEIGHT)
         subtitle_row = QHBoxLayout(subtitle_row_widget)
@@ -543,10 +624,12 @@ class HomePage(QWidget):
         self.config_header.toggled.connect(self._toggle_quick_config)
         self.performance_header.toggled.connect(self._toggle_performance_config)
         self.green_mode.toggled.connect(self._update_enabled)
+        self.alpha_mode.toggled.connect(self._update_enabled)
         self.subtitle_enable.toggled.connect(self._update_enabled)
         self.log_toggle.toggled.connect(self._update_enabled)
         self.video_dirs_manage_button.clicked.connect(self.manage_video_dirs)
         self.player_support_button.clicked.connect(self.show_player_support)
+        self.alpha_2d_button.clicked.connect(self.show_alpha_2d_settings)
         self._update_enabled()
         self.update_video_dirs_summary()
 
@@ -581,6 +664,14 @@ class HomePage(QWidget):
         dialog = PlayerSupportDialog(self.i18n, self)
         dialog.exec()
 
+    def show_alpha_2d_settings(self) -> None:
+        dialog = Alpha2DSettingsDialog(self.i18n, self.settings, self)
+        if dialog.exec() != Alpha2DSettingsDialog.DialogCode.Accepted:
+            return
+        self.settings.data["alpha_2d_projection"] = dialog.selected_projection()
+        self.settings.data["alpha_2d_distance_m"] = dialog.selected_distance_m()
+        self.settings.save()
+
     def update_video_dirs_summary(self) -> None:
         roots = build_media_roots(parse_video_dirs("|".join(self.settings.video_dirs()), UI_ROOT / "videos"))
         names = [root.label for root in roots]
@@ -590,6 +681,7 @@ class HomePage(QWidget):
 
     def _update_enabled(self) -> None:
         self.bg_color.setVisible(self.green_mode.isChecked())
+        self.alpha_2d_button.setVisible(self.alpha_mode.isChecked())
         self.subtitle_style_button.setVisible(self.subtitle_enable.isChecked())
         self.log.setVisible(self.log_toggle.isChecked())
         debug_visible = self.log_toggle.isChecked()
@@ -700,6 +792,7 @@ class HomePage(QWidget):
         self.green_mode_label.setText(self.i18n.t("mode.green"))
         self.alpha_mode.setText("")
         self.alpha_mode_label.setText(self.i18n.t("mode.alpha"))
+        self.alpha_2d_button.setText(self.i18n.t("alpha2d.button"))
         self.subtitle_enable.setText("")
         self.subtitle_enable_label.setText(self.i18n.t("subtitle.enable"))
         self.subtitle_style_button.setText(self.i18n.t("subtitle.style_config"))

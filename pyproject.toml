@@ -8,8 +8,8 @@ requires-python = ">=3.12,<3.13"
 dependencies = [
     "fastapi>=0.115",
     "uvicorn[standard]>=0.30",
-    #   onnxruntime-directml。Windows 10/11 use。
-    #   onnxruntime-gpu       — need CUDA 12 + cuDNN 9（1.19+）
+    # onnxruntime-gpu provides the Python onnxruntime package with CUDA support.
+    # Do not add CPU-only onnxruntime; it overrides the CUDA-capable package.
     "onnxruntime-gpu>=1.19",
     "numpy>=1.26,<2.1",
     "opencv-python>=4.10",
@@ -18,11 +18,14 @@ dependencies = [
     "cupy-cuda12x",
     "pynvvideocodec>=2.1.0",
     "pyinstaller>=6.20.0",
+    "osam==0.4.0",
 ]
 
 [tool.uv]
 package = false
-
+override-dependencies = [
+    "onnxruntime; sys_platform == 'never'", #avoid osam install it
+]
 
 [tool.uv.sources]
 

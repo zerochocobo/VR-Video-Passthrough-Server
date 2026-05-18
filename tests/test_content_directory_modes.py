@@ -103,7 +103,21 @@ class ContentDirectoryModeTests(unittest.TestCase):
         self.assertNotIn("mode=green", didl)
 
     def test_alpha_virtual_title_uses_file_name(self) -> None:
-        self.assertEqual(cds._passthrough_virtual_title(Path("movie.mp4"), "alpha"), "movie_FISHEYE180_alpha_live")
+        self.assertEqual(cds._passthrough_virtual_title(Path("movie.mp4"), "alpha"), "movie_FISHEYE_alpha_live")
+
+    def test_alpha_virtual_title_uses_3d_for_flat2d_flat3d(self) -> None:
+        with patch.object(cds, "ALPHA_2D_PROJECTION", "flat3d"):
+            self.assertEqual(
+                cds._passthrough_virtual_title(Path("movie.mp4"), "alpha", 1920, 1080),
+                "movie_3D_alpha_live",
+            )
+
+    def test_alpha_virtual_title_keeps_fisheye_for_vr_sbs_flat3d(self) -> None:
+        with patch.object(cds, "ALPHA_2D_PROJECTION", "flat3d"):
+            self.assertEqual(
+                cds._passthrough_virtual_title(Path("movie.mp4"), "alpha", 4096, 2048),
+                "movie_FISHEYE_alpha_live",
+            )
 
     def test_mkv_needs_fix_hides_passthrough_without_marking_title(self) -> None:
         child = SimpleNamespace(
@@ -160,7 +174,7 @@ class ContentDirectoryModeTests(unittest.TestCase):
 
         self.assertEqual(
             [item["title"] for item in items],
-            ["00:00_movie_FISHEYE180_alpha_live", "00:05_movie_FISHEYE180_alpha_live"],
+            ["00:00_movie_FISHEYE_alpha_live", "00:05_movie_FISHEYE_alpha_live"],
         )
 
     def test_multi_root_items_are_virtual_folders(self) -> None:

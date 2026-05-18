@@ -7,6 +7,7 @@ from PySide6.QtGui import QColor, QFont, QIcon, QPainter, QPen, QPixmap
 from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
+    QDialog,
     QFileDialog,
     QGridLayout,
     QHBoxLayout,
@@ -145,6 +146,12 @@ class OfflinePage(QWidget):
         combo.addItem("", "matanyone2")
         return combo
 
+    def _recognition_combo(self) -> QComboBox:
+        combo = _fit_combo(QComboBox())
+        combo.addItem("", "yoloworld_efficientsam")
+        combo.addItem("", "sam3")
+        return combo
+
     def _mode_combo(self) -> QComboBox:
         combo = _fit_combo(QComboBox())
         combo.addItem("", "green")
@@ -171,13 +178,8 @@ class OfflinePage(QWidget):
 
     def _performance_row(self, combo: QComboBox) -> QHBoxLayout:
         row = QHBoxLayout()
-        label = QLabel()
-        row.addWidget(label)
         row.addWidget(combo)
         row.addStretch(1)
-        if not hasattr(self, "performance_skip_labels"):
-            self.performance_skip_labels = []
-        self.performance_skip_labels.append(label)
         return row
 
     def _time_row(self) -> QHBoxLayout:
@@ -207,13 +209,19 @@ class OfflinePage(QWidget):
         browse_out.clicked.connect(lambda: self._browse_dir(self.single_out_dir))
         self.single_mode = self._mode_combo()
         self.single_engine = self._engine_combo()
+        self.single_recognition = self._recognition_combo()
         self.single_matanyone_help = _help_button()
+        self.single_sam3_prompt_button = QPushButton()
+        self.single_sam3_prompt_label = QLabel()
         self.single_quality_speed = self._quality_speed_combo()
         self.single_skip = QCheckBox()
         self.single_skip.setChecked(True)
         self.start_single.clicked.connect(self.run_single)
         self.single_engine.currentIndexChanged.connect(self._update_matanyone_help_visibility)
+        self.single_engine.currentIndexChanged.connect(self._update_recognition_visibility)
+        self.single_recognition.currentIndexChanged.connect(self._update_recognition_visibility)
         self.single_matanyone_help.clicked.connect(self.show_matanyone_help)
+        self.single_sam3_prompt_button.clicked.connect(self.show_sam3_prompt_dialog)
         row_video = QHBoxLayout()
         row_video.addWidget(self.single_video)
         row_video.addWidget(browse_video)
@@ -227,7 +235,7 @@ class OfflinePage(QWidget):
         grid = QGridLayout(page)
         grid.setColumnMinimumWidth(0, OFFLINE_LABEL_WIDTH)
         grid.setColumnStretch(1, 1)
-        self.single_labels = {key: _label() for key in ("video", "output", "mode", "engine", "performance", "time")}
+        self.single_labels = {key: _label() for key in ("video", "output", "mode", "engine", "recognition", "performance", "time")}
         grid.addWidget(self.single_labels["video"], 0, 0)
         grid.addLayout(row_video, 0, 1)
         grid.addWidget(self.single_labels["output"], 1, 0)
@@ -237,15 +245,22 @@ class OfflinePage(QWidget):
         grid.addWidget(self.single_labels["engine"], 3, 0)
         single_engine_row = QHBoxLayout()
         single_engine_row.addWidget(self.single_engine)
-        single_engine_row.addWidget(self.single_matanyone_help)
         single_engine_row.addStretch(1)
         grid.addLayout(single_engine_row, 3, 1)
-        grid.addWidget(self.single_labels["performance"], 4, 0)
-        grid.addLayout(self._performance_row(self.single_quality_speed), 4, 1)
-        grid.addWidget(self.single_labels["time"], 5, 0)
-        grid.addLayout(self._time_row(), 5, 1)
-        grid.addWidget(self.single_skip, 6, 1)
-        grid.addLayout(actions, 7, 1)
+        grid.addWidget(self.single_labels["recognition"], 4, 0)
+        single_recognition_row = QHBoxLayout()
+        single_recognition_row.addWidget(self.single_recognition)
+        single_recognition_row.addWidget(self.single_matanyone_help)
+        single_recognition_row.addWidget(self.single_sam3_prompt_button)
+        single_recognition_row.addWidget(self.single_sam3_prompt_label)
+        single_recognition_row.addStretch(1)
+        grid.addLayout(single_recognition_row, 4, 1)
+        grid.addWidget(self.single_labels["performance"], 5, 0)
+        grid.addLayout(self._performance_row(self.single_quality_speed), 5, 1)
+        grid.addWidget(self.single_labels["time"], 6, 0)
+        grid.addLayout(self._time_row(), 6, 1)
+        grid.addWidget(self.single_skip, 7, 1)
+        grid.addLayout(actions, 8, 1)
         self.tabs.addTab(page, "")
         self._update_custom_duration_visibility()
 
@@ -256,7 +271,10 @@ class OfflinePage(QWidget):
         browse_dir.clicked.connect(lambda: self._browse_dir(self.batch_dir))
         self.batch_mode = self._mode_combo()
         self.batch_engine = self._engine_combo()
+        self.batch_recognition = self._recognition_combo()
         self.batch_matanyone_help = _help_button()
+        self.batch_sam3_prompt_button = QPushButton()
+        self.batch_sam3_prompt_label = QLabel()
         self.batch_quality_speed = self._quality_speed_combo()
         self.batch_recursive = QCheckBox()
         self.batch_recursive.setChecked(True)
@@ -264,7 +282,10 @@ class OfflinePage(QWidget):
         self.batch_skip.setChecked(True)
         self.start_batch.clicked.connect(self.run_batch)
         self.batch_engine.currentIndexChanged.connect(self._update_matanyone_help_visibility)
+        self.batch_engine.currentIndexChanged.connect(self._update_recognition_visibility)
+        self.batch_recognition.currentIndexChanged.connect(self._update_recognition_visibility)
         self.batch_matanyone_help.clicked.connect(self.show_matanyone_help)
+        self.batch_sam3_prompt_button.clicked.connect(self.show_sam3_prompt_dialog)
         row_dir = QHBoxLayout()
         row_dir.addWidget(self.batch_dir)
         row_dir.addWidget(browse_dir)
@@ -275,7 +296,7 @@ class OfflinePage(QWidget):
         grid = QGridLayout(page)
         grid.setColumnMinimumWidth(0, OFFLINE_LABEL_WIDTH)
         grid.setColumnStretch(1, 1)
-        self.batch_labels = {key: _label() for key in ("directory", "mode", "engine", "performance")}
+        self.batch_labels = {key: _label() for key in ("directory", "mode", "engine", "recognition", "performance")}
         grid.addWidget(self.batch_labels["directory"], 0, 0)
         grid.addLayout(row_dir, 0, 1)
         grid.addWidget(self.batch_labels["mode"], 1, 0)
@@ -283,14 +304,21 @@ class OfflinePage(QWidget):
         grid.addWidget(self.batch_labels["engine"], 2, 0)
         batch_engine_row = QHBoxLayout()
         batch_engine_row.addWidget(self.batch_engine)
-        batch_engine_row.addWidget(self.batch_matanyone_help)
         batch_engine_row.addStretch(1)
         grid.addLayout(batch_engine_row, 2, 1)
-        grid.addWidget(self.batch_labels["performance"], 3, 0)
-        grid.addLayout(self._performance_row(self.batch_quality_speed), 3, 1)
-        grid.addWidget(self.batch_recursive, 4, 1)
-        grid.addWidget(self.batch_skip, 5, 1)
-        grid.addLayout(actions, 6, 1)
+        grid.addWidget(self.batch_labels["recognition"], 3, 0)
+        batch_recognition_row = QHBoxLayout()
+        batch_recognition_row.addWidget(self.batch_recognition)
+        batch_recognition_row.addWidget(self.batch_matanyone_help)
+        batch_recognition_row.addWidget(self.batch_sam3_prompt_button)
+        batch_recognition_row.addWidget(self.batch_sam3_prompt_label)
+        batch_recognition_row.addStretch(1)
+        grid.addLayout(batch_recognition_row, 3, 1)
+        grid.addWidget(self.batch_labels["performance"], 4, 0)
+        grid.addLayout(self._performance_row(self.batch_quality_speed), 4, 1)
+        grid.addWidget(self.batch_recursive, 5, 1)
+        grid.addWidget(self.batch_skip, 6, 1)
+        grid.addLayout(actions, 7, 1)
         self.tabs.addTab(page, "")
 
     def _browse_file(self, target: QLineEdit) -> None:
@@ -337,8 +365,40 @@ class OfflinePage(QWidget):
         self.single_custom_minutes.setVisible(visible)
 
     def _update_matanyone_help_visibility(self) -> None:
-        self.single_matanyone_help.setVisible(self.single_engine.currentData() == "matanyone2")
-        self.batch_matanyone_help.setVisible(self.batch_engine.currentData() == "matanyone2")
+        self.single_matanyone_help.setVisible(str(self.single_engine.currentData()) == "matanyone2")
+        self.batch_matanyone_help.setVisible(str(self.batch_engine.currentData()) == "matanyone2")
+
+    def _update_recognition_visibility(self) -> None:
+        single_visible = str(self.single_engine.currentData()) == "matanyone2"
+        batch_visible = str(self.batch_engine.currentData()) == "matanyone2"
+        single_sam3_visible = single_visible and str(self.single_recognition.currentData()) == "sam3"
+        batch_sam3_visible = batch_visible and str(self.batch_recognition.currentData()) == "sam3"
+        self.single_labels["recognition"].setVisible(single_visible)
+        self.single_recognition.setVisible(single_visible)
+        self.single_sam3_prompt_button.setVisible(single_sam3_visible)
+        self.single_sam3_prompt_label.setVisible(single_sam3_visible)
+        self.batch_labels["recognition"].setVisible(batch_visible)
+        self.batch_recognition.setVisible(batch_visible)
+        self.batch_sam3_prompt_button.setVisible(batch_sam3_visible)
+        self.batch_sam3_prompt_label.setVisible(batch_sam3_visible)
+        self._update_sam3_prompt_labels()
+        self._update_matanyone_help_visibility()
+
+    def _effective_engine(self, engine_combo: QComboBox, recognition_combo: QComboBox) -> str:
+        engine = str(engine_combo.currentData())
+        if engine != "matanyone2":
+            return engine
+        recognition = str(recognition_combo.currentData())
+        return "matanyone2_medium" if recognition == "yoloworld_efficientsam" else "matanyone2"
+
+    def _sam3_prompt(self) -> str:
+        prompt = str(self.settings.data.get("offline_sam3_prompt") or "").strip()
+        return prompt or "person"
+
+    def _update_sam3_prompt_labels(self) -> None:
+        prompt = self._sam3_prompt()
+        self.single_sam3_prompt_label.setText(prompt)
+        self.batch_sam3_prompt_label.setText(prompt)
 
     def show_matanyone_help(self) -> None:
         QMessageBox.information(
@@ -346,6 +406,39 @@ class OfflinePage(QWidget):
             self.i18n.t("offline.matanyone_help_title"),
             self.i18n.t("offline.matanyone_help_msg"),
         )
+
+    def show_sam3_prompt_dialog(self) -> None:
+        dialog = QDialog(self)
+        dialog.setWindowTitle(self.i18n.t("offline.sam3_prompt_title"))
+        layout = QVBoxLayout(dialog)
+        hint = QLabel(self.i18n.t("offline.sam3_prompt_hint"))
+        hint.setWordWrap(True)
+        prompt_row = QHBoxLayout()
+        prompt_label = QLabel(self.i18n.t("offline.sam3_prompt_label"))
+        prompt_edit = QLineEdit(self._sam3_prompt())
+        prompt_edit.setMinimumWidth(260)
+        prompt_row.addWidget(prompt_label)
+        prompt_row.addWidget(prompt_edit, 1)
+        buttons = QHBoxLayout()
+        save_button = QPushButton(self.i18n.t("button.save"))
+        close_button = QPushButton(self.i18n.t("button.close"))
+        buttons.addStretch(1)
+        buttons.addWidget(save_button)
+        buttons.addWidget(close_button)
+
+        def save_prompt() -> None:
+            prompt = prompt_edit.text().strip() or "person"
+            self.settings.data["offline_sam3_prompt"] = prompt
+            self.settings.save()
+            self._update_sam3_prompt_labels()
+            dialog.accept()
+
+        save_button.clicked.connect(save_prompt)
+        close_button.clicked.connect(dialog.reject)
+        layout.addWidget(hint)
+        layout.addLayout(prompt_row)
+        layout.addLayout(buttons)
+        dialog.exec()
 
     def _save_quality_speed(self) -> None:
         sender = self.sender()
@@ -372,13 +465,14 @@ class OfflinePage(QWidget):
                     combo.blockSignals(False)
 
     def run_single(self) -> None:
+        engine = self._effective_engine(self.single_engine, self.single_recognition)
         args = [
             "single",
             self.single_video.text(),
             "--mode",
             self.single_mode.currentData(),
             "--engine",
-            self.single_engine.currentData(),
+            engine,
             "--start",
             str(self._start_seconds()),
             "--duration",
@@ -390,6 +484,8 @@ class OfflinePage(QWidget):
             args.extend(["--out-dir", self.single_out_dir.text().strip()])
         if self.single_skip.isChecked():
             args.append("--skip-existing")
+        if engine == "matanyone2":
+            args.extend(["--sam3-prompt", self._sam3_prompt()])
         self.settings.save()
         env = self.settings.server_env()
         env["PT_DECODE_MAX_SIDE"] = "0"
@@ -397,19 +493,22 @@ class OfflinePage(QWidget):
         self.process.start(args, env)
 
     def run_batch(self) -> None:
+        engine = self._effective_engine(self.batch_engine, self.batch_recognition)
         args = [
             "batch",
             self.batch_dir.text(),
             "--mode",
             self.batch_mode.currentData(),
             "--engine",
-            self.batch_engine.currentData(),
+            engine,
             "--skip-frames",
             "0",
         ]
         args.append("--recursive" if self.batch_recursive.isChecked() else "--no-recursive")
         if self.batch_skip.isChecked():
             args.append("--skip-existing")
+        if engine == "matanyone2":
+            args.extend(["--sam3-prompt", self._sam3_prompt()])
         self.settings.save()
         env = self.settings.server_env()
         env["PT_DECODE_MAX_SIDE"] = "0"
@@ -446,12 +545,14 @@ class OfflinePage(QWidget):
         self.single_labels["output"].setText(self.i18n.t("offline.output"))
         self.single_labels["mode"].setText(self.i18n.t("offline.mode"))
         self.single_labels["engine"].setText(self.i18n.t("offline.engine"))
-        self.single_labels["performance"].setText(self.i18n.t("offline.performance"))
+        self.single_labels["recognition"].setText(self.i18n.t("offline.recognition_model"))
+        self.single_labels["performance"].setText(self.i18n.t("performance.quality_speed"))
         self.single_labels["time"].setText(self.i18n.t("offline.time_range"))
         self.batch_labels["directory"].setText(self.i18n.t("offline.directory"))
         self.batch_labels["mode"].setText(self.i18n.t("offline.mode"))
         self.batch_labels["engine"].setText(self.i18n.t("offline.engine"))
-        self.batch_labels["performance"].setText(self.i18n.t("offline.performance"))
+        self.batch_labels["recognition"].setText(self.i18n.t("offline.recognition_model"))
+        self.batch_labels["performance"].setText(self.i18n.t("performance.quality_speed"))
         for combo in (self.single_mode, self.batch_mode):
             combo.setItemText(0, self.i18n.t("mode.green"))
             combo.setItemText(1, self.i18n.t("mode.alpha"))
@@ -459,14 +560,17 @@ class OfflinePage(QWidget):
             combo.setItemText(0, self.i18n.t("engine.rvm_fast"))
             combo.setItemText(1, self.i18n.t("engine.rvm_balanced"))
             combo.setItemText(2, self.i18n.t("engine.matanyone2"))
+        for combo in (self.single_recognition, self.batch_recognition):
+            combo.setItemText(0, self.i18n.t("recognition.yoloworld_efficientsam"))
+            combo.setItemText(1, self.i18n.t("recognition.sam3"))
+        self.single_sam3_prompt_button.setText(self.i18n.t("offline.sam3_prompt_button"))
+        self.batch_sam3_prompt_button.setText(self.i18n.t("offline.sam3_prompt_button"))
         self.single_matanyone_help.setToolTip(self.i18n.t("offline.matanyone_help_title"))
         self.batch_matanyone_help.setToolTip(self.i18n.t("offline.matanyone_help_title"))
-        self._update_matanyone_help_visibility()
+        self._update_recognition_visibility()
         for index, key in enumerate(("offline.duration_15s", "offline.duration_30s", "offline.duration_1m", "offline.duration_custom", "offline.duration_full")):
             self.single_duration.setItemText(index, self.i18n.t(key))
         self.single_custom_minutes_label.setText(self.i18n.t("offline.minutes"))
-        for label in self.performance_skip_labels:
-            label.setText(self.i18n.t("performance.quality_speed"))
         for combo in (self.single_quality_speed, self.batch_quality_speed):
             for index, key in enumerate(("quality_speed.ultrafast", "quality_speed.medium", "quality_speed.veryslow")):
                 combo.setItemText(index, self.i18n.t(key))

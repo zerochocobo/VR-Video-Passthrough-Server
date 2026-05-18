@@ -14,6 +14,20 @@ import config
 
 PACK_SCALE = 0.4
 FISHEYE_RADIUS_SCALE = 1.0
+IPD_METERS = 0.063
+
+
+def _ceil_even(value: float) -> int:
+    out = int(math.ceil(value))
+    return out if (out & 1) == 0 else out + 1
+
+
+def alpha_2d_disparity_px(output_w: int) -> float:
+    """Convert configured flat-2D alpha depth in meters to stereo disparity px."""
+    eye_w = max(2, int(output_w) // 2)
+    distance_m = max(0.1, float(config.ALPHA_2D_DISTANCE_M))
+    angle_rad = 2.0 * math.atan(IPD_METERS / (2.0 * distance_m))
+    return max(0.0, float(round((angle_rad / math.pi) * eye_w)))
 
 
 def is_sbs_vr_size(w: int, h: int) -> bool:
@@ -26,11 +40,19 @@ def alpha_output_size(src_w: int, src_h: int) -> tuple[int, int]:
     src_h = max(2, int(src_h) & ~1)
     if is_sbs_vr_size(src_w, src_h) or not config.ALPHA_2D_ENABLE:
         return src_w, src_h
+    if str(config.ALPHA_2D_PROJECTION).lower() == "flat3d":
+        safe_w = max(0.01, min(1.0, float(config.ALPHA_2D_FLAT3D_SAFE_W)))
+        safe_h = max(0.01, min(1.0, float(config.ALPHA_2D_FLAT3D_SAFE_H)))
+        max_eye = max(2, int(config.ALPHA_2D_MAX_EYE_SIZE) & ~1)
+        eye = _ceil_even(max(src_w / safe_w, src_h / safe_h))
+        eye = max(2, min(max_eye, eye))
+        return eye * 2, eye
     fov = max(1.0, min(179.0, float(config.ALPHA_2D_FOV)))
     eye = int(math.ceil(max(src_w, src_h) * 180.0 / fov))
     if eye & 1:
         eye += 1
-    eye = max(2, eye)
+    max_eye = max(2, int(config.ALPHA_2D_MAX_EYE_SIZE) & ~1)
+    eye = min(max_eye, max(2, eye))
     return eye * 2, eye
 
 
@@ -169,6 +191,40 @@ class AlphaPacker:
         float v = (py * 0.5f + 0.5f) * canvas - y0;
         float eye_shift = eye == 0 ? (disparity_px * 0.5f) : (-disparity_px * 0.5f);
         u -= eye_shift;
+        if (u < 0.f || u > (float)(src_w - 1) || v < 0.f || v > (float)(src_h - 1)) {
+            return false;
+        }
+        *src_x = u;
+        *src_y = v;
+        return true;
+    }
+
+    __device__ bool flat3d_to_source(
+        int x, int y,
+        int out_w, int out_h,
+        int src_w, int src_h,
+        float safe_w_frac,
+        float safe_h_frac,
+        float disparity_px,
+        float* src_x,
+        float* src_y
+    ) {
+        int eye_w = out_w >> 1;
+        int eye = x >= eye_w ? 1 : 0;
+        float lx = (float)(x - eye * eye_w) + 0.5f;
+        float ly = (float)y + 0.5f;
+        float safe_w = (float)eye_w * safe_w_frac;
+        float safe_h = (float)out_h * safe_h_frac;
+        if (safe_w < 1.f || safe_h < 1.f) return false;
+        float scale = fminf(safe_w / (float)src_w, safe_h / (float)src_h);
+        if (scale <= 0.f) return false;
+        float draw_w = (float)src_w * scale;
+        float draw_h = (float)src_h * scale;
+        float left = ((float)eye_w - draw_w) * 0.5f;
+        float top = ((float)out_h - draw_h) * 0.5f;
+        float eye_shift = eye == 0 ? (disparity_px * 0.5f) : (-disparity_px * 0.5f);
+        float u = (lx - left - eye_shift) / scale;
+        float v = (ly - top) / scale;
         if (u < 0.f || u > (float)(src_w - 1) || v < 0.f || v > (float)(src_h - 1)) {
             return false;
         }
@@ -397,6 +453,54 @@ class AlphaPacker:
     }
 
     extern "C" __global__
+    void project_flat2d_3d_nv12_alpha(
+        const unsigned char* __restrict__ src_nv12,
+        const float* __restrict__ alpha_lr,
+        int src_w, int src_h,
+        int out_w, int out_h,
+        int aw, int ah,
+        float safe_w_frac,
+        float safe_h_frac,
+        float disparity_px,
+        float alpha_cutoff, int alpha_hard_edge, float alpha_contrast,
+        unsigned char* __restrict__ out_nv12,
+        unsigned char* __restrict__ fisheye_alpha
+    ) {
+        int x = blockIdx.x * blockDim.x + threadIdx.x;
+        int y = blockIdx.y * blockDim.y + threadIdx.y;
+        if (x >= out_w || y >= out_h) return;
+
+        int y_idx = y * out_w + x;
+        float src_x = 0.f;
+        float src_y = 0.f;
+        bool inside = flat3d_to_source(
+            x, y, out_w, out_h, src_w, src_h, safe_w_frac, safe_h_frac, disparity_px, &src_x, &src_y
+        );
+        unsigned char yv = inside ? sample_y_bilinear(src_nv12, src_w, src_h, src_x, src_y) : (unsigned char)16;
+        unsigned char uv_u = 128;
+        unsigned char uv_v = 128;
+        if (inside) {
+            sample_uv_nearest(src_nv12, src_w, src_h, src_x, src_y, &uv_u, &uv_v);
+        }
+        out_nv12[y_idx] = yv;
+
+        float a = 0.f;
+        if (inside) {
+            a = adjust_alpha(
+                sample_alpha_lr(alpha_lr, aw, ah, src_w, src_h, (int)src_x, (int)src_y),
+                alpha_cutoff, alpha_hard_edge, alpha_contrast
+            );
+        }
+        fisheye_alpha[y_idx] = (unsigned char)(a * 255.f + 0.5f);
+
+        if (((x | y) & 1) == 0) {
+            int uv_idx = out_w * out_h + (y >> 1) * out_w + x;
+            out_nv12[uv_idx] = uv_u;
+            out_nv12[uv_idx + 1] = uv_v;
+        }
+    }
+
+    extern "C" __global__
     void blend_projected_overlay_to_fisheye(
         unsigned char* __restrict__ out_nv12,
         unsigned char* __restrict__ fisheye_alpha,
@@ -511,6 +615,7 @@ class AlphaPacker:
         self._cp = cp
         self._project_kernel = cp.RawKernel(self._KERNEL_SRC, "project_fisheye_nv12_alpha")
         self._project_flat2d_kernel = cp.RawKernel(self._KERNEL_SRC, "project_flat2d_fisheye_nv12_alpha")
+        self._project_flat3d_kernel = cp.RawKernel(self._KERNEL_SRC, "project_flat2d_3d_nv12_alpha")
         self._overlay_kernel = cp.RawKernel(self._KERNEL_SRC, "overlay_alpha_packer_layout")
         self._blend_projected_overlay_kernel = cp.RawKernel(self._KERNEL_SRC, "blend_projected_overlay_to_fisheye")
         self._g_alpha = None
@@ -520,10 +625,16 @@ class AlphaPacker:
     def output_size(self, src_w: int, src_h: int) -> tuple[int, int]:
         return alpha_output_size(src_w, src_h)
 
-    def projection_mode(self, src_w: int, src_h: int) -> str:
+    @staticmethod
+    def projection_mode_static(src_w: int, src_h: int) -> str:
         if is_sbs_vr_size(src_w, src_h) or not config.ALPHA_2D_ENABLE:
             return "sbs_half_equirect"
-        return "flat2d"
+        if str(config.ALPHA_2D_PROJECTION).lower() == "flat3d":
+            return "flat2d_3d"
+        return "flat2d_fisheye"
+
+    def projection_mode(self, src_w: int, src_h: int) -> str:
+        return self.projection_mode_static(src_w, src_h)
 
     def _blend_one_projected_subtitle(self, out_nv12, h: int, w: int, alpha_w: int, alpha_h: int, subtitle_overlay) -> None:
         cp = self._cp
@@ -596,7 +707,9 @@ class AlphaPacker:
         ah, aw = alpha_dev.shape[:2]
         block = (16, 16, 1)
         grid = ((out_w + block[0] - 1) // block[0], (out_h + block[1] - 1) // block[1], 1)
-        if self.projection_mode(src_w, src_h) == "flat2d":
+        projection_mode = self.projection_mode(src_w, src_h)
+        flat2d_disparity_px = alpha_2d_disparity_px(out_w)
+        if projection_mode == "flat2d_fisheye":
             self._project_flat2d_kernel(
                 grid,
                 block,
@@ -611,7 +724,30 @@ class AlphaPacker:
                     np.int32(ah),
                     np.float32(self.radius_scale),
                     np.float32(np.deg2rad(config.ALPHA_2D_FOV)),
-                    np.float32(config.ALPHA_2D_DISPARITY_PX),
+                    np.float32(flat2d_disparity_px),
+                    np.float32(self.alpha_cutoff),
+                    np.int32(1 if self.alpha_hard_edge else 0),
+                    np.float32(self.alpha_contrast),
+                    out_nv12,
+                    self._g_fisheye_alpha,
+                ),
+            )
+        elif projection_mode == "flat2d_3d":
+            self._project_flat3d_kernel(
+                grid,
+                block,
+                (
+                    self.matter._g_frame,
+                    alpha_dev,
+                    np.int32(src_w),
+                    np.int32(src_h),
+                    np.int32(out_w),
+                    np.int32(out_h),
+                    np.int32(aw),
+                    np.int32(ah),
+                    np.float32(config.ALPHA_2D_FLAT3D_SAFE_W),
+                    np.float32(config.ALPHA_2D_FLAT3D_SAFE_H),
+                    np.float32(flat2d_disparity_px),
                     np.float32(self.alpha_cutoff),
                     np.int32(1 if self.alpha_hard_edge else 0),
                     np.float32(self.alpha_contrast),

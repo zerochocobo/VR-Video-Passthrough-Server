@@ -29,12 +29,14 @@ _WARMUP_NOTICE_PRINTED = False
 ENGINES = {
     "rvm_fast": ("rvm", ROOT / "models" / "rvm_mobilenetv3_fp32.onnx"),
     "rvm_balanced": ("rvm", ROOT / "models" / "rvm_resnet50_fp32.onnx"),
+    "matanyone2_medium": ("matanyone2_onnx", None),
     "matanyone2": ("matanyone2_onnx", None),
 }
 
 ENGINE_TAGS = {
     "rvm_fast": "rvm1",
     "rvm_balanced": "rvm2",
+    "matanyone2_medium": "matanyone2m",
     "matanyone2": "matanyone2",
 }
 
@@ -64,7 +66,7 @@ def _tool_command(mode: str) -> list[str]:
 
 
 def _default_out(src: Path, mode: str) -> Path:
-    suffix = "_FISHEYE180_alpha.mp4" if mode == "alpha" else "_passthrough.mp4"
+    suffix = "_FISHEYE_alpha.mp4" if mode == "alpha" else "_passthrough.mp4"
     return src.with_name(f"{src.stem}{suffix}")
 
 
@@ -88,7 +90,7 @@ def _single_out(src: Path, args: argparse.Namespace) -> Path:
     engine_tag = ENGINE_TAGS[args.engine]
     start_tag = f"S{_time_tag(args.start)}"
     duration_tag = _duration_tag(args.duration)
-    suffix = "FISHEYE180_alpha" if args.mode == "alpha" else "passthrough"
+    suffix = "FISHEYE_alpha" if args.mode == "alpha" else "passthrough"
     return src.with_name(f"{src.stem}_{engine_tag}_{start_tag}_{duration_tag}_{suffix}.mp4")
 
 
@@ -125,7 +127,15 @@ def _base_cmd(args: argparse.Namespace, src: Path, out: Path) -> list[str]:
     fps = float(args.fps or 0.0)
     if fps > 0:
         cmd.extend(["--fps", str(fps)])
-    cmd.extend(["--alpha-stride", str(int(args.skip_frames) + 1)])
+    cmd.extend(["--alpha-stride", "1"])
+    if args.engine in ("matanyone2", "matanyone2_medium"):
+        cmd.extend(["--matanyone2-size", "512"])
+        cmd.extend(["--matanyone2-batch", "1"])
+        cmd.append("--no-sbs-batch")
+    if args.engine == "matanyone2":
+        cmd.extend(["--sam3-prompt", str(getattr(args, "sam3_prompt", "person") or "person")])
+    if args.engine == "matanyone2_medium":
+        cmd.extend(["--matanyone2-prepass", "yoloworld_efficientsam"])
     if engine == "rvm":
         cmd.extend(["--input-size", str(args.input_size)])
         cmd.append("--sbs-batch")
@@ -246,6 +256,7 @@ def main(argv: list[str] | None = None) -> int:
     single.add_argument("--bitrate", default=RVM_DEFAULT_ARGS["bitrate"])
     single.add_argument("--preset", default=RVM_DEFAULT_ARGS["preset"])
     single.add_argument("--cq", type=int, default=RVM_DEFAULT_ARGS["cq"])
+    single.add_argument("--sam3-prompt", default="person")
     single.add_argument("--skip-existing", action="store_true")
 
     batch = sub.add_parser("batch", help="convert all videos under a directory")
@@ -260,6 +271,7 @@ def main(argv: list[str] | None = None) -> int:
     batch.add_argument("--bitrate", default=RVM_DEFAULT_ARGS["bitrate"])
     batch.add_argument("--preset", default=RVM_DEFAULT_ARGS["preset"])
     batch.add_argument("--cq", type=int, default=RVM_DEFAULT_ARGS["cq"])
+    batch.add_argument("--sam3-prompt", default="person")
     batch.set_defaults(out="", start=0.0, duration=0.0)
 
     args = parser.parse_args(argv)

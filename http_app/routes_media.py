@@ -447,13 +447,13 @@ def _can_preempt_owner(active_owner: tuple, new_owner: tuple) -> bool:
     if active_owner == new_owner:
         kind = _owner_kind(new_owner)
         if is_live_owner:
-            return kind in ("nplayer", "quest_dalvik")
+            return kind in ("nplayer", "4xvr", "avpro")
         return kind in ("", "libmpv", "vlc", "nplayer")
     if _owner_base(active_owner) != new_base:
         return False
     active_kind = _owner_kind(active_owner)
     new_kind = _owner_kind(new_owner)
-    if is_live_owner and new_kind in ("nplayer", "quest_dalvik"):
+    if is_live_owner and new_kind in ("nplayer", "4xvr", "avpro"):
         return True
     if active_kind == "lavf" and new_kind in ("vlc", "libmpv"):
         return True
@@ -1160,11 +1160,11 @@ def _live_response_profile(user_agent: str) -> str:
     if "nplayer" in ua:
         return "nplayer"
     if "avpromobilevideo" in ua or "exoplayerlib" in ua:
-        return "4xvr"
+        return "avpro"
     if "libmpv" in ua or "skybox" in ua:
         return "libmpv"
-    if "dalvik/" in ua and "quest" in ua:
-        return "quest_dalvik"
+    if "dalvik/" in ua:
+        return "4xvr"
     if "vlc" in ua or "libvlc" in ua or "moonvr" in ua:
         return "vlc"
     if "lavf/" in ua:
@@ -1377,7 +1377,7 @@ async def passthrough_live_get(
     live_max_fps = _live_adaptive_max_fps(path, live_meta)
     live_profile = _live_response_profile(user_agent)
     is_nplayer = _is_nplayer_client(user_agent)
-    use_managed_live_session = live_profile in {"4xvr", "libmpv", "quest_dalvik"} or is_nplayer
+    use_managed_live_session = live_profile in {"4xvr", "avpro", "libmpv"} or is_nplayer
     live_total = _estimated_passthrough_size(path, max(0.0, info.duration - t), PYNV_OUTPUT_CODEC)
     live_send_bps = _estimated_passthrough_bps(path, PYNV_OUTPUT_CODEC)
     live_send_pacing = PASSTHROUGH_SEND_REALTIME_PACING and live_profile != "libmpv"
@@ -1394,7 +1394,7 @@ async def passthrough_live_get(
             rid, range_header, live_byte_range, live_total,
         )
     if (
-        live_profile not in {"4xvr", "libmpv", "quest_dalvik"}
+        live_profile not in {"4xvr", "avpro", "libmpv"}
         and not is_nplayer
         and range_header
         and not _is_zero_open_range(range_header, live_byte_range)
@@ -1509,7 +1509,7 @@ async def passthrough_live_get(
         slot_token,
         who=f"live:{path.name}@{t:.2f}s",
         owner=owner,
-        allow_same_owner_preempt=is_nplayer or live_profile in {"4xvr", "quest_dalvik"},
+        allow_same_owner_preempt=is_nplayer or live_profile in {"4xvr", "avpro"},
     )
     if preempted is False:
         await _clear_live_starting(live_key, live_starting_at)

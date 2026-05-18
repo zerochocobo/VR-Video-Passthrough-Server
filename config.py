@@ -299,15 +299,35 @@ ALPHA_CONTRAST = max(0.01, float(_env("ALPHA_CONTRAST", 1.0)))
 #   stereo fisheye SBS output. Existing SBS VR sources keep the original path.
 ALPHA_2D_ENABLE = _env("ALPHA_2D_ENABLE", "1") == "1"
 
+# PT_ALPHA_2D_PROJECTION:
+#   Projection used for non-SBS / non-2:1 flat videos in alpha passthrough.
+#     fisheye - existing flat-2D-to-fisheye SBS projection.
+#     flat3d  - stereo SBS without fisheye projection; the image is centered in
+#               a safe area so it does not overlap the alpha packer blocks.
+ALPHA_2D_PROJECTION = _env("ALPHA_2D_PROJECTION", "fisheye").lower()
+
 # PT_ALPHA_2D_FOV:
 #   Field of view in degrees used when projecting a flat 2D video plane into
 #   each fisheye eye. 90 keeps the plane natural and avoids excessive zoom.
 ALPHA_2D_FOV = max(1.0, min(179.0, float(_env("ALPHA_2D_FOV", 80.0))))
 
-# PT_ALPHA_2D_DISPARITY_PX:
-#   Stereo offset for flat 2D alpha passthrough. The left eye image is shifted
-#   right by half this value and the right eye image is shifted left by half.
-ALPHA_2D_DISPARITY_PX = float(_env("ALPHA_2D_DISPARITY_PX", 10.0))
+# PT_ALPHA_2D_MAX_EYE_SIZE:
+#   Maximum square size for one eye in flat-2D alpha passthrough. The full SBS
+#   output is 2x this value by this value. Default 4096 keeps flat-2D alpha
+#   output within an 8192x4096 HEVC/NVENC-friendly envelope.
+ALPHA_2D_MAX_EYE_SIZE = max(2, int(_env("ALPHA_2D_MAX_EYE_SIZE", 4096)) & ~1)
+
+# PT_ALPHA_2D_FLAT3D_SAFE_W / PT_ALPHA_2D_FLAT3D_SAFE_H:
+#   In flat3d mode, the visible source image is centered inside this fraction of
+#   one eye canvas. Defaults keep the source away from the alpha packer blocks.
+ALPHA_2D_FLAT3D_SAFE_W = max(0.01, min(1.0, float(_env("ALPHA_2D_FLAT3D_SAFE_W", 0.7))))
+ALPHA_2D_FLAT3D_SAFE_H = max(0.01, min(1.0, float(_env("ALPHA_2D_FLAT3D_SAFE_H", 0.6))))
+
+# PT_ALPHA_2D_DISTANCE_M:
+#   Stereo depth in meters for flat 2D alpha passthrough. Lower values create
+#   more parallax. Runtime code converts this to pixels using the same IPD
+#   formula as subtitles and the current output eye width.
+ALPHA_2D_DISTANCE_M = max(0.1, float(_env("ALPHA_2D_DISTANCE_M", 4.0)))
 
 # PT_RVM_IOBINDING:
 #   1 enables ORT IOBinding for the RVM path. This usually reduces copies and

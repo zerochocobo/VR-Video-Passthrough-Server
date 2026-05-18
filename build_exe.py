@@ -230,6 +230,7 @@ def build_server(pyi: list[str], env: dict[str, str]) -> None:
             "--collect-submodules", "utils",
             "--hidden-import", "cupy_backends.cuda._softlink",
             "--collect-all", "onnxruntime",
+            "--collect-data", "osam",
             "--collect-all", "cupy",
             "--collect-all", "cupy_backends",
             "--collect-submodules", "cupy_backends",
@@ -394,6 +395,14 @@ def copy_ort_cuda_ep_dependencies() -> None:
                 info(f"  {src}")
 
 
+def copy_clip_tokenizer_cache() -> None:
+    src = ROOT / "runtime_cache" / "clip_text_onnx" / "bpe_simple_vocab_16e6.txt.gz"
+    if not src.exists():
+        info(f"Optional CLIP BPE tokenizer cache not found: {src}")
+        return
+    copy_file(src, DIST_DIR / "_internal" / "runtime_cache" / "clip_text_onnx" / src.name)
+
+
 def verify_base_runtime() -> None:
     (DIST_DIR / "bin").mkdir(parents=True, exist_ok=True)
     (DIST_DIR / "bin" / ".keep").write_bytes(b"")
@@ -405,6 +414,16 @@ def verify_base_runtime() -> None:
         fail("Missing onnxruntime_providers_cuda.dll.")
     if not (DIST_DIR / "_internal" / "onnxruntime" / "capi" / "onnxruntime_providers_shared.dll").exists():
         fail("Missing onnxruntime_providers_shared.dll.")
+
+
+def verify_clip_tokenizer_runtime() -> None:
+    osam_bpe = DIST_DIR / "_internal" / "osam" / "_models" / "yoloworld" / "clip" / "bpe_simple_vocab_16e6.txt.gz"
+    fallback_bpe = DIST_DIR / "_internal" / "runtime_cache" / "clip_text_onnx" / "bpe_simple_vocab_16e6.txt.gz"
+    if not osam_bpe.exists() and not fallback_bpe.exists():
+        fail(
+            "Missing CLIP BPE tokenizer data for SAM3 prompt tokenization. "
+            f"Expected {osam_bpe} or {fallback_bpe}."
+        )
 
 
 def verify_cuda_auxiliary_runtime() -> None:
@@ -572,9 +591,11 @@ def main() -> int:
         remove_stale_icu()
         verify_no_duplicate_critical_dlls()
         prepare_resources_and_models()
+        copy_clip_tokenizer_cache()
         copy_cuda_auxiliary_dlls()
         copy_ort_cuda_ep_dependencies()
         verify_base_runtime()
+        verify_clip_tokenizer_runtime()
         verify_cuda_auxiliary_runtime()
         verify_ort_cuda_ep_runtime()
         run_frozen_probe(env)

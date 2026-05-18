@@ -429,6 +429,13 @@ DLNA client
 - Live chapter containers are the current coarse seek strategy.
 - Startup GPU warmup is important on systems where ORT CUDA first-run JIT is
   expensive.
+- Direct development diagnostics that need ONNX Runtime CUDA must launch with
+  the same DLL environment as the UI. Reuse
+  `ui.services.process_helpers.base_environment()` or prepend equivalent
+  `PT_CUDNN_BIN`, `CUDA_PATH\bin`, and `CUDA_HOME\bin` entries to `PATH` before
+  running `uv run`/Python tools; otherwise ORT can fail to load CUDA provider
+  DLLs such as `cublasLt64_12.dll` / `cudnn64_9.dll` and silently fall back to
+  CPU.
 - Translation JSON files under `ui/translations/` are intentionally kept as
   UTF-8 with BOM. When editing or generating them programmatically, read/write
   with `utf-8-sig` and preserve the BOM.

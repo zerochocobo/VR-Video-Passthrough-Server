@@ -4,6 +4,19 @@ This file lists implemented user-facing and technically relevant changes. Entrie
 
 ## English
 
+### 2026-05-18
+
+- Added a MatAnyone2 medium offline path using YOLO-World + EfficientSAM as the bootstrap recognizer before MatAnyone2 propagation.
+- Improved MatAnyone2 medium person detection with ViT-B/32 multi-prompt text features, YOLO-World-L defaults, 1280 detector input, stricter person-box geometry filtering, stereo left/right pairing, and short inactive-gap filling.
+- Reduced MatAnyone2 medium peak VRAM by running the YOLO-World/EfficientSAM prepass in a subprocess and defaulting MatAnyone2 offline processing to batch 1 with non-SBS batching.
+- Improved SAM3-backed MatAnyone2 slow mode with shared SAM3 helper code, stereo mask consistency guarding, short inactive-gap filling, and configurable SAM3 text prompts.
+- Updated the offline UI so MatAnyone2 is selected once, with a recognition-model selector for `YOLOWorld-EfficientSAM` or `SAM3 (16GB+ VRAM)`, plus a SAM3-only prompt dialog.
+- Forced offline alpha generation to use alpha stride 1 for all offline channels.
+- Added flat 2D alpha output controls: output-size cap, fisheye/flat3d projection mode, distance-based disparity, square-eye flat3d sizing, and Home-page 2D alpha settings.
+- Renamed generated alpha fisheye outputs from `FISHEYE180_alpha` to `FISHEYE_alpha` for DeoVR filename recognition.
+- Improved 4XVR/AVPro live-profile detection by classifying generic Android `Dalvik/` user agents as managed 4XVR-style live sessions.
+- Fixed the ONNX Runtime dependency setup so the project depends on `onnxruntime-gpu` only; `osam` is no longer a project dependency because it can pull CPU-only `onnxruntime` and hide CUDA providers.
+
 ### 2026-05-17
 
 - **v0.1.0-beta.1 officially released for public beta testing.**
@@ -134,6 +147,20 @@ This file lists implemented user-facing and technically relevant changes. Entrie
 - Added `PT_CONTAINER` support for MP4 and MPEG-TS passthrough output.
 
 ## 中文
+
+### 2026-05-18
+
+- **v0.1.0-beta.3修补和新增功能**
+- 新增 MatAnyone2 中速离线通道，使用 YOLO-World + EfficientSAM 作为 MatAnyone2 传播前的前置识别模型。
+- 改进 MatAnyone2 中速人像识别：使用 ViT-B/32 多提示词文本特征、默认 YOLO-World-L、1280 检测输入、更严格的人像框几何过滤、左右眼配对，以及短 inactive 缺口填补。
+- 降低 MatAnyone2 中速峰值显存：YOLO-World/EfficientSAM 前置改为子进程运行，MatAnyone2 离线默认 batch 1 且关闭 SBS batch。
+- 改进 SAM3 前置的 MatAnyone2 慢速模式：抽取共享 SAM3 helper、增加左右眼 mask 一致性防护、短 inactive 缺口填补，以及可配置 SAM3 文本提示词。
+- 调整离线 UI：MatAnyone2 作为统一引擎显示，下方增加识别模型选择，可选 `YOLOWorld-EfficientSAM` 或 `SAM3 (16GB+ VRAM)`，并增加仅 SAM3 使用的提示词对话框。
+- 所有离线 alpha 生成强制使用 alpha stride 1。
+- 新增 2D alpha 输出控制：输出尺寸上限、fisheye/flat3d 投影模式、按距离计算视差、flat3d 方形单眼画布，以及首页 2D alpha 设置入口。
+- 将生成的 alpha 鱼眼文件名从 `FISHEYE180_alpha` 改为 `FISHEYE_alpha`，匹配 DeoVR 文件名识别。
+- 改进 4XVR/AVPro live profile 识别：将通用 Android `Dalvik/` UA 归入托管的 4XVR 风格 live session。
+- 修复 ONNX Runtime 依赖配置：项目只依赖 `onnxruntime-gpu`；`osam` 不再作为项目依赖，避免它拉入 CPU-only `onnxruntime` 并隐藏 CUDA provider。
 
 ### 2026-05-17
 

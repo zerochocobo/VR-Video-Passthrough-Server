@@ -23,6 +23,7 @@ if errorlevel 1 goto :fail
 
 echo.
 echo Build script completed.
+python make_update_package.py
 pause
 exit /b 0
 

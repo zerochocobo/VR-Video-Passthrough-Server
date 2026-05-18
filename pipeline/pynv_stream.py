@@ -1586,13 +1586,9 @@ class PyNvPassthroughStream:
             alpha_projection_mode = ""
             alpha_process_w, alpha_process_h = out_w, out_h
             if self.output_mode == "alpha":
-                from pipeline.alpha_packer import alpha_output_size, is_sbs_vr_size
+                from pipeline.alpha_packer import AlphaPacker, alpha_output_size
 
-                alpha_projection_mode = (
-                    "sbs_half_equirect"
-                    if is_sbs_vr_size(alpha_process_w, alpha_process_h) or not config.ALPHA_2D_ENABLE
-                    else "flat2d"
-                )
+                alpha_projection_mode = AlphaPacker.projection_mode_static(alpha_process_w, alpha_process_h)
                 out_w, out_h = alpha_output_size(alpha_process_w, alpha_process_h)
             self.output_fps = fps
             if not timing.is_cfr:
@@ -1645,7 +1641,9 @@ class PyNvPassthroughStream:
                 codec_meta = self.metadata.codec
                 color_meta = self.metadata.color
                 log.info(
-                    "[PYNV][%d] source meta: codec=%s profile=%s pix_fmt=%s bit_depth=%d level=%s size=%dx%d process_size=%dx%d source_fps=%.3f output_fps=%.3f fps_cap=%.3f duration=%.3f frames=%d color=%s/%s/%s/%s container=%s output_mode=%s",
+                    "[PYNV][%d] source meta: codec=%s profile=%s pix_fmt=%s bit_depth=%d level=%s "
+                    "size=%dx%d process_size=%dx%d output_size=%dx%d source_fps=%.3f output_fps=%.3f "
+                    "fps_cap=%.3f duration=%.3f frames=%d color=%s/%s/%s/%s container=%s output_mode=%s",
                     self.sid,
                     codec_meta.codec_name,
                     codec_meta.profile,
@@ -1654,6 +1652,8 @@ class PyNvPassthroughStream:
                     codec_meta.level,
                     info.width,
                     info.height,
+                    alpha_process_w,
+                    alpha_process_h,
                     out_w,
                     out_h,
                     source_fps,
@@ -1771,11 +1771,12 @@ class PyNvPassthroughStream:
             )
             alpha_packer = None
             if self.output_mode == "alpha":
-                from pipeline.alpha_packer import AlphaPacker
+                from pipeline.alpha_packer import AlphaPacker, alpha_2d_disparity_px
 
                 alpha_packer = AlphaPacker(self.matter)
+                alpha_2d_disparity = alpha_2d_disparity_px(out_w)
                 log.info(
-                    "[PYNV][%d] alpha passthrough active: projection=%s process=%dx%d output=%dx%d scale=%.3f radius=%.3f layout=alpha-packer-6block flat2d_fov=%.1f flat2d_disparity=%.1fpx",
+                    "[PYNV][%d] alpha passthrough active: projection=%s process=%dx%d output=%dx%d scale=%.3f radius=%.3f layout=alpha-packer-6block flat2d_fov=%.1f flat2d_distance=%.2fm flat2d_disparity=%.1fpx",
                     self.sid,
                     alpha_projection_mode or alpha_packer.projection_mode(alpha_process_w, alpha_process_h),
                     alpha_process_w,
@@ -1785,7 +1786,8 @@ class PyNvPassthroughStream:
                     alpha_packer.scale,
                     alpha_packer.radius_scale,
                     config.ALPHA_2D_FOV,
-                    config.ALPHA_2D_DISPARITY_PX,
+                    config.ALPHA_2D_DISTANCE_M,
+                    alpha_2d_disparity,
                 )
             slate_nv12 = None
             slate_frames = 0

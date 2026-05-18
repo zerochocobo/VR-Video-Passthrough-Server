@@ -16,7 +16,6 @@ import subprocess
 import sys
 import tempfile
 import time
-import gc
 from collections import defaultdict
 from pathlib import Path
 
@@ -27,6 +26,13 @@ from utils.bitrate_estimator import effective_default_bitrate, parse_bitrate, so
 from utils.gpu_runtime_cache import configure_gpu_runtime_cache  # noqa: E402
 from utils.subprocess_hidden import hidden_subprocess_kwargs  # noqa: E402
 from utils.video_metadata import cfr_source_index, probe_color_metadata, probe_timing_metadata, probe_video_metadata, select_backend  # noqa: E402
+from offline.sam3_matanyone2 import (  # noqa: E402
+    Sam3TextMasker,
+    apply_sam3_stereo_guard,
+    clear_gpu_memory_pools,
+    empty_sam3_mask,
+    fill_short_inactive_gaps,
+)
 
 GPU_CACHE_ENV = configure_gpu_runtime_cache()
 
@@ -71,7 +77,7 @@ def _resolve_matanyone2_model_dir(args, width: int = 0, height: int = 0) -> Path
     if getattr(args, "model", ""):
         return Path(args.model).resolve()
     size = int(getattr(args, "matanyone2_size", 512) or 512)
-    batch_arg = str(getattr(args, "matanyone2_batch", "auto") or "auto").lower()
+    batch_arg = str(getattr(args, "matanyone2_batch", "1") or "1").lower()
     if batch_arg == "auto":
         is_sbs = width > 0 and height > 0 and width >= 2 * height
         # 1024 batch2 is memory-bandwidth/workspace heavy in ORT CUDA on this
@@ -87,17 +93,6 @@ def _resolve_matanyone2_model_dir(args, width: int = 0, height: int = 0) -> Path
             print(f"[offline] warning: {model_dir} not found, falling back to {fallback}")
             return fallback.resolve()
     return model_dir.resolve()
-
-
-def _clear_gpu_memory_pools() -> None:
-    gc.collect()
-    try:
-        import cupy as cp
-
-        cp.get_default_memory_pool().free_all_blocks()
-        cp.get_default_pinned_memory_pool().free_all_blocks()
-    except Exception:
-        pass
 
 
 def _patch_tempdir() -> None:
@@ -304,7 +299,7 @@ def _nvidia_mem_stats() -> tuple[int, int]:
 
 
 def _require_sam3_vram(args) -> None:
-    if args.engine != "matanyone2_onnx" or args.mask or args.sam3_provider != "cuda":
+    if args.engine != "matanyone2_onnx" or args.mask or args.matanyone2_prepass != "sam3" or args.sam3_provider != "cuda":
         return
     if args.sam3_min_vram_gb <= 0:
         return
@@ -392,232 +387,6 @@ class RvmOfflineEngine(OfflineMattingEngine):
             if values:
                 lines.append(f"rvm_{key}_avg = {statistics.fmean(values):.3f} ms n={len(values)}")
         return lines
-
-
-class Sam3TextMasker:
-    _KNOWN_CLIP_TOKENS = {
-        "person": [2533],
-    }
-
-    def __init__(
-        self,
-        model_dir: Path,
-        prompt: str,
-        providers: list[str],
-        decoder_providers: list[str] | None = None,
-        score_threshold: float = 0.5,
-        min_area_ratio: float = 0.0005,
-        max_area_ratio: float = 0.95,
-        top_k: int = 0,
-        low_memory: bool = True,
-    ):
-        import onnxruntime as ort
-
-        self.model_dir = model_dir
-        self.prompt = prompt.strip() or "person"
-        self.providers = providers
-        self.decoder_providers = decoder_providers or providers
-        self.score_threshold = float(score_threshold)
-        self.min_area_ratio = float(min_area_ratio)
-        self.max_area_ratio = float(max_area_ratio)
-        self.top_k = max(0, int(top_k))
-        self.low_memory = bool(low_memory)
-        self.image_encoder = None
-        self.decoder = None
-        if not self.low_memory:
-            self.image_encoder = ort.InferenceSession(
-                str(model_dir / "sam3_image_encoder.onnx"),
-                providers=providers,
-            )
-            self.decoder = ort.InferenceSession(
-                str(model_dir / "sam3_decoder.onnx"),
-                providers=self.decoder_providers,
-            )
-        # The SAM3 language encoder is a large text model, but for a single
-        # short prompt it is much faster and far lighter on CPU. In local
-        # tests, CUDA took tens of seconds for "person" while CPU took
-        # well under a second, and CUDA also inflated VRAM pressure.
-        language_encoder = ort.InferenceSession(
-            str(model_dir / "sam3_language_encoder.onnx"),
-            providers=["CPUExecutionProvider"],
-        )
-        self.language_mask, self.language_features, _ = language_encoder.run(
-            None,
-            {"tokens": self._tokenize(self.prompt)},
-        )
-        del language_encoder
-
-    @staticmethod
-    def _is_ort_cuda_arena_oom(exc: Exception) -> bool:
-        text = str(exc)
-        return (
-            "BFCArena::AllocateRawInternal" in text
-            or "Available memory" in text and "requested bytes" in text
-            or "Failed to allocate memory" in text
-        )
-
-    def _reset_image_encoder(self) -> None:
-        if self.low_memory:
-            return
-        del self.image_encoder
-        _clear_gpu_memory_pools()
-        self.image_encoder = self._image_encoder_session()
-
-    def _reset_decoder(self) -> None:
-        if self.low_memory:
-            return
-        del self.decoder
-        _clear_gpu_memory_pools()
-        self.decoder = self._decoder_session()
-
-    def _image_encoder_session(self):
-        import onnxruntime as ort
-
-        return ort.InferenceSession(
-            str(self.model_dir / "sam3_image_encoder.onnx"),
-            providers=self.providers,
-        )
-
-    def _decoder_session(self):
-        import onnxruntime as ort
-
-        return ort.InferenceSession(
-            str(self.model_dir / "sam3_decoder.onnx"),
-            providers=self.decoder_providers,
-        )
-
-    def _run_image_encoder(self, sam_image):
-        if self.low_memory:
-            session = self._image_encoder_session()
-            try:
-                return session.run(None, {"image": sam_image})
-            finally:
-                del session
-                _clear_gpu_memory_pools()
-        try:
-            return self.image_encoder.run(None, {"image": sam_image})
-        except Exception as exc:
-            if not self._is_ort_cuda_arena_oom(exc):
-                raise
-            print("[offline] SAM3 image encoder CUDA arena exhausted; recreating encoder session and retrying once")
-            self._reset_image_encoder()
-            return self.image_encoder.run(None, {"image": sam_image})
-
-    def _run_decoder(self, feed):
-        if self.low_memory:
-            session = self._decoder_session()
-            try:
-                return session.run(None, feed)
-            finally:
-                del session
-                _clear_gpu_memory_pools()
-        try:
-            return self.decoder.run(None, feed)
-        except Exception as exc:
-            if not self._is_ort_cuda_arena_oom(exc):
-                raise
-            print("[offline] SAM3 decoder CUDA arena exhausted; recreating decoder session and retrying once")
-            self._reset_decoder()
-            return self.decoder.run(None, feed)
-
-    def prepare_image(self, image_rgb: "np.ndarray") -> "tuple[np.ndarray, tuple[int, int]]":
-        import cv2
-        import numpy as np
-
-        h, w = image_rgb.shape[:2]
-        sam_image = cv2.resize(image_rgb, (1008, 1008), interpolation=cv2.INTER_AREA)
-        sam_image = np.ascontiguousarray(sam_image.transpose(2, 0, 1).astype(np.uint8, copy=False))
-        return sam_image, (w, h)
-
-    def encode_prepared(self, image_encoder, sam_image):
-        if image_encoder is None:
-            return self._run_image_encoder(sam_image)
-        return image_encoder.run(None, {"image": sam_image})
-
-    def decode_encoded(
-        self,
-        decoder,
-        image_out,
-        source_size: "tuple[int, int]",
-        out_size: "tuple[int, int] | None" = None,
-    ) -> "tuple[np.ndarray, dict]":
-        import numpy as np
-
-        source_w, source_h = source_size
-        out_w, out_h = out_size or source_size
-        run_decoder = self._run_decoder if decoder is None else lambda feed: decoder.run(None, feed)
-        boxes, scores, masks = run_decoder({
-            "original_height": np.array(out_h, dtype=np.int64),
-            "original_width": np.array(out_w, dtype=np.int64),
-            "vision_pos_enc_2": image_out[2],
-            "backbone_fpn_0": image_out[3],
-            "backbone_fpn_1": image_out[4],
-            "backbone_fpn_2": image_out[5],
-            "language_mask": self.language_mask,
-            "language_features": self.language_features,
-            "box_coords": np.zeros((1, 1, 4), dtype=np.float32),
-            "box_labels": np.array([[1]], dtype=np.int64),
-            "box_masks": np.array([[True]], dtype=np.bool_),
-        })
-        del image_out
-        if masks.size == 0:
-            raise RuntimeError("SAM3 returned no masks for text prompt")
-        masks = masks[:, 0].astype(np.bool_, copy=False)
-        areas = masks.reshape(masks.shape[0], -1).sum(axis=1).astype(np.float32)
-        if np.max(areas) <= 0:
-            raise RuntimeError("SAM3 returned empty masks for text prompt")
-        scores = scores.astype(np.float32, copy=False)
-        area_ratios = areas / float(out_h * out_w)
-        keep = (
-            (scores >= self.score_threshold)
-            & (area_ratios >= self.min_area_ratio)
-            & (area_ratios <= self.max_area_ratio)
-        )
-        if not np.any(keep):
-            area_weight = np.sqrt(np.maximum(areas, 1.0) / float(out_h * out_w))
-            keep[int(np.argmax(scores * area_weight))] = True
-        selected = np.where(keep)[0]
-        if self.top_k > 0 and selected.size > self.top_k:
-            order = selected[np.argsort(scores[selected])[::-1]]
-            selected = order[: self.top_k]
-        union = np.any(masks[selected], axis=0)
-        union_area_ratio = float(union.sum() / float(out_h * out_w))
-        info = {
-            "count": int(masks.shape[0]),
-            "selected": selected.astype(int).tolist(),
-            "scores": [float(x) for x in scores.tolist()],
-            "area_ratios": [float(x) for x in area_ratios.tolist()],
-            "union_area_ratio": union_area_ratio,
-            "source_size": [int(source_w), int(source_h)],
-            "mask_size": [int(out_w), int(out_h)],
-        }
-        return union.astype(np.float32), info
-
-    @classmethod
-    def _tokenize(cls, text: str) -> "np.ndarray":
-        import numpy as np
-
-        normalized = " ".join(text.lower().strip().split())
-        token_ids = cls._KNOWN_CLIP_TOKENS.get(normalized)
-        if token_ids is None:
-            try:
-                from osam._models.yoloworld.clip import tokenize
-
-                return tokenize(texts=[text], context_length=32).astype(np.int64)
-            except Exception as exc:
-                raise RuntimeError(
-                    "SAM3 text prompt tokenization currently supports built-in prompt "
-                    f"'person'. Install osam-yoloworld for arbitrary prompts. prompt={text!r}"
-                ) from exc
-        tokens = np.zeros((1, 32), dtype=np.int64)
-        seq = [49406, *token_ids, 49407]
-        tokens[0, :len(seq)] = seq
-        return tokens
-
-    def mask(self, image_rgb: "np.ndarray", out_size: "tuple[int, int] | None" = None) -> "tuple[np.ndarray, dict]":
-        sam_image, source_size = self.prepare_image(image_rgb)
-        image_out = self.encode_prepared(None, sam_image)
-        return self.decode_encoded(None, image_out, source_size, out_size)
 
 
 class MatAnyone2OnnxEngine(OfflineMattingEngine):
@@ -958,8 +727,8 @@ class MatAnyone2OnnxEngine(OfflineMattingEngine):
         sam3_masks = self.segment_masks.get(segment_start)
         if sam3_masks is None:
             raise RuntimeError(
-                f"Missing precomputed SAM3 mask for segment_start={segment_start}. "
-                "Run the SAM3 prepass or pass --mask."
+                f"Missing precomputed MatAnyone2 bootstrap mask for segment_start={segment_start}. "
+                "Run the configured prepass or pass --mask."
             )
         alpha = sam3_masks[eye_idx][0, 0]
         # MatAnyone2 writes the first-frame mask into memory, so prefer a
@@ -1175,19 +944,6 @@ def _object_count_from_infos(infos: list[dict]) -> int:
     return max((len(info.get("selected") or []) for info in infos), default=0)
 
 
-def _empty_sam3_mask(width: int, height: int, reason: str = ""):
-    import numpy as np
-
-    return np.zeros((height, width), dtype=np.bool_), {
-        "count": 0,
-        "selected": [],
-        "scores": [],
-        "area_ratios": [],
-        "union_area_ratio": 0.0,
-        "empty_reason": reason,
-    }
-
-
 def _planned_starts_from_sam3_records(
     records: list[dict],
     target: int,
@@ -1319,12 +1075,16 @@ def _precompute_sam3_segment_masks(args, src: Path, dec, source_fps: float, fps:
                     f"[offline] SAM3 prepass warning: frame={start} eye={eye_name} "
                     f"has no usable masks; treating this eye as inactive ({message})"
                 )
-                mask, info = _empty_sam3_mask(
+                mask, info = empty_sam3_mask(
                     args._matanyone2_in_w,
                     args._matanyone2_in_h,
                     reason=message,
                 )
             infos.append(info)
+            masks.append(mask.astype(np.float32, copy=False))
+        masks, infos, stereo_mode = apply_sam3_stereo_guard(masks, infos)
+        mask_tensors = []
+        for eye_idx, (mask, info, image_rgb) in enumerate(zip(masks, infos, eye_images)):
             if debug_dir is not None:
                 eye_name = "left" if eye_idx == 0 else "right"
                 debug_frame = cv2.resize(
@@ -1334,14 +1094,14 @@ def _precompute_sam3_segment_masks(args, src: Path, dec, source_fps: float, fps:
                 )
                 cv2.imwrite(str(debug_dir / f"seg_{start:06d}_{eye_name}_frame.png"), cv2.cvtColor(debug_frame, cv2.COLOR_RGB2BGR))
                 cv2.imwrite(str(debug_dir / f"seg_{start:06d}_{eye_name}_mask.png"), (mask * 255).astype(np.uint8))
-            masks.append(mask[None, None, :, :].astype(np.float32, copy=False))
+            mask_tensors.append(mask[None, None, :, :].astype(np.float32, copy=False))
         active = (
             infos[0]["union_area_ratio"] >= args.sam3_active_min_area_ratio
             or infos[1]["union_area_ratio"] >= args.sam3_active_min_area_ratio
         )
         object_count = _object_count_from_infos(infos) if active else 0
         if active:
-            masks_by_start[start] = masks
+            masks_by_start[start] = mask_tensors
         gpu_used, gpu_total = _nvidia_mem_stats() if args.sam3_log_vram else (0, 0)
         records.append(
             {
@@ -1358,16 +1118,25 @@ def _precompute_sam3_segment_masks(args, src: Path, dec, source_fps: float, fps:
             f"ms={(time.perf_counter() - t0) * 1000:.1f} "
             f"active={active} objects={object_count} "
             f"L={infos[0]['selected']} area={infos[0]['union_area_ratio']:.4f} "
-            f"R={infos[1]['selected']} area={infos[1]['union_area_ratio']:.4f}"
+            f"R={infos[1]['selected']} area={infos[1]['union_area_ratio']:.4f} "
+            f"stereo={stereo_mode}"
             + (f" gpu={gpu_used}/{gpu_total}MiB" if gpu_total else "")
         )
         if release_interval and n % release_interval == 0:
             del masker
             masker = None
-            _clear_gpu_memory_pools()
+            clear_gpu_memory_pools()
     if masker is not None:
         del masker
-    _clear_gpu_memory_pools()
+    clear_gpu_memory_pools()
+    gap_fill_frames = int(getattr(args, "sam3_gap_fill_frames", max_segment_frames) or 0)
+    filled_gaps = fill_short_inactive_gaps(records, masks_by_start, gap_fill_frames)
+    if filled_gaps:
+        print(
+            f"[offline] SAM3 prepass filled short inactive gaps frames={filled_gaps} "
+            f"max_gap_frames={gap_fill_frames}",
+            flush=True,
+        )
     starts = _planned_starts_from_sam3_records(
         records,
         target,
@@ -1439,6 +1208,8 @@ def _precompute_sam3_segment_masks_subprocess(args, src: Path, source_fps: float
         str(args.matanyone2_segment_frames),
         "--matanyone2-min-segment-sec",
         str(args.matanyone2_min_segment_sec),
+        "--sam3-gap-fill-frames",
+        str(args.sam3_gap_fill_frames),
         "--frames",
         str(target),
         "--fps",
@@ -1467,7 +1238,7 @@ def _precompute_sam3_segment_masks_subprocess(args, src: Path, source_fps: float
         result_path.unlink(missing_ok=True)
     except Exception:
         pass
-    _clear_gpu_memory_pools()
+    clear_gpu_memory_pools()
     return masks_by_start, starts
 
 
@@ -1494,9 +1265,50 @@ def main() -> int:
     parser.add_argument("--model", default="", help="model path; RVM defaults to models/rvm_mobilenetv3_fp32.onnx")
     parser.add_argument("--matanyone2-size", type=int, default=512, choices=[512, 1024],
                         help="MatAnyone2 ONNX size to auto-select when --model is omitted")
-    parser.add_argument("--matanyone2-batch", default="auto", choices=["auto", "1", "2"],
+    parser.add_argument("--matanyone2-batch", default="1", choices=["auto", "1", "2"],
                         help="MatAnyone2 ONNX batch to auto-select when --model is omitted; auto uses bs2 only for 512 SBS")
     parser.add_argument("--mask", default="", help="first-frame object mask for MatAnyone2")
+    parser.add_argument("--matanyone2-prepass", default="sam3", choices=["sam3", "yoloworld_efficientsam"],
+                        help="automatic first-mask prepass backend for MatAnyone2 when --mask is omitted")
+    parser.add_argument("--ywes-model-dir", default=str(config.ROOT / "models" / "yoloworld_efficientsam"),
+                        help="YOLO-World + EfficientSAM ONNX model directory")
+    parser.add_argument("--ywes-txt-feats", default=str(config.ROOT / "models" / "person_txt_feats.npy"),
+                        help="precomputed YOLO-World person txt_feats .npy")
+    parser.add_argument("--ywes-provider", default="cuda", choices=["cuda", "cpu"],
+                        help="execution provider for YOLO-World + EfficientSAM prepass")
+    parser.add_argument("--ywes-yolo-model", default="yolov8l-worldv2.onnx",
+                        help="YOLO-World ONNX filename under --ywes-model-dir")
+    parser.add_argument("--ywes-sam-model", default="efficientsam_s.onnx",
+                        help="EfficientSAM ONNX filename under --ywes-model-dir")
+    parser.add_argument("--ywes-yolo-size", type=int, default=1280,
+                        help="square YOLO-World letterbox input size")
+    parser.add_argument("--ywes-score-threshold", type=float, default=0.03,
+                        help="YOLO-World person score threshold")
+    parser.add_argument("--ywes-nms-threshold", type=float, default=0.6,
+                        help="YOLO-World NMS IoU threshold")
+    parser.add_argument("--ywes-box-expand", type=float, default=0.08,
+                        help="box expansion ratio before EfficientSAM")
+    parser.add_argument("--ywes-top-k", type=int, default=1,
+                        help="top detected persons per eye to segment")
+    parser.add_argument("--ywes-scan", default="hybrid", choices=["keyframe", "interval", "hybrid"],
+                        help="YOLO-World + EfficientSAM prepass sample strategy")
+    parser.add_argument("--ywes-scan-interval-sec", type=float, default=1.0,
+                        help="fallback/interval YOLO-World + EfficientSAM scan step in seconds")
+    parser.add_argument("--ywes-active-min-area-ratio", type=float, default=0.001,
+                        help="sample is active if either eye union mask area is at least this ratio")
+    parser.add_argument("--ywes-gap-fill-frames", type=int, default=300,
+                        help="fill short inactive YOLO-World samples between active samples by reusing a neighboring mask; 0 disables")
+    parser.add_argument("--ywes-debug-dir", default="",
+                        help="optional directory to save YOLO-World + EfficientSAM prepass debug files")
+    parser.add_argument("--ywes-cut-on-count-change", action=argparse.BooleanOptionalAction, default=True,
+                        help="start a new MatAnyone2 segment when selected person count changes")
+    parser.add_argument("--ywes-cut-every-active-sample", action="store_true",
+                        help="debug/quality mode: restart MatAnyone2 at every active YOLO-World sample")
+    parser.add_argument("--ywes-fail-on-empty", action=argparse.BooleanOptionalAction, default=True,
+                        help="fail instead of writing an all-background output when no person masks are found")
+    parser.add_argument("--ywes-subprocess", action=argparse.BooleanOptionalAction, default=True,
+                        help="run YOLO-World + EfficientSAM prepass in a child process so its CUDA context is released before MatAnyone2")
+    parser.add_argument("--ywes-prepass-out", default="", help=argparse.SUPPRESS)
     parser.add_argument("--sam3-model-dir", default=str(config.ROOT / "models" / "sam3_onnx"),
                         help="SAM3 ONNX model directory for MatAnyone2 first-frame text mask")
     parser.add_argument("--sam3-prompt", default="person", help="SAM3 text prompt for MatAnyone2 first-frame mask")
@@ -1516,6 +1328,8 @@ def main() -> int:
                         help="fallback/interval SAM3 scan step in seconds")
     parser.add_argument("--sam3-active-min-area-ratio", type=float, default=0.001,
                         help="sample is active if either eye union mask area is at least this ratio")
+    parser.add_argument("--sam3-gap-fill-frames", type=int, default=300,
+                        help="fill short inactive SAM3 samples between active samples by reusing a neighboring mask; 0 disables")
     parser.add_argument("--sam3-provider", default="cuda", choices=["cuda", "cpu"],
                         help="execution provider for SAM3 image encoder prepass")
     parser.add_argument("--sam3-decoder-provider", default="cuda", choices=["cuda", "cpu"],
@@ -1582,10 +1396,12 @@ def main() -> int:
     parser.add_argument("--rvm-downsample-ratio", type=float, default=0.5,
                         help="override PT_RVM_DOWNSAMPLE_RATIO before loading RVM Matter")
     parser.add_argument("--alpha-stride", type=int, default=1, help="override PT_ALPHA_STRIDE before loading Matter")
-    parser.add_argument("--sbs-batch", action=argparse.BooleanOptionalAction, default=True,
+    parser.add_argument("--sbs-batch", action=argparse.BooleanOptionalAction, default=False,
                         help="run left/right SBS eyes as a batch when the RVM model supports batch2")
     args = parser.parse_args()
     args._sam3_child = bool(args.sam3_prepass_out)
+    args._ywes_child = bool(args.ywes_prepass_out)
+    args._tool_name = "offline_passthrough"
 
     import PyNvVideoCodec as nvc
     if args.no_warmup:
@@ -1683,7 +1499,17 @@ def main() -> int:
         args._matanyone2_in_w = int(manifest.get("width") or 512)
         args._matanyone2_batch_size = int(manifest.get("batch_size") or 1)
     _require_sam3_vram(args)
-    sam3_masks, segment_starts = _precompute_sam3_segment_masks(args, src, dec, source_fps, fps, target)
+    if args.engine == "matanyone2_onnx" and not args.mask and args.matanyone2_prepass == "yoloworld_efficientsam":
+        from offline.yoloworld_efficientsam import precompute_segment_masks as _precompute_ywes_segment_masks
+        from offline.yoloworld_efficientsam import write_prepass_result as _write_ywes_prepass_result
+
+        sam3_masks, segment_starts = _precompute_ywes_segment_masks(args, src, dec, source_fps, fps, target, cfr_source_index)
+    else:
+        sam3_masks, segment_starts = _precompute_sam3_segment_masks(args, src, dec, source_fps, fps, target)
+    if args.ywes_prepass_out:
+        _write_ywes_prepass_result(Path(args.ywes_prepass_out).resolve(), sam3_masks, segment_starts)
+        dec.stop()
+        return 0
     if args.sam3_prepass_out:
         _write_sam3_prepass_result(Path(args.sam3_prepass_out).resolve(), sam3_masks, segment_starts)
         dec.stop()
