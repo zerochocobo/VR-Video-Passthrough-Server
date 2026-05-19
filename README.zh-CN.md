@@ -2,6 +2,8 @@
 
 中文 | [English](README.md) | [日本語](README.ja-JP.md)
 
+项目官网：[https://wapok.com](https://wapok.com)
+
 VR视频透视服务器 的目标是让所有VR视频都可以透视，实现混合现实(MR)。
 
 ![VR视频透视服务器概览](assets/intro_cn_s.png)

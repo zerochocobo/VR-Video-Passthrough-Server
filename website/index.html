@@ -1,0 +1,230 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="description" data-i18n-attr="content:meta.description" content="VR Video Passthrough Server brings passthrough viewing to local VR videos.">
+    <title>VR Video Passthrough Server</title>
+    <link rel="icon" href="favicon.ico" sizes="any">
+    <link rel="shortcut icon" href="favicon.ico">
+    <link rel="stylesheet" href="styles.css">
+  </head>
+  <body>
+    <header class="site-header" data-scrolled="false">
+      <a class="brand" href="#top" aria-label="VR Video Passthrough Server">
+        <img src="assets/logo_192.png" alt="" width="44" height="44">
+        <span class="brand-text">
+          <span class="brand-local" data-i18n="brand.local">VR Video Passthrough Server</span>
+          <span class="brand-sub" data-i18n="brand.sub"></span>
+        </span>
+      </a>
+      <nav class="top-nav" aria-label="Main navigation">
+        <a href="#features" data-i18n="nav.features">Features</a>
+        <a href="#gallery" data-i18n="nav.gallery">Gallery</a>
+        <a href="#download" data-i18n="nav.download">Download</a>
+      </nav>
+      <div class="language-switcher" aria-label="Language">
+        <button type="button" data-lang-button="en">EN</button>
+        <button type="button" data-lang-button="zh">中文</button>
+        <button type="button" data-lang-button="ja">日本語</button>
+      </div>
+    </header>
+
+    <main id="top">
+      <section class="hero section-reveal">
+        <div class="hero-copy">
+          <p class="eyebrow" data-i18n="hero.eyebrow">A mixed reality video tool for VR180 and local media libraries</p>
+          <h1 data-i18n="hero.title">Give your VR videos a passthrough viewing experience</h1>
+          <p class="hero-text" data-i18n="hero.text">
+            Run a local DLNA media server on Windows, stream videos to Quest and other VR players, and generate green-screen or Alpha passthrough output in realtime.
+          </p>
+          <div class="hero-actions">
+            <a class="button primary" href="#download" data-i18n="hero.primary">Download</a>
+            <a class="button ghost" href="#gallery" data-i18n="hero.secondary">View Results</a>
+          </div>
+          <div class="release-strip" aria-label="Release information">
+            <span><span data-i18n="release.versionLabel">Current version</span> <strong>v0.1.0-beta.3</strong></span>
+            <span><span data-i18n="release.dateLabel">Release date</span> <strong>2026-05-18</strong></span>
+          </div>
+        </div>
+        <div class="hero-visual" aria-label="Software preview">
+          <img class="hero-logo" src="assets/app_icon_256.jpg" alt="">
+          <img class="hero-screen" data-lang-image="heroScreen" src="assets/soft_mainwindow_en.png" alt="VR Video Passthrough Server main window">
+          <div class="signal-card">
+            <span class="pulse-dot"></span>
+            <span data-i18n="hero.badge">Realtime passthrough stream</span>
+          </div>
+        </div>
+      </section>
+
+      <section class="intro-band section-reveal" aria-label="Overview">
+        <img data-lang-image="intro" src="assets/intro_en_s.png" alt="VR Video Passthrough Server overview">
+      </section>
+
+      <section id="features" class="features section-reveal">
+        <div class="section-heading">
+          <p class="eyebrow" data-i18n="features.eyebrow">No need to rebuild your video library</p>
+          <h2 data-i18n="features.title">Turn local VR videos into a passthrough-ready media library</h2>
+          <p data-i18n="features.text">Your PC handles the video processing. Your VR player discovers and plays the library over your home network.</p>
+        </div>
+        <div class="feature-grid">
+          <article class="feature-card">
+            <span class="feature-icon">DLNA</span>
+            <h3 data-i18n="featureCards.discovery.title">Automatic VR player discovery</h3>
+            <p data-i18n="featureCards.discovery.text">Expose local video folders through DLNA/UPnP for common VR players such as Skybox, Moon Player, 4XVR, DeoVR, and HereSphere.</p>
+          </article>
+          <article class="feature-card">
+            <span class="feature-icon">MR</span>
+            <h3 data-i18n="featureCards.realtime.title">Realtime passthrough output</h3>
+            <p data-i18n="featureCards.realtime.text">Use GPU matting and HEVC encoding to convert normal VR video into green-screen or Alpha passthrough streams.</p>
+          </article>
+          <article class="feature-card">
+            <span class="feature-icon">TXT</span>
+            <h3 data-i18n="featureCards.subtitles.title">Realtime subtitle embedding</h3>
+            <p data-i18n="featureCards.subtitles.text">Keep subtitles visible in passthrough playback, with desktop preview and style controls.</p>
+          </article>
+          <article class="feature-card">
+            <span class="feature-icon">OFF</span>
+            <h3 data-i18n="featureCards.offline.title">Offline video generation</h3>
+            <p data-i18n="featureCards.offline.text">Pre-generate passthrough videos when you want saved output or less realtime load while watching.</p>
+          </article>
+          <article class="feature-card">
+            <span class="feature-icon">UI</span>
+            <h3 data-i18n="featureCards.ui.title">Desktop control</h3>
+            <p data-i18n="featureCards.ui.text">Start the server, select folders, switch output modes, and manage settings from a Chinese, English, or Japanese desktop UI.</p>
+          </article>
+          <article class="feature-card">
+            <span class="feature-icon">8K</span>
+            <h3 data-i18n="featureCards.performance.title">Optimized for high-resolution sources</h3>
+            <p data-i18n="featureCards.performance.text">The pipeline is tuned around VRAM and throughput, targeting 8K-class VR180 sources when hardware can sustain them.</p>
+          </article>
+        </div>
+      </section>
+
+      <section id="gallery" class="gallery section-reveal">
+        <div class="section-heading">
+          <p class="eyebrow" data-i18n="gallery.eyebrow">Output examples</p>
+          <h2 data-i18n="gallery.title">Choose the passthrough format your player supports</h2>
+          <p data-i18n="gallery.text">Alpha works best with players that support transparency. Green-screen output works with ChromaKey playback.</p>
+        </div>
+        <div class="showcase">
+          <figure>
+            <img src="assets/sample_alpha_1200.jpg" alt="Alpha Passthrough output example">
+            <figcaption>Alpha Passthrough</figcaption>
+          </figure>
+          <figure>
+            <img src="assets/sample_green_1200.jpg" alt="Green-screen Passthrough output example">
+            <figcaption>Green-screen Passthrough</figcaption>
+          </figure>
+        </div>
+      </section>
+
+      <section class="requirements section-reveal">
+        <div class="section-heading">
+          <p class="eyebrow" data-i18n="requirements.eyebrow">Requirements</p>
+          <h2 data-i18n="requirements.title">Designed for local Windows PCs</h2>
+        </div>
+        <div class="requirement-list">
+          <div><strong>Windows 10 / 11</strong><span data-i18n="requirements.windows">Primary runtime platform</span></div>
+          <div><strong>NVIDIA GPU</strong><span data-i18n="requirements.gpu">RTX 20 series or newer is recommended. Realtime processing is recommended with 6GB+ VRAM.</span></div>
+          <div><strong>FFmpeg / FFprobe</strong><span data-i18n="requirements.ffmpeg">Used for media probing, encoding, and muxing.</span></div>
+          <div><strong>Meta Quest 3 / Pico 4</strong><span data-i18n="requirements.quest">Tested on Quest 3 and Pico 4, and usable with compatible DLNA passthrough players.</span></div>
+        </div>
+      </section>
+
+      <section class="compatibility section-reveal">
+        <div class="section-heading">
+          <p class="eyebrow" data-i18n="compatibility.eyebrow">Player compatibility</p>
+          <h2 data-i18n="compatibility.title">Match the output mode to your VR player</h2>
+          <p data-i18n="compatibility.text">Support varies by player and playback mode. Choose Alpha when your player supports it, or use ChromaKey green-screen mode as the broader fallback.</p>
+        </div>
+        <div class="compat-table-wrap">
+          <table class="compat-table">
+            <thead>
+              <tr>
+                <th scope="col" data-i18n="compatibility.player">Player</th>
+                <th scope="col" data-i18n="compatibility.alpha">Alpha passthrough</th>
+                <th scope="col" data-i18n="compatibility.gray">Gray green screen</th>
+                <th scope="col" data-i18n="compatibility.chroma">ChromaKey green screen</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr>
+                <th scope="row">Skybox VR Player 2.0.2 Preview</th>
+                <td class="yes">✓</td>
+                <td class="no">-</td>
+                <td class="yes">✓</td>
+              </tr>
+              <tr>
+                <th scope="row">Moon Player</th>
+                <td class="no">-</td>
+                <td class="yes">✓</td>
+                <td class="yes">✓</td>
+              </tr>
+              <tr>
+                <th scope="row">4XVR Video Player</th>
+                <td class="yes">✓</td>
+                <td class="no">-</td>
+                <td class="yes">✓</td>
+              </tr>
+              <tr>
+                <th scope="row">DeoVR Player</th>
+                <td class="yes">✓</td>
+                <td class="no">-</td>
+                <td class="yes">✓</td>
+              </tr>
+              <tr>
+                <th scope="row">HereSphere VR Video Player</th>
+                <td class="yes">✓</td>
+                <td class="no">-</td>
+                <td class="yes">✓</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+
+      <section id="download" class="download section-reveal">
+        <div>
+          <p class="eyebrow" data-i18n="download.eyebrow">Get started</p>
+          <h2 data-i18n="download.title">Download the package and connect your VR player</h2>
+          <p data-i18n="download.text">
+            Run it on your Windows PC, choose your local video folders, then find the server from your VR player through DLNA.
+          </p>
+        </div>
+        <div class="download-panel">
+          <div class="version-box">
+            <span data-i18n="release.versionLabel">Current version</span>
+            <strong>v0.1.0-beta.3</strong>
+            <small><span data-i18n="release.dateLabel">Release date</span>: 2026-05-18</small>
+          </div>
+          <a class="button primary full download-link" data-download-link="githubRelease" href="https://github.com/zerochocobo/VR-Video-Passthrough-Server/releases/latest" rel="noopener" target="_blank">
+            <span class="link-icon github-icon" aria-hidden="true"></span>
+            <span data-i18n="download.githubRelease">Download from GitHub Releases</span>
+          </a>
+          <div class="china-downloads">
+            <a class="button secondary full" href="https://pan.quark.cn/s/573eb1709e18?pwd=T3bS" rel="noopener" target="_blank">
+              <span class="link-icon quark-icon" aria-hidden="true">Q</span>
+              <span data-i18n="download.quark">Quark Cloud Drive</span>
+            </a>
+            <a class="button secondary full" href="https://pan.baidu.com/s/1uHFVFjKwlaXVxrYQ0_qcnQ?pwd=1234" rel="noopener" target="_blank">
+              <span class="link-icon baidu-icon" aria-hidden="true">B</span>
+              <span data-i18n="download.baidu">Baidu Netdisk</span>
+            </a>
+          </div>
+          <a class="source-link" href="https://github.com/zerochocobo/VR-Video-Passthrough-Server" rel="noopener" target="_blank">
+            <span class="link-icon github-icon" aria-hidden="true"></span>
+            <span data-i18n="download.source">GitHub source code</span>
+          </a>
+        </div>
+      </section>
+    </main>
+
+    <footer class="site-footer">
+      <span>VR Video Passthrough Server</span>
+      <span>License: AGPL-3.0-or-later</span>
+    </footer>
+
+    <script src="script.js"></script>
+  </body>
+</html>
