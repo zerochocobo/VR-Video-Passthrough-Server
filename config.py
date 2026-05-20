@@ -225,10 +225,9 @@ PASSTHROUGH_LIVE_DEFAULT_PROFILE = _env("PASSTHROUGH_LIVE_DEFAULT_PROFILE", "vlc
 
 # ---- Matting and startup warmup ----
 # PT_MODEL_PATH:
-#   ONNX matting model path. Realtime production defaults to RVM MobileNetV3
-#   FP16 after local DLNA realtime benchmarks showed ~16% higher FPS than FP32.
-#   Override with models\rvm_mobilenetv3_fp32.onnx if FP32 output is needed.
-MODEL_PATH: Path = Path(_env("MODEL_PATH", ROOT / "models" / "rvm_mobilenetv3_fp16.onnx")).resolve()
+#   ONNX matting model path. Realtime defaults to RVM MobileNetV3 FP32 while
+#   investigating FP16 alpha stability on some 2D sources.
+MODEL_PATH: Path = Path(_env("MODEL_PATH", ROOT / "models" / "rvm_mobilenetv3_fp32.onnx")).resolve()
 
 # PT_MATTING_DEVICE:
 #   Matting backend selection.

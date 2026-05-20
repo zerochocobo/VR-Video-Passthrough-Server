@@ -6,8 +6,12 @@ This file only keeps version releases, major bug fixes, major UI/UX updates, and
 
 ### 2026-05-20
 
+
+- **v0.1.0-beta.4 patches and additions.**
+
 - **Major bug fix:** Offline generation now targets the source video bitrate by default for all engines, including RVM fast/balanced and MatAnyone2 medium/slow. This keeps generated video size closer to the original source. If source bitrate is unavailable, offline generation falls back to 40 Mbps.
 - **Major bug fix:** Fixed lingering FFmpeg child processes after playback or server stop. PyNv streams now track and stop audio FFmpeg subprocesses, wait for slate audio/cache threads during close, clean up partially spawned pipe-TS muxers, remove stale temporary AAC files, and forced UI server stop now terminates child processes through `taskkill /T /F` on Windows.
+- **Major bug fix:** Fixed realtime 2D alpha blocks turning gray during playback by switching the default realtime RVM model back to FP32. The issue was caused by FP16 precision loss accumulating in RVM's recurrent `rec1`-`rec4` state across frames, not by alpha packing or realtime bitrate control.
 
 ### 2026-05-19
 
@@ -105,8 +109,10 @@ This file only keeps version releases, major bug fixes, major UI/UX updates, and
 
 ### 2026-05-20
 
+- **v0.1.0-beta.4 修补和新增功能。**
 - **重大 BUG 修复：** 所有离线生成引擎默认改为按源视频码率输出，包括 RVM 快速/均衡和 MatAnyone2 中速/慢速，使生成文件大小更接近原始视频。读取不到源码率时回退到 40 Mbps。
 - **重大 BUG 修复：** 修复播放或停止服务器后 FFmpeg 子进程后台常驻的问题。PyNv 流现在会跟踪并停止音频 FFmpeg 子进程，关闭时等待 slate 音频/缓存线程，清理部分启动失败的 pipe-TS muxer，删除残留临时 AAC 文件；UI 强制停止服务器时也会在 Windows 上通过 `taskkill /T /F` 终止子进程。
+- **重大 BUG 修复：** 修复实时 2D alpha 播放中 alpha 区块逐渐变灰的问题，默认实时 RVM 模型切回 FP32。根因是 RVM 的 `rec1`-`rec4` 循环状态在 FP16 下逐帧累积精度误差，不是 alpha 打包或实时码率控制。
 
 ### 2026-05-19
 

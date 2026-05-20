@@ -15,8 +15,8 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 VARIANTS = [
-    ("rvm1024_dr0p5", 1024, 0.5),
-    ("rvm2048_dr0p5", 2048, 0.5),
+    ("full_sbs_batch1", 1024, 0.5, 0, 0),
+    ("split_sbs_batch2", 1024, 0.5, 1, 1),
 ]
 
 
@@ -74,7 +74,7 @@ def _left_half(img):
     return img[:, : max(1, w // 2)].copy()
 
 
-def _write_compare_sheets(out_dir: Path, videos: list[str], frames: int) -> None:
+def _write_compare_sheets(out_dir: Path, videos: list[str], frames: int, stack: str) -> None:
     import cv2
     import numpy as np
 
@@ -90,8 +90,8 @@ def _write_compare_sheets(out_dir: Path, videos: list[str], frames: int) -> None
 
             cells = []
             labels = [
-                (f"matte {input_size} / {ratio:g}", out_dir / label / safe / f"{i:02d}_matte.jpg")
-                for label, input_size, ratio in VARIANTS
+                (f"{label} {input_size} / {ratio:g}", out_dir / label / safe / f"{i:02d}_matte.jpg")
+                for label, input_size, ratio, _split_sbs, _sbs_batch in VARIANTS
             ]
             imgs = []
             for label, path in labels:
@@ -102,7 +102,7 @@ def _write_compare_sheets(out_dir: Path, videos: list[str], frames: int) -> None
 
             for label, img in imgs:
                 cells.append(_label(img, label))
-            sheet = np.hstack(cells)
+            sheet = np.vstack(cells) if stack == "vertical" else np.hstack(cells)
             cv2.imwrite(str(compare_dir / f"{safe}_{i:02d}_compare.jpg"), sheet, [cv2.IMWRITE_JPEG_QUALITY, 92])
 
 
@@ -187,8 +187,8 @@ def _worker(args: argparse.Namespace) -> int:
     os.environ["PT_MODEL_PATH"] = str(Path(args.model).resolve())
     os.environ["PT_MATTING_INPUT_SIZE"] = str(args.input_size)
     os.environ["PT_RVM_DOWNSAMPLE_RATIO"] = str(args.downsample_ratio)
-    os.environ["PT_MATTING_SBS_BATCH"] = "1"
-    os.environ["PT_MATTING_SPLIT_SBS"] = "1"
+    os.environ["PT_MATTING_SBS_BATCH"] = str(args.sbs_batch)
+    os.environ["PT_MATTING_SPLIT_SBS"] = str(args.split_sbs)
     os.environ["PT_MATTING_WARMUP_RUNS"] = "0"
     os.environ["PT_STARTUP_GPU_WARMUP"] = "0"
 
@@ -294,7 +294,7 @@ def _parent(args: argparse.Namespace) -> int:
         model = Path.cwd() / model
 
     reuse_root = Path(args.reuse_first_variant_from).resolve() if args.reuse_first_variant_from else None
-    for idx, (label, input_size, ratio) in enumerate(VARIANTS):
+    for idx, (label, input_size, ratio, split_sbs, sbs_batch) in enumerate(VARIANTS):
         if idx == 0 and reuse_root is not None:
             src_root = reuse_root / label
             print(f"[compare] reusing {src_root} -> {out_dir / label}")
@@ -310,6 +310,10 @@ def _parent(args: argparse.Namespace) -> int:
             str(input_size),
             "--downsample-ratio",
             str(ratio),
+            "--split-sbs",
+            str(split_sbs),
+            "--sbs-batch",
+            str(sbs_batch),
             "--model",
             str(model),
             "--frames",
@@ -324,7 +328,7 @@ def _parent(args: argparse.Namespace) -> int:
         print("[compare] running", subprocess.list2cmdline(cmd))
         subprocess.run(cmd, cwd=str(ROOT), env=base_environment(), check=True)
 
-    _write_compare_sheets(out_dir, args.videos, int(args.frames))
+    _write_compare_sheets(out_dir, args.videos, int(args.frames), args.stack)
     print(f"[compare] wrote {out_dir}")
     print(f"[compare] comparison sheets: {out_dir / 'comparison'}")
     return 0
@@ -341,6 +345,9 @@ def main() -> int:
     parser.add_argument("--variant-label", default="")
     parser.add_argument("--input-size", type=int, default=1024)
     parser.add_argument("--downsample-ratio", type=float, default=0.5)
+    parser.add_argument("--split-sbs", type=int, choices=[0, 1], default=1)
+    parser.add_argument("--sbs-batch", type=int, choices=[0, 1], default=1)
+    parser.add_argument("--stack", choices=["horizontal", "vertical"], default="horizontal")
     parser.add_argument("--left-only", action="store_true", help="save only the left half of each matte image")
     parser.add_argument(
         "--reuse-first-variant-from",

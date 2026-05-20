@@ -1374,7 +1374,7 @@ def main() -> int:
     parser.add_argument("--maxrate-multiplier", type=float, default=1.2, help="NVENC max bitrate multiplier over target bitrate")
     parser.add_argument("--bufsize-multiplier", type=float, default=2.0, help="NVENC VBV buffer multiplier over target bitrate")
     parser.add_argument("--rc", default="vbr", choices=["vbr", "vbr_hq", "cbr"], help="PyNv NVENC rate-control mode")
-    parser.add_argument("--cq", type=int, default=18, help="PyNv NVENC CQ value; set -1 to omit")
+    parser.add_argument("--cq", type=int, default=-1, help="PyNv NVENC CQ value; set -1 to omit")
     parser.add_argument("--preset", default=config.PASSTHROUGH_PYNV_PRESET, help="PyNv NVENC preset, e.g. P1..P7")
     parser.add_argument("--realtime-encoder-args", action="store_true",
                         help="diagnostic: pass only bitrate/fps/gop/bf to PyNv encoder like realtime live mode")

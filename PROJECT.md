@@ -371,7 +371,7 @@ These directories are generated or environment-specific:
 | `PT_HTTP_PORT` | `8200` | HTTP media/control port. |
 | `PT_VIDEO_DIR` | `G:\Downloads` | Media library root. |
 | `PT_MODEL_PATH` | RVM MobileNetV3 fp16 | ONNX matting model. |
-| `PT_MATTING_INPUT_SIZE` | RVM `2048`, other models `512` | Matting reference input size. |
+| `PT_MATTING_INPUT_SIZE` | RVM `1024`, other models `512` | Matting reference input size. |
 | `PT_MATTING_SPLIT_SBS` | `1` | Split side-by-side VR frames before matting. |
 | `PT_ALPHA_STRIDE` | `3` | Run matting once every N output frames, reuse alpha otherwise. |
 | `PT_USE_PYNV` | `1` | Enable PyNv backend for eligible sources. |
@@ -436,6 +436,12 @@ DLNA client
   running `uv run`/Python tools; otherwise ORT can fail to load CUDA provider
   DLLs such as `cublasLt64_12.dll` / `cudnn64_9.dll` and silently fall back to
   CPU.
+- Debug tools that instantiate `Matter`/ORT directly must also call
+  `utils.gpu_runtime_cache.configure_gpu_runtime_cache()` before importing
+  CUDA-heavy modules, and should keep `tempfile.TemporaryDirectory` under
+  `config.RUNTIME_TMP_DIR` like `tools/offline_alpha_passthrough.py`. After
+  creating the ONNX session, verify that `CUDAExecutionProvider` is both
+  available and active; if it is not, fail fast instead of continuing on CPU.
 - Translation JSON files under `ui/translations/` are intentionally kept as
   UTF-8 with BOM. When editing or generating them programmatically, read/write
   with `utf-8-sig` and preserve the BOM.

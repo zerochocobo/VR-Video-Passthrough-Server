@@ -137,11 +137,11 @@ def _base_cmd(args: argparse.Namespace, src: Path, out: Path) -> list[str]:
         cmd.extend(["--sam3-prompt", str(getattr(args, "sam3_prompt", "person") or "person")])
     if args.engine == "matanyone2_medium":
         cmd.extend(["--matanyone2-prepass", "yoloworld_efficientsam"])
+    cmd.extend(["--preset", str(args.preset)])
+    cmd.extend(["--cq", str(getattr(args, "cq", RVM_DEFAULT_ARGS["cq"]))])
     if engine == "rvm":
         cmd.extend(["--input-size", str(args.input_size)])
         cmd.append("--sbs-batch")
-        cmd.extend(["--preset", str(args.preset)])
-        cmd.extend(["--cq", str(getattr(args, "cq", RVM_DEFAULT_ARGS["cq"]))])
     return cmd
 
 

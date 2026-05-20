@@ -10,9 +10,9 @@
 
 8K 实时透传在 v0.1.0-beta.1 后从 40-50 FPS 掉到 30+ FPS，根因是为了画质把 `ALPHA_STRIDE` 从 3 改成 1。回退会引起黑十字与远景人物丢失，因此画质决策保留，**性能损失改由 TensorRT 加速 RVM 推理来弥补**。
 
-已知 `rvm_mobilenetv3_fp16.onnx` 相比 fp32 提升约 16% FPS。本期目标是在 fp16 模型基础上再叠加 TensorRT FP16 后端，进一步压缩单次推理耗时。TensorRT 在 RTX 2080 上对 fp16 ONNX 的实测增益通常仍有 1.5-2×，但首次启动需要编译 engine（5-15 分钟），driver/CUDA/TRT/ORT/模型任何一项变化都会让缓存失效。我们要做的不是把 TRT "开起来"——`ONNX_TRT_FP16_ENABLE` 默认已经是 1，只是 `ONNX_PROVIDERS` 没把 `TensorrtExecutionProvider` 放进去——而是给用户一套**可见、可控、可撤销**的 UI 流程。
+本期使用 `rvm_mobilenetv3_fp32.onnx` 作为唯一推理模型（fp16 变体经验证在 VR 场景画质损失明显，已弃用）。**性能提升完全由 TensorRT FP16 后端从 fp32 ONNX 直接编译时落地**——TRT 在 build 阶段以 FP16 精度构造 engine（`trt_fp16_enable=1` 默认开启），同时保留 fp32 ONNX 的权重精度作为编译输入，在 RTX 2080 上对 RVM 的实测增益通常仍有 1.5-2×。但首次启动需要编译 engine（5-15 分钟），driver/CUDA/TRT/ORT/模型任何一项变化都会让缓存失效。我们要做的不是把 TRT "开起来"——`ONNX_TRT_FP16_ENABLE` 默认已经是 1，只是 `ONNX_PROVIDERS` 没把 `TensorrtExecutionProvider` 放进去——而是给用户一套**可见、可控、可撤销**的 UI 流程。
 
-**TensorRT 加速只针对 `rvm_mobilenetv3_fp16.onnx` 一个模型**。fp32 模型不在加速范围；启用 TensorRT 时 server 必须使用 fp16 模型。
+**TensorRT 加速只针对 `rvm_mobilenetv3_fp32.onnx` 这一个模型**。其他模型不在本期加速范围。
 
 **输入策略**：`MATTING_INPUT_SIZE=1024` 固定方阵 + `RVM_DOWNSAMPLE_RATIO=0.5`。经验证，长边 2048 + 0.125 下采样会导致 VR 场景下人像抠不完整甚至丢失，因此保留 1024 方阵这一对 TRT 极友好的策略：只有两种固定 shape（`1×3×1024×1024` 和 `2×3×1024×1024`），TRT 各编一个 static engine，缓存最稳、kernel 最优、profile 无烦恼。
 
@@ -149,7 +149,8 @@ TensorRT 加速    [○○]    [配置]    未缓存
 ```
 ┌─ TensorRT 加速配置 ───────────────────────────┐
 │                                                │
-│  模型：rvm_mobilenetv3_fp16.onnx               │
+│  模型：rvm_mobilenetv3_fp32.onnx               │
+│  TRT 精度：FP16（由 fp32 ONNX 编译）             │
 │  GPU：NVIDIA GeForce RTX 2080                  │
 │  驱动：560.94                                   │
 │  TensorRT：10.0.1.6                            │
@@ -159,8 +160,8 @@ TensorRT 加速    [○○]    [配置]    未缓存
 │  引擎大小：106 MB                                │
 │  缓存路径：runtime_cache/trt_engines/           │
 │                                                │
-│  ⓘ 启用 TensorRT 后，server 将自动切换到 fp16   │
-│    模型并使用 TensorRT FP16 后端推理。           │
+│  ⓘ 启用 TensorRT 后，server 以 TensorRT FP16   │
+│    后端从 fp32 ONNX 编译 engine 进行推理。      │
 │                                                │
 │  ⚠ 编译期间 GPU 会被占用，请勿同时播放视频。      │
 │                                                │
@@ -183,7 +184,7 @@ TensorRT 加速    [○○]    [配置]    未缓存
 ```
 ┌─ TensorRT 加速配置 ───────────────────────────┐
 │                                                │
-│  正在编译 rvm_mobilenetv3_fp16.onnx             │
+│  正在编译 rvm_mobilenetv3_fp32.onnx (TRT FP16)  │
 │                                                │
 │  [████████████░░░░░░░░░░░░] 阶段 2 / 3         │
 │                                                │

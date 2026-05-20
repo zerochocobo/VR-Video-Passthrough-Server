@@ -106,3 +106,19 @@
 | `1024 + 1.0` | `48.16 ms` | `26.56 ms` | `debug_output/rvm_matte_compare_1024_dr1_vs_dr0p5` |
 | `1024 + 0.5` | `15.55 ms` | `26.11 ms` | `debug_output/rvm_matte_compare_1024_dr1_vs_dr0p5` |
 | `2048 + 0.5` | `45.25 ms` | `24.52 ms` | `debug_output/rvm_matte_compare_left_1024_dr0p5_vs_2048_dr0p5` |
+
+## 完整 SBS 和拆分左右眼 Batch2 的 Matte 检查
+
+在最终 `1024 + 0.5` 参数固定不变的前提下，又追加比较了完整 SBS 单图输入和拆分左右眼 batch2：
+
+| 模式 | 设置 | 实际 RVM shape | ORT 均值，排除 sample 0 | Composite 均值，排除 sample 0 |
+|---|---|---:|---:|---:|
+| 完整 SBS batch1 | `PT_MATTING_SPLIT_SBS=0`，`PT_MATTING_SBS_BATCH=0` | `(1,3,1024,2048)` | `17.25 ms` | `37.27 ms` |
+| 拆分 SBS batch2 | `PT_MATTING_SPLIT_SBS=1`，`PT_MATTING_SBS_BATCH=1` | `(2,3,1024,1024)` | `14.60 ms` | `31.48 ms` |
+
+产物：
+
+- `debug_output/rvm_matte_compare_full_sbs_vs_split_batch2`
+- 视频：`test_4k.mp4`、`test_8k.mp4`、`72456_3840p.mp4`
+- 每个视频 10 张采样帧
+- 比较图为上下堆叠；8K 样例中，单项 matte 图为 `1280x640`，比较图为 `1280x1280`。

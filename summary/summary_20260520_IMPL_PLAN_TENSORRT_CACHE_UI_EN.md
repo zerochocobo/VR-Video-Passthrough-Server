@@ -10,9 +10,9 @@
 
 After v0.1.0-beta.1, 8K real-time passthrough dropped from 40-50 FPS to ~30 FPS. Root cause: `ALPHA_STRIDE` was changed from 3 to 1 for quality. Reverting causes alpha black crosses and loss of distant figures, so the quality decision stays. **The performance loss is recovered by accelerating RVM inference with TensorRT.**
 
-It is already measured that `rvm_mobilenetv3_fp16.onnx` gives about a 16% FPS improvement over the fp32 model. This iteration layers a TensorRT FP16 backend on top of the fp16 model to further reduce per-inference time. On RTX 2080, TensorRT typically still gives a 1.5-2x gain on an fp16 ONNX, but the first launch must compile engines (5-15 minutes). Any change to driver / CUDA / TRT / ORT / model invalidates the cache. The task here is not "turn on TRT" — `ONNX_TRT_FP16_ENABLE` already defaults to 1, just `ONNX_PROVIDERS` does not include `TensorrtExecutionProvider`. The task is to give the user a **visible, controllable, reversible** UI flow.
+This iteration uses `rvm_mobilenetv3_fp32.onnx` as the only inference model (the fp16 variant was verified to noticeably degrade matting quality in VR scenes and has been dropped). **All the speedup comes from the TensorRT FP16 backend compiling directly from the fp32 ONNX** — TRT builds the engine in FP16 precision (`trt_fp16_enable=1` is already on by default) while taking the fp32 ONNX weights as compile-time input. On RTX 2080 this typically yields 1.5-2x over CUDA EP for RVM. The first launch must compile engines (5-15 minutes); any change to driver / CUDA / TRT / ORT / model invalidates the cache. The task here is not "turn on TRT" — `ONNX_TRT_FP16_ENABLE` already defaults to 1, just `ONNX_PROVIDERS` does not include `TensorrtExecutionProvider`. The task is to give the user a **visible, controllable, reversible** UI flow.
 
-**TensorRT acceleration targets only `rvm_mobilenetv3_fp16.onnx`.** The fp32 model is out of scope; when TensorRT is enabled the server must use the fp16 model.
+**TensorRT acceleration targets only `rvm_mobilenetv3_fp32.onnx`.** No other models are in scope for this iteration.
 
 **Input strategy**: fixed square `MATTING_INPUT_SIZE=1024` + `RVM_DOWNSAMPLE_RATIO=0.5`. A 2048 long-side + 0.125 downsample variant was tried but verified to lose subjects almost entirely in VR scenes, so we stay on the 1024 square layout — which also happens to be ideal for TRT: only two fixed shapes (`1×3×1024×1024` and `2×3×1024×1024`), each gets its own static engine with the most stable cache, best kernel selection, and no profile management to worry about.
 
@@ -149,7 +149,8 @@ Clicking `[Configure]` opens a modal dialog. This dialog is the only entry point
 ```
 ┌─ TensorRT Acceleration ───────────────────────┐
 │                                                │
-│  Model:   rvm_mobilenetv3_fp16.onnx            │
+│  Model:    rvm_mobilenetv3_fp32.onnx           │
+│  TRT prec: FP16 (compiled from fp32 ONNX)       │
 │  GPU:     NVIDIA GeForce RTX 2080              │
 │  Driver:  560.94                                │
 │  TensorRT: 10.0.1.6                            │
@@ -159,9 +160,9 @@ Clicking `[Configure]` opens a modal dialog. This dialog is the only entry point
 │  Engine size:  106 MB                           │
 │  Cache path:   runtime_cache/trt_engines/       │
 │                                                │
-│  ⓘ Enabling TensorRT switches the server to    │
-│    the fp16 model and runs inference via the   │
-│    TensorRT FP16 backend.                       │
+│  ⓘ Enabling TensorRT runs inference via the    │
+│    TensorRT FP16 backend, compiled directly    │
+│    from the fp32 ONNX model.                    │
 │                                                │
 │  ⚠ The GPU is busy during the build. Do not   │
 │    play video while building.                   │
@@ -185,7 +186,7 @@ After clicking `Start build` / `Rebuild`, **the same dialog switches to a progre
 ```
 ┌─ TensorRT Acceleration ───────────────────────┐
 │                                                │
-│  Building rvm_mobilenetv3_fp16.onnx             │
+│  Building rvm_mobilenetv3_fp32.onnx (TRT FP16)  │
 │                                                │
 │  [████████████░░░░░░░░░░░░] Stage 2 / 3        │
 │                                                │

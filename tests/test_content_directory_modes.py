@@ -35,6 +35,8 @@ class ContentDirectoryModeTests(unittest.TestCase):
             self.assertEqual(cds._video_item_count(derived), 1)
         with patch.object(cds, "PASSTHROUGH_OUTPUT_MODE", "all"):
             self.assertEqual(cds._video_item_count(Path("movie.mkv"), needs_fix), 1)
+        with patch.object(cds, "PASSTHROUGH_OUTPUT_MODE", "all"), patch.object(cds, "has_offline_passthrough_output", return_value=True):
+            self.assertEqual(cds._video_item_count(source), 1)
 
     def test_live_ids_distinguish_alpha(self) -> None:
         with patch.object(cds, "PASSTHROUGH_OUTPUT_MODE", "all"):
@@ -69,6 +71,29 @@ class ContentDirectoryModeTests(unittest.TestCase):
         self.assertIn("mode=green", passthrough[0]["url"])
         self.assertIn("mode=alpha", passthrough[1]["url"])
         self.assertEqual([item["passthrough_mode"] for item in passthrough], ["green", "alpha"])
+
+    def test_existing_offline_output_hides_virtual_modes(self) -> None:
+        child = SimpleNamespace(
+            size=1024,
+            video=SimpleNamespace(
+                duration=60.0,
+                width=3840,
+                height=2160,
+                resolution="3840x2160",
+                backend_verdict="pynv_hevc",
+                probe_error="",
+                mkv_needs_fix=False,
+            ),
+        )
+        with (
+            patch.object(cds, "_rel_key", return_value="movie.mp4"),
+            patch.object(cds, "PASSTHROUGH_OUTPUT_MODE", "all"),
+            patch.object(cds, "has_offline_passthrough_output", return_value=True),
+        ):
+            items = cds._video_items_from_index(Path("movie.mp4"), "0", child)
+
+        self.assertEqual(len(items), 1)
+        self.assertFalse(items[0].get("passthrough"))
 
     def test_short_live_metadata_keeps_alpha_mode(self) -> None:
         source = Path("movie.mp4")

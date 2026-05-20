@@ -39,6 +39,7 @@ from pipeline.ffmpeg_io import probe_cached
 from utils.bitrate_estimator import estimate_for_media
 from utils.logger import get
 from utils.media_index import IndexedChild, get_media_index
+from utils.offline_outputs import has_offline_passthrough_output, is_offline_passthrough_output_name
 from utils.subtitles import SubtitleTrack, find_external_subtitles, subtitle_output_enabled
 from utils.video_metadata import probe_video_metadata, select_backend
 
@@ -164,8 +165,9 @@ def _parent_id_for_dir(path: Path) -> str:
 
 def _video_item_count(path: Path, child: IndexedChild | None = None) -> int:
     if (
-        "passthrough" in path.name.lower()
+        is_offline_passthrough_output_name(path.name)
         or PASSTHROUGH_OUTPUT_MODE == "none"
+        or has_offline_passthrough_output(path)
         or _hide_passthrough_for_path(path, child)
     ):
         return 1
@@ -327,7 +329,12 @@ def _video_items(path: Path, parent_id: str) -> list[dict]:
     return _video_items_from_index(path, parent_id, None)
 
 
-def _video_items_from_index(path: Path, parent_id: str, child: IndexedChild | None) -> list[dict]:
+def _video_items_from_index(
+    path: Path,
+    parent_id: str,
+    child: IndexedChild | None,
+    siblings: list[Path] | None = None,
+) -> list[dict]:
     base = f"http://{LAN_IP}:{HTTP_PORT}"
     pt_bps = _parse_bitrate(PASSTHROUGH_BITRATE)
     rel = _rel_key(path)
@@ -381,7 +388,11 @@ def _video_items_from_index(path: Path, parent_id: str, child: IndexedChild | No
             "subtitles": [_subtitle_item(track) for track in find_external_subtitles(path)],
         }
     ]
-    if "passthrough" in path.name.lower() or _hide_passthrough_for_path(path, child):
+    if (
+        is_offline_passthrough_output_name(path.name)
+        or has_offline_passthrough_output(path, siblings)
+        or _hide_passthrough_for_path(path, child)
+    ):
         return items
 
     estimate_codec = PYNV_OUTPUT_CODEC
@@ -432,6 +443,8 @@ def _video_items_from_index(path: Path, parent_id: str, child: IndexedChild | No
 
 
 def _live_chapter_items(path: Path, mode: str) -> list[dict]:
+    if has_offline_passthrough_output(path):
+        return []
     base = f"http://{LAN_IP}:{HTTP_PORT}"
     rel = _rel_key(path)
     quoted = quote(rel)
@@ -503,6 +516,7 @@ def _children_for_dir(directory: Path) -> list[dict]:
     cached = _dir_items_cache.get(cache_key)
     if cached is not None:
         return list(cached)
+    sibling_paths = [child.path for child in snapshot.children]
     for child in snapshot.children:
         if child.is_dir:
             items.append(
@@ -515,7 +529,7 @@ def _children_for_dir(directory: Path) -> list[dict]:
                 }
             )
         elif child.path.suffix.lower() in VIDEO_EXTS:
-            items.extend(_video_items_from_index(child.path, parent_id, child))
+            items.extend(_video_items_from_index(child.path, parent_id, child, sibling_paths))
     if len(_dir_items_cache) >= _DIR_ITEMS_CACHE_MAX:
         _dir_items_cache.pop(next(iter(_dir_items_cache)))
     _dir_items_cache[cache_key] = list(items)

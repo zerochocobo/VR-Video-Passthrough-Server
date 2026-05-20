@@ -19,6 +19,7 @@ from pathlib import Path
 import config
 from utils.logger import get
 from utils.mkv_cues import MkvCuesInfo, probe_mkv_cues
+from utils.offline_outputs import has_offline_passthrough_output, is_offline_passthrough_output_name
 from utils.video_metadata import probe_video_metadata, select_backend
 
 log = get("media_index")
@@ -586,8 +587,9 @@ class MediaIndex:
                     count += 1
                 elif child.is_file() and child.suffix.lower() in config.VIDEO_EXTS:
                     if (
-                        "passthrough" in child.name.lower()
+                        is_offline_passthrough_output_name(child.name)
                         or config.PASSTHROUGH_OUTPUT_MODE == "none"
+                        or has_offline_passthrough_output(child, children)
                         or self._hide_passthrough_for_path(child)
                     ):
                         count += 1

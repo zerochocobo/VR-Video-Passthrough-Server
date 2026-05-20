@@ -88,3 +88,19 @@ Only the left half was exported for single-variant and comparison images.
 | `1024 + 1.0` | `48.16 ms` | `26.56 ms` | `debug_output/rvm_matte_compare_1024_dr1_vs_dr0p5` |
 | `1024 + 0.5` | `15.55 ms` | `26.11 ms` | `debug_output/rvm_matte_compare_1024_dr1_vs_dr0p5` |
 | `2048 + 0.5` | `45.25 ms` | `24.52 ms` | `debug_output/rvm_matte_compare_left_1024_dr0p5_vs_2048_dr0p5` |
+
+## Full SBS vs Split-SBS Matte Check
+
+With the final `1024 + 0.5` parameters fixed, another screenshot experiment compared full SBS input against split-SBS batch2:
+
+| Mode | Settings | Actual RVM shape | ORT mean, sample 0 excluded | Composite mean, sample 0 excluded |
+|---|---|---:|---:|---:|
+| Full SBS batch1 | `PT_MATTING_SPLIT_SBS=0`, `PT_MATTING_SBS_BATCH=0` | `(1,3,1024,2048)` | `17.25 ms` | `37.27 ms` |
+| Split SBS batch2 | `PT_MATTING_SPLIT_SBS=1`, `PT_MATTING_SBS_BATCH=1` | `(2,3,1024,1024)` | `14.60 ms` | `31.48 ms` |
+
+Artifacts:
+
+- `debug_output/rvm_matte_compare_full_sbs_vs_split_batch2`
+- Videos: `test_4k.mp4`, `test_8k.mp4`, `72456_3840p.mp4`
+- 10 sampled frames per video
+- Comparison sheets are stacked vertically; for the 8K sample, single matte images are `1280x640` and comparison sheets are `1280x1280`.
