@@ -33,6 +33,7 @@ from offline.sam3_matanyone2 import (  # noqa: E402
     empty_sam3_mask,
     fill_short_inactive_gaps,
 )
+from offline.decoded_frames import decoded_frame_to_bgr  # noqa: E402
 
 GPU_CACHE_ENV = configure_gpu_runtime_cache()
 
@@ -242,7 +243,7 @@ def _parse_bitrate(value: str, src: Path) -> str:
     if raw in {"", "source", "auto", "same"}:
         bitrate = source_video_bitrate(src)
         if not bitrate:
-            raise RuntimeError(f"source bitrate unavailable for {src}")
+            return "40000000"
         return str(bitrate)
     return str(value)
 
@@ -1040,13 +1041,7 @@ def _precompute_sam3_segment_masks(args, src: Path, dec, source_fps: float, fps:
             masker = make_masker()
         src_idx = min(len(dec) - 1, cfr_source_index(start, source_fps, fps))
         frame = dec.frame_at(src_idx)
-        try:
-            import cupy as cp
-        except Exception as exc:
-            raise RuntimeError("SAM3 prepass needs CuPy to read decoded NV12 frame") from exc
-        nv12 = cp.asnumpy(cp.concatenate([frame.y.as_cupy().reshape(frame.height, frame.width),
-                                          frame.uv.as_cupy().reshape(frame.height // 2, frame.width)], axis=0))
-        bgr = cv2.cvtColor(nv12, cv2.COLOR_YUV2BGR_NV12)
+        bgr = decoded_frame_to_bgr(frame)
         half = frame.width // 2
         eye_images = [
             cv2.cvtColor(bgr[:, :half], cv2.COLOR_BGR2RGB),

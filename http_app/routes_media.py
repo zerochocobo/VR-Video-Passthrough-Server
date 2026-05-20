@@ -50,6 +50,7 @@ from config import (
     PASSTHROUGH_SEEK_MODE,
     DEBUG_LOGS,
     LIVE_REQUEST_HEADER_DUMP,
+    LIGHT_MATCH_FLUSH_QUEUES,
     MEDIA_LIBRARY,
     ROOT,
     USE_PYNV,
@@ -63,6 +64,7 @@ from pipeline.pynv_stream import PYNV_BACKEND_LABEL, PYNV_OUTPUT_CODEC, PyNvPass
 from pipeline.thumbnail import get_thumb
 from utils.bitrate_estimator import estimate_for_media, record_actual_bps
 from utils.logger import get
+from utils.runtime_settings import get_light_match
 from utils.subprocess_hidden import hidden_subprocess_kwargs
 from utils.mkv_cues import probe_mkv_cues
 from utils.subtitles import find_external_subtitles, is_subtitle_path, subtitle_mime
@@ -104,6 +106,28 @@ _LIVE_NPLAYER_START_DEBOUNCE_SEC = max(1.5, _LIVE_FIRST_CHUNK_TIMEOUT_SEC)
 
 
 _LIVE_END = object()
+
+
+def _drain_live_queue_nowait(q: asyncio.Queue[bytes | object]) -> tuple[int, int, bool]:
+    chunks = 0
+    bytes_dropped = 0
+    saw_end = False
+    while True:
+        try:
+            item = q.get_nowait()
+        except asyncio.QueueEmpty:
+            break
+        if item is _LIVE_END:
+            saw_end = True
+            try:
+                q.put_nowait(_LIVE_END)
+            except asyncio.QueueFull:
+                pass
+            break
+        if isinstance(item, (bytes, bytearray, memoryview)):
+            chunks += 1
+            bytes_dropped += len(item)
+    return chunks, bytes_dropped, saw_end
 
 
 def _set_probe_cache_locked(key: str, data: bytes) -> None:
@@ -172,6 +196,7 @@ class LiveSession:
         self.expire_task: asyncio.Task | None = None
         self._stream_iter = None
         self._producer_start = self.created
+        self._light_match_version = get_light_match().version
         self._append_cache(first_chunk)
 
     def start(self, stream_iter) -> None:
@@ -207,6 +232,29 @@ class LiveSession:
     async def _publish(self, chunk: bytes) -> None:
         stale: list[LiveSubscriber] = []
         async with self.lock:
+            current_light_match_version = get_light_match().version
+            if LIGHT_MATCH_FLUSH_QUEUES and current_light_match_version != self._light_match_version:
+                cache_bytes = len(self.cache)
+                self.cache.clear()
+                dropped_chunks = 0
+                dropped_bytes = 0
+                saw_end = False
+                for subscriber in list(self.subscribers):
+                    d_chunks, d_bytes, d_end = _drain_live_queue_nowait(subscriber.queue)
+                    dropped_chunks += d_chunks
+                    dropped_bytes += d_bytes
+                    saw_end = saw_end or d_end
+                log.info(
+                    "passthrough_live light match changed v%d->v%d; cleared cache=%d queued_chunks=%d queued_bytes=%d end=%s key=%s",
+                    self._light_match_version,
+                    current_light_match_version,
+                    cache_bytes,
+                    dropped_chunks,
+                    dropped_bytes,
+                    saw_end,
+                    _live_session_log_key(self.key),
+                )
+                self._light_match_version = current_light_match_version
             self._append_cache(chunk)
             subscribers = list(self.subscribers)
         for subscriber in subscribers:
@@ -1186,6 +1234,37 @@ def _format_fps_header(fps: float | None) -> str | None:
     return str(int(fps)) if float(fps).is_integer() else f"{fps:.3f}".rstrip("0").rstrip(".")
 
 
+_LIVE_MAX_SIDE = 8192
+
+
+def _live_block_reason(path: Path, meta) -> str:
+    if path.suffix.lower() == ".mkv":
+        policy = PASSTHROUGH_MKV_LIVE_POLICY
+        if policy not in {"block", "head_cues", "allow"}:
+            policy = "block"
+        if policy == "block":
+            return "MKV live passthrough is disabled"
+        if policy == "head_cues":
+            info = probe_mkv_cues(path)
+            if info.needs_fix:
+                return "MKV needs remux before live passthrough"
+    codec = meta.codec
+    if codec.width <= 0 or codec.height <= 0:
+        return "missing video dimensions"
+    if codec.width > _LIVE_MAX_SIDE or codec.height > _LIVE_MAX_SIDE:
+        return f"video dimensions exceed live limit {_LIVE_MAX_SIDE}px"
+    decision = select_backend(meta.timing, meta.codec, meta.color)
+    if decision.verdict != "pynv_hevc":
+        return decision.reason
+    return ""
+
+
+def _probe_live_request_metadata(path: Path):
+    info = probe_cached(path)
+    live_meta = probe_video_metadata(path)
+    return info, live_meta, _live_block_reason(path, live_meta)
+
+
 def _select_passthrough_stream(
     path: Path,
     start_sec: float,
@@ -1324,8 +1403,11 @@ async def passthrough_live_get(
 ):
     rid = next(_request_ids)
     path = _safe_video_path(name)
-    _reject_unsafe_mkv_live_path(path)
-    info = probe_cached(path)
+    try:
+        info, live_meta, live_block_reason = await asyncio.to_thread(_probe_live_request_metadata, path)
+    except Exception as e:
+        log.warning("passthrough_live[%d] metadata probe failed; reject live source: %s", rid, e)
+        return Response("live passthrough unsupported: metadata probe failed", status_code=409)
     requested_t = t
     npt_t = _parse_npt_seconds(time_seek_range)
     if npt_t is not None:
@@ -1369,11 +1451,9 @@ async def passthrough_live_get(
         rid, path.name, t, request.client, requested_t, live_output_mode, requested_mode or None, time_seek_range,
     )
 
-    live_meta = None
-    try:
-        live_meta = probe_video_metadata(path)
-    except Exception as e:
-        log.warning("passthrough_live[%d] adaptive metadata probe failed: %s", rid, e)
+    if live_block_reason:
+        log.info("passthrough_live[%d] reject unsupported live source: %s reason=%s", rid, path.name, live_block_reason)
+        return Response(f"live passthrough unsupported: {live_block_reason}", status_code=409)
     live_max_fps = _live_adaptive_max_fps(path, live_meta)
     live_profile = _live_response_profile(user_agent)
     is_nplayer = _is_nplayer_client(user_agent)
@@ -1692,6 +1772,7 @@ async def passthrough_live_get(
             pace_start_wall = last_send_wall
             delivery_queue: asyncio.Queue[bytes | object] = asyncio.Queue(maxsize=PASSTHROUGH_LIVE_SUB_QUEUE_CHUNKS)
             released = False
+            light_match_version = get_light_match().version
 
             async def close_and_release(reason: str) -> None:
                 nonlocal released
@@ -1782,6 +1863,20 @@ async def passthrough_live_get(
                     if item is _LIVE_END:
                         break
                     chunk = item
+                    current_light_match_version = get_light_match().version
+                    if LIGHT_MATCH_FLUSH_QUEUES and current_light_match_version != light_match_version:
+                        dropped_chunks, dropped_bytes, saw_end = _drain_live_queue_nowait(delivery_queue)
+                        log.info(
+                            "passthrough_live[%d] light match changed v%d->v%d; dropped VLC delivery current plus queued_chunks=%d queued_bytes=%d end=%s",
+                            rid,
+                            light_match_version,
+                            current_light_match_version,
+                            dropped_chunks,
+                            dropped_bytes + len(chunk),
+                            saw_end,
+                        )
+                        light_match_version = current_light_match_version
+                        continue
                     sent += len(chunk)
                     last_send_wall = asyncio.get_running_loop().time()
                     if first_chunk:

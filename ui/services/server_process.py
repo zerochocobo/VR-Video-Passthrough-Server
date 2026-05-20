@@ -1,5 +1,8 @@
 ﻿from __future__ import annotations
 
+import subprocess
+import sys
+
 from PySide6.QtCore import QObject, QProcess, QProcessEnvironment, Signal
 
 from ui.log_sanitizer import clean_log_text
@@ -35,9 +38,22 @@ class ServerProcess(QObject):
     def stop(self) -> None:
         if not self.is_running():
             return
+        pid = int(self.process.processId())
         self.process.terminate()
         if not self.process.waitForFinished(3000):
-            self.process.kill()
+            if sys.platform.startswith("win") and pid > 0:
+                try:
+                    subprocess.run(
+                        ["taskkill", "/PID", str(pid), "/T", "/F"],
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                        timeout=5,
+                        check=False,
+                    )
+                except Exception:
+                    self.process.kill()
+            else:
+                self.process.kill()
 
     def _read_stdout(self) -> None:
         data = clean_log_text(bytes(self.process.readAllStandardOutput()).decode("utf-8", "replace"))

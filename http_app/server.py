@@ -4,6 +4,7 @@ import asyncio
 
 from fastapi import FastAPI
 
+from http_app.routes_control import router as control_router
 from http_app.routes_dlna import router as dlna_router
 from http_app.routes_media import router as media_router
 from utils.logger import get
@@ -38,6 +39,7 @@ def _install_asyncio_noise_filter() -> None:
 def create_app() -> FastAPI:
     """Create the HTTP app without starting network listeners."""
     app = FastAPI(title="PT VR Passthrough Server", docs_url=None, redoc_url=None)
+    app.include_router(control_router)
     app.include_router(dlna_router)
     app.include_router(media_router)
 

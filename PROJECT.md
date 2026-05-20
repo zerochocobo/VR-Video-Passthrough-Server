@@ -370,8 +370,8 @@ These directories are generated or environment-specific:
 | `PT_LAN_IP` | auto-detect | LAN address advertised to DLNA clients. |
 | `PT_HTTP_PORT` | `8200` | HTTP media/control port. |
 | `PT_VIDEO_DIR` | `G:\Downloads` | Media library root. |
-| `PT_MODEL_PATH` | RVM MobileNetV3 fp32 | ONNX matting model. |
-| `PT_MATTING_INPUT_SIZE` | `512` | Matting reference input size. |
+| `PT_MODEL_PATH` | RVM MobileNetV3 fp16 | ONNX matting model. |
+| `PT_MATTING_INPUT_SIZE` | RVM `2048`, other models `512` | Matting reference input size. |
 | `PT_MATTING_SPLIT_SBS` | `1` | Split side-by-side VR frames before matting. |
 | `PT_ALPHA_STRIDE` | `3` | Run matting once every N output frames, reuse alpha otherwise. |
 | `PT_USE_PYNV` | `1` | Enable PyNv backend for eligible sources. |

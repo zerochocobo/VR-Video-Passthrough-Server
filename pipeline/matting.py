@@ -18,6 +18,8 @@ import cv2
 import numpy as np
 import onnxruntime as ort
 
+from pipeline.light_match import LIGHT_MATCH_DEVICE_SRC, build_light_match_tables
+from utils.runtime_settings import get_light_match
 from config import (
     ALPHA_CONTRAST,
     ALPHA_CUTOFF,
@@ -66,6 +68,8 @@ _preprocess_nv12_kernel = None
 _preprocess_kernel_fp16 = None
 _preprocess_nv12_kernel_fp16 = None
 _GPU_OK = False
+
+_LIGHT_MATCH_DEVICE_SRC = LIGHT_MATCH_DEVICE_SRC
 
 if MATTING_DEVICE in ("auto", "gpu"):
     try:
@@ -443,7 +447,7 @@ if MATTING_DEVICE in ("auto", "gpu"):
             _PREPROCESS_NV12_KERNEL_FP16_SRC, "preprocess_nv12_chw_norm_fp16"
         )
 
-        _COMPOSITE_NV12_UPSAMPLE_KERNEL_SRC = r"""
+        _COMPOSITE_NV12_UPSAMPLE_KERNEL_SRC = _LIGHT_MATCH_DEVICE_SRC + r"""
         __device__ float adjust_alpha(float a, float cutoff, int hard_edge, float contrast) {
             a = a < 0.f ? 0.f : (a > 1.f ? 1.f : a);
             if (contrast != 1.f) {
@@ -469,7 +473,10 @@ if MATTING_DEVICE in ("auto", "gpu"):
             float scale_x, float scale_y,
             unsigned char gB, unsigned char gG, unsigned char gR,
             float alpha_cutoff, int alpha_hard_edge, float alpha_contrast,
-            unsigned char* __restrict__ out
+            unsigned char* __restrict__ out,
+            const float* __restrict__ light_coeffs,
+            const unsigned char* __restrict__ light_gamma_lut,
+            int light_identity
         ) {
             int x = blockIdx.x * blockDim.x + threadIdx.x;
             int y = blockIdx.y * blockDim.y + threadIdx.y;
@@ -501,12 +508,28 @@ if MATTING_DEVICE in ("auto", "gpu"):
             float C = Y - 16.f; if (C < 0.f) C = 0.f;
             float D = U - 128.f;
             float E = V - 128.f;
-            float r0 = 1.16438356f * C + 1.59602678f * E;
-            float g0 = 1.16438356f * C - 0.39176229f * D - 0.81296765f * E;
-            float b0 = 1.16438356f * C + 2.01723214f * D;
+            float r0 = 1.16438356f * C + 1.79274107f * E;
+            float g0 = 1.16438356f * C - 0.21324861f * D - 0.53290933f * E;
+            float b0 = 1.16438356f * C + 2.11240179f * D;
             b0 = b0 < 0.f ? 0.f : (b0 > 255.f ? 255.f : b0);
             g0 = g0 < 0.f ? 0.f : (g0 > 255.f ? 255.f : g0);
             r0 = r0 < 0.f ? 0.f : (r0 > 255.f ? 255.f : r0);
+            if (!light_identity) {
+                float yy, uu, vv;
+                yy = 16.f + 0.182586f * r0 + 0.614231f * g0 + 0.062007f * b0;
+                uu = 128.f - 0.100644f * r0 - 0.338572f * g0 + 0.439216f * b0;
+                vv = 128.f + 0.439216f * r0 - 0.398942f * g0 - 0.040274f * b0;
+                apply_light_match(&yy, &uu, &vv, light_coeffs, light_gamma_lut, light_identity);
+                float C2 = yy - 16.f; if (C2 < 0.f) C2 = 0.f;
+                float D2 = uu - 128.f;
+                float E2 = vv - 128.f;
+                r0 = 1.16438356f * C2 + 1.79274107f * E2;
+                g0 = 1.16438356f * C2 - 0.21324861f * D2 - 0.53290933f * E2;
+                b0 = 1.16438356f * C2 + 2.11240179f * D2;
+                b0 = b0 < 0.f ? 0.f : (b0 > 255.f ? 255.f : b0);
+                g0 = g0 < 0.f ? 0.f : (g0 > 255.f ? 255.f : g0);
+                r0 = r0 < 0.f ? 0.f : (r0 > 255.f ? 255.f : r0);
+            }
             int p = (y * out_w + x) * 3;
             out[p]     = (unsigned char)(b0 * a + (float)gB * inv + 0.5f);
             out[p + 1] = (unsigned char)(g0 * a + (float)gG * inv + 0.5f);
@@ -517,7 +540,7 @@ if MATTING_DEVICE in ("auto", "gpu"):
             _COMPOSITE_NV12_UPSAMPLE_KERNEL_SRC, "composite_green_nv12_upsample"
         )
 
-        _COMPOSITE_NV12_TO_NV12_KERNEL_SRC = r"""
+        _COMPOSITE_NV12_TO_NV12_KERNEL_SRC = _LIGHT_MATCH_DEVICE_SRC + r"""
         __device__ float adjust_alpha(float a, float cutoff, int hard_edge, float contrast) {
             a = a < 0.f ? 0.f : (a > 1.f ? 1.f : a);
             if (contrast != 1.f) {
@@ -570,7 +593,10 @@ if MATTING_DEVICE in ("auto", "gpu"):
             unsigned char gY, unsigned char gU, unsigned char gV,
             int fast_uv_alpha,
             float alpha_cutoff, int alpha_hard_edge, float alpha_contrast,
-            unsigned char* __restrict__ out_nv12
+            unsigned char* __restrict__ out_nv12,
+            const float* __restrict__ light_coeffs,
+            const unsigned char* __restrict__ light_gamma_lut,
+            int light_identity
         ) {
             int x = blockIdx.x * blockDim.x + threadIdx.x;
             int y = blockIdx.y * blockDim.y + threadIdx.y;
@@ -581,7 +607,9 @@ if MATTING_DEVICE in ("auto", "gpu"):
                 sample_alpha_lr(alpha_lr, aw, ah, out_w, out_h, x, y),
                 alpha_cutoff, alpha_hard_edge, alpha_contrast
             );
-            float yv = (float)src_nv12[y_idx] * a + (float)gY * (1.f - a);
+            float src_y = (float)src_nv12[y_idx];
+            apply_light_match_y_only(&src_y, light_coeffs, light_gamma_lut, light_identity);
+            float yv = src_y * a + (float)gY * (1.f - a);
             yv = yv < 0.f ? 0.f : (yv > 255.f ? 255.f : yv);
             out_nv12[y_idx] = (unsigned char)(yv + 0.5f);
 
@@ -594,8 +622,11 @@ if MATTING_DEVICE in ("auto", "gpu"):
                     float a11 = adjust_alpha(sample_alpha_lr(alpha_lr, aw, ah, out_w, out_h, x + 1, y + 1), alpha_cutoff, alpha_hard_edge, alpha_contrast);
                     auv = 0.25f * (a + a01 + a10 + a11);
                 }
-                float u = (float)src_nv12[uv_idx] * auv + (float)gU * (1.f - auv);
-                float v = (float)src_nv12[uv_idx + 1] * auv + (float)gV * (1.f - auv);
+                float src_u = (float)src_nv12[uv_idx];
+                float src_v = (float)src_nv12[uv_idx + 1];
+                apply_light_match_uv_only(&src_u, &src_v, light_coeffs, light_identity);
+                float u = src_u * auv + (float)gU * (1.f - auv);
+                float v = src_v * auv + (float)gV * (1.f - auv);
                 u = u < 0.f ? 0.f : (u > 255.f ? 255.f : u);
                 v = v < 0.f ? 0.f : (v > 255.f ? 255.f : v);
                 out_nv12[uv_idx] = (unsigned char)(u + 0.5f);
@@ -607,7 +638,7 @@ if MATTING_DEVICE in ("auto", "gpu"):
             _COMPOSITE_NV12_TO_NV12_KERNEL_SRC, "composite_green_nv12_to_nv12"
         )
 
-        _COMPOSITE_NV12_Y_KERNEL_SRC = r"""
+        _COMPOSITE_NV12_Y_KERNEL_SRC = _LIGHT_MATCH_DEVICE_SRC + r"""
         __device__ float adjust_alpha(float a, float cutoff, int hard_edge, float contrast) {
             a = a < 0.f ? 0.f : (a > 1.f ? 1.f : a);
             if (contrast != 1.f) {
@@ -657,7 +688,10 @@ if MATTING_DEVICE in ("auto", "gpu"):
             int aw, int ah,
             unsigned char gY,
             float alpha_cutoff, int alpha_hard_edge, float alpha_contrast,
-            unsigned char* __restrict__ out_nv12
+            unsigned char* __restrict__ out_nv12,
+            const float* __restrict__ light_coeffs,
+            const unsigned char* __restrict__ light_gamma_lut,
+            int light_identity
         ) {
             int x = blockIdx.x * blockDim.x + threadIdx.x;
             int y = blockIdx.y * blockDim.y + threadIdx.y;
@@ -667,7 +701,9 @@ if MATTING_DEVICE in ("auto", "gpu"):
                 sample_alpha_lr_y(alpha_lr, aw, ah, out_w, out_h, x, y),
                 alpha_cutoff, alpha_hard_edge, alpha_contrast
             );
-            float yv = (float)src_nv12[idx] * a + (float)gY * (1.f - a);
+            float src_y = (float)src_nv12[idx];
+            apply_light_match_y_only(&src_y, light_coeffs, light_gamma_lut, light_identity);
+            float yv = src_y * a + (float)gY * (1.f - a);
             yv = yv < 0.f ? 0.f : (yv > 255.f ? 255.f : yv);
             out_nv12[idx] = (unsigned char)(yv + 0.5f);
         }
@@ -676,7 +712,7 @@ if MATTING_DEVICE in ("auto", "gpu"):
             _COMPOSITE_NV12_Y_KERNEL_SRC, "composite_green_nv12_y"
         )
 
-        _COMPOSITE_NV12_UV_KERNEL_SRC = r"""
+        _COMPOSITE_NV12_UV_KERNEL_SRC = _LIGHT_MATCH_DEVICE_SRC + r"""
         __device__ float adjust_alpha(float a, float cutoff, int hard_edge, float contrast) {
             a = a < 0.f ? 0.f : (a > 1.f ? 1.f : a);
             if (contrast != 1.f) {
@@ -729,7 +765,9 @@ if MATTING_DEVICE in ("auto", "gpu"):
             unsigned char gU, unsigned char gV,
             int fast_uv_alpha,
             float alpha_cutoff, int alpha_hard_edge, float alpha_contrast,
-            unsigned char* __restrict__ out_nv12
+            unsigned char* __restrict__ out_nv12,
+            const float* __restrict__ light_coeffs,
+            int light_identity
         ) {
             int ux = blockIdx.x * blockDim.x + threadIdx.x;
             int uy = blockIdx.y * blockDim.y + threadIdx.y;
@@ -750,8 +788,11 @@ if MATTING_DEVICE in ("auto", "gpu"):
                 auv = 0.25f * (a + a01 + a10 + a11);
             }
             int uv_idx = out_w * out_h + uy * out_w + x;
-            float u = (float)src_nv12[uv_idx] * auv + (float)gU * (1.f - auv);
-            float v = (float)src_nv12[uv_idx + 1] * auv + (float)gV * (1.f - auv);
+            float src_u = (float)src_nv12[uv_idx];
+            float src_v = (float)src_nv12[uv_idx + 1];
+            apply_light_match_uv_only(&src_u, &src_v, light_coeffs, light_identity);
+            float u = src_u * auv + (float)gU * (1.f - auv);
+            float v = src_v * auv + (float)gV * (1.f - auv);
             u = u < 0.f ? 0.f : (u > 255.f ? 255.f : u);
             v = v < 0.f ? 0.f : (v > 255.f ? 255.f : v);
             out_nv12[uv_idx] = (unsigned char)(u + 0.5f);
@@ -883,6 +924,7 @@ class Matter:
         self._rvm_io_sig: tuple[int, int, int] | None = None
         self._rvm_io_outputs: dict[str, ort.OrtValue] = {}
         self._rvm_io_downsample: ort.OrtValue | None = None
+        self._rvm_state_slots: dict[str, dict[str, object]] = {}
         self._rvm_output_channels: dict[str, int] = {}
         self._rvm_iobinding_enabled = False
         self._rvm_iobinding_failed = False
@@ -911,6 +953,10 @@ class Matter:
         self._h_out_nv12 = None
         self._h_out_nv12_mem = None
         self._sync_probe_count = 0
+        self._light_match_version = -1
+        self._light_match_identity = 1
+        self._g_light_coeffs = None
+        self._g_light_gamma_lut = None
         if not load_model:
             print("[matting] utility mode: ONNX matting model not loaded", file=sys.stderr)
             return
@@ -989,6 +1035,49 @@ class Matter:
         )
         self.warmup(MATTING_WARMUP_RUNS)
 
+    def _ensure_light_match_tables(self):
+        cp = _cp
+        if cp is None:
+            return None, None, np.int32(1)
+        state = get_light_match()
+        if (
+            self._g_light_coeffs is None
+            or self._g_light_gamma_lut is None
+            or self._light_match_version != state.version
+        ):
+            tables = build_light_match_tables(state.params())
+            coeffs = tables.coeffs.astype(np.float32, copy=False)
+            gamma_lut = tables.gamma_lut.astype(np.uint8, copy=False)
+            if self._g_light_coeffs is None or self._g_light_coeffs.shape != coeffs.shape:
+                self._g_light_coeffs = cp.empty(coeffs.shape, dtype=cp.float32)
+            if self._g_light_gamma_lut is None or self._g_light_gamma_lut.shape != gamma_lut.shape:
+                self._g_light_gamma_lut = cp.empty(gamma_lut.shape, dtype=cp.uint8)
+            self._g_light_coeffs.set(coeffs)
+            self._g_light_gamma_lut.set(gamma_lut)
+            self._light_match_identity = 1 if tables.identity else 0
+            self._light_match_version = state.version
+            if state.version > 0 or not tables.identity:
+                log.info(
+                    "light match updated: enabled=%s temp_k=%d tint=%.1f ev=%.2f contrast=%.2f gamma=%.2f saturation=%.2f preset=%s version=%d identity=%s",
+                    state.enabled,
+                    state.temp_k,
+                    state.tint,
+                    state.exposure_ev,
+                    state.contrast,
+                    state.gamma,
+                    state.saturation,
+                    state.preset,
+                    state.version,
+                    bool(tables.identity),
+                )
+        return self._g_light_coeffs, self._g_light_gamma_lut, np.int32(self._light_match_identity)
+
+    def light_match_kernel_args(self, include_gamma: bool = True):
+        coeffs, gamma_lut, identity = self._ensure_light_match_tables()
+        if include_gamma:
+            return coeffs, gamma_lut, identity
+        return coeffs, identity
+
     def reset_state(self) -> None:
         """Clear temporal matting state between independent videos/requests."""
         self._rvm_rec = None
@@ -997,6 +1086,7 @@ class Matter:
         self._rvm_io_sig = None
         self._rvm_io_outputs = {}
         self._rvm_io_downsample = None
+        self._rvm_state_slots = {}
         self._rvm_iobinding_failed = False
         self._cached_alpha_small = None
         self._cached_alpha_shape = None
@@ -1021,7 +1111,8 @@ class Matter:
             return
         import time as _time
 
-        frame = np.zeros((MATTING_INPUT_SIZE, MATTING_INPUT_SIZE, 3), dtype=np.uint8)
+        warmup_size = MATTING_INPUT_SIZE if MATTING_INPUT_SIZE > 0 else 1024
+        frame = np.zeros((warmup_size, warmup_size, 3), dtype=np.uint8)
         start = _time.perf_counter()
         for _ in range(runs):
             self.alpha(frame)
@@ -1037,11 +1128,16 @@ class Matter:
     def _matting_size_for(self, w: int, h: int) -> tuple[int, int]:
         """ _resize_to_matting_input target shape GPU """
         ref = MATTING_INPUT_SIZE
+        if self.model_kind == "rvm" and ref <= 0:
+            new_w, new_h = w, h
+            new_w -= new_w % 32
+            new_h -= new_h % 32
+            return max(new_w, 32), max(new_h, 32)
         if self.model_kind in {"rmbg", "ben2"}:
             return ref, ref
         if MATTING_SQUARE:
             return ref, ref
-        if max(h, w) < ref or min(h, w) > ref:
+        if min(h, w) > ref:
             if w >= h:
                 new_h = ref
                 new_w = int(w / h * ref)
@@ -1555,6 +1651,54 @@ class Matter:
         out = self.sess.run([self.output_name], {self.input_name: x})[0]
         return self._postprocess_alpha_batch(self._extract_alpha_batch(out))
 
+    def _capture_rvm_state(self) -> dict[str, object]:
+        return {
+            "rec": self._rvm_rec,
+            "rec_ort": self._rvm_rec_ort,
+            "rec_sig": getattr(self, "_rvm_rec_sig", None),
+            "io_sig": self._rvm_io_sig,
+            "io_outputs": self._rvm_io_outputs,
+            "io_downsample": self._rvm_io_downsample,
+        }
+
+    def _restore_rvm_state(self, state: dict[str, object] | None) -> None:
+        if state is None:
+            self._rvm_rec = None
+            self._rvm_rec_ort = None
+            self._rvm_rec_sig = None
+            self._rvm_io_sig = None
+            self._rvm_io_outputs = {}
+            self._rvm_io_downsample = None
+            return
+        self._rvm_rec = state.get("rec")  # type: ignore[assignment]
+        self._rvm_rec_ort = state.get("rec_ort")  # type: ignore[assignment]
+        self._rvm_rec_sig = state.get("rec_sig")
+        self._rvm_io_sig = state.get("io_sig")  # type: ignore[assignment]
+        self._rvm_io_outputs = state.get("io_outputs") or {}  # type: ignore[assignment]
+        self._rvm_io_downsample = state.get("io_downsample")  # type: ignore[assignment]
+
+    def _run_matting_in_rvm_slot(self, slot: str, x: np.ndarray) -> np.ndarray:
+        if self.model_kind != "rvm":
+            return self._run_matting(x)
+        current = self._capture_rvm_state()
+        self._restore_rvm_state(self._rvm_state_slots.get(slot))
+        try:
+            out = self._run_matting(x)
+            self._rvm_state_slots[slot] = self._capture_rvm_state()
+            return out
+        finally:
+            self._restore_rvm_state(current)
+
+    def _run_rvm_iobinding_in_slot(self, slot: str, x_dev) -> np.ndarray:
+        current = self._capture_rvm_state()
+        self._restore_rvm_state(self._rvm_state_slots.get(slot))
+        try:
+            out = self._run_rvm_iobinding_from_dev(x_dev)
+            self._rvm_state_slots[slot] = self._capture_rvm_state()
+            return out
+        finally:
+            self._restore_rvm_state(current)
+
     def _reset_rvm_rec_if_needed(self, batch: int, h: int, w: int) -> None:
         sig = (batch, h, w)
         if (self._rvm_rec is None
@@ -1799,15 +1943,15 @@ class Matter:
             xL = self._resize_to_matting_input(left)
             xR = self._resize_to_matting_input(right)
             t1 = _time.perf_counter()
-            if (self._supports_batch2 or self.model_kind == "rvm") and xL.shape == xR.shape:
+            if self._supports_batch2 and xL.shape == xR.shape:
                 x = np.concatenate([xL, xR], axis=0)
                 a_batch = self._run_matting_batch(x)
                 aL_small = a_batch[0]
                 aR_small = a_batch[1]
                 ort_shape = str(x.shape)
             else:
-                aL_small = self._run_matting(xL)
-                aR_small = self._run_matting(xR)
+                aL_small = self._run_matting_in_rvm_slot("sbs_left", xL)
+                aR_small = self._run_matting_in_rvm_slot("sbs_right", xR)
                 ort_shape = f"2x{xL.shape}"
             t2 = _time.perf_counter()
             a_small = np.concatenate([aL_small, aR_small], axis=1)
@@ -1842,7 +1986,7 @@ class Matter:
         if split_sbs_active:
             half = w // 2
             out_w, out_h = self._matting_size_for(half, h)
-            if self._supports_batch2 or self.model_kind == "rvm":
+            if self._supports_batch2:
                 use_iobinding = self._rvm_iobinding_enabled and not self._rvm_iobinding_failed
                 preprocess_one(0, half, out_w, out_h, batch=2, batch_idx=0, copy_to_host=not use_iobinding)
                 preprocess_one(half, half, out_w, out_h, batch=2, batch_idx=1, copy_to_host=not use_iobinding)
@@ -1871,13 +2015,34 @@ class Matter:
                 pre_ms = (t1 - t0) * 1000
                 ort_ms = (t2 - t1) * 1000
             else:
-                xL = preprocess_one(0, half, out_w, out_h)
+                use_iobinding = self._rvm_iobinding_enabled and not self._rvm_iobinding_failed
+                xL = preprocess_one(0, half, out_w, out_h, copy_to_host=not use_iobinding)
                 t1 = _time.perf_counter()
-                aL_small = self._run_matting(xL)  # ORT buffer
+                if use_iobinding:
+                    try:
+                        aL_small = self._run_rvm_iobinding_in_slot("sbs_left", xL)[0]
+                    except Exception as e:
+                        self._rvm_iobinding_failed = True
+                        log.warning("[DIAG] RVM IOBinding failed; falling back to sess.run: %s", e)
+                        cp = _cp
+                        cp.asnumpy(xL, out=self._ensure_pinned_chw(out_w, out_h, 1))
+                        aL_small = self._run_matting_in_rvm_slot("sbs_left", self._h_chw)
+                else:
+                    aL_small = self._run_matting_in_rvm_slot("sbs_left", xL)
                 t_pre_R = _time.perf_counter()
-                xR = preprocess_one(half, half, out_w, out_h)
+                xR = preprocess_one(half, half, out_w, out_h, copy_to_host=not use_iobinding)
                 t_ort_R0 = _time.perf_counter()
-                aR_small = self._run_matting(xR)
+                if use_iobinding and not self._rvm_iobinding_failed:
+                    try:
+                        aR_small = self._run_rvm_iobinding_in_slot("sbs_right", xR)[0]
+                    except Exception as e:
+                        self._rvm_iobinding_failed = True
+                        log.warning("[DIAG] RVM IOBinding failed; falling back to sess.run: %s", e)
+                        cp = _cp
+                        cp.asnumpy(xR, out=self._ensure_pinned_chw(out_w, out_h, 1))
+                        aR_small = self._run_matting_in_rvm_slot("sbs_right", self._h_chw)
+                else:
+                    aR_small = self._run_matting_in_rvm_slot("sbs_right", xR)
                 t2 = _time.perf_counter()
                 ort_shape = f"2x(1,3,{out_h},{out_w})"
                 pre_ms = (t1 - t0) * 1000 + (t_ort_R0 - t_pre_R) * 1000
@@ -2212,6 +2377,7 @@ class Matter:
         gB, gG, gR = GREEN_BGR
         scale_x = aw / float(w)
         scale_y = ah / float(h)
+        light_coeffs, light_gamma_lut, light_identity = self.light_match_kernel_args()
         block = (16, 16, 1)
         grid = ((w + block[0] - 1) // block[0], (h + block[1] - 1) // block[1], 1)
         _composite_nv12_upsample_kernel(
@@ -2224,6 +2390,9 @@ class Matter:
                 np.uint8(gB), np.uint8(gG), np.uint8(gR),
                 np.float32(ALPHA_CUTOFF), np.int32(1 if ALPHA_HARD_EDGE else 0), np.float32(ALPHA_CONTRAST),
                 self._g_out,
+                light_coeffs,
+                light_gamma_lut,
+                light_identity,
             ),
         )
         out_host = self._ensure_pinned_out(h, w)
@@ -2259,6 +2428,7 @@ class Matter:
         out_nv12 = self._ensure_dev_nv12_out(h, w)
 
         gY, gU, gV = self._green_yuv()
+        light_coeffs, light_gamma_lut, light_identity = self.light_match_kernel_args()
         block = (16, 16, 1)
         grid = ((w + block[0] - 1) // block[0], (h + block[1] - 1) // block[1], 1)
         if SPLIT_NV12_COMPOSITE:
@@ -2271,6 +2441,9 @@ class Matter:
                     np.uint8(gY),
                     np.float32(ALPHA_CUTOFF), np.int32(1 if ALPHA_HARD_EDGE else 0), np.float32(ALPHA_CONTRAST),
                     out_nv12,
+                    light_coeffs,
+                    light_gamma_lut,
+                    light_identity,
                 ),
             )
             uv_grid = (((w >> 1) + block[0] - 1) // block[0], ((h >> 1) + block[1] - 1) // block[1], 1)
@@ -2284,6 +2457,8 @@ class Matter:
                     np.int32(1 if FAST_UV_ALPHA else 0),
                     np.float32(ALPHA_CUTOFF), np.int32(1 if ALPHA_HARD_EDGE else 0), np.float32(ALPHA_CONTRAST),
                     out_nv12,
+                    light_coeffs,
+                    light_identity,
                 ),
             )
         else:
@@ -2297,6 +2472,9 @@ class Matter:
                     np.int32(1 if FAST_UV_ALPHA else 0),
                     np.float32(ALPHA_CUTOFF), np.int32(1 if ALPHA_HARD_EDGE else 0), np.float32(ALPHA_CONTRAST),
                     out_nv12,
+                    light_coeffs,
+                    light_gamma_lut,
+                    light_identity,
                 ),
             )
         out_host = out if out is not None else self._ensure_pinned_nv12_out(h, w)
@@ -2461,6 +2639,7 @@ class Matter:
             alpha_dev = self._g_alpha
         out_nv12 = out if out is not None else self._ensure_dev_nv12_out(h, w)
         gY, gU, gV = self._green_yuv()
+        light_coeffs, light_gamma_lut, light_identity = self.light_match_kernel_args()
         block = (16, 16, 1)
         grid = ((w + block[0] - 1) // block[0], (h + block[1] - 1) // block[1], 1)
         if SPLIT_NV12_COMPOSITE:
@@ -2474,6 +2653,9 @@ class Matter:
                     np.uint8(gY),
                     np.float32(ALPHA_CUTOFF), np.int32(1 if ALPHA_HARD_EDGE else 0), np.float32(ALPHA_CONTRAST),
                     out_nv12,
+                    light_coeffs,
+                    light_gamma_lut,
+                    light_identity,
                 ),
             )
             if debug:
@@ -2490,6 +2672,8 @@ class Matter:
                     np.int32(1 if FAST_UV_ALPHA else 0),
                     np.float32(ALPHA_CUTOFF), np.int32(1 if ALPHA_HARD_EDGE else 0), np.float32(ALPHA_CONTRAST),
                     out_nv12,
+                    light_coeffs,
+                    light_identity,
                 ),
             )
             if debug:
@@ -2506,6 +2690,9 @@ class Matter:
                     np.int32(1 if FAST_UV_ALPHA else 0),
                     np.float32(ALPHA_CUTOFF), np.int32(1 if ALPHA_HARD_EDGE else 0), np.float32(ALPHA_CONTRAST),
                     out_nv12,
+                    light_coeffs,
+                    light_gamma_lut,
+                    light_identity,
                 ),
             )
             if debug:

@@ -8,6 +8,7 @@ from ui.i18n import system_language
 
 ROOT = Path(sys.executable).resolve().parent if getattr(sys, "frozen", False) else Path(__file__).resolve().parents[1]
 SETTINGS_PATH = ROOT / "runtime_cache" / "ui_settings.json"
+SETTINGS_META_PATH = ROOT / "runtime_cache" / "ui_settings_meta.json"
 
 
 def _setting_value(data: dict, key: str, default):
@@ -26,6 +27,14 @@ DEFAULTS = {
     "offline_sam3_prompt": "person",
     "passthrough_max_fps": 30,
     "decode_max_side": 4096,
+    "light_match_enabled": False,
+    "light_match_temp_k": 5500,
+    "light_match_tint": 0.0,
+    "light_match_exposure_ev": 0.0,
+    "light_match_contrast": 1.0,
+    "light_match_gamma": 1.0,
+    "light_match_saturation": 1.0,
+    "light_match_preset": "custom",
     "alpha_2d_projection": "fisheye",
     "alpha_2d_distance_m": 4.0,
     "subtitle_enable": True,
@@ -42,7 +51,6 @@ DEFAULTS = {
     "subtitle_color": "",
     "subtitle_outline_color": "000000",
     "subtitle_v360": True,
-    "defaults_migrated_20260517_fps_size": True,
 }
 
 
@@ -75,32 +83,60 @@ def quality_speed_env(value) -> dict[str, str]:
 class Settings:
     def __init__(self) -> None:
         self.data = dict(DEFAULTS)
+        self._meta = self._load_meta()
         self.load()
+
+    def _load_meta(self) -> dict:
+        if not SETTINGS_META_PATH.exists():
+            return {"migrations": []}
+        try:
+            loaded = json.loads(SETTINGS_META_PATH.read_text(encoding="utf-8-sig"))
+        except Exception:
+            return {"migrations": []}
+        if not isinstance(loaded, dict):
+            return {"migrations": []}
+        migrations = loaded.get("migrations")
+        return {"migrations": migrations if isinstance(migrations, list) else []}
+
+    def _migration_done(self, name: str, loaded: dict) -> bool:
+        return name in self._meta.get("migrations", []) or bool(loaded.get(f"defaults_migrated_{name}"))
+
+    def _mark_migration_done(self, name: str) -> None:
+        migrations = self._meta.setdefault("migrations", [])
+        if name not in migrations:
+            migrations.append(name)
 
     def load(self) -> None:
         if SETTINGS_PATH.exists():
             try:
                 loaded = json.loads(SETTINGS_PATH.read_text(encoding="utf-8-sig"))
                 if isinstance(loaded, dict):
-                    self.data.update(loaded)
+                    self.data.update({k: v for k, v in loaded.items() if not str(k).startswith("defaults_migrated_")})
                     if "quality_speed" in loaded and "offline_quality_speed" not in loaded:
                         self.data["offline_quality_speed"] = quality_speed_value(loaded.get("quality_speed"), "medium")
                         self.data["quality_speed"] = DEFAULTS["quality_speed"]
-                    if not loaded.get("defaults_migrated_20260517_fps_size"):
+                    if not self._migration_done("20260517_fps_size", loaded):
                         if int(loaded.get("passthrough_max_fps", 0) or 0) == 0:
                             self.data["passthrough_max_fps"] = DEFAULTS["passthrough_max_fps"]
                         if int(loaded.get("decode_max_side", DEFAULTS["decode_max_side"]) or 0) == 0:
                             self.data["decode_max_side"] = DEFAULTS["decode_max_side"]
-                        self.data["defaults_migrated_20260517_fps_size"] = True
+                        self._mark_migration_done("20260517_fps_size")
                     elif "passthrough_max_fps" not in loaded:
                         self.data["passthrough_max_fps"] = DEFAULTS["passthrough_max_fps"]
+                    if not self._migration_done("20260519_light_match_off", loaded):
+                        self.data["light_match_enabled"] = False
+                        self._mark_migration_done("20260519_light_match_off")
             except Exception:
                 pass
 
     def save(self) -> None:
         SETTINGS_PATH.parent.mkdir(parents=True, exist_ok=True)
         SETTINGS_PATH.write_text(
-            json.dumps(self.data, ensure_ascii=False, indent=2),
+            json.dumps({k: v for k, v in self.data.items() if not str(k).startswith("defaults_migrated_")}, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        SETTINGS_META_PATH.write_text(
+            json.dumps(self._meta, ensure_ascii=False, indent=2),
             encoding="utf-8",
         )
 
@@ -126,6 +162,14 @@ class Settings:
             "PT_PASSTHROUGH_MAX_FPS": str(passthrough_max_fps),
             "PT_PASSTHROUGH_PRODUCER_REALTIME_PACING": "1" if float(passthrough_max_fps or 0) > 0 else "0",
             "PT_DECODE_MAX_SIDE": str(_setting_value(self.data, "decode_max_side", 4096)),
+            "PT_LIGHT_MATCH_ENABLED": "1" if self.data.get("light_match_enabled") else "0",
+            "PT_LIGHT_MATCH_TEMP_K": str(_setting_value(self.data, "light_match_temp_k", 5500)),
+            "PT_LIGHT_MATCH_TINT": str(_setting_value(self.data, "light_match_tint", 0.0)),
+            "PT_LIGHT_MATCH_EXPOSURE_EV": str(_setting_value(self.data, "light_match_exposure_ev", 0.0)),
+            "PT_LIGHT_MATCH_CONTRAST": str(_setting_value(self.data, "light_match_contrast", 1.0)),
+            "PT_LIGHT_MATCH_GAMMA": str(_setting_value(self.data, "light_match_gamma", 1.0)),
+            "PT_LIGHT_MATCH_SATURATION": str(_setting_value(self.data, "light_match_saturation", 1.0)),
+            "PT_LIGHT_MATCH_PRESET": str(self.data.get("light_match_preset") or "custom"),
             "PT_ALPHA_2D_PROJECTION": str(self.data.get("alpha_2d_projection") or "fisheye"),
             "PT_ALPHA_2D_DISTANCE_M": str(_setting_value(self.data, "alpha_2d_distance_m", 4.0)),
             "PT_SUBTITLE_ENABLE": "1" if self.data.get("subtitle_enable") else "0",

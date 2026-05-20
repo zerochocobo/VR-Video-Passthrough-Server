@@ -14,6 +14,7 @@ import numpy as np
 import onnxruntime as ort
 
 import config
+from offline.decoded_frames import decoded_frame_to_bgr
 
 
 @dataclass
@@ -464,15 +465,10 @@ def precompute_segment_masks(args, src: Path, dec, source_fps: float, fps: float
     )
     masks_by_start: dict[int, list[np.ndarray]] = {}
     records: list[dict] = []
-    import cupy as cp
     for n, start in enumerate(scan_points, 1):
         src_idx = min(len(dec) - 1, cfr_source_index(start, source_fps, fps))
         frame = dec.frame_at(src_idx)
-        nv12 = cp.asnumpy(cp.concatenate([
-            frame.y.as_cupy().reshape(frame.height, frame.width),
-            frame.uv.as_cupy().reshape(frame.height // 2, frame.width),
-        ], axis=0))
-        bgr = cv2.cvtColor(nv12, cv2.COLOR_YUV2BGR_NV12)
+        bgr = decoded_frame_to_bgr(frame)
         half = frame.width // 2
         eye_images = [
             cv2.cvtColor(bgr[:, :half], cv2.COLOR_BGR2RGB),

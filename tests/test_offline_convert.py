@@ -46,7 +46,7 @@ class OfflineConvertTests(unittest.TestCase):
             fps=0.0,
             input_size=1024,
             skip_frames=2,
-            bitrate="live",
+            bitrate="source",
             preset="P5",
         )
         cmd = convert._base_cmd(args, Path("input.mp4"), Path("out.mp4"))
@@ -61,10 +61,10 @@ class OfflineConvertTests(unittest.TestCase):
         self.assertIn("--input-size", cmd)
         self.assertIn("1024", cmd)
         self.assertIn("--alpha-stride", cmd)
-        self.assertIn("3", cmd)
+        self.assertIn("1", cmd)
         self.assertIn("--sbs-batch", cmd)
         self.assertIn("--bitrate", cmd)
-        self.assertIn("live", cmd)
+        self.assertIn("source", cmd)
         self.assertIn("--preset", cmd)
         self.assertIn("P5", cmd)
         self.assertIn("--cq", cmd)
@@ -81,7 +81,7 @@ class OfflineConvertTests(unittest.TestCase):
             fps=30.0,
             input_size=1024,
             skip_frames=0,
-            bitrate="live",
+            bitrate="source",
             preset="P5",
             cq=-1,
         )
@@ -99,7 +99,7 @@ class OfflineConvertTests(unittest.TestCase):
             fps=0.0,
             input_size=1024,
             skip_frames=0,
-            bitrate="live",
+            bitrate="source",
             preset="P4",
         )
         cmd = convert._base_cmd(args, Path("input.mp4"), Path("out.mp4"))
@@ -114,14 +114,16 @@ class OfflineConvertTests(unittest.TestCase):
             fps=30.0,
             input_size=1024,
             skip_frames=2,
-            bitrate="live",
+            bitrate="source",
             preset="P4",
         )
         cmd = convert._base_cmd(args, Path("input.mp4"), Path("out.mp4"))
         self.assertIn("--fps", cmd)
+        self.assertIn("--bitrate", cmd)
+        self.assertIn("source", cmd)
         self.assertNotIn("--input-size", cmd)
         self.assertIn("--alpha-stride", cmd)
-        self.assertIn("3", cmd)
+        self.assertIn("1", cmd)
 
     def test_single_out_dir_uses_default_passthrough_name(self) -> None:
         root = Path("runtime_cache/test_offline_out_dir")
@@ -139,6 +141,12 @@ class OfflineConvertTests(unittest.TestCase):
             seen["out"] = out_path
             return ["python", "-c", "import sys; sys.exit(0)"]
 
+        fake_meta = SimpleNamespace(
+            timing=SimpleNamespace(),
+            codec=SimpleNamespace(codec_name="hevc", profile="Main", pix_fmt="yuv420p", width=3840, height=1920),
+            color=SimpleNamespace(),
+        )
+        fake_decision = SimpleNamespace(verdict="pynv_hevc", reason="test")
         convert._base_cmd = fake_base_cmd
         try:
             args = SimpleNamespace(
@@ -152,12 +160,15 @@ class OfflineConvertTests(unittest.TestCase):
                 fps=0.0,
                 input_size=1024,
                 skip_frames=0,
-                bitrate="live",
+                bitrate="source",
                 preset="P4",
                 skip_existing=False,
                 cq=-1,
             )
-            self.assertEqual(convert._run_one(args, src), 0)
+            with patch.object(convert, "probe_video_metadata", return_value=fake_meta), patch.object(
+                convert, "select_backend", return_value=fake_decision
+            ):
+                self.assertEqual(convert._run_one(args, src), 0)
         finally:
             convert._base_cmd = original_base_cmd
 

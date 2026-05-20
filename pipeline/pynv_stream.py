@@ -30,6 +30,7 @@ from pipeline.subtitles import SubtitleRenderer, find_subtitle_for_video
 from utils.logger import get
 from utils.cache_key import fingerprint, stat_key
 from utils.bitrate_estimator import effective_default_bitrate
+from utils.runtime_settings import get_light_match
 from utils.video_metadata import VideoProbeMetadata, cfr_source_index, probe_color_metadata, probe_timing_metadata
 
 log = get("pynv_stream")
@@ -53,9 +54,36 @@ _preflight_ok: dict[str, float] = {}
 _stream_ids = itertools.count(1)
 _audio_cache_locks: dict[str, threading.Lock] = {}
 _audio_cache_locks_guard = threading.Lock()
+_audio_tmp_cleanup_done = False
+_audio_tmp_cleanup_lock = threading.Lock()
 _pynv_runtime_tainted = threading.Event()
 _SUBTITLE_BLEND_Y_KERNEL = None
 _SUBTITLE_BLEND_UV_KERNEL = None
+
+
+def _drain_async_queue_nowait(q: asyncio.Queue, *, keep_sentinel: bool = True) -> tuple[int, int, bool]:
+    """Drop queued byte chunks and optionally preserve an end sentinel."""
+    chunks = 0
+    bytes_dropped = 0
+    saw_sentinel = False
+    while True:
+        try:
+            item = q.get_nowait()
+        except asyncio.QueueEmpty:
+            break
+        if item is None:
+            saw_sentinel = True
+            if keep_sentinel:
+                try:
+                    q.put_nowait(None)
+                except asyncio.QueueFull:
+                    pass
+                break
+            continue
+        if isinstance(item, (bytes, bytearray, memoryview)):
+            chunks += 1
+            bytes_dropped += len(item)
+    return chunks, bytes_dropped, saw_sentinel
 
 
 def _pynv_encoder_kwargs(*, bitrate: str, fps: str) -> dict[str, str]:
@@ -191,6 +219,30 @@ def _file_size_or_zero(path: Path) -> int:
         return 0
 
 
+def _cleanup_stale_audio_tmp_files() -> None:
+    global _audio_tmp_cleanup_done
+    if _audio_tmp_cleanup_done:
+        return
+    with _audio_tmp_cleanup_lock:
+        if _audio_tmp_cleanup_done:
+            return
+        cache_dir = config.PASSTHROUGH_AUDIO_MPEGTS_CACHE_DIR
+        removed = 0
+        try:
+            if cache_dir.exists():
+                for stale in cache_dir.glob("*.tmp.aac"):
+                    try:
+                        stale.unlink()
+                        removed += 1
+                    except OSError:
+                        pass
+        except OSError as e:
+            log.warning("stale audio tmp cleanup failed: dir=%s error=%s", cache_dir, e)
+        if removed:
+            log.info("stale audio tmp cleanup removed %d files from %s", removed, cache_dir)
+        _audio_tmp_cleanup_done = True
+
+
 class PyNvPassthroughStream:
     """PyNv decode -> GPU matting -> PyNv HEVC encode -> FFmpeg mux."""
 
@@ -217,6 +269,7 @@ class PyNvPassthroughStream:
         self.output_mode = (output_mode or config.PASSTHROUGH_OUTPUT_MODE).lower()
         if self.output_mode == "all":
             self.output_mode = "green"
+        _cleanup_stale_audio_tmp_files()
         self.bytes_emitted = 0
         self.frames_produced = 0
         self.output_fps = 0.0
@@ -229,9 +282,12 @@ class PyNvPassthroughStream:
         self._worker: threading.Thread | None = None
         self._mux: subprocess.Popen | None = None
         self._video_mux: subprocess.Popen | None = None
+        self._audio_procs: set[subprocess.Popen] = set()
+        self._audio_procs_lock = threading.Lock()
         self._dec: PyNvSimpleDecoder | PyNvThreadedSerialDecoder | None = None
         self._enc = None
         self._slate_audio_thread: threading.Thread | None = None
+        self._slate_audio_cache_thread: threading.Thread | None = None
         self._slate_audio_ready = threading.Event()
         self._slate_direct_ready = threading.Event()
         self._slate_audio_failed = threading.Event()
@@ -239,6 +295,49 @@ class PyNvPassthroughStream:
         self._slate_audio_addr: tuple[str, int] | None = None
         self._slate_audio_cache_path: Path | None = None
         self.startup_error: str | None = None
+
+    def _register_audio_proc(self, proc: subprocess.Popen) -> subprocess.Popen:
+        with self._audio_procs_lock:
+            self._audio_procs.add(proc)
+        return proc
+
+    def _unregister_audio_proc(self, proc: subprocess.Popen) -> None:
+        with self._audio_procs_lock:
+            self._audio_procs.discard(proc)
+
+    def _stop_proc(self, proc: subprocess.Popen, label: str, *, close_pipes: bool = True, wait_timeout: float = 1.0) -> None:
+        try:
+            if proc.poll() is None:
+                proc.terminate()
+        except Exception:
+            pass
+        if close_pipes:
+            for pipe in (proc.stdin, proc.stdout, proc.stderr):
+                try:
+                    if pipe:
+                        pipe.close()
+                except Exception:
+                    pass
+        try:
+            if proc.poll() is None:
+                proc.wait(timeout=wait_timeout)
+        except Exception:
+            try:
+                if proc.poll() is None:
+                    log.info("[PYNV][%d] killing %s pid=%s", self.sid, label, getattr(proc, "pid", None))
+                    proc.kill()
+            except Exception:
+                pass
+            try:
+                proc.wait(timeout=wait_timeout)
+            except Exception:
+                pass
+
+    def _stop_audio_procs(self) -> None:
+        with self._audio_procs_lock:
+            procs = list(self._audio_procs)
+        for proc in procs:
+            self._stop_proc(proc, "audio ffmpeg", wait_timeout=0.5)
 
     def _log_vram(self, label: str) -> None:
         if not config.DEBUG_LOGS:
@@ -406,28 +505,20 @@ class PyNvPassthroughStream:
             started = time.perf_counter()
             if self._stop.is_set():
                 return None
-            proc = subprocess.Popen(
+            proc = self._register_audio_proc(subprocess.Popen(
                 cmd,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True,
                 errors="replace",
-            )
+            ))
             interrupted = False
             last_progress_log = started
             last_progress_size = 0
             while proc.poll() is None:
                 if self._stop.wait(0.1):
                     interrupted = True
-                    try:
-                        proc.terminate()
-                        proc.wait(timeout=1.0)
-                    except Exception:
-                        try:
-                            proc.kill()
-                            proc.wait(timeout=1.0)
-                        except Exception:
-                            pass
+                    self._stop_proc(proc, "audio cache build")
                     break
                 now = time.perf_counter()
                 if config.DEBUG_LOGS and now - last_progress_log >= _AUDIO_CACHE_PROGRESS_INTERVAL:
@@ -444,7 +535,13 @@ class PyNvPassthroughStream:
                     last_progress_log = now
                     last_progress_size = current_size
             proc_exit_at = time.perf_counter()
-            stdout, stderr = proc.communicate()
+            try:
+                stdout, stderr = proc.communicate(timeout=1.0)
+            except Exception:
+                self._stop_proc(proc, "audio cache build communicate")
+                stdout, stderr = "", ""
+            finally:
+                self._unregister_audio_proc(proc)
             communicate_elapsed = time.perf_counter() - proc_exit_at
             elapsed = time.perf_counter() - started
             if interrupted or self._stop.is_set():
@@ -552,28 +649,20 @@ class PyNvPassthroughStream:
             ]
             log.info("[PYNV][%d] slate audio cache build cmd: %s", self.sid, " ".join(cmd))
             started = time.perf_counter()
-            proc = subprocess.Popen(
+            proc = self._register_audio_proc(subprocess.Popen(
                 cmd,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True,
                 errors="replace",
-            )
+            ))
             interrupted = False
             last_progress_log = started
             last_progress_size = 0
             while proc.poll() is None:
                 if self._stop.wait(0.1):
                     interrupted = True
-                    try:
-                        proc.terminate()
-                        proc.wait(timeout=1.0)
-                    except Exception:
-                        try:
-                            proc.kill()
-                            proc.wait(timeout=1.0)
-                        except Exception:
-                            pass
+                    self._stop_proc(proc, "slate audio cache build")
                     break
                 now = time.perf_counter()
                 if now - last_progress_log >= _AUDIO_CACHE_PROGRESS_INTERVAL:
@@ -590,7 +679,13 @@ class PyNvPassthroughStream:
                     last_progress_log = now
                     last_progress_size = current_size
             proc_exit_at = time.perf_counter()
-            stdout, stderr = proc.communicate()
+            try:
+                stdout, stderr = proc.communicate(timeout=1.0)
+            except Exception:
+                self._stop_proc(proc, "slate audio cache build communicate")
+                stdout, stderr = "", ""
+            finally:
+                self._unregister_audio_proc(proc)
             communicate_elapsed = time.perf_counter() - proc_exit_at
             elapsed = time.perf_counter() - started
             stat_started = time.perf_counter()
@@ -634,7 +729,7 @@ class PyNvPassthroughStream:
         server.settimeout(0.25)
         addr = server.getsockname()
         self._slate_audio_addr = (str(addr[0]), int(addr[1]))
-        self._start_aac_cache_build(cache_key, cache_path)
+        self._slate_audio_cache_thread = self._start_aac_cache_build(cache_key, cache_path)
         self._slate_audio_thread = threading.Thread(
             target=self._slate_audio_server_loop,
             args=(server,),
@@ -874,12 +969,12 @@ class PyNvPassthroughStream:
                 "adts",
                 "-",
             ]
-            silence_proc = subprocess.Popen(
+            silence_proc = self._register_audio_proc(subprocess.Popen(
                 silence_cmd,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 bufsize=0,
-            )
+            ))
             assert silence_proc.stdout is not None
             log.info("[PYNV][%d] slate audio silence cmd: %s", self.sid, " ".join(silence_cmd))
             while not self._stop.is_set():
@@ -919,14 +1014,8 @@ class PyNvPassthroughStream:
                     conn.sendall(data)
                 except OSError:
                     return
-            try:
-                silence_proc.terminate()
-                silence_proc.wait(timeout=1.0)
-            except Exception:
-                try:
-                    silence_proc.kill()
-                except Exception:
-                    pass
+            self._stop_proc(silence_proc, "slate audio silence")
+            self._unregister_audio_proc(silence_proc)
             silence_proc = None
             if self._stop.is_set() or self._slate_audio_failed.is_set():
                 return
@@ -986,12 +1075,12 @@ class PyNvPassthroughStream:
                     "-",
                 ]
                 log_label = "slate audio direct stream cmd"
-            real_proc = subprocess.Popen(
+            real_proc = self._register_audio_proc(subprocess.Popen(
                 real_cmd,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 bufsize=0,
-            )
+            ))
             assert real_proc.stdout is not None
             log.info("[PYNV][%d] %s: %s", self.sid, log_label, " ".join(real_cmd))
             try:
@@ -1004,14 +1093,8 @@ class PyNvPassthroughStream:
                     except OSError:
                         break
             finally:
-                try:
-                    real_proc.terminate()
-                    real_proc.wait(timeout=1.0)
-                except Exception:
-                    try:
-                        real_proc.kill()
-                    except Exception:
-                        pass
+                self._stop_proc(real_proc, log_label)
+                self._unregister_audio_proc(real_proc)
             log.info("[PYNV][%d] slate audio server done", self.sid)
         finally:
             try:
@@ -1024,10 +1107,8 @@ class PyNvPassthroughStream:
             except OSError:
                 pass
             if silence_proc is not None:
-                try:
-                    silence_proc.kill()
-                except Exception:
-                    pass
+                self._stop_proc(silence_proc, "slate audio silence finally")
+                self._unregister_audio_proc(silence_proc)
 
     def _open_pipe_ts_muxer(self, fps: float, duration: float, audio_input: Path) -> subprocess.Popen:
         ffmpeg = shutil.which("ffmpeg") or "ffmpeg"
@@ -1141,15 +1222,22 @@ class PyNvPassthroughStream:
             stderr=subprocess.PIPE,
             bufsize=0,
         )
-        assert video_proc.stdout is not None
-        final_proc = subprocess.Popen(
-            final_cmd,
-            stdin=video_proc.stdout,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            bufsize=0,
-        )
-        video_proc.stdout.close()
+        final_proc = None
+        try:
+            assert video_proc.stdout is not None
+            final_proc = subprocess.Popen(
+                final_cmd,
+                stdin=video_proc.stdout,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                bufsize=0,
+            )
+            video_proc.stdout.close()
+        except BaseException:
+            if final_proc is not None:
+                self._stop_proc(final_proc, "pipe_ts final mux fallback", wait_timeout=0.2)
+            self._stop_proc(video_proc, "pipe_ts video mux fallback", wait_timeout=0.2)
+            raise
         self._video_mux = video_proc
         return final_proc
 
@@ -1270,15 +1358,22 @@ class PyNvPassthroughStream:
             stderr=subprocess.PIPE,
             bufsize=0,
         )
-        assert video_proc.stdout is not None
-        final_proc = subprocess.Popen(
-            final_cmd,
-            stdin=video_proc.stdout,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            bufsize=0,
-        )
-        video_proc.stdout.close()
+        final_proc = None
+        try:
+            assert video_proc.stdout is not None
+            final_proc = subprocess.Popen(
+                final_cmd,
+                stdin=video_proc.stdout,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                bufsize=0,
+            )
+            video_proc.stdout.close()
+        except BaseException:
+            if final_proc is not None:
+                self._stop_proc(final_proc, "slate pipe_ts final mux fallback", wait_timeout=0.2)
+            self._stop_proc(video_proc, "slate pipe_ts video mux fallback", wait_timeout=0.2)
+            raise
         self._video_mux = video_proc
         return final_proc
 
@@ -2434,11 +2529,30 @@ class PyNvPassthroughStream:
         log.info("[PYNV][%d] iter start", self.sid)
         try:
             chunks = 0
+            light_match_version = get_light_match().version
             while True:
                 chunk = await self._queue.get()
                 if chunk is None:
                     log.info("[PYNV][%d] iter got sentinel chunks=%d bytes=%d", self.sid, chunks, self.bytes_emitted)
                     break
+                current_light_match_version = get_light_match().version
+                if (
+                    config.LIGHT_MATCH_FLUSH_QUEUES
+                    and self.container == "mpegts"
+                    and current_light_match_version != light_match_version
+                ):
+                    dropped_chunks, dropped_bytes, saw_sentinel = _drain_async_queue_nowait(self._queue)
+                    log.info(
+                        "[PYNV][%d] light match changed v%d->v%d; dropped current mux chunk plus pending chunks=%d bytes=%d sentinel=%s",
+                        self.sid,
+                        light_match_version,
+                        current_light_match_version,
+                        dropped_chunks,
+                        dropped_bytes + len(chunk),
+                        saw_sentinel,
+                    )
+                    light_match_version = current_light_match_version
+                    continue
                 self.bytes_emitted += len(chunk)
                 chunks += 1
                 if chunks == 1:
@@ -2457,32 +2571,14 @@ class PyNvPassthroughStream:
         self._stop.set()
         log.info("[PYNV][%d] close begin bytes=%d frames=%d", self.sid, self.bytes_emitted, self.frames_produced)
         self._log_vram("close_begin")
+        self._stop_audio_procs()
         for proc in (self._video_mux, self._mux):
             if not proc:
                 continue
-            try:
-                if proc.poll() is None:
-                    proc.terminate()
-            except Exception:
-                pass
-            for pipe in (proc.stdin, proc.stdout, proc.stderr):
-                try:
-                    if pipe:
-                        pipe.close()
-                except Exception:
-                    pass
-            try:
-                if proc.poll() is None:
-                    proc.wait(timeout=0.1)
-            except Exception:
-                try:
-                    if proc.poll() is None:
-                        proc.kill()
-                except Exception:
-                    pass
+            self._stop_proc(proc, "mux ffmpeg", wait_timeout=0.1)
         current = threading.current_thread()
         worker_alive_after_first_join = False
-        for thread in (self._worker, self._reader, self._stderr_reader):
+        for thread in (self._slate_audio_thread, self._slate_audio_cache_thread, self._worker, self._reader, self._stderr_reader):
             if thread and thread.is_alive() and thread is not current:
                 log.info("[PYNV][%d] close: waiting thread name=%s", self.sid, thread.name)
                 timeout = (

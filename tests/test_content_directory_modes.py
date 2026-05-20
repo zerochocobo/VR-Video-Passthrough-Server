@@ -42,8 +42,8 @@ class ContentDirectoryModeTests(unittest.TestCase):
             self.assertEqual(cds._passthrough_live_prefix("alpha"), "pla_")
             self.assertEqual(cds._passthrough_live_item_prefix("green"), "lg_")
             self.assertEqual(cds._passthrough_live_item_prefix("alpha"), "la_")
-            self.assertEqual(cds._passthrough_live_query("green"), "mode=green")
-            self.assertEqual(cds._passthrough_live_query("alpha"), "mode=alpha")
+            self.assertIn("mode=green", cds._passthrough_live_query("green"))
+            self.assertIn("mode=alpha", cds._passthrough_live_query("alpha"))
 
     def test_short_live_items_keep_distinct_modes(self) -> None:
         child = SimpleNamespace(
@@ -119,11 +119,13 @@ class ContentDirectoryModeTests(unittest.TestCase):
                 "movie_FISHEYE_alpha_live",
             )
 
-    def test_mkv_needs_fix_hides_passthrough_without_marking_title(self) -> None:
+    def test_mkv_needs_fix_hides_passthrough_and_marks_title(self) -> None:
         child = SimpleNamespace(
             size=1024,
             video=SimpleNamespace(
                 duration=60.0,
+                width=3840,
+                height=2160,
                 resolution="3840x2160",
                 backend_verdict="pynv_hevc",
                 probe_error="",
@@ -138,13 +140,15 @@ class ContentDirectoryModeTests(unittest.TestCase):
             items = cds._video_items_from_index(Path("movie.mkv"), "0", child)
 
         self.assertEqual(len(items), 1)
-        self.assertEqual(items[0]["title"], "movie")
+        self.assertEqual(items[0]["title"], "[NoLive] movie")
 
     def test_mkv_live_passthrough_is_hidden_by_default_policy(self) -> None:
         child = SimpleNamespace(
             size=1024,
             video=SimpleNamespace(
                 duration=60.0,
+                width=3840,
+                height=2160,
                 resolution="3840x2160",
                 backend_verdict="pynv_hevc",
                 probe_error="",
@@ -159,7 +163,73 @@ class ContentDirectoryModeTests(unittest.TestCase):
             items = cds._video_items_from_index(Path("movie.mkv"), "0", child)
 
         self.assertEqual(len(items), 1)
-        self.assertEqual(items[0]["title"], "movie")
+        self.assertEqual(items[0]["title"], "[NoLive] movie")
+
+    def test_non_pynv_backend_hides_passthrough_and_marks_title(self) -> None:
+        child = SimpleNamespace(
+            size=1024,
+            video=SimpleNamespace(
+                duration=60.0,
+                width=3840,
+                height=2160,
+                resolution="3840x2160",
+                backend_verdict="ffmpeg_fallback",
+                probe_error="",
+                mkv_needs_fix=False,
+            ),
+        )
+        with (
+            patch.object(cds, "_rel_key", return_value="movie.mp4"),
+            patch.object(cds, "PASSTHROUGH_OUTPUT_MODE", "all"),
+        ):
+            items = cds._video_items_from_index(Path("movie.mp4"), "0", child)
+
+        self.assertEqual(len(items), 1)
+        self.assertEqual(items[0]["title"], "[NoLive] movie")
+
+    def test_oversized_video_hides_passthrough_and_marks_title(self) -> None:
+        child = SimpleNamespace(
+            size=1024,
+            video=SimpleNamespace(
+                duration=60.0,
+                width=9000,
+                height=4096,
+                resolution="9000x4096",
+                backend_verdict="pynv_hevc",
+                probe_error="",
+                mkv_needs_fix=False,
+            ),
+        )
+        with (
+            patch.object(cds, "_rel_key", return_value="movie.mp4"),
+            patch.object(cds, "PASSTHROUGH_OUTPUT_MODE", "all"),
+        ):
+            items = cds._video_items_from_index(Path("movie.mp4"), "0", child)
+
+        self.assertEqual(len(items), 1)
+        self.assertEqual(items[0]["title"], "[NoLive] movie")
+
+    def test_probe_error_hides_passthrough_and_marks_title(self) -> None:
+        child = SimpleNamespace(
+            size=1024,
+            video=SimpleNamespace(
+                duration=0.0,
+                width=0,
+                height=0,
+                resolution="",
+                backend_verdict="",
+                probe_error="pending",
+                mkv_needs_fix=False,
+            ),
+        )
+        with (
+            patch.object(cds, "_rel_key", return_value="movie.mp4"),
+            patch.object(cds, "PASSTHROUGH_OUTPUT_MODE", "all"),
+        ):
+            items = cds._video_items_from_index(Path("movie.mp4"), "0", child)
+
+        self.assertEqual(len(items), 1)
+        self.assertEqual(items[0]["title"], "[NoLive] movie")
 
     def test_live_chapter_titles_sort_by_time(self) -> None:
         source = Path("movie.mp4")

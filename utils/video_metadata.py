@@ -11,11 +11,13 @@ import shutil
 import subprocess
 from dataclasses import dataclass
 from fractions import Fraction
+from functools import lru_cache
 from pathlib import Path
 from typing import Literal
 
 import config
 from utils.cache_key import stat_key
+from utils.gpu_requirements import detect_nvidia_gpu_requirement, parse_compute_capability
 
 BackendVerdict = Literal["pynv_hevc", "ffmpeg_fallback", "block"]
 
@@ -323,6 +325,13 @@ def select_backend(
         if codec in {"mpeg4", "msmpeg4v3"}:
             return BackendDecision("ffmpeg_fallback", f"codec {codec or 'unknown'} is not enabled for PyNv route")
         return BackendDecision("block", f"unsupported or unknown video codec: {codec or 'unknown'}")
+    if codec == "av1":
+        gpu, cc_text, cc = _av1_decode_gpu_capability()
+        if cc is None or cc < 8.6:
+            return BackendDecision(
+                "ffmpeg_fallback",
+                f"AV1 NVDEC is not available on {gpu} (compute capability {cc_text}); using FFmpeg decode fallback",
+            )
     if not timing.is_cfr:
         return BackendDecision("ffmpeg_fallback", "VFR or weak-CFR source needs timestamp-preserving path")
     if pix_fmt not in {"yuv420p", "yuvj420p", "nv12", "p010le", "yuv420p10le"}:
@@ -343,6 +352,14 @@ def select_backend(
     if codec_meta.resolution_bucket == "8k_plus":
         return BackendDecision("pynv_hevc", "8K+ output should use HEVC; H.264 NVENC failed in probe")
     return BackendDecision("pynv_hevc", "CFR SDR 8-bit source is eligible for all-HEVC PyNv passthrough")
+
+
+@lru_cache(maxsize=1)
+def _av1_decode_gpu_capability() -> tuple[str, str, float | None]:
+    requirement = detect_nvidia_gpu_requirement()
+    gpu = requirement.name or "current NVIDIA GPU"
+    cc_text = requirement.compute_capability or "unknown"
+    return gpu, cc_text, parse_compute_capability(cc_text)
 
 
 def cfr_source_index(out_index: int, source_fps: float, output_fps: float) -> int:

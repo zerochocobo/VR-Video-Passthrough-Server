@@ -59,9 +59,11 @@ DLNA_FLAGS_TIME_SEEK = "41700000000000000000000000000000"
 DIDL_NS = "urn:schemas-upnp-org:metadata-1-0/DIDL-Lite/"
 
 _DIR_ITEMS_CACHE_MAX = 256
-_DIDL_SCHEMA_VERSION = 3
+_DIDL_SCHEMA_VERSION = 4
 _SYSTEM_UPDATE_ID = _DIDL_SCHEMA_VERSION
 _dir_items_cache: dict[tuple, list[dict]] = {}
+_LIVE_MAX_SIDE = 8192
+_NO_LIVE_PREFIX = "[NoLive] "
 
 
 def _parse_bitrate(s: str) -> int:
@@ -171,16 +173,47 @@ def _video_item_count(path: Path, child: IndexedChild | None = None) -> int:
 
 
 def _marked_original_title(path: Path, child: IndexedChild | None = None) -> str:
-    return path.stem
+    title = path.stem
+    if _hide_passthrough_for_path(path, child) and not title.startswith(_NO_LIVE_PREFIX.strip()):
+        return f"{_NO_LIVE_PREFIX}{title}"
+    return title
+
+
+def _indexed_video_dimensions(child: IndexedChild | None) -> tuple[int, int]:
+    video = child.video if child is not None else None
+    if video is None:
+        return 0, 0
+    width = int(getattr(video, "width", 0) or 0)
+    height = int(getattr(video, "height", 0) or 0)
+    if width <= 0 or height <= 0:
+        width, height = _parse_resolution(getattr(video, "resolution", ""))
+    return width, height
+
+
+def _live_passthrough_block_reason(path: Path, child: IndexedChild | None) -> str:
+    video = child.video if child is not None else None
+    if path.suffix.lower() == ".mkv" and PASSTHROUGH_MKV_LIVE_POLICY == "block":
+        return "mkv_disabled"
+    if path.suffix.lower() == ".mkv" and PASSTHROUGH_MKV_LIVE_POLICY == "head_cues":
+        if video is None or video.mkv_needs_fix:
+            return "mkv_needs_remux"
+    if video is not None and video.mkv_needs_fix:
+        return "mkv_needs_remux"
+    if video is not None and getattr(video, "probe_error", ""):
+        return "probe_error"
+    width, height = _indexed_video_dimensions(child)
+    if video is not None and (width <= 0 or height <= 0):
+        return "missing_dimensions"
+    if width > _LIVE_MAX_SIDE or height > _LIVE_MAX_SIDE:
+        return "resolution_too_large"
+    verdict = str(getattr(video, "backend_verdict", "") if video is not None else "")
+    if verdict and verdict != "pynv_hevc":
+        return verdict
+    return ""
 
 
 def _hide_passthrough_for_path(path: Path, child: IndexedChild | None) -> bool:
-    if path.suffix.lower() == ".mkv" and PASSTHROUGH_MKV_LIVE_POLICY == "block":
-        return True
-    video = child.video if child is not None else None
-    if path.suffix.lower() == ".mkv" and PASSTHROUGH_MKV_LIVE_POLICY == "head_cues":
-        return bool(video is None or video.mkv_needs_fix)
-    return bool(video is not None and video.mkv_needs_fix)
+    return bool(_live_passthrough_block_reason(path, child))
 
 
 def _passthrough_modes() -> tuple[str, ...]:

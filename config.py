@@ -226,9 +226,9 @@ PASSTHROUGH_LIVE_DEFAULT_PROFILE = _env("PASSTHROUGH_LIVE_DEFAULT_PROFILE", "vlc
 # ---- Matting and startup warmup ----
 # PT_MODEL_PATH:
 #   ONNX matting model path. Realtime production defaults to RVM MobileNetV3
-#   FP32 for stable output. Override with models\rvm_mobilenetv3_fp16.onnx only
-#   when explicitly benchmarking FP16.
-MODEL_PATH: Path = Path(_env("MODEL_PATH", ROOT / "models" / "rvm_mobilenetv3_fp32.onnx")).resolve()
+#   FP16 after local DLNA realtime benchmarks showed ~16% higher FPS than FP32.
+#   Override with models\rvm_mobilenetv3_fp32.onnx if FP32 output is needed.
+MODEL_PATH: Path = Path(_env("MODEL_PATH", ROOT / "models" / "rvm_mobilenetv3_fp16.onnx")).resolve()
 
 # PT_MATTING_DEVICE:
 #   Matting backend selection.
@@ -250,7 +250,9 @@ MATTING_SPLIT_SBS = _env("MATTING_SPLIT_SBS", "1") == "1"
 
 # PT_MATTING_SBS_BATCH:
 #   1 batches both SBS halves into a single ORT call when the exported model
-#   and current runtime shape support it.
+#   and current runtime shape support it. This remains the production default;
+#   RVM also respects this switch, and batch=2 benchmarked faster than two
+#   separate batch=1 eye inferences.
 MATTING_SBS_BATCH = _env("MATTING_SBS_BATCH", "1") == "1"
 
 # PT_MATTING_MODEL_KIND:
@@ -353,10 +355,12 @@ SPLIT_NV12_COMPOSITE = _env("SPLIT_NV12_COMPOSITE", "0") == "1"
 CUDA_CUDNN_CONV_ALGO_SEARCH = _env("CUDA_CUDNN_CONV_ALGO_SEARCH", "")
 
 # PT_MATTING_INPUT_SIZE:
-#   Reference model input size for non-RVM matting models. RVM production uses
-#   its model default below and intentionally does not expose this as a startup
-#   profile override; changing it can make 8K SBS masks miss small people.
-MATTING_INPUT_SIZE = 1024 if MATTING_MODEL_KIND == "rvm" else int(_env("MATTING_INPUT_SIZE", 512))
+#   Reference model input size. RVM defaults to 1024 for matte quality.
+#   2048 + PT_RVM_DOWNSAMPLE_RATIO=0.125 was faster in realtime benchmarks,
+#   but quality validation showed the mask became too weak.
+#   Set 0 only for RVM experiments that feed the current source/eye working
+#   size directly and rely on PT_RVM_DOWNSAMPLE_RATIO.
+MATTING_INPUT_SIZE = int(_env("MATTING_INPUT_SIZE", 1024 if MATTING_MODEL_KIND == "rvm" else 512))
 
 # PT_MATTING_WARMUP_RUNS:
 #   Number of dummy matting runs inside Matter initialization. This is distinct
@@ -473,6 +477,30 @@ COMPOSITE_BG_RGB = _rgb_hex(COMPOSITE_BG_RGB_HEX, "00FF00")
 
 # OpenCV/Numpy frames and legacy GPU BGR kernels use BGR channel order.
 GREEN_BGR = (COMPOSITE_BG_RGB[2], COMPOSITE_BG_RGB[1], COMPOSITE_BG_RGB[0])
+
+
+# ---- Foreground ambient light matching ----
+# PT_LIGHT_MATCH_ENABLED:
+#   Enables foreground-only color/luma correction for passthrough output.
+LIGHT_MATCH_ENABLED = str(_env("LIGHT_MATCH_ENABLED", "0")).lower() in {"1", "true", "yes", "on"}
+LIGHT_MATCH_TEMP_K = int(float(_env("LIGHT_MATCH_TEMP_K", "5500")))
+LIGHT_MATCH_TINT = float(_env("LIGHT_MATCH_TINT", "0"))
+LIGHT_MATCH_EXPOSURE_EV = float(_env("LIGHT_MATCH_EXPOSURE_EV", "0.0"))
+LIGHT_MATCH_CONTRAST = float(_env("LIGHT_MATCH_CONTRAST", "1.0"))
+LIGHT_MATCH_GAMMA = float(_env("LIGHT_MATCH_GAMMA", "1.0"))
+LIGHT_MATCH_SATURATION = float(_env("LIGHT_MATCH_SATURATION", "1.0"))
+LIGHT_MATCH_PRESET = str(_env("LIGHT_MATCH_PRESET", "custom")).lower()
+LIGHT_MATCH_FLUSH_QUEUES = str(_env("LIGHT_MATCH_FLUSH_QUEUES", "0")).lower() in {"1", "true", "yes", "on"}
+LIGHT_MATCH_DICT = {
+    "enabled": LIGHT_MATCH_ENABLED,
+    "temp_k": LIGHT_MATCH_TEMP_K,
+    "tint": LIGHT_MATCH_TINT,
+    "exposure_ev": LIGHT_MATCH_EXPOSURE_EV,
+    "contrast": LIGHT_MATCH_CONTRAST,
+    "gamma": LIGHT_MATCH_GAMMA,
+    "saturation": LIGHT_MATCH_SATURATION,
+    "preset": LIGHT_MATCH_PRESET,
+}
 
 
 # ---- Passthrough encoding and DLNA behavior ----

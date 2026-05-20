@@ -11,6 +11,10 @@ import math
 import numpy as np
 
 import config
+from pipeline.light_match import LIGHT_MATCH_DEVICE_SRC
+from utils.logger import get
+
+log = get("alpha_packer")
 
 PACK_SCALE = 0.4
 FISHEYE_RADIUS_SCALE = 1.0
@@ -59,7 +63,7 @@ def alpha_output_size(src_w: int, src_h: int) -> tuple[int, int]:
 class AlphaPacker:
     """Convert uploaded NV12 + alpha to DeoVR-style alpha-packed fisheye NV12."""
 
-    _KERNEL_SRC = r"""
+    _KERNEL_SRC = LIGHT_MATCH_DEVICE_SRC + r"""
     __device__ float adjust_alpha(float a, float cutoff, int hard_edge, float contrast) {
         a = a < 0.f ? 0.f : (a > 1.f ? 1.f : a);
         if (contrast != 1.f) {
@@ -370,7 +374,10 @@ class AlphaPacker:
         float radius_scale,
         float alpha_cutoff, int alpha_hard_edge, float alpha_contrast,
         unsigned char* __restrict__ out_nv12,
-        unsigned char* __restrict__ fisheye_alpha
+        unsigned char* __restrict__ fisheye_alpha,
+        const float* __restrict__ light_coeffs,
+        const unsigned char* __restrict__ light_gamma_lut,
+        int light_identity
     ) {
         int x = blockIdx.x * blockDim.x + threadIdx.x;
         int y = blockIdx.y * blockDim.y + threadIdx.y;
@@ -385,6 +392,13 @@ class AlphaPacker:
         unsigned char uv_v = 128;
         if (inside) {
             sample_uv_nearest(src_nv12, out_w, out_h, src_x, src_y, &uv_u, &uv_v);
+            float yy = (float)yv;
+            float uu = (float)uv_u;
+            float vv = (float)uv_v;
+            apply_light_match(&yy, &uu, &vv, light_coeffs, light_gamma_lut, light_identity);
+            yv = (unsigned char)(yy + 0.5f);
+            uv_u = (unsigned char)(uu + 0.5f);
+            uv_v = (unsigned char)(vv + 0.5f);
         }
         out_nv12[y_idx] = yv;
 
@@ -416,7 +430,10 @@ class AlphaPacker:
         float disparity_px,
         float alpha_cutoff, int alpha_hard_edge, float alpha_contrast,
         unsigned char* __restrict__ out_nv12,
-        unsigned char* __restrict__ fisheye_alpha
+        unsigned char* __restrict__ fisheye_alpha,
+        const float* __restrict__ light_coeffs,
+        const unsigned char* __restrict__ light_gamma_lut,
+        int light_identity
     ) {
         int x = blockIdx.x * blockDim.x + threadIdx.x;
         int y = blockIdx.y * blockDim.y + threadIdx.y;
@@ -433,6 +450,13 @@ class AlphaPacker:
         unsigned char uv_v = 128;
         if (inside) {
             sample_uv_nearest(src_nv12, src_w, src_h, src_x, src_y, &uv_u, &uv_v);
+            float yy = (float)yv;
+            float uu = (float)uv_u;
+            float vv = (float)uv_v;
+            apply_light_match(&yy, &uu, &vv, light_coeffs, light_gamma_lut, light_identity);
+            yv = (unsigned char)(yy + 0.5f);
+            uv_u = (unsigned char)(uu + 0.5f);
+            uv_v = (unsigned char)(vv + 0.5f);
         }
         out_nv12[y_idx] = yv;
 
@@ -464,7 +488,10 @@ class AlphaPacker:
         float disparity_px,
         float alpha_cutoff, int alpha_hard_edge, float alpha_contrast,
         unsigned char* __restrict__ out_nv12,
-        unsigned char* __restrict__ fisheye_alpha
+        unsigned char* __restrict__ fisheye_alpha,
+        const float* __restrict__ light_coeffs,
+        const unsigned char* __restrict__ light_gamma_lut,
+        int light_identity
     ) {
         int x = blockIdx.x * blockDim.x + threadIdx.x;
         int y = blockIdx.y * blockDim.y + threadIdx.y;
@@ -481,6 +508,13 @@ class AlphaPacker:
         unsigned char uv_v = 128;
         if (inside) {
             sample_uv_nearest(src_nv12, src_w, src_h, src_x, src_y, &uv_u, &uv_v);
+            float yy = (float)yv;
+            float uu = (float)uv_u;
+            float vv = (float)uv_v;
+            apply_light_match(&yy, &uu, &vv, light_coeffs, light_gamma_lut, light_identity);
+            yv = (unsigned char)(yy + 0.5f);
+            uv_u = (unsigned char)(uu + 0.5f);
+            uv_v = (unsigned char)(vv + 0.5f);
         }
         out_nv12[y_idx] = yv;
 
@@ -702,13 +736,22 @@ class AlphaPacker:
 
         out_nv12 = self.matter._ensure_dev_nv12_out(out_h, out_w)
         if self._g_fisheye_alpha is None or self._g_fisheye_alpha.shape != (out_h, out_w):
-            self._g_fisheye_alpha = cp.empty((out_h, out_w), dtype=cp.uint8)
+            self._g_fisheye_alpha = cp.empty((out_h, out_w), dtype=getattr(cp, "uint8", np.uint8))
 
         ah, aw = alpha_dev.shape[:2]
         block = (16, 16, 1)
         grid = ((out_w + block[0] - 1) // block[0], (out_h + block[1] - 1) // block[1], 1)
-        projection_mode = self.projection_mode(src_w, src_h)
+        if hasattr(self, "_project_flat2d_kernel") and hasattr(self, "_project_flat3d_kernel"):
+            projection_mode = self.projection_mode(src_w, src_h)
+        else:
+            log.warning("alpha packer flat projection kernels unavailable; falling back to fisheye projection")
+            projection_mode = "fisheye"
         flat2d_disparity_px = alpha_2d_disparity_px(out_w)
+        if hasattr(self.matter, "light_match_kernel_args"):
+            light_coeffs, light_gamma_lut, light_identity = self.matter.light_match_kernel_args()
+        else:
+            log.warning("Matter.light_match_kernel_args unavailable; alpha packer disables light matching")
+            light_coeffs, light_gamma_lut, light_identity = None, None, np.int32(1)
         if projection_mode == "flat2d_fisheye":
             self._project_flat2d_kernel(
                 grid,
@@ -730,6 +773,9 @@ class AlphaPacker:
                     np.float32(self.alpha_contrast),
                     out_nv12,
                     self._g_fisheye_alpha,
+                    light_coeffs,
+                    light_gamma_lut,
+                    light_identity,
                 ),
             )
         elif projection_mode == "flat2d_3d":
@@ -753,6 +799,9 @@ class AlphaPacker:
                     np.float32(self.alpha_contrast),
                     out_nv12,
                     self._g_fisheye_alpha,
+                    light_coeffs,
+                    light_gamma_lut,
+                    light_identity,
                 ),
             )
         else:
@@ -772,6 +821,9 @@ class AlphaPacker:
                     np.float32(self.alpha_contrast),
                     out_nv12,
                     self._g_fisheye_alpha,
+                    light_coeffs,
+                    light_gamma_lut,
+                    light_identity,
                 ),
             )
         self._blend_projected_subtitles(out_nv12, out_h, out_w, alpha_w, alpha_h, subtitle_overlay)
@@ -799,7 +851,12 @@ class AlphaPacker:
         use_config_scale: bool = True,
     ):
         src_h, src_w = int(frame.height), int(frame.width)
-        w, h = self.matter.pynv_scaled_size(src_w, src_h) if use_config_scale else (src_w, src_h)
+        if use_config_scale and hasattr(self.matter, "pynv_scaled_size"):
+            w, h = self.matter.pynv_scaled_size(src_w, src_h)
+        else:
+            if use_config_scale:
+                log.warning("Matter.pynv_scaled_size unavailable; alpha packer uses source size")
+            w, h = src_w, src_h
         if out_w is not None and out_h is not None:
             pack_w, pack_h = int(out_w), int(out_h)
         else:
@@ -810,7 +867,14 @@ class AlphaPacker:
             result = before_pack(self.matter._g_frame)
             if result is not None:
                 subtitle_overlay = result
-        return self.pack_uploaded(alpha, h, w, subtitle_overlay=subtitle_overlay, out_h=pack_h, out_w=pack_w), timing
+        try:
+            packed = self.pack_uploaded(alpha, h, w, subtitle_overlay=subtitle_overlay, out_h=pack_h, out_w=pack_w)
+        except TypeError as exc:
+            if "out_h" not in str(exc) and "out_w" not in str(exc):
+                raise
+            log.warning("alpha packer pack_uploaded does not accept out_h/out_w; falling back to implicit output size")
+            packed = self.pack_uploaded(alpha, h, w, subtitle_overlay=subtitle_overlay)
+        return packed, timing
 
     def pack_gpu_p016_frame(
         self,
@@ -823,23 +887,45 @@ class AlphaPacker:
         use_config_scale: bool = True,
     ):
         src_h, src_w = int(frame.height), int(frame.width)
-        w, h = self.matter.pynv_scaled_size(src_w, src_h) if use_config_scale else (src_w, src_h)
+        if use_config_scale and hasattr(self.matter, "pynv_scaled_size"):
+            w, h = self.matter.pynv_scaled_size(src_w, src_h)
+        else:
+            if use_config_scale:
+                log.warning("Matter.pynv_scaled_size unavailable; alpha packer uses source size")
+            w, h = src_w, src_h
         if out_w is not None and out_h is not None:
             pack_w, pack_h = int(out_w), int(out_h)
         else:
             pack_w, pack_h = self.output_size(w, h)
-        self.matter.upload_p016_planes_as_nv12_gpu_scaled(
-            frame.y.as_cupy(),
-            frame.uv.as_cupy(),
-            src_h,
-            src_w,
-            h,
-            w,
-            shift_bits=shift_bits,
-        )
+        if hasattr(self.matter, "upload_p016_planes_as_nv12_gpu_scaled"):
+            self.matter.upload_p016_planes_as_nv12_gpu_scaled(
+                frame.y.as_cupy(),
+                frame.uv.as_cupy(),
+                src_h,
+                src_w,
+                h,
+                w,
+                shift_bits=shift_bits,
+            )
+        else:
+            log.warning("Matter.upload_p016_planes_as_nv12_gpu_scaled unavailable; alpha packer uses unscaled P016 upload")
+            self.matter.upload_p016_planes_as_nv12_gpu(
+                frame.y.as_cupy(),
+                frame.uv.as_cupy(),
+                src_h,
+                src_w,
+                shift_bits=shift_bits,
+            )
         alpha, timing, _ = self.matter._alpha_low_res_gpu(h, w, use_nv12=True)
         if before_pack is not None:
             result = before_pack(self.matter._g_frame)
             if result is not None:
                 subtitle_overlay = result
-        return self.pack_uploaded(alpha, h, w, subtitle_overlay=subtitle_overlay, out_h=pack_h, out_w=pack_w), timing
+        try:
+            packed = self.pack_uploaded(alpha, h, w, subtitle_overlay=subtitle_overlay, out_h=pack_h, out_w=pack_w)
+        except TypeError as exc:
+            if "out_h" not in str(exc) and "out_w" not in str(exc):
+                raise
+            log.warning("alpha packer pack_uploaded does not accept out_h/out_w; falling back to implicit output size")
+            packed = self.pack_uploaded(alpha, h, w, subtitle_overlay=subtitle_overlay)
+        return packed, timing

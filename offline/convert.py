@@ -44,7 +44,7 @@ RVM_DEFAULT_ARGS = {
     "input_size": 1024,
     "skip_frames": 0,
     "fps": 0.0,
-    "bitrate": "live",
+    "bitrate": "source",
     "preset": config.PASSTHROUGH_PYNV_PRESET,
     "cq": -1,
 }
@@ -127,6 +127,7 @@ def _base_cmd(args: argparse.Namespace, src: Path, out: Path) -> list[str]:
     fps = float(args.fps or 0.0)
     if fps > 0:
         cmd.extend(["--fps", str(fps)])
+    cmd.extend(["--bitrate", str(args.bitrate)])
     cmd.extend(["--alpha-stride", "1"])
     if args.engine in ("matanyone2", "matanyone2_medium"):
         cmd.extend(["--matanyone2-size", "512"])
@@ -139,7 +140,6 @@ def _base_cmd(args: argparse.Namespace, src: Path, out: Path) -> list[str]:
     if engine == "rvm":
         cmd.extend(["--input-size", str(args.input_size)])
         cmd.append("--sbs-batch")
-        cmd.extend(["--bitrate", str(args.bitrate)])
         cmd.extend(["--preset", str(args.preset)])
         cmd.extend(["--cq", str(getattr(args, "cq", RVM_DEFAULT_ARGS["cq"]))])
     return cmd

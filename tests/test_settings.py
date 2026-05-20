@@ -16,6 +16,9 @@ class SettingsTests(unittest.TestCase):
         patcher = patch.object(settings_module, "SETTINGS_PATH", root / "ui_settings.json")
         patcher.start()
         self.addCleanup(patcher.stop)
+        meta_patcher = patch.object(settings_module, "SETTINGS_META_PATH", root / "ui_settings_meta.json")
+        meta_patcher.start()
+        self.addCleanup(meta_patcher.stop)
         return settings_module.Settings()
 
     def test_passthrough_mode_mapping(self) -> None:
@@ -68,6 +71,31 @@ class SettingsTests(unittest.TestCase):
         self.assertEqual(s.data["subtitle_fov"], 60.0)
         self.assertEqual(s.data["subtitle_direction"], "horizontal_bottom")
         self.assertEqual(s.data["subtitle_color"], "")
+
+    def test_internal_migration_flags_are_not_user_settings(self) -> None:
+        root = Path("runtime_cache/test_ui_settings_migrations")
+        root.mkdir(parents=True, exist_ok=True)
+        self.addCleanup(lambda: shutil.rmtree(root, ignore_errors=True))
+        settings_path = root / "ui_settings.json"
+        meta_path = root / "ui_settings_meta.json"
+        settings_path.write_text(
+            '{"light_match_enabled": true, "defaults_migrated_20260517_fps_size": true}',
+            encoding="utf-8",
+        )
+
+        with (
+            patch.object(settings_module, "SETTINGS_PATH", settings_path),
+            patch.object(settings_module, "SETTINGS_META_PATH", meta_path),
+        ):
+            s = settings_module.Settings()
+            self.assertNotIn("defaults_migrated_20260517_fps_size", s.data)
+            self.assertNotIn("defaults_migrated_20260519_light_match_off", s.data)
+            self.assertFalse(s.data["light_match_enabled"])
+
+            s.save()
+            saved = settings_path.read_text(encoding="utf-8")
+            self.assertNotIn("defaults_migrated_", saved)
+            self.assertTrue(meta_path.exists())
 
 
 if __name__ == "__main__":

@@ -1,6 +1,11 @@
 ﻿from __future__ import annotations
 
-from PySide6.QtCore import QPoint, QSize, Qt, QUrl
+import json
+import os
+import threading
+import urllib.request
+
+from PySide6.QtCore import QPoint, QSize, Qt, QTimer, QUrl
 from PySide6.QtGui import QColor, QDesktopServices, QFont, QIcon, QPainter, QPen, QPixmap
 from PySide6.QtWidgets import (
     QCheckBox,
@@ -10,6 +15,7 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QHeaderView,
     QLabel,
+    QMessageBox,
     QAbstractItemView,
     QPushButton,
     QRadioButton,
@@ -37,12 +43,17 @@ SWITCH_OFF_IMAGE = SWITCH_OFF_IMAGE_PATH.as_posix()
 SWITCH_ON_IMAGE = SWITCH_ON_IMAGE_PATH.as_posix()
 HOME_COMPACT_WIDTH = 560
 HOME_LOG_WIDTH = 380
-HOME_HEIGHT = 508
+HOME_HEIGHT = 560
 CONFIG_ROW_HEIGHT = 34
 SERVER_ICON_SIZE = 22
-PROJECT_URL = "https://github.com/zerochocobo/VR-Video-Passthrough-Server"
+PROJECT_URL = "https://wapok.com"
 PROJECT_LINK_HEIGHT = 28
 ICON_BUTTON_SIZE = 30
+LIGHT_MATCH_PRESETS = {
+    "home_warm": {"temp_k": 3000, "tint": 0, "exposure_ev": 0.0, "contrast": 1.0, "gamma": 1.0, "saturation": 1.05},
+    "daylight": {"temp_k": 5500, "tint": 0, "exposure_ev": 0.0, "contrast": 1.0, "gamma": 1.0, "saturation": 1.0},
+    "night_cool": {"temp_k": 6500, "tint": 0, "exposure_ev": -0.1, "contrast": 1.0, "gamma": 1.0, "saturation": 0.95},
+}
 
 
 def _retain_size_when_hidden(widget: QWidget) -> None:
@@ -56,6 +67,15 @@ def _int_setting(value, default: int) -> int:
         return default
     try:
         return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _float_setting(value, default: float) -> float:
+    if value is None or value == "":
+        return default
+    try:
+        return float(value)
     except (TypeError, ValueError):
         return default
 
@@ -303,6 +323,130 @@ class Alpha2DSettingsDialog(QDialog):
         return float(self.distance_slider.value())
 
 
+class LightMatchAdvancedDialog(QDialog):
+    def __init__(self, i18n, payload: dict, live_callback, parent=None) -> None:
+        super().__init__(parent)
+        self.i18n = i18n
+        self._live_callback = live_callback
+        self._updating = False
+        self.setModal(True)
+        self.setWindowTitle(self.i18n.t("light_match.custom_title"))
+
+        self.temp = self._slider(2700, 9000, _int_setting(payload.get("temp_k"), 5500))
+        self.tint = self._slider(-50, 50, _int_setting(payload.get("tint"), 0))
+        self.exposure = self._slider(-100, 100, int(round(_float_setting(payload.get("exposure_ev"), 0.0) * 100)))
+        self.contrast = self._slider(80, 120, int(round(_float_setting(payload.get("contrast"), 1.0) * 100)))
+        self.gamma = self._slider(85, 115, int(round(_float_setting(payload.get("gamma"), 1.0) * 100)))
+        self.saturation = self._slider(50, 150, int(round(_float_setting(payload.get("saturation"), 1.0) * 100)))
+        self._value_labels: dict[QSlider, QLabel] = {}
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(16, 14, 16, 14)
+        layout.setSpacing(10)
+        for label_key, slider, left_text, right_text in (
+            ("light_match.temp_k", self.temp, "2700K", "9000K"),
+            ("light_match.tint", self.tint, "-50", "+50"),
+            ("light_match.exposure", self.exposure, "-1EV", "+1EV"),
+            ("light_match.contrast", self.contrast, "80%", "120%"),
+            ("light_match.gamma", self.gamma, "0.85", "1.15"),
+            ("light_match.saturation", self.saturation, "50%", "150%"),
+        ):
+            row = QHBoxLayout()
+            row.setSpacing(6)
+            label = QLabel(self.i18n.t(label_key))
+            label.setFixedWidth(92)
+            label.setStyleSheet("color: #5f6368;")
+            value_label = QLabel()
+            value_label.setFixedWidth(72)
+            value_label.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+            value_label.setStyleSheet("color: #1677c7; font-weight: 600;")
+            self._value_labels[slider] = value_label
+            row.addWidget(label)
+            left_value = QLabel(left_text)
+            left_value.setStyleSheet("color: #8a8f98;")
+            row.addWidget(left_value)
+            row.addWidget(slider, 1)
+            right_value = QLabel(right_text)
+            right_value.setStyleSheet("color: #8a8f98;")
+            row.addWidget(right_value)
+            row.addSpacing(8)
+            row.addWidget(value_label)
+            layout.addLayout(row)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel)
+        buttons.button(QDialogButtonBox.StandardButton.Save).setText(self.i18n.t("button.save"))
+        buttons.button(QDialogButtonBox.StandardButton.Cancel).setText(self.i18n.t("button.cancel"))
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        self.restore_defaults_button = QPushButton(self.i18n.t("light_match.restore_defaults"))
+        bottom = QHBoxLayout()
+        bottom.addWidget(self.restore_defaults_button)
+        bottom.addStretch(1)
+        bottom.addWidget(buttons)
+        layout.addLayout(bottom)
+
+        for slider in (self.temp, self.tint, self.exposure, self.contrast, self.gamma, self.saturation):
+            slider.valueChanged.connect(self._manual_changed)
+        self.restore_defaults_button.clicked.connect(self._restore_defaults)
+        self._update_value_labels()
+        self.resize(520, 340)
+
+    def _slider(self, minimum: int, maximum: int, value: int) -> QSlider:
+        slider = QSlider(Qt.Orientation.Horizontal)
+        slider.setRange(minimum, maximum)
+        slider.setValue(max(minimum, min(maximum, value)))
+        return slider
+
+    def payload(self) -> dict:
+        return {
+            "enabled": True,
+            "temp_k": int(self.temp.value()),
+            "tint": float(self.tint.value()),
+            "exposure_ev": float(self.exposure.value()) / 100.0,
+            "contrast": float(self.contrast.value()) / 100.0,
+            "gamma": float(self.gamma.value()) / 100.0,
+            "saturation": float(self.saturation.value()) / 100.0,
+            "preset": "custom",
+        }
+
+    def _emit_live(self) -> None:
+        if not self._updating:
+            self._live_callback(self.payload())
+
+    def _manual_changed(self) -> None:
+        self._update_value_labels()
+        self._emit_live()
+
+    def _restore_defaults(self) -> None:
+        self._updating = True
+        for slider, value in (
+            (self.temp, 5500),
+            (self.tint, 0),
+            (self.exposure, 0),
+            (self.contrast, 100),
+            (self.gamma, 100),
+            (self.saturation, 100),
+        ):
+            slider.setValue(value)
+        self._updating = False
+        self._update_value_labels()
+        self._emit_live()
+
+    def _update_value_labels(self) -> None:
+        values = {
+            self.temp: f"{self.temp.value()}K",
+            self.tint: f"{self.tint.value():+d}",
+            self.exposure: f"{self.exposure.value() / 100.0:+.2f}EV",
+            self.contrast: f"{self.contrast.value()}%",
+            self.gamma: f"{self.gamma.value() / 100.0:.2f}",
+            self.saturation: f"{self.saturation.value()}%",
+        }
+        for slider, text in values.items():
+            label = self._value_labels.get(slider)
+            if label is not None:
+                label.setText(text)
+
+
 class HomePage(QWidget):
     def __init__(self, i18n, settings, display_version: str = "") -> None:
         super().__init__()
@@ -385,6 +529,8 @@ class HomePage(QWidget):
         self.debug_toggle_label = QLabel()
         _retain_size_when_hidden(self.debug_toggle)
         _retain_size_when_hidden(self.debug_toggle_label)
+        self.problem_help_button = QPushButton()
+        self.problem_help_button.setFixedWidth(104)
 
         self.log = QTextEdit()
         self.log.setReadOnly(True)
@@ -486,6 +632,7 @@ class HomePage(QWidget):
         log_row.addWidget(self.debug_toggle_label)
         log_row.addWidget(self.debug_toggle)
         log_row.addStretch(1)
+        log_row.addWidget(self.problem_help_button)
         group_layout.addWidget(dirs_row_widget)
         group_layout.addWidget(green_row_widget)
         group_layout.addWidget(alpha_row_widget)
@@ -536,6 +683,22 @@ class HomePage(QWidget):
         self.performance_output_size.setFixedWidth(150)
         idx = self.performance_output_size.findData(_int_setting(settings.data.get("decode_max_side"), 4096))
         self.performance_output_size.setCurrentIndex(max(0, idx))
+        self.light_match_enabled = QCheckBox()
+        self.light_match_enabled.setChecked(bool(settings.data.get("light_match_enabled")))
+        _apply_switch_style(self.light_match_enabled)
+        self.light_match_enabled_label = QLabel()
+        self.light_match_help = _icon_button(_question_icon())
+        self.light_match_advanced_button = QPushButton()
+        self.light_match_preset = QComboBox()
+        for key in ("home_warm", "daylight", "night_cool", "custom"):
+            self.light_match_preset.addItem("", key)
+        self.light_match_preset.setFixedWidth(150)
+        idx = self.light_match_preset.findData(settings.data.get("light_match_preset", "custom"))
+        self.light_match_preset.setCurrentIndex(max(0, idx))
+        self._light_match_live_timer = QTimer(self)
+        self._light_match_live_timer.setSingleShot(True)
+        self._light_match_live_timer.setInterval(80)
+        self._light_match_live_timer.timeout.connect(self._send_light_match_live_update)
         memory_row_widget = QWidget()
         memory_row_widget.setFixedHeight(CONFIG_ROW_HEIGHT)
         memory_row = QHBoxLayout(memory_row_widget)
@@ -563,6 +726,42 @@ class HomePage(QWidget):
         performance_layout.addWidget(self.performance_header)
         performance_layout.addWidget(self.performance_content)
         self.performance_content.setVisible(False)
+
+        light_match_config = QWidget()
+        light_match_config.setObjectName("QuickConfig")
+        light_match_config.setStyleSheet(quick_config.styleSheet())
+        light_match_layout = QVBoxLayout(light_match_config)
+        light_match_layout.setContentsMargins(0, 0, 0, 0)
+        light_match_layout.setSpacing(0)
+        self.light_match_header = QToolButton()
+        self.light_match_header.setObjectName("QuickConfigHeader")
+        self.light_match_header.setCheckable(True)
+        self.light_match_header.setChecked(False)
+        self.light_match_header.setArrowType(Qt.ArrowType.RightArrow)
+        self.light_match_header.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
+        self.light_match_header.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.light_match_header.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self.light_match_header.setStyleSheet(self.config_header.styleSheet())
+        self.light_match_header.setMinimumHeight(42)
+        self.light_match_content = QWidget()
+        self.light_match_content.setObjectName("QuickConfigContent")
+        light_content_layout = QVBoxLayout(self.light_match_content)
+        light_content_layout.setContentsMargins(10, 8, 10, 8)
+        light_content_layout.setSpacing(4)
+        light_enable_row_widget = QWidget()
+        light_enable_row_widget.setFixedHeight(CONFIG_ROW_HEIGHT)
+        light_enable_row = QHBoxLayout(light_enable_row_widget)
+        light_enable_row.setContentsMargins(0, 0, 0, 0)
+        light_enable_row.addWidget(self.light_match_enabled_label)
+        light_enable_row.addWidget(self.light_match_enabled)
+        light_enable_row.addWidget(self.light_match_preset)
+        light_enable_row.addWidget(self.light_match_advanced_button)
+        light_enable_row.addStretch(1)
+        light_enable_row.addWidget(self.light_match_help)
+        light_content_layout.addWidget(light_enable_row_widget)
+        light_match_layout.addWidget(self.light_match_header)
+        light_match_layout.addWidget(self.light_match_content)
+        self.light_match_content.setVisible(False)
         for label in (
             self.video_dirs_title,
             self.green_mode_label,
@@ -572,6 +771,7 @@ class HomePage(QWidget):
             self.performance_quality_label,
             self.performance_fps_label,
             self.performance_output_size_label,
+            self.light_match_enabled_label,
         ):
             label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
 
@@ -579,11 +779,14 @@ class HomePage(QWidget):
         left_panel.setFixedWidth(HOME_COMPACT_WIDTH)
         left_layout = QVBoxLayout(left_panel)
         left_layout.setContentsMargins(20, 16, 20, 16)
-        left_layout.setSpacing(12)
+        left_layout.setSpacing(0)
         left_layout.addLayout(title_box)
+        left_layout.addSpacing(12)
         left_layout.addLayout(buttons)
+        left_layout.addSpacing(12)
         left_layout.addWidget(quick_config)
         left_layout.addWidget(performance_config)
+        left_layout.addWidget(light_match_config)
         left_layout.addStretch(1)
         left_layout.addWidget(self.project_link)
         layout = QHBoxLayout(self)
@@ -593,6 +796,7 @@ class HomePage(QWidget):
         layout.addWidget(self.log)
         self.config_group = quick_config
         self.performance_group = performance_config
+        self.light_match_group = light_match_config
         self.retranslate()
         self._bind_settings()
 
@@ -621,8 +825,12 @@ class HomePage(QWidget):
         self.performance_quality.currentIndexChanged.connect(self._save)
         self.performance_fps.currentIndexChanged.connect(self._save)
         self.performance_output_size.currentIndexChanged.connect(self._save)
+        self.light_match_enabled.toggled.connect(self._save_light_match)
+        self.light_match_preset.currentIndexChanged.connect(self._preset_light_match)
+        self.light_match_advanced_button.clicked.connect(self.show_light_match_advanced)
         self.config_header.toggled.connect(self._toggle_quick_config)
         self.performance_header.toggled.connect(self._toggle_performance_config)
+        self.light_match_header.toggled.connect(self._toggle_light_match_config)
         self.green_mode.toggled.connect(self._update_enabled)
         self.alpha_mode.toggled.connect(self._update_enabled)
         self.subtitle_enable.toggled.connect(self._update_enabled)
@@ -630,7 +838,10 @@ class HomePage(QWidget):
         self.video_dirs_manage_button.clicked.connect(self.manage_video_dirs)
         self.player_support_button.clicked.connect(self.show_player_support)
         self.alpha_2d_button.clicked.connect(self.show_alpha_2d_settings)
+        self.light_match_help.clicked.connect(self._show_light_match_help)
+        self.problem_help_button.clicked.connect(self.show_problem_help)
         self._update_enabled()
+        self._update_light_match_visibility()
         self.update_video_dirs_summary()
 
     def _save(self) -> None:
@@ -643,6 +854,88 @@ class HomePage(QWidget):
         self.settings.data["decode_max_side"] = self.performance_output_size.currentData()
         self.settings.data["subtitle_enable"] = self.subtitle_enable.isChecked()
         self.settings.save()
+
+    def _light_match_payload(self) -> dict:
+        return {
+            "enabled": self.light_match_enabled.isChecked(),
+            "temp_k": _int_setting(self.settings.data.get("light_match_temp_k"), 5500),
+            "tint": _float_setting(self.settings.data.get("light_match_tint"), 0.0),
+            "exposure_ev": _float_setting(self.settings.data.get("light_match_exposure_ev"), 0.0),
+            "contrast": _float_setting(self.settings.data.get("light_match_contrast"), 1.0),
+            "gamma": _float_setting(self.settings.data.get("light_match_gamma"), 1.0),
+            "saturation": _float_setting(self.settings.data.get("light_match_saturation"), 1.0),
+            "preset": str(self.light_match_preset.currentData() or "custom"),
+        }
+
+    def _apply_light_match_payload(self, payload: dict, save: bool) -> None:
+        for key, value in payload.items():
+            self.settings.data[f"light_match_{key}"] = value
+        idx = self.light_match_preset.findData(payload.get("preset", "custom"))
+        if idx >= 0 and self.light_match_preset.currentIndex() != idx:
+            self.light_match_preset.blockSignals(True)
+            self.light_match_preset.setCurrentIndex(idx)
+            self.light_match_preset.blockSignals(False)
+        if self.light_match_enabled.isChecked() != bool(payload.get("enabled")):
+            self.light_match_enabled.blockSignals(True)
+            self.light_match_enabled.setChecked(bool(payload.get("enabled")))
+            self.light_match_enabled.blockSignals(False)
+        self._update_light_match_visibility()
+        if save:
+            self.settings.save()
+        self._send_light_match_live_update(payload)
+
+    def _save_light_match(self) -> None:
+        self._update_light_match_visibility()
+        self._apply_light_match_payload(self._light_match_payload(), save=True)
+
+    def _send_light_match_live_update(self, payload: dict | None = None) -> None:
+        payload = payload or self._light_match_payload()
+        port = str(os.environ.get("PT_HTTP_PORT") or "8200").strip() or "8200"
+        url = f"http://127.0.0.1:{port}/control/light_match"
+
+        def worker() -> None:
+            try:
+                data = json.dumps(payload).encode("utf-8")
+                request = urllib.request.Request(
+                    url,
+                    data=data,
+                    method="PUT",
+                    headers={"Content-Type": "application/json"},
+                )
+                with urllib.request.urlopen(request, timeout=0.35) as response:
+                    response.read(2048)
+            except Exception:
+                pass
+
+        threading.Thread(target=worker, name="light-match-live-update", daemon=True).start()
+
+    def _preset_light_match(self) -> None:
+        preset = str(self.light_match_preset.currentData() or "custom")
+        self._update_light_match_visibility()
+        payload = self._light_match_payload()
+        values = LIGHT_MATCH_PRESETS.get(preset, {})
+        payload.update(values)
+        payload["preset"] = preset
+        self._apply_light_match_payload(payload, save=True)
+
+    def show_light_match_advanced(self) -> None:
+        before = self._light_match_payload()
+        dialog = LightMatchAdvancedDialog(self.i18n, before, lambda payload: self._send_light_match_live_update(payload), self)
+        if dialog.exec() == LightMatchAdvancedDialog.DialogCode.Accepted:
+            self._apply_light_match_payload(dialog.payload(), save=True)
+            return
+        self._apply_light_match_payload(before, save=False)
+
+    def _update_light_match_visibility(self) -> None:
+        enabled = self.light_match_enabled.isChecked()
+        preset = str(self.light_match_preset.currentData() or "custom")
+        self.light_match_preset.setVisible(enabled)
+        self.light_match_advanced_button.setVisible(enabled and preset == "custom")
+
+    def _show_light_match_help(self) -> None:
+        from PySide6.QtWidgets import QMessageBox
+
+        QMessageBox.information(self, self.i18n.t("light_match.title"), self.i18n.t("light_match.help"))
 
     def sync_from_settings(self) -> None:
         value = quality_speed_value(self.settings.data.get("quality_speed"))
@@ -672,6 +965,13 @@ class HomePage(QWidget):
         self.settings.data["alpha_2d_distance_m"] = dialog.selected_distance_m()
         self.settings.save()
 
+    def show_problem_help(self) -> None:
+        QMessageBox.information(
+            self,
+            self.i18n.t("problem_help.title"),
+            self.i18n.t("problem_help.message"),
+        )
+
     def update_video_dirs_summary(self) -> None:
         roots = build_media_roots(parse_video_dirs("|".join(self.settings.video_dirs()), UI_ROOT / "videos"))
         names = [root.label for root in roots]
@@ -699,6 +999,13 @@ class HomePage(QWidget):
             self.performance_content.setVisible(False)
             self.performance_header.setArrowType(Qt.ArrowType.RightArrow)
             self._update_performance_config_title()
+        if expanded and self.light_match_header.isChecked():
+            self.light_match_header.blockSignals(True)
+            self.light_match_header.setChecked(False)
+            self.light_match_header.blockSignals(False)
+            self.light_match_content.setVisible(False)
+            self.light_match_header.setArrowType(Qt.ArrowType.RightArrow)
+            self._update_light_match_config_title()
         self.config_content.setVisible(expanded)
         self.config_header.setArrowType(Qt.ArrowType.DownArrow if expanded else Qt.ArrowType.RightArrow)
         self._update_quick_config_title()
@@ -713,10 +1020,38 @@ class HomePage(QWidget):
             self.config_content.setVisible(False)
             self.config_header.setArrowType(Qt.ArrowType.RightArrow)
             self._update_quick_config_title()
+        if expanded and self.light_match_header.isChecked():
+            self.light_match_header.blockSignals(True)
+            self.light_match_header.setChecked(False)
+            self.light_match_header.blockSignals(False)
+            self.light_match_content.setVisible(False)
+            self.light_match_header.setArrowType(Qt.ArrowType.RightArrow)
+            self._update_light_match_config_title()
         self.performance_content.setVisible(expanded)
         self.performance_header.setArrowType(Qt.ArrowType.DownArrow if expanded else Qt.ArrowType.RightArrow)
         self._update_performance_config_title()
         self.performance_group.updateGeometry()
+        self._adjust_window()
+
+    def _toggle_light_match_config(self, expanded: bool) -> None:
+        if expanded and self.config_header.isChecked():
+            self.config_header.blockSignals(True)
+            self.config_header.setChecked(False)
+            self.config_header.blockSignals(False)
+            self.config_content.setVisible(False)
+            self.config_header.setArrowType(Qt.ArrowType.RightArrow)
+            self._update_quick_config_title()
+        if expanded and self.performance_header.isChecked():
+            self.performance_header.blockSignals(True)
+            self.performance_header.setChecked(False)
+            self.performance_header.blockSignals(False)
+            self.performance_content.setVisible(False)
+            self.performance_header.setArrowType(Qt.ArrowType.RightArrow)
+            self._update_performance_config_title()
+        self.light_match_content.setVisible(expanded)
+        self.light_match_header.setArrowType(Qt.ArrowType.DownArrow if expanded else Qt.ArrowType.RightArrow)
+        self._update_light_match_config_title()
+        self.light_match_group.updateGeometry()
         self._adjust_window()
 
     def _update_quick_config_title(self) -> None:
@@ -726,6 +1061,10 @@ class HomePage(QWidget):
     def _update_performance_config_title(self) -> None:
         key = "group.performance_config" if self.performance_header.isChecked() else "group.performance_config_short"
         self.performance_header.setText(self.i18n.t(key))
+
+    def _update_light_match_config_title(self) -> None:
+        key = "group.light_match_config" if self.light_match_header.isChecked() else "group.light_match_config_short"
+        self.light_match_header.setText(self.i18n.t(key))
 
     def _current_home_height(self) -> int:
         return HOME_HEIGHT
@@ -771,6 +1110,7 @@ class HomePage(QWidget):
             self.performance_quality_label,
             self.performance_fps_label,
             self.performance_output_size_label,
+            self.light_match_enabled_label,
         )
         width = max(label.sizeHint().width() for label in labels)
         for label in labels:
@@ -786,6 +1126,7 @@ class HomePage(QWidget):
         self.offline_button.setText(self.i18n.t("button.offline"))
         self._update_quick_config_title()
         self._update_performance_config_title()
+        self._update_light_match_config_title()
         self.video_dirs_manage_button.setToolTip(self.i18n.t("button.manage"))
         self.video_dirs_title.setText(self.i18n.t("video_dirs.label"))
         self.green_mode.setText("")
@@ -799,17 +1140,29 @@ class HomePage(QWidget):
         self.player_support_button.setToolTip(self.i18n.t("player_support.window_title"))
         self.log_toggle.setText("")
         self.log_toggle_label.setText(self.i18n.t("log.show"))
+        self.problem_help_button.setText(self.i18n.t("problem_help.button"))
         self.debug_toggle.setText("")
         self.debug_toggle_label.setText(self.i18n.t("log.debug"))
         self.performance_quality_label.setText(self.i18n.t("performance.quality_speed"))
         self.performance_fps_label.setText(self.i18n.t("performance.output_fps"))
         self.performance_output_size_label.setText(self.i18n.t("performance.output_size"))
+        self.light_match_enabled.setText("")
+        self.light_match_enabled_label.setText(self.i18n.t("light_match.enabled"))
+        self.light_match_help.setToolTip(self.i18n.t("light_match.help"))
+        self.light_match_advanced_button.setText(self.i18n.t("light_match.advanced"))
         self.performance_fps.setItemText(0, self.i18n.t("performance.output_fps_unlimited"))
         for i, key in enumerate(("quality_speed.ultrafast", "quality_speed.medium")):
             self.performance_quality.setItemText(i, self.i18n.t(key))
         self.performance_output_size.setItemText(0, self.i18n.t("performance.output_size_original"))
         self.performance_output_size.setItemText(1, self.i18n.t("performance.output_size_4k"))
         self.performance_output_size.setItemText(2, self.i18n.t("performance.output_size_8k"))
+        for i, key in enumerate((
+            "light_match.preset_home_warm",
+            "light_match.preset_daylight",
+            "light_match.preset_night_cool",
+            "light_match.preset_custom",
+        )):
+            self.light_match_preset.setItemText(i, self.i18n.t(key))
         self.update_video_dirs_summary()
         for i, key in enumerate(("bg.neutral_gray", "bg.light_gray", "bg.soft_green", "bg.soft_blue")):
             self.bg_color.setItemText(i, self.i18n.t(key))
