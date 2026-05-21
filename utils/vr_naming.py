@@ -8,7 +8,7 @@ import re
 # - HereSphere/SKYBOX/DeoVR: this project treats only underscore and hyphen as
 #   reliable filename marker separators.
 # - SKYBOX: 3D/angle/fisheye keywords can appear in any order/case.
-# - DeoVR: local filenames use markers such as _SBS_180 and _fisheye190.
+# - DeoVR: local filenames use markers such as _LR_180 and _fisheye190.
 _MARKER_RE = re.compile(
     r"(^|[_\-])("
     r"lr|rl|lrf|rlf|3dh|3dhf|sbs|sbsf|hsbs|"
@@ -22,15 +22,16 @@ _MARKER_RE = re.compile(
     r"180|360|180x180|vr180|"
     r"f180|180f|fisheye|fisheye180|fisheye190|rf52|"
     r"mkx200|mkx22|vrca220|eac360|360eac|"
-    r"alpha|passthrough|3d_alpha|fisheye_alpha|f180_alpha|sbs_f180_alpha"
+    r"alpha|passthrough|3d_alpha|fisheye_alpha|f180_alpha|sbs_f180_alpha|"
+    r"lr_180_fisheye_alpha|lr_180_fisheye_f180_alpha"
     r")($|[_\-])",
     re.IGNORECASE,
 )
 
-SBS_180_SOURCE_SUFFIX = "_SBS_180"
+SBS_180_SOURCE_SUFFIX = "_LR_180"
 GREEN_LIVE_PASSTHROUGH_SUFFIX = "_passthrough"
-GREEN_OFFLINE_PASSTHROUGH_SUFFIX = "_SBS_180_passthrough"
-ALPHA_PASSTHROUGH_SUFFIX = "_SBS_F180_alpha"
+GREEN_OFFLINE_PASSTHROUGH_SUFFIX = "_LR_180_passthrough"
+ALPHA_PASSTHROUGH_SUFFIX = "_LR_180_FISHEYE_F180_alpha"
 _VIDEO_SUFFIXES = {".mp4", ".mkv", ".mov", ".m4v", ".avi", ".webm", ".ts", ".m2ts"}
 
 
@@ -75,9 +76,9 @@ def green_passthrough_stem(stem_or_name: str, width: int = 0, height: int = 0) -
 
 
 def alpha_passthrough_stem(stem_or_name: str) -> str:
-    """Return alpha passthrough stem using F180 + SBS markers."""
+    """Return alpha passthrough stem using LR 180 + fisheye markers."""
     stem = _as_stem(stem_or_name)
-    stem = re.sub(r"fisheye", "F180", stem, flags=re.IGNORECASE)
+    stem = re.sub(r"fisheye", "FISHEYE", stem, flags=re.IGNORECASE)
     if stem.lower().endswith(ALPHA_PASSTHROUGH_SUFFIX.lower()):
         return stem
     return f"{stem}{ALPHA_PASSTHROUGH_SUFFIX}"
