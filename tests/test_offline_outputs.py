@@ -15,8 +15,11 @@ class OfflineOutputDetectionTests(unittest.TestCase):
         source = Path("movie.mp4")
 
         self.assertTrue(matches_offline_output_for_source(source, Path("movie_passthrough.mp4")))
+        self.assertTrue(matches_offline_output_for_source(source, Path("movie_SBS_180_passthrough.mp4")))
         self.assertTrue(matches_offline_output_for_source(source, Path("movie_FISHEYE_alpha.mp4")))
+        self.assertTrue(matches_offline_output_for_source(source, Path("movie_SBS_F180_alpha.mp4")))
         self.assertTrue(matches_offline_output_for_source(source, Path("movie_rvm2_S000000_ALL_FISHEYE_alpha.mp4")))
+        self.assertTrue(matches_offline_output_for_source(source, Path("movie_rvm2_S000000_ALL_SBS_F180_alpha.mp4")))
         self.assertTrue(matches_offline_output_for_source(source, Path("movie_matanyone2_S000005_5M_3D_alpha.mp4")))
 
     def test_rejects_unrelated_names(self) -> None:
@@ -29,6 +32,7 @@ class OfflineOutputDetectionTests(unittest.TestCase):
     def test_passthrough_output_name_suffixes(self) -> None:
         self.assertTrue(is_offline_passthrough_output_name("movie_FISHEYE180_alpha.mp4"))
         self.assertTrue(is_offline_passthrough_output_name("movie_FISHEYE190_alpha.mp4"))
+        self.assertTrue(is_offline_passthrough_output_name("movie_SBS_F180_alpha.mp4"))
         self.assertFalse(is_offline_passthrough_output_name("movie_alpha_notes.mp4"))
 
     def test_has_offline_output_accepts_snapshot_siblings(self) -> None:

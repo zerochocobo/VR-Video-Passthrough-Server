@@ -10,10 +10,12 @@ import config
 
 OFFLINE_PASSTHROUGH_SUFFIXES = (
     "_passthrough",
+    "_SBS_180_passthrough",
     "_FISHEYE_alpha",
     "_FISHEYE180_alpha",
     "_FISHEYE190_alpha",
     "_3D_alpha",
+    "_SBS_F180_alpha",
 )
 
 _ENGINE_SEGMENT_RE = re.compile(

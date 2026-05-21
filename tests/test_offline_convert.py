@@ -13,8 +13,9 @@ import offline.convert as convert
 class OfflineConvertTests(unittest.TestCase):
     def test_default_output_names(self) -> None:
         src = Path("sample.mp4")
-        self.assertEqual(convert._default_out(src, "green"), Path("sample_passthrough.mp4"))
-        self.assertEqual(convert._default_out(src, "alpha"), Path("sample_FISHEYE_alpha.mp4"))
+        self.assertEqual(convert._default_out(src, "green", 1920, 1080), Path("sample_passthrough.mp4"))
+        self.assertEqual(convert._default_out(src, "green", 3840, 1920), Path("sample_SBS_180_passthrough.mp4"))
+        self.assertEqual(convert._default_out(src, "alpha"), Path("sample_SBS_F180_alpha.mp4"))
 
     def test_single_output_name_includes_mode_engine_start_and_duration(self) -> None:
         src = Path("sample.mp4")
@@ -22,9 +23,12 @@ class OfflineConvertTests(unittest.TestCase):
         alpha_args = SimpleNamespace(command="single", mode="alpha", engine="matanyone2", start=5.0, duration=300.0)
         all_args = SimpleNamespace(command="single", mode="green", engine="rvm_balanced", start=0.0, duration=0.0)
 
-        self.assertEqual(convert._single_out(src, green_args), Path("sample_rvm1_S000500_15S_passthrough.mp4"))
-        self.assertEqual(convert._single_out(src, alpha_args), Path("sample_matanyone2_S000005_5M_FISHEYE_alpha.mp4"))
-        self.assertEqual(convert._single_out(src, all_args), Path("sample_rvm2_S000000_ALL_passthrough.mp4"))
+        self.assertEqual(
+            convert._single_out(src, green_args, 3840, 1920),
+            Path("sample_rvm1_S000500_15S_SBS_180_passthrough.mp4"),
+        )
+        self.assertEqual(convert._single_out(src, alpha_args), Path("sample_matanyone2_S000005_5M_SBS_F180_alpha.mp4"))
+        self.assertEqual(convert._single_out(src, all_args, 1920, 1080), Path("sample_rvm2_S000000_ALL_passthrough.mp4"))
 
     def test_batch_video_files_skip_passthrough(self) -> None:
         root = Path("runtime_cache/test_offline_convert")
@@ -176,7 +180,7 @@ class OfflineConvertTests(unittest.TestCase):
         finally:
             convert._base_cmd = original_base_cmd
 
-        self.assertEqual(seen["out"], (root / "out" / "demo_rvm2_S000500_15S_FISHEYE_alpha.mp4").resolve())
+        self.assertEqual(seen["out"], (root / "out" / "demo_rvm2_S000500_15S_SBS_F180_alpha.mp4").resolve())
 
 
 if __name__ == "__main__":

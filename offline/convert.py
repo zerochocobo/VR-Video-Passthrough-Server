@@ -21,6 +21,7 @@ import config
 from utils.gpu_requirements import detect_nvidia_gpu_requirement, unsupported_gpu_message
 from utils.subprocess_hidden import hidden_subprocess_kwargs
 from utils.video_metadata import probe_video_metadata, select_backend
+from utils.vr_naming import offline_passthrough_stem
 
 ROOT = config.ROOT
 VIDEO_EXTS = {".mp4", ".mkv", ".mov", ".m4v"}
@@ -65,9 +66,8 @@ def _tool_command(mode: str) -> list[str]:
     return [sys.executable, str(_script_for(mode))]
 
 
-def _default_out(src: Path, mode: str) -> Path:
-    suffix = "_FISHEYE_alpha.mp4" if mode == "alpha" else "_passthrough.mp4"
-    return src.with_name(f"{src.stem}{suffix}")
+def _default_out(src: Path, mode: str, width: int = 0, height: int = 0) -> Path:
+    return src.with_name(f"{offline_passthrough_stem(src.stem, mode, width, height)}.mp4")
 
 
 def _time_tag(seconds: float) -> str:
@@ -86,12 +86,12 @@ def _duration_tag(seconds: float) -> str:
     return f"{total}S"
 
 
-def _single_out(src: Path, args: argparse.Namespace) -> Path:
+def _single_out(src: Path, args: argparse.Namespace, width: int = 0, height: int = 0) -> Path:
     engine_tag = ENGINE_TAGS[args.engine]
     start_tag = f"S{_time_tag(args.start)}"
     duration_tag = _duration_tag(args.duration)
-    suffix = "FISHEYE_alpha" if args.mode == "alpha" else "passthrough"
-    return src.with_name(f"{src.stem}_{engine_tag}_{start_tag}_{duration_tag}_{suffix}.mp4")
+    base = f"{src.stem}_{engine_tag}_{start_tag}_{duration_tag}"
+    return src.with_name(f"{offline_passthrough_stem(base, args.mode, width, height)}.mp4")
 
 
 def _video_files(root: Path, recursive: bool) -> list[Path]:
@@ -195,7 +195,13 @@ def _run_one(args: argparse.Namespace, src: Path) -> int:
             flush=True,
         )
         return 4
-    default_out = _single_out(src, args) if getattr(args, "command", "") == "single" else _default_out(src, args.mode)
+    width = int(getattr(meta.codec, "width", 0) or 0)
+    height = int(getattr(meta.codec, "height", 0) or 0)
+    default_out = (
+        _single_out(src, args, width, height)
+        if getattr(args, "command", "") == "single"
+        else _default_out(src, args.mode, width, height)
+    )
     if getattr(args, "out_dir", ""):
         out = Path(args.out_dir).resolve() / default_out.name
     else:

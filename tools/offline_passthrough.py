@@ -26,6 +26,7 @@ from utils.bitrate_estimator import effective_default_bitrate, parse_bitrate, so
 from utils.gpu_runtime_cache import configure_gpu_runtime_cache  # noqa: E402
 from utils.subprocess_hidden import hidden_subprocess_kwargs  # noqa: E402
 from utils.video_metadata import cfr_source_index, probe_color_metadata, probe_timing_metadata, probe_video_metadata, select_backend  # noqa: E402
+from utils.vr_naming import offline_passthrough_stem  # noqa: E402
 from offline.sam3_matanyone2 import (  # noqa: E402
     Sam3TextMasker,
     apply_sam3_stereo_guard,
@@ -125,8 +126,8 @@ def _resolve_video(value: str) -> Path:
     return p.resolve()
 
 
-def _default_out(src: Path) -> Path:
-    return src.with_name(f"{src.stem}_passthrough.mp4")
+def _default_out(src: Path, width: int = 0, height: int = 0) -> Path:
+    return src.with_name(f"{offline_passthrough_stem(src.stem, 'green', width, height)}.mp4")
 
 
 def _open_muxer(out: Path, fps: float, src: Path, codec: str, audio: str, duration: float, start_sec: float = 0.0):
@@ -1417,12 +1418,15 @@ def main() -> int:
     )
 
     src = _resolve_video(args.video)
-    out = Path(args.out) if args.out else _default_out(src)
+    meta = probe_video_metadata(src)
+    out = Path(args.out) if args.out else _default_out(
+        src,
+        int(getattr(meta.codec, "width", 0) or 0),
+        int(getattr(meta.codec, "height", 0) or 0),
+    )
     if not out.is_absolute():
         out = (config.ROOT / out).resolve()
     out.parent.mkdir(parents=True, exist_ok=True)
-
-    meta = probe_video_metadata(src)
     print(
         f"[offline] input codec={meta.codec.codec_name} profile={meta.codec.profile} "
         f"pix_fmt={meta.codec.pix_fmt} bit_depth={meta.codec.bit_depth} "

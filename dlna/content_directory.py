@@ -26,15 +26,12 @@ from config import (
     PASSTHROUGH_MKV_LIVE_POLICY,
     PASSTHROUGH_OUTPUT_MODE,
     PASSTHROUGH_SEEK_MODE,
-    PASSTHROUGH_SUFFIX,
-    ALPHA_2D_ENABLE,
-    ALPHA_2D_PROJECTION,
     MEDIA_LIBRARY,
     VIDEO_DIR,
     VIDEO_EXTS,
 )
 from dlna.profiles import passthrough_frame_rate
-from pipeline.alpha_packer import alpha_output_size, is_sbs_vr_size
+from pipeline.alpha_packer import alpha_output_size
 from pipeline.ffmpeg_io import probe_cached
 from utils.bitrate_estimator import estimate_for_media
 from utils.logger import get
@@ -42,6 +39,7 @@ from utils.media_index import IndexedChild, get_media_index
 from utils.offline_outputs import has_offline_passthrough_output, is_offline_passthrough_output_name
 from utils.subtitles import SubtitleTrack, find_external_subtitles, subtitle_output_enabled
 from utils.video_metadata import probe_video_metadata, select_backend
+from utils.vr_naming import live_passthrough_title, source_display_stem
 
 log = get("cds")
 
@@ -60,7 +58,7 @@ DLNA_FLAGS_TIME_SEEK = "41700000000000000000000000000000"
 DIDL_NS = "urn:schemas-upnp-org:metadata-1-0/DIDL-Lite/"
 
 _DIR_ITEMS_CACHE_MAX = 256
-_DIDL_SCHEMA_VERSION = 4
+_DIDL_SCHEMA_VERSION = 5
 _SYSTEM_UPDATE_ID = _DIDL_SCHEMA_VERSION
 _dir_items_cache: dict[tuple, list[dict]] = {}
 _LIVE_MAX_SIDE = 8192
@@ -175,7 +173,8 @@ def _video_item_count(path: Path, child: IndexedChild | None = None) -> int:
 
 
 def _marked_original_title(path: Path, child: IndexedChild | None = None) -> str:
-    title = path.stem
+    width, height = _indexed_video_dimensions(child)
+    title = source_display_stem(path.stem, width, height)
     if _hide_passthrough_for_path(path, child) and not title.startswith(_NO_LIVE_PREFIX.strip()):
         return f"{_NO_LIVE_PREFIX}{title}"
     return title
@@ -238,22 +237,8 @@ def _subtitle_item(track: SubtitleTrack) -> dict:
     }
 
 
-def _alpha_virtual_suffix(width: int = 0, height: int = 0) -> str:
-    if (
-        ALPHA_2D_ENABLE
-        and str(ALPHA_2D_PROJECTION).lower() == "flat3d"
-        and int(width) > 0
-        and int(height) > 0
-        and not is_sbs_vr_size(int(width), int(height))
-    ):
-        return "3D_alpha"
-    return "FISHEYE_alpha"
-
-
 def _passthrough_virtual_title(path: Path, mode: str, width: int = 0, height: int = 0) -> str:
-    if mode == "alpha":
-        return f"{path.stem}_{_alpha_virtual_suffix(width, height)}_live"
-    return f"{path.stem}{PASSTHROUGH_SUFFIX}_live"
+    return live_passthrough_title(path.stem, mode, width, height)
 
 
 def _passthrough_live_prefix(mode: str) -> str:

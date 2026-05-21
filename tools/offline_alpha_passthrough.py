@@ -26,6 +26,7 @@ from utils.bitrate_estimator import effective_default_bitrate, parse_bitrate, so
 from utils.gpu_runtime_cache import configure_gpu_runtime_cache  # noqa: E402
 from utils.subprocess_hidden import hidden_subprocess_kwargs  # noqa: E402
 from utils.video_metadata import cfr_source_index, probe_color_metadata, probe_timing_metadata, probe_video_metadata, select_backend  # noqa: E402
+from utils.vr_naming import offline_passthrough_stem  # noqa: E402
 from offline.sam3_matanyone2 import (  # noqa: E402
     Sam3TextMasker,
     apply_sam3_stereo_guard,
@@ -126,7 +127,7 @@ def _resolve_video(value: str) -> Path:
 
 
 def _default_out(src: Path) -> Path:
-    return src.with_name(f"{src.stem}_ALPHA_passthrough.mp4")
+    return src.with_name(f"{offline_passthrough_stem(src.stem, 'alpha_passthrough.mp4')}.mp4")
 
 
 def _open_muxer(out: Path, fps: float, src: Path, codec: str):
@@ -1291,7 +1292,7 @@ def main() -> int:
     _patch_tempdir()
     parser = argparse.ArgumentParser(description="Generate an offline DeoVR alpha-packed passthrough MP4 from a source video.")
     parser.add_argument("video", help="video path, absolute or relative to PT_VIDEO_DIR")
-    parser.add_argument("--out", default="", help="output mp4 path; default is source-stem_ALPHA_passthrough.mp4")
+    parser.add_argument("--out", default="", help="output mp4 path; default is source-stem_SBS_F180_alpha.mp4")
     parser.add_argument("--engine", default="rvm", choices=["rvm", "matanyone2_onnx"])
     parser.add_argument("--model", default="", help="model path; RVM defaults to models/rvm_mobilenetv3_fp32.onnx")
     parser.add_argument("--matanyone2-size", type=int, default=512, choices=[512, 1024],
