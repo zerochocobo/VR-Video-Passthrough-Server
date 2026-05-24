@@ -6,6 +6,7 @@ This file only keeps version releases, major bug fixes, major UI/UX updates, and
 
 ### 2026-05-24
 
+- **v0.1.0-beta.5 released.**
 - **Major bug fix:** Fixed a one-GOP live A/V sync offset caused by `+nobuffer` in the raw HEVC-to-MPEG-TS mux path. The default now disables `PT_MUX_NOBUFFER_ENABLE`, avoiding dropped first-GOP video while keeping the diagnostic override available.
 - **Major UI/packaging update:** Added a TensorRT runtime library download flow for packaged Windows builds. The TensorRT dialog can detect missing runtime DLLs, offer automatic or manual NVIDIA wheel download, verify the wheel hash, extract only required DLLs, and show progress even when `Content-Length` is unavailable.
 - **Major core/UI update:** Added offline TensorRT cache support for MatAnyone2 `step_update`, separated RVM and MatAnyone2 TensorRT manifests/cache directories, added offline-only TensorRT switches for single and batch conversion, and removed the RVM balanced option from the offline UI.
@@ -146,6 +147,7 @@ This file only keeps version releases, major bug fixes, major UI/UX updates, and
 
 ### 2026-05-24
 
+- **v0.1.0-beta.5 发布。**
 - **重大 BUG 修复：** 修复 raw HEVC 到 MPEG-TS mux 路径中 `+nobuffer` 导致首个 GOP 视频被丢弃、进而产生约一个 GOP A/V 偏移的问题。默认关闭 `PT_MUX_NOBUFFER_ENABLE`，同时保留诊断覆盖开关。
 - **重大 UI/打包更新：** 为 Windows 打包版新增 TensorRT 运行库下载流程。TensorRT 对话框可检测缺失运行时 DLL，提供自动/手动下载 NVIDIA wheel，校验哈希，仅解压所需 DLL，并在缺少 `Content-Length` 时仍显示进度。
 - **重大内核/UI 更新：** 新增 MatAnyone2 `step_update` 离线 TensorRT cache 支持，分离 RVM 与 MatAnyone2 的 TensorRT manifest/cache 目录，增加单文件/批量离线专用 TensorRT 开关，并从离线 UI 移除 RVM 均衡选项。
