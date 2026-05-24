@@ -13,6 +13,11 @@ This file only keeps version releases, major bug fixes, major UI/UX updates, and
 - **Major UI/core update:** Updated light matching defaults to daylight, softened the warm preset, and refreshed Home-page TensorRT/FPS labels and help text. Realtime FPS defaults returned to 30 FPS, while the `Same as source` option remains available.
 - **Major DLNA compatibility update:** Updated VR naming for 4XVR compatibility from `_LR_180` to `_LR_180_SBS`, preserved legacy generated-output detection, and added invisible ObjectID versioning so DLNA clients such as SKYBOX refresh cached virtual names.
 - **Major logging fix:** Added a targeted uvicorn socket-send noise filter that suppresses repeated `socket.send() raised exception` messages while keeping other uvicorn warnings and errors.
+- **Major packaging/UI fix:** Hid transient Windows console windows from packaged startup, server start/stop, offline conversion, TensorRT cache build, and runtime probe processes while preserving streamed logs.
+- **Major bug fix:** Hardened offline conversion child-process output forwarding so cold CUDA/ONNX/TensorRT startup no longer appears to stop silently, and conversion logs now show both child and UI-level exit status.
+- **Major compatibility fix:** Hardened ffprobe JSON handling on Windows by decoding JSON output as UTF-8 bytes instead of locale text, improving reliability for Chinese/Japanese paths and metadata.
+- **Major TensorRT fix:** TensorRT runtime installation no longer overwrites already-loaded DLLs, and TensorRT build errors such as missing ONNX models now stay visible instead of flashing away.
+- **Major runtime fix:** Improved UI process lifecycle handling, safer forced server stop, startup polling stability, redacted passthrough owner logs, and added retry hints for busy/preempted passthrough requests.
 
 ### 2026-05-23
 
@@ -154,6 +159,11 @@ This file only keeps version releases, major bug fixes, major UI/UX updates, and
 - **重大 UI/内核更新：** 光照匹配默认改为自然日光，暖黄光预设降温并降低饱和度；同步刷新首页 TensorRT/FPS 文案与帮助说明。实时 FPS 默认回到 30 FPS，同时保留“同原视频”选项。
 - **重大 DLNA 兼容性更新：** 为 4XVR 兼容性将自动 VR 命名从 `_LR_180` 调整为 `_LR_180_SBS`，保留旧生成文件识别，并新增不可见 ObjectID 版本号以促使 SKYBOX 等 DLNA 客户端刷新虚拟名称缓存。
 - **重大日志修复：** 新增精确的 uvicorn socket-send 噪声过滤器，只抑制重复的 `socket.send() raised exception`，保留其他 uvicorn 警告和错误。
+- **重大 UI/打包修复：** 隐藏打包版启动、服务启停、离线转换、TensorRT 缓存构建和运行时探测时闪现的 Windows 黑色控制台窗口，同时保留日志输出。
+- **重大 BUG 修复：** 加固离线转换子进程日志转发，冷启动 CUDA/ONNX/TensorRT 时不再表现为静默停止，并在日志中显示子进程和 UI 外层退出状态。
+- **重大兼容性修复：** 加固 Windows 下 ffprobe JSON 读取，改为按 UTF-8 字节解码，提升含中文/日文路径和元数据时的可靠性。
+- **重大 TensorRT 修复：** TensorRT 运行库安装不再覆盖已加载 DLL；TensorRT 构建错误（如 ONNX 模型缺失）会持续显示，不再一闪而过。
+- **重大运行时修复：** 改进 UI 进程生命周期处理、服务强制停止、启动状态轮询稳定性，脱敏透视任务日志，并为繁忙或被抢占的透视请求返回重试提示。
 
 ### 2026-05-23
 
