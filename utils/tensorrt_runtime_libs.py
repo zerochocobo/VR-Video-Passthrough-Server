@@ -121,13 +121,13 @@ def download_tensorrt_wheel(
 
 def extract_required_tensorrt_libs(whl_path: Path, lib_dir: Path | None = None) -> list[Path]:
     status = check_tensorrt_runtime_libs(lib_dir)
-    names = set(STANDARD_TRT_DLLS)
-    if status.sm_dll:
-        names.add(status.sm_dll)
+    names = set(status.missing)
     target_dir = status.lib_dir
     target_dir.mkdir(parents=True, exist_ok=True)
     extracted: list[Path] = []
     found: set[str] = set()
+    if not names:
+        return extracted
     with zipfile.ZipFile(whl_path) as archive:
         for info in archive.infolist():
             name = Path(info.filename).name

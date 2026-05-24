@@ -15,6 +15,7 @@ import onnxruntime as ort
 
 import config
 from offline.decoded_frames import decoded_frame_to_bgr
+from utils.subprocess_hidden import hidden_subprocess_kwargs, run_hidden_streaming
 
 
 @dataclass
@@ -318,7 +319,7 @@ def _probe_keyframe_indices(path: Path, source_fps: float, target: int, output_f
         "-of", "json", str(path),
     ]
     try:
-        data = json.loads(subprocess.check_output(cmd, stderr=subprocess.DEVNULL))
+        data = json.loads(subprocess.check_output(cmd, stderr=subprocess.DEVNULL, **hidden_subprocess_kwargs()))
     except Exception:
         return []
     indices = []
@@ -610,7 +611,7 @@ def precompute_segment_masks_subprocess(args, src: Path, source_fps: float, fps:
     if not bool(getattr(args, "ywes_fail_on_empty", True)):
         cmd += ["--no-ywes-fail-on-empty"]
     print("[offline] YOLO-World+EfficientSAM prepass subprocess=" + subprocess.list2cmdline(cmd))
-    subprocess.run(cmd, check=True)
+    run_hidden_streaming(cmd, check=True, exit_label="offline-ywes")
     masks_by_start, starts = read_prepass_result(result_path)
     try:
         result_path.unlink(missing_ok=True)

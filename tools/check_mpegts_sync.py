@@ -9,9 +9,12 @@ from __future__ import annotations
 
 import argparse
 import json
-import subprocess
 import sys
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from utils.ffprobe_json import run_ffprobe_json  # noqa: E402
 
 
 def _ffprobe_json(path: Path) -> dict:
@@ -29,10 +32,7 @@ def _ffprobe_json(path: Path) -> dict:
         "json",
         str(path),
     ]
-    r = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, errors="replace")
-    if r.returncode != 0:
-        raise RuntimeError(r.stderr.strip() or f"ffprobe failed rc={r.returncode}")
-    return json.loads(r.stdout or "{}")
+    return run_ffprobe_json(cmd)
 
 
 def _stream_start(obj: dict, codec_type: str) -> float | None:

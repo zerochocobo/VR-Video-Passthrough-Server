@@ -19,6 +19,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import config  # noqa: E402
+from utils.ffprobe_json import run_ffprobe_json  # noqa: E402
 
 
 def _resolve_video(value: str) -> Path:
@@ -63,10 +64,10 @@ def _ffprobe_packets(path: Path) -> dict:
         "json",
         str(path),
     ]
-    result = _run(cmd, timeout=60.0)
-    if result.returncode != 0:
-        return {"error": result.stderr.strip()}
-    packets = json.loads(result.stdout or "{}").get("packets", [])
+    try:
+        packets = run_ffprobe_json(cmd, timeout=60.0).get("packets", [])
+    except RuntimeError as exc:
+        return {"error": str(exc).strip()}
     dts_values: list[float] = []
     pts_values: list[float] = []
     regressions = 0

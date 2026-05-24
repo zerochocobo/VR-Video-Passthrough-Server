@@ -41,6 +41,7 @@ from config import (
 )
 from utils.cache_key import stat_key
 from utils.logger import get
+from utils.subprocess_hidden import hidden_subprocess_kwargs
 
 log = get("ffmpeg")
 
@@ -65,7 +66,7 @@ def probe(path: Path) -> VideoInfo:
         "-show_entries", "stream=codec_name,pix_fmt,width,height,r_frame_rate:format=duration",
         "-of", "json", str(path),
     ]
-    out = subprocess.check_output(cmd)
+    out = subprocess.check_output(cmd, stderr=subprocess.DEVNULL, **hidden_subprocess_kwargs())
     j = json.loads(out)
     s = j["streams"][0]
     num, den = s["r_frame_rate"].split("/")
@@ -112,6 +113,7 @@ class DecoderProcess:
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             bufsize=0,
+            **hidden_subprocess_kwargs(),
         )
         # Probe the post-filter output size because scaling/fps filters can
         # change the byte layout consumed by the caller.
@@ -305,7 +307,7 @@ class DecoderProcess:
             r = subprocess.run(
                 probe_cmd,
                 capture_output=True,
-                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                **hidden_subprocess_kwargs(),
             )
             if r.returncode == 0:
                 if s.name != (FFMPEG_HWACCEL or "auto").strip().lower():
@@ -461,6 +463,7 @@ class EncoderProcess:
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             bufsize=0,
+            **hidden_subprocess_kwargs(),
         )
 
     def write_frame(self, frame_bgr) -> bool:

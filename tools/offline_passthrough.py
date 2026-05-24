@@ -25,7 +25,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import config  # noqa: E402
 from utils.bitrate_estimator import effective_default_bitrate, parse_bitrate, source_video_bitrate  # noqa: E402
 from utils.gpu_runtime_cache import configure_gpu_runtime_cache  # noqa: E402
-from utils.subprocess_hidden import hidden_subprocess_kwargs  # noqa: E402
+from utils.subprocess_hidden import hidden_subprocess_kwargs, run_hidden_streaming  # noqa: E402
 from utils.trt_manifest import (  # noqa: E402
     MATANYONE2_TRT_ONNX_NAME,
     TRT_MODEL_MATANYONE2,
@@ -215,7 +215,13 @@ def _open_muxer(out: Path, fps: float, src: Path, codec: str):
         "mp4",
         str(out),
     ]
-    return cmd, subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    return cmd, subprocess.Popen(
+        cmd,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        **hidden_subprocess_kwargs(),
+    )
 
 
 def _extract_audio_sidecar(src: Path, out: Path, audio: str, start_sec: float = 0.0, duration: float = 0.0) -> tuple[list[str], subprocess.CompletedProcess, Path]:
@@ -248,7 +254,14 @@ def _extract_audio_sidecar(src: Path, out: Path, audio: str, start_sec: float = 
         "adts",
         str(audio_path),
     ]
-    return cmd, subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, errors="replace"), audio_path
+    return cmd, subprocess.run(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        errors="replace",
+        **hidden_subprocess_kwargs(),
+    ), audio_path
 
 
 def _mux_audio_sidecar_after(video_only: Path, out: Path, audio_path: Path, src: Path, duration: float = 0.0) -> tuple[list[str], subprocess.CompletedProcess]:
@@ -283,7 +296,14 @@ def _mux_audio_sidecar_after(video_only: Path, out: Path, audio_path: Path, src:
         "+faststart",
         str(out),
     ]
-    return cmd, subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, errors="replace")
+    return cmd, subprocess.run(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        errors="replace",
+        **hidden_subprocess_kwargs(),
+    )
 
 
 def _ffprobe(path: Path) -> str:
@@ -299,7 +319,14 @@ def _ffprobe(path: Path) -> str:
         "default=nw=1",
         str(path),
     ]
-    p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, errors="replace")
+    p = subprocess.run(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        errors="replace",
+        **hidden_subprocess_kwargs(),
+    )
     return (p.stdout + p.stderr).strip()
 
 
@@ -321,7 +348,7 @@ def _probe_keyframe_indices(path: Path, source_fps: float, target: int, output_f
         str(path),
     ]
     try:
-        data = json.loads(subprocess.check_output(cmd, stderr=subprocess.DEVNULL))
+        data = json.loads(subprocess.check_output(cmd, stderr=subprocess.DEVNULL, **hidden_subprocess_kwargs()))
     except Exception:
         return []
     indices = []
@@ -1342,7 +1369,7 @@ def _precompute_sam3_segment_masks_subprocess(args, src: Path, source_fps: float
     if args.sam3_cut_every_active_sample:
         cmd += ["--sam3-cut-every-active-sample"]
     print("[offline] SAM3 prepass subprocess=" + subprocess.list2cmdline(cmd))
-    subprocess.run(cmd, check=True)
+    run_hidden_streaming(cmd, check=True, exit_label="offline-sam3")
     data = np.load(result_path, allow_pickle=False)
     starts = [int(x) for x in data["segment_starts"].tolist()]
     active_starts = [int(x) for x in data["active_starts"].tolist()]

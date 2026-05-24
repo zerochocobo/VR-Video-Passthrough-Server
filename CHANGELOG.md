@@ -4,6 +4,42 @@ This file only keeps version releases, major bug fixes, major UI/UX updates, and
 
 ## English
 
+### 2026-05-24
+
+- **Major bug fix:** Fixed a one-GOP live A/V sync offset caused by `+nobuffer` in the raw HEVC-to-MPEG-TS mux path. The default now disables `PT_MUX_NOBUFFER_ENABLE`, avoiding dropped first-GOP video while keeping the diagnostic override available.
+- **Major UI/packaging update:** Added a TensorRT runtime library download flow for packaged Windows builds. The TensorRT dialog can detect missing runtime DLLs, offer automatic or manual NVIDIA wheel download, verify the wheel hash, extract only required DLLs, and show progress even when `Content-Length` is unavailable.
+- **Major core/UI update:** Added offline TensorRT cache support for MatAnyone2 `step_update`, separated RVM and MatAnyone2 TensorRT manifests/cache directories, added offline-only TensorRT switches for single and batch conversion, and removed the RVM balanced option from the offline UI.
+- **Major UI/core update:** Updated light matching defaults to daylight, softened the warm preset, and refreshed Home-page TensorRT/FPS labels and help text. Realtime FPS defaults returned to 30 FPS, while the `Same as source` option remains available.
+- **Major DLNA compatibility update:** Updated VR naming for 4XVR compatibility from `_LR_180` to `_LR_180_SBS`, preserved legacy generated-output detection, and added invisible ObjectID versioning so DLNA clients such as SKYBOX refresh cached virtual names.
+- **Major logging fix:** Added a targeted uvicorn socket-send noise filter that suppresses repeated `socket.send() raised exception` messages while keeping other uvicorn warnings and errors.
+
+### 2026-05-23
+
+- **Major performance/core update:** Added Track A first-chunk latency diagnostics and startup warmups, including mux timing marks, CuPy composite/alpha warmup, NVENC startup preflight, and validated low-latency mux defaults for the pipe-TS path.
+- **Major bug fix:** Resolved the nPlayer audio-only regression by removing `hevc_metadata=aud=insert` from the pipe-TS video-stage bitstream filter when `setts` timestamps are applied. Strict players now receive usable HEVC codec parameters and enter video playback mode.
+- **Major bug fix:** Fixed the FastAPI startup deprecation warning by moving runtime startup registration to a lifespan-based `create_app(startup_hook=...)` flow.
+- **Major A/V sync update:** Reduced slate startup A/V skew by limiting immediate slate burst frames, pacing subsequent slate frames, and adding slate and MPEG-TS sync validation tools.
+- **Major A/V sync investigation/update:** Added live MPEG-TS capture, audio-content alignment, and video-content alignment tools. Reworked the default live path to avoid slate/cache startup skew, use source audio directly when the AAC cache is disabled, and disable generated video slate by default for real-device A/B testing.
+- **Major UI/runtime update:** Migrated Home-page realtime output FPS handling toward source-cadence testing, added source-FPS pacing, and documented that remaining subjective A/V issues may be client playback behavior when server-side captures are objectively aligned.
+
+### 2026-05-22
+
+- **Major performance/core update:** Improved TensorRT cold-start warmup by warming the process-global `Matter` singleton, preloading static TensorRT sessions for warmup shapes, resetting recurrent state after warmup, and separating startup warmup control from global matting config mutation.
+- **Major performance/core update:** Added composite/alpha CuPy warmup and NVENC startup preflight so first-playback latency no longer pays common kernel JIT or encoder initialization costs.
+- **Major core update:** Enabled offline RVM fast mode to use ready TensorRT caches, while forcing CUDA/CPU providers for unsupported offline engines and adding clearer TensorRT provider diagnostics.
+- **Major bug fix:** Fixed offline TensorRT disable behavior so UI-launched child processes no longer inherit stale TensorRT provider settings, and failed static TensorRT activation no longer retries and floods logs every frame.
+- **Major performance bug fix:** Fixed offline alpha RVM throughput by adding the missing CUDA stream synchronization before NVENC encode. Offline alpha throughput on the 8K test path rose from about 36 FPS to about 75 FPS.
+- **Major bug fix:** Fixed misleading live headers for FPS-capped sources by advertising the actual effective stream FPS instead of the configured cap when the source FPS is lower.
+- **Major bug fix:** Reduced shutdown noise in live audio-cache cleanup by avoiding premature pipe closing during interrupted `communicate()` calls and logging interrupted slate cache builds as expected cleanup.
+
+### 2026-05-21
+
+- **Major DLNA/offline naming update:** Centralized VR/player filename handling in `utils.vr_naming` and reused it across DLNA titles, offline default output names, and generated-output detection.
+- **Major compatibility update:** Updated generated 2:1 half-equirectangular naming from `_SBS_180` to `_LR_180`, and alpha naming to `_LR_180_FISHEYE_F180_alpha` for broader player compatibility, including HereSphere.
+- **Major DLNA update:** Bumped the DIDL schema version and refreshed live/raw naming rules so generated green and alpha entries use player-compatible markers while preserving original playback URLs.
+- **Major offline update:** Updated RVM and alpha offline output defaults to use the new VR naming rules while keeping legacy generated-output suffixes detectable.
+- **Major bug fix:** Cleaned up audio-cache interruption handling to avoid misleading `ValueError: I/O operation on closed file` reader-thread tracebacks during stream shutdown.
+
 ### 2026-05-20
 
 
@@ -107,6 +143,42 @@ This file only keeps version releases, major bug fixes, major UI/UX updates, and
 - **Major core update:** Added initial DLNA time-seek metadata, passthrough HEAD support, and `PT_CONTAINER` support for MP4 and MPEG-TS passthrough output.
 
 ## 中文
+
+### 2026-05-24
+
+- **重大 BUG 修复：** 修复 raw HEVC 到 MPEG-TS mux 路径中 `+nobuffer` 导致首个 GOP 视频被丢弃、进而产生约一个 GOP A/V 偏移的问题。默认关闭 `PT_MUX_NOBUFFER_ENABLE`，同时保留诊断覆盖开关。
+- **重大 UI/打包更新：** 为 Windows 打包版新增 TensorRT 运行库下载流程。TensorRT 对话框可检测缺失运行时 DLL，提供自动/手动下载 NVIDIA wheel，校验哈希，仅解压所需 DLL，并在缺少 `Content-Length` 时仍显示进度。
+- **重大内核/UI 更新：** 新增 MatAnyone2 `step_update` 离线 TensorRT cache 支持，分离 RVM 与 MatAnyone2 的 TensorRT manifest/cache 目录，增加单文件/批量离线专用 TensorRT 开关，并从离线 UI 移除 RVM 均衡选项。
+- **重大 UI/内核更新：** 光照匹配默认改为自然日光，暖黄光预设降温并降低饱和度；同步刷新首页 TensorRT/FPS 文案与帮助说明。实时 FPS 默认回到 30 FPS，同时保留“同原视频”选项。
+- **重大 DLNA 兼容性更新：** 为 4XVR 兼容性将自动 VR 命名从 `_LR_180` 调整为 `_LR_180_SBS`，保留旧生成文件识别，并新增不可见 ObjectID 版本号以促使 SKYBOX 等 DLNA 客户端刷新虚拟名称缓存。
+- **重大日志修复：** 新增精确的 uvicorn socket-send 噪声过滤器，只抑制重复的 `socket.send() raised exception`，保留其他 uvicorn 警告和错误。
+
+### 2026-05-23
+
+- **重大性能/内核更新：** 新增 Track A 首包延迟诊断和启动 warmup，包括 mux 时间标记、CuPy composite/alpha warmup、NVENC 启动预检，以及 pipe-TS 路径验证后的低延迟 mux 默认值。
+- **重大 BUG 修复：** 修复 nPlayer 进入 audio-only 模式的回归问题：在 pipe-TS 视频阶段应用 `setts` 时间戳时移除 `hevc_metadata=aud=insert`，使严格播放器能拿到可用 HEVC codec 参数并进入视频播放。
+- **重大 BUG 修复：** 将 FastAPI 启动注册迁移到基于 lifespan 的 `create_app(startup_hook=...)`，修复 `on_event` 弃用警告。
+- **重大 A/V 同步更新：** 通过限制 slate 初始突发帧并对后续 slate 帧按 wallclock pacing，降低启动 slate A/V 偏移；同时新增 slate 和 MPEG-TS 同步验证工具。
+- **重大 A/V 同步调查/更新：** 新增 live MPEG-TS capture、音频内容对齐和视频内容对齐工具；调整默认 live 路径以避开 slate/cache 启动偏移，在禁用 AAC cache 时直接使用源音频，并默认关闭生成的视频 slate 供真机 A/B 测试。
+- **重大 UI/运行时更新：** 调整首页实时输出 FPS 处理以支持源帧率测试，增加源帧率 pacing，并记录当服务器侧 capture 已客观对齐时，剩余主观 A/V 问题可能来自客户端播放行为。
+
+### 2026-05-22
+
+- **重大性能/内核更新：** 改进 TensorRT 冷启动 warmup：启动阶段预热进程全局 `Matter` singleton，预加载 warmup shape 的 static TensorRT session，warmup 后重置循环状态，并将启动 warmup 控制从全局 matting 配置变更中剥离。
+- **重大性能/内核更新：** 新增 composite/alpha CuPy warmup 和 NVENC 启动预检，降低首次播放承担 kernel JIT 或编码器初始化成本的概率。
+- **重大内核更新：** 离线 RVM fast 模式可在 cache ready 时使用 TensorRT；不支持的离线引擎强制使用 CUDA/CPU provider，并增加更清晰的 TensorRT provider 诊断输出。
+- **重大 BUG 修复：** 修复 UI 启动的子进程在关闭 TensorRT 后仍可能继承旧 provider 环境的问题；static TensorRT 激活失败后也不再逐帧重试并刷屏日志。
+- **重大性能 BUG 修复：** 修复离线 alpha RVM 在 NVENC 编码前缺少 CUDA stream 同步导致的吞吐问题。8K 测试路径离线 alpha 从约 36 FPS 提升到约 75 FPS。
+- **重大 BUG 修复：** 修复实时 FPS cap 下响应头误报帧率的问题；当源视频帧率低于配置 cap 时，live header 现在使用实际有效输出 FPS。
+- **重大 BUG 修复：** 改进 live 音频 cache 清理逻辑，避免中断 `communicate()` 时过早关闭 pipe 导致噪声 traceback，并将被中断的 slate cache 构建作为正常清理记录。
+
+### 2026-05-21
+
+- **重大 DLNA/离线命名更新：** 将 VR/player 文件名处理集中到 `utils.vr_naming`，并统一用于 DLNA 标题、离线默认输出名和生成文件识别。
+- **重大兼容性更新：** 将自动生成的 2:1 half-equirectangular 命名从 `_SBS_180` 调整为 `_LR_180`，并将 alpha 命名调整为 `_LR_180_FISHEYE_F180_alpha`，提升包括 HereSphere 在内的播放器兼容性。
+- **重大 DLNA 更新：** 提升 DIDL schema 版本并刷新 live/raw 命名规则，使生成的绿幕和 alpha 入口使用更兼容播放器的标记，同时保持播放 URL 不变。
+- **重大离线更新：** RVM 与 alpha 离线默认输出名改用新的 VR 命名规则，同时继续识别旧版生成文件后缀。
+- **重大 BUG 修复：** 改进音频 cache 中断清理，避免 stream 关闭时出现误导性的 `ValueError: I/O operation on closed file` reader-thread traceback。
 
 ### 2026-05-20
 

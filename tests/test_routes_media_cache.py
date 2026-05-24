@@ -64,18 +64,36 @@ class LiveQueueTests(unittest.TestCase):
 
 
 class LiveProfileTests(unittest.TestCase):
-    def test_quest_dalvik_uses_managed_live_profile(self) -> None:
+    def test_quest_dalvik_uses_4xvr_live_profile(self) -> None:
         ua = "Dalvik/2.1.0 (Linux; U; Android 14; Quest 3 Build/UP1A.231005.007.A1)"
-        self.assertEqual(routes_media._live_response_profile(ua), "quest_dalvik")
+        self.assertEqual(routes_media._live_response_profile(ua), "4xvr")
 
     def test_known_profiles_still_win(self) -> None:
         self.assertEqual(routes_media._live_response_profile("nPlayer/3.12"), "nplayer")
         self.assertEqual(routes_media._live_response_profile("libmpv Android"), "libmpv")
         self.assertEqual(routes_media._live_response_profile("VLC/3.0"), "vlc")
 
-    def test_quest_dalvik_live_owner_can_preempt_same_device(self) -> None:
-        owner = ("live", "192.168.31.112", "quest_dalvik")
+    def test_4xvr_live_owner_can_preempt_same_device(self) -> None:
+        owner = ("live", "192.168.31.112", "4xvr")
         self.assertTrue(routes_media._can_preempt_owner(owner, owner))
+
+    def test_owner_log_value_hides_local_path_and_client_ip(self) -> None:
+        owner = (r"G:\VR\private_movie.mp4", "192.168.31.112")
+        text = str(routes_media._owner_log_value(owner))
+
+        self.assertIn("private_movie.mp4", text)
+        self.assertIn("client-", text)
+        self.assertNotIn(r"G:\VR", text)
+        self.assertNotIn("192.168.31.112", text)
+
+    def test_live_owner_log_value_hides_client_ip(self) -> None:
+        owner = ("live", "192.168.31.112", "vlc")
+        text = str(routes_media._owner_log_value(owner))
+
+        self.assertIn("live", text)
+        self.assertIn("vlc", text)
+        self.assertIn("client-", text)
+        self.assertNotIn("192.168.31.112", text)
 
 
 class LiveSupportTests(unittest.TestCase):

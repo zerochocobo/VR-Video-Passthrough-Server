@@ -10,7 +10,6 @@ from __future__ import annotations
 import json
 import os
 import shutil
-import subprocess
 import tempfile
 import time
 from contextlib import contextmanager
@@ -22,6 +21,7 @@ from typing import Any
 import config
 from config import PASSTHROUGH_BITRATE, PASSTHROUGH_HEVC_BITRATE, PASSTHROUGH_MAX_FPS
 from utils.cache_key import stat_key
+from utils.ffprobe_json import run_ffprobe_json
 
 CACHE_PATH = config.BITRATE_ESTIMATES
 LOCK_PATH = CACHE_PATH.with_suffix(CACHE_PATH.suffix + ".lock")
@@ -75,10 +75,7 @@ def source_video_bitrate(path: Path) -> int | None:
         str(path),
     ]
     try:
-        p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, errors="replace")
-        if p.returncode != 0:
-            return None
-        data = json.loads(p.stdout or "{}")
+        data = run_ffprobe_json(cmd)
     except Exception:
         return None
     for stream in data.get("streams") or []:

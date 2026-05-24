@@ -19,7 +19,7 @@ if __package__ in (None, ""):
 
 import config
 from utils.gpu_requirements import detect_nvidia_gpu_requirement, unsupported_gpu_message
-from utils.subprocess_hidden import hidden_subprocess_kwargs
+from utils.subprocess_hidden import hidden_subprocess_kwargs, run_hidden_streaming
 from utils.trt_manifest import TRT_MODEL_MATANYONE2, TRT_MODEL_RVM, TRT_PROVIDER_CHAIN, cache_status
 from utils.video_metadata import probe_video_metadata, select_backend
 from utils.vr_naming import offline_passthrough_stem
@@ -66,6 +66,8 @@ def _env_flag_enabled(env: dict[str, str], key: str, default: bool = True) -> bo
 def _offline_child_env(args: argparse.Namespace, base_env: dict[str, str] | None = None) -> dict[str, str]:
     env = dict(os.environ if base_env is None else base_env)
     env["PYTHONUNBUFFERED"] = "1"
+    env["PYTHONUTF8"] = "1"
+    env["PYTHONIOENCODING"] = "utf-8:replace"
     provider_text = env.get("PT_ONNX_PROVIDERS", "")
     wants_trt = "TensorrtExecutionProvider" in [p.strip() for p in provider_text.split(",") if p.strip()]
     if getattr(args, "engine", "") == "rvm_fast" and _env_flag_enabled(env, "PT_OFFLINE_RVM_TRT_ENABLE"):
@@ -273,7 +275,7 @@ def _run_one(args: argparse.Namespace, src: Path) -> int:
         f"offline_matanyone2_trt={env.get('PT_OFFLINE_MATANYONE2_TRT', '0')}",
         flush=True,
     )
-    return subprocess.run(cmd, env=env).returncode
+    return run_hidden_streaming(cmd, cwd=ROOT, env=env, exit_label="offline")
 
 
 def _gpu_vram_gb() -> float:

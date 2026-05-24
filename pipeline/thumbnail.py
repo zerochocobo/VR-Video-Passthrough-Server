@@ -18,6 +18,7 @@ from config import RUNTIME_CACHE_DIR, THUMB_FFMPEG_TIMEOUT_SEC
 from pipeline.ffmpeg_io import FFMPEG, probe_cached
 from utils.cache_key import fingerprint
 from utils.logger import get
+from utils.subprocess_hidden import hidden_subprocess_kwargs
 
 log = get("thumb")
 
@@ -70,7 +71,7 @@ def _extract_frame(src: Path, seek_sec: float) -> np.ndarray | None:
             cmd,
             capture_output=True,
             timeout=THUMB_FFMPEG_TIMEOUT_SEC,
-            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            **hidden_subprocess_kwargs(),
         )
     except subprocess.TimeoutExpired:
         log.warning("ffmpeg thumb extract timed out after %.1fs: %s", THUMB_FFMPEG_TIMEOUT_SEC, src)

@@ -328,6 +328,32 @@ class ContentDirectoryModeTests(unittest.TestCase):
         self.assertNotIn("bitrate=", didl)
         self.assertIn('resolution="3840x2160"', didl)
 
+    def test_didl_res_url_escapes_query_ampersands(self) -> None:
+        didl = cds._didl_for(
+            [
+                {
+                    "id": "lg_movie.mp4",
+                    "parent_id": "0",
+                    "title": "movie",
+                    "url": "http://127.0.0.1:8200/passthrough_live/movie.mp4?t=0&mode=green&ptv=7",
+                    "thumb": "http://127.0.0.1:8200/thumb/movie.mp4",
+                    "size": 0,
+                    "duration": 60.0,
+                    "resolution": "3840x2160",
+                    "bitrate": 20_000_000,
+                    "mime": "video/MP2T",
+                    "dlna_pn": "HEVC_TS_NA_ISO",
+                    "frame_rate": None,
+                    "passthrough": True,
+                    "protocol_info": "http-get:*:video/MP2T:DLNA.ORG_PN=HEVC_TS_NA_ISO;DLNA.ORG_OP=00",
+                    "subtitles": [],
+                }
+            ]
+        )
+
+        self.assertIn("?t=0&amp;mode=green&amp;ptv=7", didl)
+        self.assertNotIn("?t=0&mode=green&ptv=7", didl)
+
     def test_multi_root_items_are_virtual_folders(self) -> None:
         roots = build_media_roots([Path(r"D:\VR"), Path(r"E:\VR")])
         library = MediaLibrary(roots)

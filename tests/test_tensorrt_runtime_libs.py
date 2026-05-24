@@ -43,6 +43,26 @@ class TensorRTRuntimeLibTests(unittest.TestCase):
             self.assertEqual({path.name for path in extracted}, {*trt_libs.STANDARD_TRT_DLLS, "nvinfer_builder_resource_sm120_10.dll"})
             self.assertFalse((target / "nvinfer_builder_resource_sm75_10.dll").exists())
 
+    def test_extract_only_installs_missing_libs(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            whl = root / "trt.whl"
+            target = root / "installed"
+            target.mkdir()
+            for name in trt_libs.STANDARD_TRT_DLLS:
+                (target / name).write_bytes(f"existing:{name}".encode("utf-8"))
+            with zipfile.ZipFile(whl, "w") as archive:
+                for name in (*trt_libs.STANDARD_TRT_DLLS, "nvinfer_builder_resource_sm120_10.dll"):
+                    archive.writestr(f"tensorrt_libs/{name}", f"wheel:{name}".encode("utf-8"))
+
+            gpu = GpuRequirementResult(True, True, name="GPU", compute_capability="12.0")
+            with patch.object(trt_libs, "detect_nvidia_gpu_requirement", return_value=gpu):
+                extracted = trt_libs.extract_required_tensorrt_libs(whl, target)
+
+            self.assertEqual([path.name for path in extracted], ["nvinfer_builder_resource_sm120_10.dll"])
+            for name in trt_libs.STANDARD_TRT_DLLS:
+                self.assertEqual((target / name).read_bytes(), f"existing:{name}".encode("utf-8"))
+
     def test_frozen_lib_dir_uses_internal(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             exe = Path(raw) / "app.exe"

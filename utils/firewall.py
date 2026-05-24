@@ -16,6 +16,7 @@ from pathlib import Path
 
 from config import HTTP_PORT
 from utils.logger import get
+from utils.subprocess_hidden import hidden_subprocess_kwargs
 
 log = get("firewall")
 
@@ -42,7 +43,7 @@ def _rule_exists(name: str) -> bool:
             ["netsh", "advfirewall", "firewall", "show", "rule", f"name={name}"],
             capture_output=True,
             text=True,
-            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            **hidden_subprocess_kwargs(),
         )
     except FileNotFoundError:
         return False
@@ -60,8 +61,7 @@ def _netsh_add(name: str, proto: str, port: int) -> bool:
         "edge=no",
         "enable=yes",
     ]
-    r = subprocess.run(cmd, capture_output=True, text=True,
-                       creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    r = subprocess.run(cmd, capture_output=True, text=True, **hidden_subprocess_kwargs())
     if r.returncode != 0:
         log.warning("netsh add failed (%s): %s", name, (r.stderr or r.stdout).strip())
         return False
@@ -73,7 +73,7 @@ def _netsh_delete(name: str) -> None:
         ["netsh", "advfirewall", "firewall", "delete", "rule", f"name={name}"],
         capture_output=True,
         text=True,
-        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        **hidden_subprocess_kwargs(),
     )
 
 

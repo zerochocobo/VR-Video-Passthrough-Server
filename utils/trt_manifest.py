@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Literal
 
 import config
+from utils.subprocess_hidden import hidden_subprocess_kwargs
 
 CacheStatus = Literal["missing", "ready", "stale", "failed"]
 
@@ -196,6 +197,7 @@ def _nvidia_smi_info() -> dict[str, str]:
             text=True,
             timeout=3,
             check=False,
+            **hidden_subprocess_kwargs(),
         )
     except Exception:
         return {"gpu_uuid": "unknown", "gpu_name": "unknown", "driver_version": "unknown"}

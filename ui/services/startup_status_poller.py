@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import json
 import threading
+import time
 from typing import Any
 from urllib.error import URLError
 from urllib.request import urlopen
@@ -50,24 +51,28 @@ class StartupStatusPoller(QObject):
     # Private signals used to marshal worker-thread results back to the Qt
     # main thread. Queued by Qt automatically because emitter and receiver
     # live in different threads.
-    _gotResponse = Signal(bytes)
-    _gotError = Signal(str)
+    _gotResponse = Signal(int, bytes)
+    _gotError = Signal(int, str)
 
     def __init__(
         self,
         port: int = DEFAULT_PORT,
         interval_ms: int = 500,
         timeout_sec: float = 1.0,
+        max_duration_sec: float = 300.0,
         parent: QObject | None = None,
     ) -> None:
         super().__init__(parent)
         self.port = int(port)
         self.timeout_sec = float(timeout_sec)
+        self.max_duration_sec = float(max_duration_sec)
         self._timer = QTimer(self)
         self._timer.setInterval(int(interval_ms))
         self._timer.timeout.connect(self._tick)
         self._running = False
         self._last_phase = ""
+        self._generation = 0
+        self._started_at = 0.0
         # True while a worker thread is in flight. Skips re-issuing a request
         # if the previous one has not returned yet, so a hanging endpoint
         # cannot pile up dozens of pending threads.
@@ -81,6 +86,8 @@ class StartupStatusPoller(QObject):
         self._running = True
         self._last_phase = ""
         self._inflight = False
+        self._generation += 1
+        self._started_at = time.monotonic()
         # First tick immediately so the UI does not wait one interval to react.
         self._tick()
         self._timer.start()
@@ -90,6 +97,7 @@ class StartupStatusPoller(QObject):
             return
         self._running = False
         self._timer.stop()
+        self._generation += 1
 
     def is_running(self) -> bool:
         return self._running
@@ -97,40 +105,50 @@ class StartupStatusPoller(QObject):
     def _tick(self) -> None:
         if not self._running:
             return
+        if self.max_duration_sec > 0 and self._started_at > 0:
+            elapsed = time.monotonic() - self._started_at
+            if elapsed >= self.max_duration_sec:
+                self._finish_timeout(elapsed)
+                return
         if self._inflight:
             # Previous request has not returned yet. Skip this slot to avoid
             # piling up worker threads against a hanging endpoint.
             return
         self._inflight = True
         url = f"http://127.0.0.1:{self.port}/status"
+        generation = self._generation
         worker = threading.Thread(
             target=self._fetch_worker,
             name="startup-status-poll",
-            args=(url, self.timeout_sec),
+            args=(generation, url, self.timeout_sec),
             daemon=True,
         )
         worker.start()
 
-    def _fetch_worker(self, url: str, timeout: float) -> None:
+    def _fetch_worker(self, generation: int, url: str, timeout: float) -> None:
         """Run in a daemon thread. Must never touch Qt widgets directly."""
         try:
             with urlopen(url, timeout=timeout) as resp:
                 raw = resp.read()
         except URLError as e:
-            self._gotError.emit(f"unreachable: {e.reason}")
+            self._gotError.emit(generation, f"unreachable: {e.reason}")
             return
         except Exception as e:  # pragma: no cover - defensive
-            self._gotError.emit(f"poll failed: {e}")
+            self._gotError.emit(generation, f"poll failed: {e}")
             return
-        self._gotResponse.emit(raw)
+        self._gotResponse.emit(generation, raw)
 
-    def _handle_error(self, message: str) -> None:
+    def _handle_error(self, generation: int, message: str) -> None:
+        if generation != self._generation:
+            return
         self._inflight = False
         if not self._running:
             return
         self.error.emit(message)
 
-    def _handle_response(self, raw: bytes) -> None:
+    def _handle_response(self, generation: int, raw: bytes) -> None:
+        if generation != self._generation:
+            return
         self._inflight = False
         if not self._running:
             return
@@ -146,3 +164,17 @@ class StartupStatusPoller(QObject):
             self._last_phase = phase
             self.stop()
             self.finished.emit(phase)
+
+    def _finish_timeout(self, elapsed: float) -> None:
+        if not self._running:
+            return
+        data = {
+            "phase": "failed",
+            "message": "startup status polling timed out",
+            "detail": f"no terminal startup status after {elapsed:.1f}s",
+            "reason": "startup_status_timeout",
+            "elapsed_sec": elapsed,
+        }
+        self.updated.emit(data)
+        self.stop()
+        self.finished.emit("failed")

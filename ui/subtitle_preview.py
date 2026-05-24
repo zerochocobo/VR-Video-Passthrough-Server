@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 import math
 import os
 import subprocess
@@ -8,22 +7,12 @@ import tempfile
 from pathlib import Path
 
 from PIL import Image
+from utils.ffprobe_json import run_ffprobe_json
+from utils.subprocess_hidden import hidden_subprocess_kwargs
 
 IPD_METERS = 0.063
 MAX_PREVIEW_WIDTH = 4096
 DEFAULT_PREVIEW_TEXT_LINES = ["Test Subtitle Test Subtitle"]
-
-
-def _hidden_subprocess_kwargs() -> dict:
-    kwargs = {"creationflags": getattr(subprocess, "CREATE_NO_WINDOW", 0)}
-    try:
-        startupinfo = subprocess.STARTUPINFO()
-        startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
-        startupinfo.wShowWindow = getattr(subprocess, "SW_HIDE", 0)
-        kwargs["startupinfo"] = startupinfo
-    except Exception:
-        pass
-    return kwargs
 
 
 def run_hidden(cmd: list[str]) -> None:
@@ -33,7 +22,7 @@ def run_hidden(cmd: list[str]) -> None:
         stderr=subprocess.PIPE,
         text=True,
         errors="replace",
-        **_hidden_subprocess_kwargs(),
+        **hidden_subprocess_kwargs(),
     )
     if result.returncode != 0:
         detail = (result.stderr or result.stdout or "").strip()
@@ -53,18 +42,7 @@ def get_video_info(video_path: str) -> dict:
         "json",
         video_path,
     ]
-    result = subprocess.run(
-        cmd,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        errors="replace",
-        **_hidden_subprocess_kwargs(),
-    )
-    if result.returncode != 0:
-        detail = (result.stderr or result.stdout or "").strip()
-        raise RuntimeError(detail or "ffprobe failed")
-    data = json.loads(result.stdout or "{}")
+    data = run_ffprobe_json(cmd)
     stream = (data.get("streams") or [{}])[0]
     fmt = data.get("format") or {}
     return {

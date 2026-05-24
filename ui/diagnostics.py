@@ -98,6 +98,7 @@ def _ffbinary_summary(name: str) -> str:
             stderr=subprocess.STDOUT,
             text=True,
             timeout=5,
+            **hidden_subprocess_kwargs(),
         )
     except FileNotFoundError:
         return f"  {name}: (resolved {binary} but exec failed: FileNotFoundError)"
@@ -122,6 +123,7 @@ def _ffmpeg_nvenc_summary() -> str:
             stderr=subprocess.STDOUT,
             text=True,
             timeout=5,
+            **hidden_subprocess_kwargs(),
         )
     except Exception as e:
         return f"  nvenc_encoders: (probe failed: {e})"

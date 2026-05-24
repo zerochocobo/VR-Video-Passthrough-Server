@@ -32,6 +32,7 @@ from utils.startup_status import get_startup_state, set_startup_phase
 from utils.cache_key import fingerprint, stat_key
 from utils.bitrate_estimator import effective_default_bitrate
 from utils.runtime_settings import get_light_match
+from utils.subprocess_hidden import hidden_subprocess_kwargs
 from utils.video_metadata import VideoProbeMetadata, cfr_source_index, probe_color_metadata, probe_timing_metadata
 
 log = get("pynv_stream")
@@ -742,6 +743,7 @@ class PyNvPassthroughStream:
                 stderr=subprocess.PIPE,
                 text=True,
                 errors="replace",
+                **hidden_subprocess_kwargs(),
             ))
             interrupted = False
             last_progress_log = started
@@ -886,6 +888,7 @@ class PyNvPassthroughStream:
                 stderr=subprocess.PIPE,
                 text=True,
                 errors="replace",
+                **hidden_subprocess_kwargs(),
             ))
             interrupted = False
             last_progress_log = started
@@ -1219,6 +1222,7 @@ class PyNvPassthroughStream:
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 bufsize=0,
+                **hidden_subprocess_kwargs(),
             ))
             assert silence_proc.stdout is not None
             log.info("[PYNV][%d] slate audio silence cmd: %s", self.sid, " ".join(silence_cmd))
@@ -1325,6 +1329,7 @@ class PyNvPassthroughStream:
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 bufsize=0,
+                **hidden_subprocess_kwargs(),
             ))
             assert real_proc.stdout is not None
             log.info("[PYNV][%d] %s: %s", self.sid, log_label, " ".join(real_cmd))
@@ -1481,6 +1486,7 @@ class PyNvPassthroughStream:
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             bufsize=0,
+            **hidden_subprocess_kwargs(),
         )
         self._mark_first("T0_video_mux_spawn")
         final_proc = None
@@ -1492,6 +1498,7 @@ class PyNvPassthroughStream:
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 bufsize=0,
+                **hidden_subprocess_kwargs(),
             )
             self._mark_first("T0_mux_spawn")
             video_proc.stdout.close()
@@ -1614,6 +1621,7 @@ class PyNvPassthroughStream:
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             bufsize=0,
+            **hidden_subprocess_kwargs(),
         )
         self._mark_first("T0_video_mux_spawn")
         final_proc = None
@@ -1625,6 +1633,7 @@ class PyNvPassthroughStream:
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 bufsize=0,
+                **hidden_subprocess_kwargs(),
             )
             self._mark_first("T0_mux_spawn")
             video_proc.stdout.close()
@@ -1838,6 +1847,7 @@ class PyNvPassthroughStream:
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             bufsize=0,
+            **hidden_subprocess_kwargs(),
         )
         self._mark_first("T0_mux_spawn")
         return proc

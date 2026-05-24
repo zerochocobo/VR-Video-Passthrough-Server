@@ -1,5 +1,7 @@
 ﻿from __future__ import annotations
 
+import io
+import os
 import shutil
 import sys
 import unittest
@@ -172,6 +174,20 @@ class OfflineConvertTests(unittest.TestCase):
         self.assertNotIn("--input-size", cmd)
         self.assertIn("--alpha-stride", cmd)
         self.assertIn("1", cmd)
+
+    def test_run_hidden_streaming_forwards_output_and_return_code(self) -> None:
+        out = io.StringIO()
+        err = io.StringIO()
+        script = "import sys; print('child-out'); print('child-err', file=sys.stderr); sys.exit(5)"
+        env = dict(os.environ)
+
+        with patch.object(sys, "stdout", out), patch.object(sys, "stderr", err):
+            rc = convert.run_hidden_streaming([sys.executable, "-c", script], env=env, exit_label="offline")
+
+        self.assertEqual(rc, 5)
+        self.assertIn("child-out", out.getvalue())
+        self.assertIn("[offline] child process exited rc=5", out.getvalue())
+        self.assertIn("child-err", err.getvalue())
 
     def test_single_out_dir_uses_default_passthrough_name(self) -> None:
         root = Path("runtime_cache/test_offline_out_dir")

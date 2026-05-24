@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import itertools
 import os
 import re
@@ -489,6 +490,27 @@ def _owner_kind(owner: tuple) -> str:
     return str(owner[2]) if len(owner) >= 3 else ""
 
 
+def _client_log_id(client: object) -> str:
+    text = str(client or "")
+    if not text:
+        return ""
+    digest = hashlib.sha256(text.encode("utf-8", "replace")).hexdigest()[:8]
+    return f"client-{digest}"
+
+
+def _owner_log_value(owner: tuple) -> tuple:
+    if not owner:
+        return owner
+    try:
+        first = str(owner[0])
+        client = _client_log_id(owner[1] if len(owner) >= 2 else "")
+        if first == "live":
+            return ("live", client, *owner[2:])
+        return (Path(first).name or "<path>", client, *owner[2:])
+    except Exception:
+        return ("<owner>",)
+
+
 def _can_preempt_owner(active_owner: tuple, new_owner: tuple) -> bool:
     new_base = _owner_base(new_owner)
     is_live_owner = len(new_base) > 0 and new_base[0] == "live"
@@ -635,7 +657,7 @@ async def _take_active_slot(
                         _active_started.pop(active_stream, None)
                         _active_streams[new_stream] = owner
                         _active_started[new_stream] = asyncio.get_running_loop().time()
-                        log.info("passthrough preempt previous range: %s owner=%s", who, owner)
+                        log.info("passthrough preempt previous range: %s owner=%s", who, _owner_log_value(owner))
                         return active_stream
             active = len(_active_streams)
         if PASSTHROUGH_BUSY_WAIT_SEC <= 0 or asyncio.get_running_loop().time() >= deadline:
@@ -658,7 +680,7 @@ async def _release_active_slot(stream: object) -> None:
         removed = _active_streams.pop(stream, None)
         _active_started.pop(stream, None)
         if removed is not None:
-            log.info("passthrough active slot released: active=%d owner=%s", len(_active_streams), removed)
+            log.info("passthrough active slot released: active=%d owner=%s", len(_active_streams), _owner_log_value(removed))
 
 
 async def _replace_active_slot(old_stream: object, new_stream: object) -> bool:
@@ -1623,7 +1645,7 @@ async def passthrough_live_get(
             stream.close()
             await _clear_live_starting(live_key, live_starting_at)
             log.info("passthrough_live[%d] return 409 preempted before stream", rid)
-            return Response("passthrough live preempted", status_code=409)
+            return Response("passthrough live preempted", status_code=409, headers={"Retry-After": "1"})
     except asyncio.CancelledError:
         await _release_active_slot(slot_token)
         await _clear_live_starting(live_key, live_starting_at)
@@ -1958,7 +1980,7 @@ async def passthrough_live_get(
         await asyncio.to_thread(stream.close)
         await _clear_live_starting(live_key, live_starting_at)
         log.info("passthrough_live[%d] return 409 preempted before live session", rid)
-        return Response("passthrough live preempted", status_code=409)
+        return Response("passthrough live preempted", status_code=409, headers={"Retry-After": "1"})
     await _put_live_session(live_key, session)
     await _clear_live_starting(live_key, live_starting_at)
     session.start(stream_iter)
@@ -2256,7 +2278,7 @@ async def passthrough_get(
         if not await _replace_active_slot(slot_token, stream):
             stream.close()
             log.info("passthrough[%d] return 409 preempted before stream", rid)
-            return Response("passthrough preempted", status_code=409)
+            return Response("passthrough preempted", status_code=409, headers={"Retry-After": "1"})
     except Exception:
         await _release_active_slot(slot_token)
         raise

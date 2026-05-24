@@ -2,13 +2,15 @@ from __future__ import annotations
 
 import threading
 
-from PySide6.QtCore import QObject, QProcess, QProcessEnvironment, Qt, QUrl, Signal
+from PySide6.QtCore import QObject, Qt, QUrl, Signal
 from PySide6.QtGui import QDesktopServices
 from PySide6.QtWidgets import QDialog, QHBoxLayout, QLabel, QProgressBar, QPushButton, QVBoxLayout
 
+from ui.services.hidden_process import HiddenProcess
 from ui.services.process_helpers import base_environment, trt_warmup_command
 from utils.tensorrt_runtime_libs import (
     TENSORRT_CU12_LIBS_WHL_URL,
+    TENSORRT_CU12_LIBS_WHL_SIZE_BYTES,
     check_tensorrt_runtime_libs,
     download_and_install_tensorrt_libs,
 )
@@ -27,7 +29,7 @@ from utils.trt_manifest import (
 
 
 class _TensorRTDownloadSignals(QObject):
-    progress = Signal(int, int)
+    progress = Signal(object, object)
     finished = Signal(bool, str)
 
 
@@ -36,9 +38,10 @@ class TensorRTConfigDialog(QDialog):
         super().__init__(parent)
         self.i18n = i18n
         self.model_key = normalized_model_key(model_key)
-        self.process: QProcess | None = None
+        self.process: HiddenProcess | None = None
         self.download_signals = _TensorRTDownloadSignals(self)
         self.downloading = False
+        self.build_error_text = ""
         self.stage = 0
         self.setModal(True)
         self.setWindowTitle(self.i18n.t("trt.title"))
@@ -47,11 +50,17 @@ class TensorRTConfigDialog(QDialog):
         self.info.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         self.status_label = QLabel()
         self.status_label.setStyleSheet("font-weight: 700;")
+        self.fps_hint_label = QLabel(self.i18n.t("trt.fps_hint"))
+        self.fps_hint_label.setWordWrap(True)
+        self.fps_hint_label.setStyleSheet("color: #1677c7; font-weight: 600;")
         self.progress = QProgressBar()
         self.progress.setRange(0, 3)
         self.progress.setValue(0)
+        self.progress.setTextVisible(True)
         self.progress.setVisible(False)
         self.stage_label = QLabel("")
+        self.stage_label.setWordWrap(True)
+        self.stage_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         self.engines_label = QLabel("")
 
         self.download_button = QPushButton()
@@ -83,11 +92,12 @@ class TensorRTConfigDialog(QDialog):
         layout.setSpacing(10)
         layout.addWidget(self.info)
         layout.addWidget(self.status_label)
+        layout.addWidget(self.fps_hint_label)
         layout.addWidget(self.progress)
         layout.addWidget(self.stage_label)
         layout.addWidget(self.engines_label)
         layout.addLayout(buttons)
-        self.resize(560, 310)
+        self.resize(560, 340)
         self._refresh()
 
     def _status(self) -> str:
@@ -105,7 +115,7 @@ class TensorRTConfigDialog(QDialog):
             return self.i18n.t("trt.description_matanyone2")
         return self.i18n.t("trt.description")
 
-    def _refresh(self) -> None:
+    def _refresh(self, reset_progress: bool = True) -> None:
         libs = check_tensorrt_runtime_libs()
         status = self._status()
         manifest = load_manifest_for_model(self.model_key) or {}
@@ -157,9 +167,11 @@ class TensorRTConfigDialog(QDialog):
             self.status_label.setText(self.i18n.t("trt.runtime_missing"))
         else:
             self.status_label.setText(f"{self.i18n.t('trt.cache_status')}: {self.i18n.t('trt.status_' + status)}")
-        self.progress.setRange(0, 3)
-        self.progress.setVisible(False)
-        self.stage_label.setText(self.i18n.t("trt.download_hint") if libs.frozen and not libs.ready else self._description_text())
+        if reset_progress:
+            self.progress.setRange(0, 3)
+            self.progress.setFormat("%p%")
+            self.progress.setVisible(False)
+            self.stage_label.setText(self.i18n.t("trt.download_hint") if libs.frozen and not libs.ready else self._description_text())
         self.engines_label.setText(self.i18n.t("trt.warning"))
         self.download_button.setText(self.i18n.t("trt.auto_download"))
         self.manual_download_button.setText(self.i18n.t("trt.manual_download"))
@@ -182,6 +194,14 @@ class TensorRTConfigDialog(QDialog):
         if libs.frozen and not libs.ready:
             self._refresh()
             return
+        model_path = source_model_path(self.model_key)
+        if not model_path.is_file():
+            self.build_error_text = "ERROR: " + self.i18n.t("trt.source_model_missing").format(path=model_path)
+            self.progress.setVisible(False)
+            self.stage_label.setText(self.build_error_text)
+            self.engines_label.setText("")
+            return
+        self.build_error_text = ""
         self.stage = 0
         self.progress.setRange(0, 3)
         self.progress.setVisible(True)
@@ -193,14 +213,10 @@ class TensorRTConfigDialog(QDialog):
         self.delete_button.setVisible(False)
         self.cancel_button.setVisible(True)
 
-        process = QProcess(self)
+        process = HiddenProcess(self)
         self.process = process
-        qenv = QProcessEnvironment.systemEnvironment()
-        for key, value in base_environment().items():
-            qenv.insert(key, value)
-        process.setProcessEnvironment(qenv)
-        process.readyReadStandardOutput.connect(self._read_process_output)
-        process.readyReadStandardError.connect(self._read_process_output)
+        process.stdout.connect(self._read_process_output)
+        process.stderr.connect(self._read_process_output)
         process.finished.connect(self._build_finished)
         exe, base_args = trt_warmup_command()
         args = [
@@ -219,7 +235,7 @@ class TensorRTConfigDialog(QDialog):
             str(manifest_path(self.model_key).parent),
             "--progress-stdout",
         ]
-        process.start(exe, args)
+        process.start(exe, args, env=base_environment())
 
     def _manual_download(self) -> None:
         QDesktopServices.openUrl(QUrl(TENSORRT_CU12_LIBS_WHL_URL))
@@ -230,12 +246,14 @@ class TensorRTConfigDialog(QDialog):
         self.downloading = True
         self.progress.setRange(0, 100)
         self.progress.setValue(0)
+        self.progress.setFormat("0%")
         self.progress.setVisible(True)
         self.stage_label.setText(self.i18n.t("trt.downloading"))
         self.engines_label.setText("")
         self.download_button.setEnabled(False)
         self.manual_download_button.setEnabled(False)
         self.close_button.setEnabled(False)
+        self._download_progress(0, TENSORRT_CU12_LIBS_WHL_SIZE_BYTES)
 
         def worker() -> None:
             try:
@@ -250,12 +268,17 @@ class TensorRTConfigDialog(QDialog):
         threading.Thread(target=worker, name="trt-runtime-download", daemon=True).start()
 
     def _download_progress(self, received: int, total: int) -> None:
+        received = max(0, int(received or 0))
+        total = int(total or 0)
         if total > 0:
-            self.progress.setValue(max(0, min(100, int(received * 100 / total))))
+            percent = max(0, min(100, int(received * 100 / total)))
+            self.progress.setValue(percent)
+            self.progress.setFormat(f"{percent}%")
             self.stage_label.setText(
                 self.i18n.t("trt.downloading_progress").format(done=received / (1024 * 1024), total=total / (1024 * 1024))
             )
         else:
+            self.progress.setFormat("")
             self.stage_label.setText(self.i18n.t("trt.downloading_progress_unknown").format(done=received / (1024 * 1024)))
 
     def _download_finished(self, ok: bool, message: str) -> None:
@@ -264,11 +287,13 @@ class TensorRTConfigDialog(QDialog):
         self.manual_download_button.setEnabled(True)
         self.close_button.setEnabled(True)
         if ok:
+            self.progress.setRange(0, 100)
             self.progress.setValue(100)
+            self.progress.setFormat("100%")
             self.stage_label.setText(self.i18n.t("trt.download_done"))
         else:
             self.stage_label.setText(self.i18n.t("trt.download_failed").format(error=message))
-        self._refresh()
+        self._refresh(reset_progress=False)
 
     def _append_build_log(self, text: str) -> None:
         try:
@@ -279,11 +304,7 @@ class TensorRTConfigDialog(QDialog):
         except Exception:
             pass
 
-    def _read_process_output(self) -> None:
-        if self.process is None:
-            return
-        raw = bytes(self.process.readAllStandardOutput()) + bytes(self.process.readAllStandardError())
-        text = raw.decode("utf-8", "replace")
+    def _read_process_output(self, text: str) -> None:
         self._append_build_log(text)
         for line in text.splitlines():
             if line.startswith("STAGE:"):
@@ -299,6 +320,7 @@ class TensorRTConfigDialog(QDialog):
                     elif parts[2] == "done":
                         self.progress.setValue(min(3, self.stage))
             elif line.startswith("ERROR:"):
+                self.build_error_text = line
                 self.stage_label.setText(line)
         cache_dir = manifest_path(self.model_key).parent
         count = len([
@@ -310,13 +332,22 @@ class TensorRTConfigDialog(QDialog):
 
     def _build_finished(self, exit_code: int) -> None:
         self.process = None
-        self.progress.setValue(3 if exit_code == 0 else self.progress.value())
-        self._refresh()
+        if exit_code == 0:
+            self.build_error_text = ""
+            self.progress.setValue(3)
+            self._refresh()
+            return
+        if not self.build_error_text:
+            self.build_error_text = self.i18n.t("trt.build_failed").format(error=f"exit code {exit_code}")
+        self.progress.setVisible(True)
+        self._refresh(reset_progress=False)
+        self.stage_label.setText(self.build_error_text)
 
     def _cancel_build(self) -> None:
         if self.process is not None:
             self.process.kill()
             self.process = None
+        self.build_error_text = ""
         self._refresh()
 
     def _delete_cache(self) -> None:

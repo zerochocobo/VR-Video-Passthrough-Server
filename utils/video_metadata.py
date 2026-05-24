@@ -18,6 +18,7 @@ from typing import Literal
 import config
 from utils.cache_key import stat_key
 from utils.gpu_requirements import detect_nvidia_gpu_requirement, parse_compute_capability
+from utils.subprocess_hidden import hidden_subprocess_kwargs
 
 BackendVerdict = Literal["pynv_hevc", "ffmpeg_fallback", "block"]
 
@@ -137,7 +138,7 @@ def probe_color_metadata(path: Path) -> VideoColorMetadata:
         str(path),
     ]
     try:
-        out = subprocess.check_output(cmd)
+        out = subprocess.check_output(cmd, stderr=subprocess.DEVNULL, **hidden_subprocess_kwargs())
         data = json.loads(out)
         stream = (data.get("streams") or [{}])[0]
     except Exception:
@@ -166,7 +167,7 @@ def probe_timing_metadata(path: Path) -> VideoTimingMetadata:
         str(path),
     ]
     try:
-        out = subprocess.check_output(cmd)
+        out = subprocess.check_output(cmd, stderr=subprocess.DEVNULL, **hidden_subprocess_kwargs())
         data = json.loads(out)
         stream = (data.get("streams") or [{}])[0]
         fmt = data.get("format") or {}
@@ -231,7 +232,7 @@ def probe_video_metadata(path: Path) -> VideoProbeMetadata:
         str(path),
     ]
     try:
-        out = subprocess.check_output(cmd)
+        out = subprocess.check_output(cmd, stderr=subprocess.DEVNULL, **hidden_subprocess_kwargs())
         data = json.loads(out)
         streams = data.get("streams") or []
         video = next((s for s in streams if s.get("codec_type") == "video"), streams[0] if streams else {})
