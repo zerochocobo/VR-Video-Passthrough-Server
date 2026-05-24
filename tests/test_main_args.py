@@ -64,6 +64,11 @@ class MainArgsTests(unittest.TestCase):
         self.assertEqual(seen["argv"], ["offline_passthrough", "--help"])
         self.assertEqual(sys.argv, original_argv)
 
+    def test_main_trt_warmup_dispatches_without_starting_server(self) -> None:
+        with patch("ui.services.trt_warmup_process.main", return_value=9) as warmup_main:
+            self.assertEqual(main.main(["trt_warmup", "--progress-stdout"]), 9)
+        warmup_main.assert_called_once_with(["--progress-stdout"])
+
     def test_main_tool_forces_line_buffered_output(self) -> None:
         stdout_reconfigure = getattr(sys.stdout, "reconfigure", None)
         stderr_reconfigure = getattr(sys.stderr, "reconfigure", None)

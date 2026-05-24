@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import unittest
+import math
 
 from pipeline.alpha_packer import AlphaPacker
 
@@ -63,6 +64,48 @@ class _Matter:
 
 
 class AlphaPackerTests(unittest.TestCase):
+    def test_sbs_half_equirect_to_fisheye_current_projection_anchors(self) -> None:
+        eye_w = 4096
+        out_w = eye_w * 2
+        out_h = 4096
+        radius = min(eye_w, out_h) * 0.5
+
+        def map_pixel(x: float, y: float) -> tuple[float, float]:
+            eye = 1 if x >= eye_w else 0
+            lx = x - eye * eye_w + 0.5
+            ly = y + 0.5
+            cx = eye_w * 0.5
+            cy = out_h * 0.5
+            nx = (lx - cx) / radius
+            ny = (ly - cy) / radius
+            rr = math.hypot(nx, ny)
+            if rr > 1.0:
+                return -1.0, -1.0
+            ff_theta = math.pi * 0.5 * (1.0 - rr)
+            ff_phi = math.atan2(ny, nx)
+            cos_t = math.cos(ff_theta)
+            dir_x = cos_t * math.cos(ff_phi)
+            dir_y = cos_t * math.sin(ff_phi)
+            dir_z = math.sin(ff_theta)
+            src_phi = math.atan2(dir_x, dir_z) / (math.pi * 0.5)
+            src_theta = math.asin(dir_y) / (math.pi * 0.5)
+            u = (0.5 * src_phi + 0.5) * (eye_w - 1)
+            v = (0.5 * src_theta + 0.5) * (out_h - 1)
+            return u + eye * eye_w, v
+
+        center_x, center_y = map_pixel(eye_w / 2 - 0.5, out_h / 2 - 0.5)
+        right_x, right_y = map_pixel(eye_w - 0.5, out_h / 2 - 0.5)
+        top_x, top_y = map_pixel(eye_w / 2 - 0.5, 0)
+        corner_x, corner_y = map_pixel(0, 0)
+
+        self.assertAlmostEqual(center_x, (eye_w - 1) * 0.5, places=4)
+        self.assertAlmostEqual(center_y, (out_h - 1) * 0.5, places=4)
+        self.assertAlmostEqual(right_x, eye_w - 1, delta=1.0)
+        self.assertAlmostEqual(right_y, (out_h - 1) * 0.5, places=4)
+        self.assertAlmostEqual(top_x, (eye_w - 1) * 0.5, places=4)
+        self.assertAlmostEqual(top_y, 1.0, delta=1.0)
+        self.assertEqual((corner_x, corner_y), (-1.0, -1.0))
+
     def test_pack_gpu_p016_frame_uploads_as_nv12_before_packing(self) -> None:
         matter = _Matter()
         packer = AlphaPacker.__new__(AlphaPacker)

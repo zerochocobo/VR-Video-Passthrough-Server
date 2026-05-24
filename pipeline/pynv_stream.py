@@ -27,7 +27,8 @@ from pipeline import matting as matting_module
 from pipeline.matting import Matter
 from pipeline.pynv_io import GpuNv12AppFrame, GpuP016Frame, PyNvSimpleDecoder, PyNvThreadedSerialDecoder
 from pipeline.subtitles import SubtitleRenderer, find_subtitle_for_video
-from utils.logger import get
+from utils.logger import get, warmup_event
+from utils.startup_status import get_startup_state, set_startup_phase
 from utils.cache_key import fingerprint, stat_key
 from utils.bitrate_estimator import effective_default_bitrate
 from utils.runtime_settings import get_light_match
@@ -146,15 +147,125 @@ def _mpegts_flags() -> str:
     return flags
 
 
+def _mux_fflags() -> str:
+    if config.MUX_NOBUFFER_ENABLE:
+        # Diagnostic only. With raw HEVC, nobuffer can drop packets before the
+        # first muxed GOP and make video content lead audio by about one GOP.
+        return "+genpts+nobuffer+flush_packets"
+    return "+genpts"
+
+
+def _pipe_ts_final_mux_fflags() -> str:
+    # The split final mux needs generated timestamps, but nobuffer/flush_packets
+    # shift live pipe/TCP input start PTS by about one second.
+    return "+genpts"
+
+
+def _mux_loglevel() -> str:
+    return config.MUX_FFMPEG_LOGLEVEL or "warning"
+
+
+def _mux_probe_args(
+    probesize: str | None = None,
+    *,
+    for_raw_video: bool = False,
+    analyzeduration_us: str | None = None,
+) -> list[str]:
+    if for_raw_video:
+        args: list[str] = []
+        if config.MUX_RAW_VIDEO_PROBESIZE:
+            args.extend(["-probesize", config.MUX_RAW_VIDEO_PROBESIZE])
+        if config.MUX_RAW_VIDEO_ANALYZEDURATION:
+            args.extend(["-analyzeduration", config.MUX_RAW_VIDEO_ANALYZEDURATION])
+        return args
+    args: list[str] = []
+    probe = config.MUX_PROBESIZE_OVERRIDE if probesize is None else probesize
+    if probe:
+        args.extend(["-probesize", str(probe)])
+    analyze = config.MUX_ANALYZEDURATION_US if analyzeduration_us is None else analyzeduration_us
+    if analyze:
+        args.extend(["-analyzeduration", str(analyze)])
+    return args
+
+
+def _mux_intermediate_ts_probe_args() -> list[str]:
+    """Probe controls for the pipe_ts final mux intermediate MPEG-TS stdin.
+
+    The final mux must inspect the intermediate TS long enough to see HEVC
+    VPS/SPS/PPS. Too-small values can make strict players classify the final
+    stream as audio-only, so the default intentionally keeps FFmpeg defaults.
+    """
+    args: list[str] = []
+    if config.MUX_INTERMEDIATE_TS_PROBESIZE:
+        args.extend(["-probesize", config.MUX_INTERMEDIATE_TS_PROBESIZE])
+    if config.MUX_INTERMEDIATE_TS_ANALYZEDURATION:
+        args.extend(["-analyzeduration", config.MUX_INTERMEDIATE_TS_ANALYZEDURATION])
+    return args
+
+
+def _mpegts_tick_for_fps(fps: float) -> int:
+    if abs(fps - (60000.0 / 1001.0)) < 0.001:
+        return 1502
+    return int((90000.0 / fps) + 0.5) if fps > 0 else 3000
+
+
 def _mpegts_video_bsf(timestamp_filter: str | None = None) -> list[str]:
     filters: list[str] = []
-    if PYNV_OUTPUT_CODEC == "hevc" and config.PASSTHROUGH_MPEGTS_HEVC_AUD:
+    if PYNV_OUTPUT_CODEC == "hevc" and config.PASSTHROUGH_MPEGTS_HEVC_AUD and not timestamp_filter:
         filters.append("hevc_metadata=aud=insert")
     if timestamp_filter:
         filters.append(timestamp_filter)
     if not filters:
         return []
     return ["-bsf:v", ",".join(filters)]
+
+
+def _slate_frame_pace_delay(
+    *,
+    fps: float,
+    sent_frames: int,
+    burst_frames: int,
+    pace_start: float,
+    now: float,
+) -> float:
+    """Return pre-send delay for the next slate frame.
+
+    The first burst frames may be sent immediately to expose codec headers.
+    Later frames are held until their nominal video PTS is due on the wall
+    clock, keeping slate video aligned with the realtime silent AAC source.
+    """
+    if fps <= 0:
+        return 0.0
+    burst = max(0, int(burst_frames))
+    sent = max(0, int(sent_frames))
+    if sent < burst:
+        return 0.0
+    due = pace_start + (sent / fps)
+    return max(0.0, due - now)
+
+
+def _hevc_nal_summary(data: bytes | bytearray | memoryview, *, limit: int = 12) -> str:
+    b = bytes(data)
+    starts: list[tuple[int, int]] = []
+    i = 0
+    while i < len(b) - 3 and len(starts) < limit + 1:
+        if b[i : i + 3] == b"\x00\x00\x01":
+            starts.append((i, 3))
+            i += 3
+        elif i < len(b) - 4 and b[i : i + 4] == b"\x00\x00\x00\x01":
+            starts.append((i, 4))
+            i += 4
+        else:
+            i += 1
+    parts: list[str] = []
+    for idx, (pos, sc_len) in enumerate(starts[:limit]):
+        nal_start = pos + sc_len
+        if nal_start >= len(b):
+            continue
+        nal_end = starts[idx + 1][0] if idx + 1 < len(starts) else len(b)
+        nal_type = (b[nal_start] >> 1) & 0x3F
+        parts.append(f"{nal_type}:{nal_end - nal_start}")
+    return ",".join(parts) if parts else "none"
 
 
 def _mpegts_color_args(color_meta) -> list[str]:
@@ -284,6 +395,7 @@ class PyNvPassthroughStream:
         self._video_mux: subprocess.Popen | None = None
         self._audio_procs: set[subprocess.Popen] = set()
         self._audio_procs_lock = threading.Lock()
+        self._encoder_lock = threading.Lock()
         self._dec: PyNvSimpleDecoder | PyNvThreadedSerialDecoder | None = None
         self._enc = None
         self._slate_audio_thread: threading.Thread | None = None
@@ -294,7 +406,57 @@ class PyNvPassthroughStream:
         self._real_video_started = threading.Event()
         self._slate_audio_addr: tuple[str, int] | None = None
         self._slate_audio_cache_path: Path | None = None
+        self._slate_audio_direct_only = False
+        self._first_chunk_marks: dict[str, float] = {}
         self.startup_error: str | None = None
+
+    def _mark_first(self, key: str) -> None:
+        if not config.MUX_LATENCY_DIAG or key in self._first_chunk_marks:
+            return
+        now = time.perf_counter()
+        self._first_chunk_marks[key] = now
+        t0 = self._first_chunk_marks.get("T0_mux_spawn", now)
+        log.info(
+            "[DIAG][MUX][%d] mark key=%s delta_from_T0_ms=%.1f",
+            self.sid,
+            key,
+            (now - t0) * 1000.0,
+        )
+
+    def _mark_first_write(self) -> None:
+        self._mark_first("T1_first_write")
+
+    def _log_first_chunk_breakdown(self) -> None:
+        if not config.MUX_LATENCY_DIAG:
+            return
+        now = time.perf_counter()
+        marks = self._first_chunk_marks
+        t0 = marks.get("T0_mux_spawn", now)
+
+        def delta_ms(key: str) -> float:
+            mark = marks.get(key)
+            if mark is None:
+                return -1.0
+            return (mark - t0) * 1000.0
+
+        log.info(
+            "[DIAG][MUX][%d] first_chunk_breakdown "
+            "T0_video_spawn=%.1fms T0_spawn=0.0ms T1_write=%.1fms T2_stderr=%.1fms "
+            "T2a_video=%.1fms T2b_final=%.1fms "
+            "T3a_vcodec=%.1fms T3b_acodec=%.1fms T3c_output=%.1fms "
+            "T4_reader=%.1fms total=%.1fms",
+            self.sid,
+            delta_ms("T0_video_mux_spawn"),
+            delta_ms("T1_first_write"),
+            delta_ms("T2_first_stderr"),
+            delta_ms("T2a_video_first_stderr"),
+            delta_ms("T2b_final_first_stderr"),
+            delta_ms("T3a_final_video_codec"),
+            delta_ms("T3b_final_audio_codec"),
+            delta_ms("T3c_final_output_ready"),
+            (now - t0) * 1000.0,
+            (now - t0) * 1000.0,
+        )
 
     def _register_audio_proc(self, proc: subprocess.Popen) -> subprocess.Popen:
         with self._audio_procs_lock:
@@ -421,7 +583,76 @@ class PyNvPassthroughStream:
             while len(_preflight_ok) > _PREFLIGHT_CACHE_MAX_ENTRIES:
                 _preflight_ok.pop(next(iter(_preflight_ok)), None)
 
+    @staticmethod
+    def startup_preflight() -> None:
+        """Pay process-level NVENC SDK initialization during startup."""
+        if not config.NVENC_PREFLIGHT_ENABLE:
+            warmup_event(log, phase="nvenc_preflight", enabled=False, status="disabled")
+            return
+        import PyNvVideoCodec as nvc
+
+        state = get_startup_state()
+        step_total = int(state.get("step_total") or 6)
+        set_startup_phase(
+            "warming",
+            "warming NVENC encoder",
+            step="nvenc_preflight",
+            step_index=step_total,
+            step_total=step_total,
+            progress=max(0.0, min(0.99, (step_total - 0.2) / step_total)),
+        )
+        for width, height, fps_label, bitrate in config.NVENC_PREFLIGHT_GEOMETRIES:
+            width = max(2, int(width) & ~1)
+            height = max(2, int(height) & ~1)
+            fps_label = str(fps_label)
+            bitrate = str(bitrate)
+            t0 = time.perf_counter()
+            try:
+                enc = nvc.CreateEncoder(
+                    width,
+                    height,
+                    "NV12",
+                    False,
+                    **_pynv_encoder_kwargs(bitrate=bitrate, fps=fps_label),
+                )
+                try:
+                    end = getattr(enc, "EndEncode", None)
+                    if callable(end):
+                        end()
+                finally:
+                    del enc
+                    gc.collect()
+                warmup_event(
+                    log,
+                    phase="nvenc_preflight",
+                    status="ok",
+                    geometry=[width, height],
+                    fps=fps_label,
+                    bitrate=int(bitrate),
+                    elapsed_ms=round((time.perf_counter() - t0) * 1000.0, 1),
+                )
+            except Exception:
+                warmup_event(
+                    log,
+                    phase="nvenc_preflight",
+                    status="failed",
+                    geometry=[width, height],
+                    fps=fps_label,
+                    bitrate=int(bitrate),
+                )
+                log.warning(
+                    "nvenc startup preflight failed geometry=%dx%d fps=%s bitrate=%s",
+                    width,
+                    height,
+                    fps_label,
+                    bitrate,
+                    exc_info=True,
+                )
+
     def _audio_mode(self, duration: float) -> str:
+        if config.FORCE_AUDIO_OFF:
+            log.info("[PYNV][%d] audio forced off by PT_FORCE_AUDIO_OFF", self.sid)
+            return "off"
         configured = self.audio_mode_override
         if configured is None:
             configured = config.PASSTHROUGH_AUDIO_MPEGTS if self.container == "mpegts" else config.PASSTHROUGH_AUDIO
@@ -475,7 +706,7 @@ class PyNvPassthroughStream:
                 "-nostdin",
                 "-hide_banner",
                 "-loglevel",
-                "warning",
+                _mux_loglevel(),
                 "-y",
                 "-probesize",
                 "32768",
@@ -518,7 +749,7 @@ class PyNvPassthroughStream:
             while proc.poll() is None:
                 if self._stop.wait(0.1):
                     interrupted = True
-                    self._stop_proc(proc, "audio cache build")
+                    self._stop_proc(proc, "audio cache build", close_pipes=False)
                     break
                 now = time.perf_counter()
                 if config.DEBUG_LOGS and now - last_progress_log >= _AUDIO_CACHE_PROGRESS_INTERVAL:
@@ -538,7 +769,7 @@ class PyNvPassthroughStream:
             try:
                 stdout, stderr = proc.communicate(timeout=1.0)
             except Exception:
-                self._stop_proc(proc, "audio cache build communicate")
+                self._stop_proc(proc, "audio cache build communicate", close_pipes=False)
                 stdout, stderr = "", ""
             finally:
                 self._unregister_audio_proc(proc)
@@ -621,7 +852,7 @@ class PyNvPassthroughStream:
                 "-nostdin",
                 "-hide_banner",
                 "-loglevel",
-                "warning",
+                _mux_loglevel(),
                 "-y",
                 "-probesize",
                 "32768",
@@ -662,7 +893,7 @@ class PyNvPassthroughStream:
             while proc.poll() is None:
                 if self._stop.wait(0.1):
                     interrupted = True
-                    self._stop_proc(proc, "slate audio cache build")
+                    self._stop_proc(proc, "slate audio cache build", close_pipes=False)
                     break
                 now = time.perf_counter()
                 if now - last_progress_log >= _AUDIO_CACHE_PROGRESS_INTERVAL:
@@ -682,7 +913,7 @@ class PyNvPassthroughStream:
             try:
                 stdout, stderr = proc.communicate(timeout=1.0)
             except Exception:
-                self._stop_proc(proc, "slate audio cache build communicate")
+                self._stop_proc(proc, "slate audio cache build communicate", close_pipes=False)
                 stdout, stderr = "", ""
             finally:
                 self._unregister_audio_proc(proc)
@@ -691,15 +922,25 @@ class PyNvPassthroughStream:
             stat_started = time.perf_counter()
             tmp_size = _file_size_or_zero(tmp_path)
             stat_elapsed = time.perf_counter() - stat_started
-            if interrupted or self._stop.is_set() or proc.returncode != 0 or tmp_size <= 0:
+            if interrupted or self._stop.is_set():
+                try:
+                    tmp_path.unlink(missing_ok=True)
+                except OSError:
+                    pass
+                log.info(
+                    "[PYNV][%d] slate audio cache build interrupted; discarded tmp=%s elapsed=%.2fs",
+                    self.sid, tmp_path.name, elapsed,
+                )
+                return
+            if proc.returncode != 0 or tmp_size <= 0:
                 try:
                     tmp_path.unlink(missing_ok=True)
                 except OSError:
                     pass
                 stderr = (stderr or "").strip()[-2000:]
                 log.warning(
-                    "[PYNV][%d] slate audio cache build failed interrupted=%s rc=%s elapsed=%.2fs stderr=%s",
-                    self.sid, interrupted, proc.returncode, elapsed, stderr,
+                    "[PYNV][%d] slate audio cache build failed rc=%s elapsed=%.2fs stderr=%s",
+                    self.sid, proc.returncode, elapsed, stderr,
                 )
                 self._slate_audio_failed.set()
                 return
@@ -721,7 +962,7 @@ class PyNvPassthroughStream:
                 time.perf_counter() - started,
             )
 
-    def _start_slate_audio_server(self, cache_key: str, cache_path: Path) -> tuple[str, int]:
+    def _start_slate_audio_server(self, cache_key: str, cache_path: Path, *, direct_only: bool = False) -> tuple[str, int]:
         server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         server.bind(("127.0.0.1", 0))
@@ -729,7 +970,11 @@ class PyNvPassthroughStream:
         server.settimeout(0.25)
         addr = server.getsockname()
         self._slate_audio_addr = (str(addr[0]), int(addr[1]))
-        self._slate_audio_cache_thread = self._start_aac_cache_build(cache_key, cache_path)
+        self._slate_audio_direct_only = direct_only
+        if direct_only:
+            log.info("[PYNV][%d] slate audio direct-only mode; skipping full AAC cache build", self.sid)
+        else:
+            self._slate_audio_cache_thread = self._start_aac_cache_build(cache_key, cache_path)
         self._slate_audio_thread = threading.Thread(
             target=self._slate_audio_server_loop,
             args=(server,),
@@ -958,7 +1203,7 @@ class PyNvPassthroughStream:
                 ffmpeg,
                 "-hide_banner",
                 "-loglevel",
-                "warning",
+                _mux_loglevel(),
                 "-re",
                 "-f",
                 "lavfi",
@@ -986,7 +1231,7 @@ class PyNvPassthroughStream:
             if conn is None:
                 return
             conn.settimeout(0.25)
-            direct_after = float(config.PASSTHROUGH_AUDIO_MPEGTS_SLATE_DIRECT_AFTER)
+            direct_after = 0.0 if self._slate_audio_direct_only else float(config.PASSTHROUGH_AUDIO_MPEGTS_SLATE_DIRECT_AFTER)
             direct_deadline = time.perf_counter() + direct_after if direct_after > 0.0 else time.perf_counter()
             audio_source_ready = False
             waiting_real_video_logged = False
@@ -1028,7 +1273,7 @@ class PyNvPassthroughStream:
                     "-nostdin",
                     "-hide_banner",
                     "-loglevel",
-                    "warning",
+                    _mux_loglevel(),
                     "-f",
                     "aac",
                     *(["-ss", f"{self.start_sec:.3f}"] if self.start_sec > 0.001 else []),
@@ -1052,7 +1297,7 @@ class PyNvPassthroughStream:
                     "-nostdin",
                     "-hide_banner",
                     "-loglevel",
-                    "warning",
+                    _mux_loglevel(),
                     "-probesize",
                     "32768",
                     "-analyzeduration",
@@ -1110,21 +1355,35 @@ class PyNvPassthroughStream:
                 self._stop_proc(silence_proc, "slate audio silence finally")
                 self._unregister_audio_proc(silence_proc)
 
-    def _open_pipe_ts_muxer(self, fps: float, duration: float, audio_input: Path) -> subprocess.Popen:
+    def _open_pipe_ts_muxer(
+        self,
+        fps: float,
+        duration: float,
+        audio_input: Path,
+        *,
+        audio_input_format: str | None = "aac",
+        audio_label: str = "aac",
+    ) -> subprocess.Popen:
         ffmpeg = shutil.which("ffmpeg") or "ffmpeg"
         color_args = _mpegts_color_args(
             self.metadata.color if self.metadata is not None else probe_color_metadata(self.src)
         )
         input_format = "hevc" if PYNV_OUTPUT_CODEC == "hevc" else "h264"
+        audio_probe = (
+            config.MUX_AUDIO_PROBESIZE_OVERRIDE
+            if audio_input_format == "aac"
+            else config.MUX_CONTAINER_PROBESIZE_OVERRIDE
+        )
         video_cmd = [
             ffmpeg,
             "-hide_banner",
             "-loglevel",
-            "warning",
+            _mux_loglevel(),
             "-fflags",
-            "+genpts",
+            _mux_fflags(),
             "-thread_queue_size",
             str(config.PASSTHROUGH_AUDIO_MPEGTS_QUEUE_SIZE or 1024),
+            *_mux_probe_args(for_raw_video=True),
             "-f",
             input_format,
             *(["-raw_packet_size", str(config.PASSTHROUGH_AUDIO_MPEGTS_RAW_PACKET_SIZE)] if config.PASSTHROUGH_AUDIO_MPEGTS_RAW_PACKET_SIZE > 0 else []),
@@ -1137,7 +1396,7 @@ class PyNvPassthroughStream:
             "-an",
             "-c:v",
             "copy",
-            *_mpegts_video_bsf(f"setts=time_base=1/90000:pts=N*{int(round(90000 / fps))}:dts=N*{int(round(90000 / fps))}"),
+            *_mpegts_video_bsf(f"setts=time_base=1/90000:pts=N*{_mpegts_tick_for_fps(fps)}:dts=N*{_mpegts_tick_for_fps(fps)}"),
             *color_args,
             "-flush_packets",
             "1",
@@ -1161,19 +1420,20 @@ class PyNvPassthroughStream:
             ffmpeg,
             "-hide_banner",
             "-loglevel",
-            "warning",
+            _mux_loglevel(),
             "-fflags",
-            "+genpts",
+            _pipe_ts_final_mux_fflags(),
             "-thread_queue_size",
             str(config.PASSTHROUGH_AUDIO_MPEGTS_QUEUE_SIZE or 1024),
+            *_mux_intermediate_ts_probe_args(),
             "-f",
             "mpegts",
             "-i",
             "-",
             "-thread_queue_size",
             str(config.PASSTHROUGH_AUDIO_MPEGTS_QUEUE_SIZE or 1024),
-            "-f",
-            "aac",
+            *_mux_probe_args(audio_probe),
+            *(["-f", audio_input_format] if audio_input_format else []),
             *(["-ss", f"{self.start_sec:.3f}"] if self.start_sec > 0.001 else []),
             "-t",
             f"{duration:.3f}",
@@ -1214,7 +1474,7 @@ class PyNvPassthroughStream:
             ]
         )
         log.info("[PYNV][%d] pipe_ts video mux cmd: %s", self.sid, " ".join(video_cmd))
-        log.info("[PYNV][%d] pipe_ts final mux cmd: %s audio=aac duration=%.3f", self.sid, " ".join(final_cmd), duration)
+        log.info("[PYNV][%d] pipe_ts final mux cmd: %s audio=%s duration=%.3f", self.sid, " ".join(final_cmd), audio_label, duration)
         video_proc = subprocess.Popen(
             video_cmd,
             stdin=subprocess.PIPE,
@@ -1222,6 +1482,7 @@ class PyNvPassthroughStream:
             stderr=subprocess.PIPE,
             bufsize=0,
         )
+        self._mark_first("T0_video_mux_spawn")
         final_proc = None
         try:
             assert video_proc.stdout is not None
@@ -1232,6 +1493,7 @@ class PyNvPassthroughStream:
                 stderr=subprocess.PIPE,
                 bufsize=0,
             )
+            self._mark_first("T0_mux_spawn")
             video_proc.stdout.close()
         except BaseException:
             if final_proc is not None:
@@ -1251,11 +1513,12 @@ class PyNvPassthroughStream:
             ffmpeg,
             "-hide_banner",
             "-loglevel",
-            "warning",
+            _mux_loglevel(),
             "-fflags",
-            "+genpts",
+            _mux_fflags(),
             "-thread_queue_size",
             str(config.PASSTHROUGH_AUDIO_MPEGTS_QUEUE_SIZE or 1024),
+            *_mux_probe_args(for_raw_video=True),
             "-f",
             input_format,
             *(["-raw_packet_size", str(config.PASSTHROUGH_AUDIO_MPEGTS_RAW_PACKET_SIZE)] if config.PASSTHROUGH_AUDIO_MPEGTS_RAW_PACKET_SIZE > 0 else []),
@@ -1268,7 +1531,7 @@ class PyNvPassthroughStream:
             "-an",
             "-c:v",
             "copy",
-            *_mpegts_video_bsf(f"setts=time_base=1/90000:pts=N*{int(round(90000 / fps))}:dts=N*{int(round(90000 / fps))}"),
+            *_mpegts_video_bsf(f"setts=time_base=1/90000:pts=N*{_mpegts_tick_for_fps(fps)}:dts=N*{_mpegts_tick_for_fps(fps)}"),
             *color_args,
             "-flush_packets",
             "1",
@@ -1292,27 +1555,21 @@ class PyNvPassthroughStream:
             ffmpeg,
             "-hide_banner",
             "-loglevel",
-            "warning",
+            _mux_loglevel(),
             "-fflags",
-            "+genpts",
+            _pipe_ts_final_mux_fflags(),
             "-thread_queue_size",
             str(config.PASSTHROUGH_AUDIO_MPEGTS_QUEUE_SIZE or 1024),
+            *_mux_probe_args(config.MUX_AUDIO_PROBESIZE_OVERRIDE),
             "-f",
             "aac",
-            "-probesize",
-            "32768",
-            "-analyzeduration",
-            "0",
             "-i",
             f"tcp://{audio_addr[0]}:{audio_addr[1]}",
             "-thread_queue_size",
             str(config.PASSTHROUGH_AUDIO_MPEGTS_QUEUE_SIZE or 1024),
+            *_mux_intermediate_ts_probe_args(),
             "-f",
             "mpegts",
-            "-probesize",
-            "32768",
-            "-analyzeduration",
-            "0",
             "-i",
             "-",
             "-map",
@@ -1358,6 +1615,7 @@ class PyNvPassthroughStream:
             stderr=subprocess.PIPE,
             bufsize=0,
         )
+        self._mark_first("T0_video_mux_spawn")
         final_proc = None
         try:
             assert video_proc.stdout is not None
@@ -1368,6 +1626,7 @@ class PyNvPassthroughStream:
                 stderr=subprocess.PIPE,
                 bufsize=0,
             )
+            self._mark_first("T0_mux_spawn")
             video_proc.stdout.close()
         except BaseException:
             if final_proc is not None:
@@ -1409,7 +1668,7 @@ class PyNvPassthroughStream:
                 "-movflags",
                 "+frag_keyframe+empty_moov+default_base_moof",
                 "-frag_duration",
-                "250000",
+                str(config.PASSTHROUGH_FMP4_FRAG_DURATION_US),
                 "-f",
                 "mp4",
             ]
@@ -1418,9 +1677,9 @@ class PyNvPassthroughStream:
             ffmpeg,
             "-hide_banner",
             "-loglevel",
-            "warning",
+            _mux_loglevel(),
             "-fflags",
-            "+genpts",
+            _mux_fflags(),
         ]
         input_format = "hevc" if PYNV_OUTPUT_CODEC == "hevc" else "h264"
         if audio_mode == "off":
@@ -1431,6 +1690,7 @@ class PyNvPassthroughStream:
             )
             input_args = [
                 *queue_args,
+                *_mux_probe_args(for_raw_video=True),
                 "-f",
                 input_format,
                 "-framerate",
@@ -1458,15 +1718,33 @@ class PyNvPassthroughStream:
                 timestamp_mode == "pipe_ts"
                 and self.container == "mpegts"
                 and audio_mode == "aac"
-                and config.PASSTHROUGH_AUDIO_MPEGTS_CACHE
-                and config.PASSTHROUGH_AUDIO_MPEGTS_SLATE
+                and not config.PASSTHROUGH_AUDIO_MPEGTS_CACHE
+            ):
+                log.info("[PYNV][%d] audio cache disabled; using source audio in pipe_ts final mux", self.sid)
+                return self._open_pipe_ts_muxer(
+                    fps,
+                    duration,
+                    self.src,
+                    audio_input_format=None,
+                    audio_label="source",
+                )
+            if (
+                timestamp_mode == "pipe_ts"
+                and self.container == "mpegts"
+                and audio_mode == "aac"
+                and config.PASSTHROUGH_MPEGTS_VIDEO_SLATE
             ):
                 cache_key, cache_path = self._aac_cache_path()
-                if cache_path.exists() and cache_path.stat().st_size > 0:
+                if (
+                    config.PASSTHROUGH_AUDIO_MPEGTS_CACHE
+                    and cache_path.exists()
+                    and cache_path.stat().st_size > 0
+                ):
                     audio_input = cache_path
                     log.info("[PYNV][%d] audio cache hit: %s bytes=%d total_elapsed=0.000s", self.sid, cache_path.name, cache_path.stat().st_size)
                 else:
-                    slate_audio_addr = self._start_slate_audio_server(cache_key, cache_path)
+                    direct_only = self.output_mode == "alpha"
+                    slate_audio_addr = self._start_slate_audio_server(cache_key, cache_path, direct_only=direct_only)
             else:
                 audio_input = self._cached_aac_input(audio_mode)
             if timestamp_mode == "pipe_ts" and audio_input is not None:
@@ -1474,7 +1752,7 @@ class PyNvPassthroughStream:
             if timestamp_mode == "pipe_ts" and slate_audio_addr is not None:
                 return self._open_slate_pipe_ts_muxer(fps, duration, slate_audio_addr)
             if timestamp_mode == "pipe_ts":
-                log.warning("[PYNV][%d] pipe_ts requires AAC cache; falling back to setts", self.sid)
+                log.warning("[PYNV][%d] pipe_ts audio source unavailable; falling back to setts", self.sid)
                 timestamp_mode = "setts"
             seek_args = ["-ss", f"{self.start_sec:.3f}"] if self.start_sec > 0.001 else []
             queue_args = (
@@ -1495,6 +1773,7 @@ class PyNvPassthroughStream:
             input_args = [
                 *raw_timestamp_args,
                 *queue_args,
+                *_mux_probe_args(for_raw_video=True),
                 "-f",
                 input_format,
                 *(["-raw_packet_size", str(config.PASSTHROUGH_AUDIO_MPEGTS_RAW_PACKET_SIZE)] if self.container == "mpegts" and config.PASSTHROUGH_AUDIO_MPEGTS_RAW_PACKET_SIZE > 0 else []),
@@ -1505,6 +1784,11 @@ class PyNvPassthroughStream:
                 *seek_args,
                 *audio_rate_args,
                 *queue_args,
+                *_mux_probe_args(
+                    config.MUX_AUDIO_PROBESIZE_OVERRIDE
+                    if audio_input is not None
+                    else config.MUX_CONTAINER_PROBESIZE_OVERRIDE
+                ),
                 *(["-f", "aac"] if audio_input is not None else []),
                 "-t",
                 f"{duration:.3f}",
@@ -1526,7 +1810,8 @@ class PyNvPassthroughStream:
                 if audio_mode == "aac" and audio_input is None and config.PASSTHROUGH_AUDIO_MPEGTS_AAC_BITRATE:
                     map_args.extend(["-b:a", config.PASSTHROUGH_AUDIO_MPEGTS_AAC_BITRATE])
             if self.container == "mpegts" and timestamp_mode == "setts":
-                map_args.extend(_mpegts_video_bsf("setts=time_base=1/90000:pts=N*3000:dts=N*3000"))
+                tick = _mpegts_tick_for_fps(fps)
+                map_args.extend(_mpegts_video_bsf(f"setts=time_base=1/90000:pts=N*{tick}:dts=N*{tick}"))
             elif self.container == "mpegts":
                 map_args.extend(_mpegts_video_bsf())
         cmd = [
@@ -1547,13 +1832,15 @@ class PyNvPassthroughStream:
             "[PYNV][%d] mux cmd: %s audio=%s duration=%.3f",
             self.sid, " ".join(cmd), audio_mode, duration,
         )
-        return subprocess.Popen(
+        proc = subprocess.Popen(
             cmd,
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             bufsize=0,
         )
+        self._mark_first("T0_mux_spawn")
+        return proc
 
     def _stderr_loop(self) -> None:
         proc = self._mux
@@ -1568,6 +1855,13 @@ class PyNvPassthroughStream:
         self._drain_stderr(proc, "ffmpeg-video")
 
     def _drain_stderr(self, proc: subprocess.Popen, label: str) -> None:
+        if label == "ffmpeg-video":
+            first_key = "T2a_video_first_stderr"
+        elif label == "ffmpeg":
+            first_key = "T2b_final_first_stderr"
+        else:
+            first_key = None
+        enable_stage_marks = label == "ffmpeg" and config.MUX_LATENCY_DIAG_VERBOSE
         try:
             assert proc.stderr is not None
             for raw in iter(proc.stderr.readline, b""):
@@ -1575,6 +1869,16 @@ class PyNvPassthroughStream:
                     break
                 text = raw.decode("utf-8", "replace").strip()
                 if text:
+                    if first_key:
+                        self._mark_first(first_key)
+                        self._mark_first("T2_first_stderr")
+                    if enable_stage_marks:
+                        if "Stream #" in text and ("Video: hevc" in text or "Video: h264" in text):
+                            self._mark_first("T3a_final_video_codec")
+                        elif "Stream #" in text and "Audio: " in text:
+                            self._mark_first("T3b_final_audio_codec")
+                        elif text.startswith("Output #0") or "Output #0," in text:
+                            self._mark_first("T3c_final_output_ready")
                     if any(marker in text for marker in _BENIGN_FFMPEG_WARNINGS):
                         log.debug("[PYNV][%d][%s] %s", self.sid, label, text)
                     else:
@@ -1597,6 +1901,8 @@ class PyNvPassthroughStream:
                 bytes_read += len(data)
                 if chunks == 0:
                     log.info("[PYNV][%d] reader first stdout chunk len=%d", self.sid, len(data))
+                    self._mark_first("T4_reader")
+                    self._log_first_chunk_breakdown()
                 if not self._put_chunk_from_thread(data, chunks, bytes_read):
                     return
                 chunks += 1
@@ -1637,6 +1943,8 @@ class PyNvPassthroughStream:
         except RuntimeError:
             return False
         wait_started = time.perf_counter()
+        next_wait_log_at = 5.0
+        wait_log_interval = 10.0
         while not self._stop.is_set():
             if done.wait(timeout=0.5):
                 waited = time.perf_counter() - wait_started
@@ -1650,19 +1958,24 @@ class PyNvPassthroughStream:
                     )
                 return bool(state["ok"])
             if config.DEBUG_LOGS:
-                log.warning(
-                    "[PYNV][%d] reader waiting for async queue chunks=%d bytes=%d waited=%.3fs",
-                    self.sid,
-                    chunks,
-                    bytes_read,
-                    time.perf_counter() - wait_started,
-                )
+                waited = time.perf_counter() - wait_started
+                if waited >= next_wait_log_at:
+                    log.warning(
+                        "[PYNV][%d] reader waiting for async queue chunks=%d bytes=%d waited=%.3fs",
+                        self.sid,
+                        chunks,
+                        bytes_read,
+                        waited,
+                    )
+                    next_wait_log_at += wait_log_interval
         return False
 
     def _worker_loop(self) -> None:
         log.info("[PYNV][%d] worker start src=%s path=%s start=%.3f", self.sid, self.src.name, self.src, self.start_sec)
         self._log_vram("worker_start")
         pending_nv12_slots: list[object] = []
+        slate_stop = threading.Event()
+        slate_thread: threading.Thread | None = None
         try:
             import PyNvVideoCodec as nvc
 
@@ -1884,73 +2197,96 @@ class PyNvPassthroughStream:
                     config.ALPHA_2D_DISTANCE_M,
                     alpha_2d_disparity,
                 )
-            slate_nv12 = None
-            slate_frames = 0
-            if (
-                self._slate_audio_addr is not None
-                and not self._slate_audio_ready.is_set()
-                and not self._slate_direct_ready.is_set()
-            ):
+            slate_done = threading.Event()
+            slate_error: list[str] = []
+            slate_frames_box = [0]
+
+            def slate_video_loop() -> None:
+                if self._slate_audio_addr is None:
+                    slate_done.set()
+                    return
+                slate_nv12 = None
                 slate_alloc_start = time.perf_counter()
-                slate_nv12 = self._make_slate_nv12_gpu(out_w, out_h)
-                log.info(
-                    "[PYNV][%d] slate video begin: waiting for audio cache alloc=%.3fs",
-                    self.sid,
-                    time.perf_counter() - slate_alloc_start,
-                )
-                slate_start = time.perf_counter()
-                slate_pace_start: float | None = None
-                while (
-                    not self._stop.is_set()
-                    and not self._slate_audio_ready.is_set()
-                    and not self._slate_direct_ready.is_set()
-                    and not self._slate_audio_failed.is_set()
-                ):
-                    flags = 0
-                    if slate_frames == 0:
-                        flags = int(nvc.NV_ENC_PIC_FLAGS.FORCEIDR) | int(nvc.NV_ENC_PIC_FLAGS.OUTPUT_SPSPPS)
-                    encode_start = time.perf_counter()
-                    bitstream = self._enc.Encode(GpuNv12AppFrame(slate_nv12, out_w, out_h), flags)
-                    if slate_frames == 0:
-                        log.info(
-                            "[PYNV][%d] slate first encode: bytes=%d elapsed=%.3fs",
-                            self.sid,
-                            len(bitstream) if bitstream else 0,
-                            time.perf_counter() - encode_start,
-                        )
-                    if bitstream:
-                        mux_stdin = self._video_mux.stdin if self._video_mux is not None else self._mux.stdin
-                        if self._stop.is_set() or not mux_stdin or mux_stdin.closed:
-                            break
-                        try:
-                            mux_stdin.write(bitstream)
-                        except (BrokenPipeError, OSError, ValueError) as e:
-                            log.info("[PYNV][%d] slate mux stdin write stopped at frame=%d: %s", self.sid, slate_frames + 1, e)
-                            break
-                    slate_frames += 1
-                    if fps > 0 and slate_frames > config.PASSTHROUGH_AUDIO_MPEGTS_SLATE_BURST_FRAMES:
-                        if slate_pace_start is None:
-                            slate_pace_start = time.perf_counter()
-                        paced_frames = slate_frames - config.PASSTHROUGH_AUDIO_MPEGTS_SLATE_BURST_FRAMES
-                        due = slate_pace_start + (paced_frames / fps)
-                        delay = due - time.perf_counter()
-                        if delay > 0:
-                            self._stop.wait(min(delay, 0.05))
-                log.info(
-                    "[PYNV][%d] slate video end: frames=%d ready=%s direct=%s failed=%s elapsed=%.3fs",
-                    self.sid,
-                    slate_frames,
-                    self._slate_audio_ready.is_set(),
-                    self._slate_direct_ready.is_set(),
-                    self._slate_audio_failed.is_set(),
-                    time.perf_counter() - slate_start,
-                )
-                if self._slate_audio_failed.is_set():
-                    if self._stop.is_set():
-                        log.info("[PYNV][%d] slate audio stopped during stream close", self.sid)
-                        return
-                    raise RuntimeError("slate audio cache build failed")
-            if config.PASSTHROUGH_PYNV_WORKER_MODE == "two_stage" and alpha_packer is None:
+                try:
+                    slate_nv12 = self._make_slate_nv12_gpu(out_w, out_h)
+                    log.info(
+                        "[PYNV][%d] slate video begin: continuous until first real frame ready alloc=%.3fs burst_frames=%d fps=%.3f",
+                        self.sid,
+                        time.perf_counter() - slate_alloc_start,
+                        config.PASSTHROUGH_AUDIO_MPEGTS_SLATE_BURST_FRAMES,
+                        fps,
+                    )
+                    slate_start = time.perf_counter()
+                    while (
+                        not self._stop.is_set()
+                        and not slate_stop.is_set()
+                        and not self._slate_audio_failed.is_set()
+                    ):
+                        slate_frames = slate_frames_box[0]
+                        if fps > 0:
+                            while not self._stop.is_set() and not slate_stop.is_set():
+                                delay = _slate_frame_pace_delay(
+                                    fps=fps,
+                                    sent_frames=slate_frames,
+                                    burst_frames=config.PASSTHROUGH_AUDIO_MPEGTS_SLATE_BURST_FRAMES,
+                                    pace_start=slate_start,
+                                    now=time.perf_counter(),
+                                )
+                                if delay <= 0:
+                                    break
+                                self._stop.wait(min(delay, 0.05))
+                            if self._stop.is_set() or slate_stop.is_set():
+                                break
+                        flags = 0
+                        if slate_frames == 0:
+                            flags = int(nvc.NV_ENC_PIC_FLAGS.FORCEIDR) | int(nvc.NV_ENC_PIC_FLAGS.OUTPUT_SPSPPS)
+                        encode_start = time.perf_counter()
+                        with self._encoder_lock:
+                            if self._enc is None or self._stop.is_set() or slate_stop.is_set():
+                                break
+                            bitstream = self._enc.Encode(GpuNv12AppFrame(slate_nv12, out_w, out_h), flags)
+                        if slate_frames == 0:
+                            log.info(
+                                "[PYNV][%d] slate first encode: bytes=%d elapsed=%.3fs",
+                                self.sid,
+                                len(bitstream) if bitstream else 0,
+                                time.perf_counter() - encode_start,
+                            )
+                        if bitstream:
+                            mux_stdin = self._video_mux.stdin if self._video_mux is not None else self._mux.stdin
+                            if self._stop.is_set() or not mux_stdin or mux_stdin.closed:
+                                break
+                            try:
+                                self._mark_first_write()
+                                mux_stdin.write(bitstream)
+                            except (BrokenPipeError, OSError, ValueError) as e:
+                                log.info("[PYNV][%d] slate mux stdin write stopped at frame=%d: %s", self.sid, slate_frames + 1, e)
+                                break
+                        slate_frames_box[0] = slate_frames + 1
+                    log.info(
+                        "[PYNV][%d] slate video end: frames=%d ready=%s direct=%s failed=%s real_ready=%s elapsed=%.3fs",
+                        self.sid,
+                        slate_frames_box[0],
+                        self._slate_audio_ready.is_set(),
+                        self._slate_direct_ready.is_set(),
+                        self._slate_audio_failed.is_set(),
+                        slate_stop.is_set(),
+                        time.perf_counter() - slate_start,
+                    )
+                except Exception as e:
+                    slate_error.append(f"{e}\n{traceback.format_exc(limit=8)}")
+                    self._stop.set()
+                finally:
+                    slate_done.set()
+
+            if self._slate_audio_addr is not None and config.PASSTHROUGH_MPEGTS_VIDEO_SLATE:
+                slate_thread = threading.Thread(target=slate_video_loop, name=f"pynv-slate-video-{self.sid}", daemon=True)
+                slate_thread.start()
+            if (
+                config.PASSTHROUGH_PYNV_WORKER_MODE == "two_stage"
+                and alpha_packer is None
+                and self._slate_audio_addr is None
+            ):
                 self._worker_loop_two_stage_green(
                     nvc=nvc,
                     info=info,
@@ -1969,9 +2305,10 @@ class PyNvPassthroughStream:
                 raise RuntimeError(f"unknown PT_PASSTHROUGH_PYNV_WORKER_MODE={config.PASSTHROUGH_PYNV_WORKER_MODE!r}")
             if config.PASSTHROUGH_PYNV_WORKER_MODE == "two_stage":
                 log.info(
-                    "[PYNV][%d] worker mode two_stage requested but output_mode=%s is not green; using serial",
+                    "[PYNV][%d] worker mode two_stage requested but output_mode=%s slate_active=%s; using serial",
                     self.sid,
                     self.output_mode,
+                    self._slate_audio_addr is not None,
                 )
             last_src_idx = -1
             t_start = time.perf_counter()
@@ -2079,14 +2416,27 @@ class PyNvPassthroughStream:
                     self._apply_subtitle_overlay(out_nv12, subtitle_renderer, out_idx / fps if fps > 0 else 0.0)
                 app_frame = GpuNv12AppFrame(out_nv12, out_w, out_h)
                 flags = 0
+                first_real_frame = not self._real_video_started.is_set()
                 if i == 0:
                     flags = int(nvc.NV_ENC_PIC_FLAGS.FORCEIDR) | int(nvc.NV_ENC_PIC_FLAGS.OUTPUT_SPSPPS)
                     log.info(
                         "[PYNV][%d] seek start: requested_sec=%.3f out_idx=%d src_idx=%d fps=%.3f source_fps=%.3f",
                         self.sid, self.start_sec, out_idx, src_idx, fps, source_fps,
                     )
+                if first_real_frame and slate_thread is not None:
+                    slate_stop.set()
+                    if slate_thread.is_alive():
+                        slate_thread.join(timeout=2.0)
+                    if slate_thread.is_alive():
+                        log.warning("[PYNV][%d] slate video thread did not stop before first real frame", self.sid)
+                    if slate_error:
+                        raise RuntimeError(f"slate video failed: {slate_error[0]}")
+                    if self._slate_audio_failed.is_set() and not self._stop.is_set():
+                        raise RuntimeError("slate audio cache build failed")
+                    log.info("[PYNV][%d] slate-to-real switch: slate_frames=%d first_real_frame=%d", self.sid, slate_frames_box[0], i + 1)
                 try:
-                    bitstream = self._enc.Encode(app_frame, flags)
+                    with self._encoder_lock:
+                        bitstream = self._enc.Encode(app_frame, flags)
                 except Exception:
                     self.matter.release_nv12_output_slot(nv12_slot)
                     raise
@@ -2099,15 +2449,21 @@ class PyNvPassthroughStream:
                 t4 = time.perf_counter()
                 if bitstream:
                     if self.frames_produced == 0:
-                        log.info("[PYNV][%d] first bitstream len=%d", self.sid, len(bitstream))
+                        log.info(
+                            "[PYNV][%d] first bitstream len=%d hevc_nals=%s",
+                            self.sid,
+                            len(bitstream),
+                            _hevc_nal_summary(bitstream) if PYNV_OUTPUT_CODEC == "hevc" else "n/a",
+                        )
                     mux_stdin = self._video_mux.stdin if self._video_mux is not None else self._mux.stdin
                     if self._stop.is_set() or not mux_stdin or mux_stdin.closed:
                         log.info("[PYNV][%d] mux stdin closed before write at frame=%d", self.sid, i + 1)
                         break
                     try:
                         write_started = time.perf_counter()
+                        self._mark_first_write()
                         mux_stdin.write(bitstream)
-                        if not self._real_video_started.is_set():
+                        if first_real_frame:
                             self._real_video_started.set()
                             log.info("[PYNV][%d] first real video bitstream written; slate audio may switch", self.sid)
                             self._log_vram("first_real_video_bitstream")
@@ -2203,12 +2559,14 @@ class PyNvPassthroughStream:
                     max_mat_kernel = 0.0
             if not self._stop.is_set():
                 log.info("[PYNV][%d] EndEncode begin frames=%d", self.sid, self.frames_produced)
-                tail = self._enc.EndEncode()
+                with self._encoder_lock:
+                    tail = self._enc.EndEncode()
                 if tail:
                     try:
                         mux_stdin = self._video_mux.stdin if self._video_mux is not None else self._mux.stdin
                         if mux_stdin:
                             tail_started = time.perf_counter()
+                            self._mark_first_write()
                             mux_stdin.write(tail)
                             tail_elapsed = time.perf_counter() - tail_started
                             if tail_elapsed >= 1.0:
@@ -2234,6 +2592,9 @@ class PyNvPassthroughStream:
                 self.startup_error = str(e)
             log.error("[PYNV][%d] worker exception: %s\n%s", self.sid, e, traceback.format_exc(limit=8))
         finally:
+            slate_stop.set()
+            if slate_thread is not None and slate_thread.is_alive():
+                slate_thread.join(timeout=2.0)
             while pending_nv12_slots:
                 self.matter.release_nv12_output_slot(pending_nv12_slots.pop(0))
             self._enc = None
@@ -2405,13 +2766,19 @@ class PyNvPassthroughStream:
                 t4 = time.perf_counter()
                 if bitstream:
                     if self.frames_produced == 0:
-                        log.info("[PYNV][%d] first bitstream len=%d", self.sid, len(bitstream))
+                        log.info(
+                            "[PYNV][%d] first bitstream len=%d hevc_nals=%s",
+                            self.sid,
+                            len(bitstream),
+                            _hevc_nal_summary(bitstream) if PYNV_OUTPUT_CODEC == "hevc" else "n/a",
+                        )
                     mux_stdin = self._video_mux.stdin if self._video_mux is not None else self._mux.stdin
                     if self._stop.is_set() or not mux_stdin or mux_stdin.closed:
                         log.info("[PYNV][%d] mux stdin closed before write at frame=%d", self.sid, i + 1)
                         break
                     try:
                         write_started = time.perf_counter()
+                        self._mark_first_write()
                         mux_stdin.write(bitstream)
                         if not self._real_video_started.is_set():
                             self._real_video_started.set()
@@ -2492,6 +2859,7 @@ class PyNvPassthroughStream:
             if tail:
                 mux_stdin = self._video_mux.stdin if self._video_mux is not None else self._mux.stdin
                 if mux_stdin:
+                    self._mark_first_write()
                     mux_stdin.write(tail)
                 log.info("[PYNV][%d] EndEncode tail len=%d", self.sid, len(tail))
             log.info("[PYNV][%d] EndEncode done", self.sid)

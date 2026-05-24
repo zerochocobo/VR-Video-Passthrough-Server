@@ -58,8 +58,9 @@ DLNA_FLAGS_TIME_SEEK = "41700000000000000000000000000000"
 DIDL_NS = "urn:schemas-upnp-org:metadata-1-0/DIDL-Lite/"
 
 _DIR_ITEMS_CACHE_MAX = 256
-_DIDL_SCHEMA_VERSION = 5
+_DIDL_SCHEMA_VERSION = 7
 _SYSTEM_UPDATE_ID = _DIDL_SCHEMA_VERSION
+_OBJECT_ID_VERSION_PREFIX = f"ptv{_DIDL_SCHEMA_VERSION}_"
 _dir_items_cache: dict[tuple, list[dict]] = {}
 _LIVE_MAX_SIDE = 8192
 _NO_LIVE_PREFIX = "[NoLive] "
@@ -102,9 +103,22 @@ def _rel_key(path: Path) -> str:
     return MEDIA_LIBRARY.path_to_key(path)
 
 
+def _versioned_rel(rel: str) -> str:
+    rel = str(rel or "")
+    return f"{_OBJECT_ID_VERSION_PREFIX}{rel}" if rel else rel
+
+
+def _strip_object_id_version(rel: str) -> str:
+    rel = str(rel or "")
+    if rel.startswith(_OBJECT_ID_VERSION_PREFIX):
+        return rel[len(_OBJECT_ID_VERSION_PREFIX):]
+    match = re.match(r"^ptv\d+_(.+)$", rel)
+    return match.group(1) if match else rel
+
+
 def _folder_id(path: Path) -> str:
     rel = _rel_key(path)
-    return ROOT_ID if not rel or rel == "." else f"{FOLDER_PREFIX}{rel}"
+    return ROOT_ID if not rel or rel == "." else f"{FOLDER_PREFIX}{_versioned_rel(rel)}"
 
 
 def _id_to_dir(object_id: str) -> Path | None:
@@ -117,6 +131,7 @@ def _id_to_dir(object_id: str) -> Path | None:
         rel = object_id[len(LEGACY_FOLDER_PREFIX):].replace("\\", "/").strip("/")
     else:
         return None
+    rel = _strip_object_id_version(rel)
     path = MEDIA_LIBRARY.key_to_path(rel)
     if path is not None and MEDIA_LIBRARY.contains(path):
         return path
@@ -143,6 +158,7 @@ def _id_to_live(object_id: str) -> tuple[Path, str] | None:
         else:
             return None
     rel = object_id[len(prefix):].replace("\\", "/").strip("/")
+    rel = _strip_object_id_version(rel)
     path = MEDIA_LIBRARY.key_to_path(rel)
     if path is not None and MEDIA_LIBRARY.contains(path) and path.is_file() and path.suffix.lower() in VIDEO_EXTS:
         return path, mode
@@ -256,6 +272,10 @@ def _passthrough_live_query(mode: str) -> str:
     return version
 
 
+def _live_passthrough_protocol_info() -> str:
+    return "http-get:*:video/MP2T:DLNA.ORG_PN=HEVC_TS_NA_ISO;DLNA.ORG_OP=00;DLNA.ORG_CI=1"
+
+
 def _resolution_str(width: int, height: int) -> str:
     return f"{int(width)}x{int(height)}" if int(width) > 0 and int(height) > 0 else ""
 
@@ -333,6 +353,7 @@ def _video_items_from_index(
             width, height = _parse_resolution(getattr(child.video, "resolution", ""))
         resolution = _resolution_str(width, height)
         backend_verdict = child.video.backend_verdict
+        source_fps = float(getattr(child.video, "fps", 0.0) or 0.0)
     else:
         try:
             info = probe_cached(path)
@@ -343,6 +364,7 @@ def _video_items_from_index(
             meta = probe_video_metadata(path)
             backend = select_backend(meta.timing, meta.codec, meta.color)
             backend_verdict = backend.verdict
+            source_fps = float(meta.timing.source_fps or getattr(info, "fps", 0.0) or 0.0)
         except Exception as e:
             log.warning("probe %s failed: %s", rel, e)
             duration = 0.0
@@ -350,6 +372,7 @@ def _video_items_from_index(
             height = 0
             resolution = ""
             backend_verdict = ""
+            source_fps = 0.0
 
     if child is not None and child.video is not None and child.video.probe_error:
         duration = 0.0
@@ -357,7 +380,7 @@ def _video_items_from_index(
 
     items: list[dict] = [
         {
-            "id": f"v_{rel}",
+            "id": f"v_{_versioned_rel(rel)}",
             "parent_id": parent_id,
             "title": _marked_original_title(path, child),
             "url": f"{base}/media/{quoted}",
@@ -392,7 +415,7 @@ def _video_items_from_index(
         query = _passthrough_live_query(mode)
         suffix = "alpha" if mode == "alpha" else "green"
         if _uses_live_chapter_container(duration):
-            live_id = f"{_passthrough_live_prefix(mode)}{rel}"
+            live_id = f"{_passthrough_live_prefix(mode)}{_versioned_rel(rel)}"
             items.append(
                 {
                     "container": True,
@@ -405,7 +428,7 @@ def _video_items_from_index(
         else:
             items.append(
                 {
-                    "id": f"{_passthrough_live_item_prefix(mode)}{rel}",
+                    "id": f"{_passthrough_live_item_prefix(mode)}{_versioned_rel(rel)}",
                     "parent_id": parent_id,
                     "title": _passthrough_virtual_title(path, mode, width, height),
                     "url": f"{base}/passthrough_live/{quoted}" + (f"?{query}" if query else ""),
@@ -416,12 +439,12 @@ def _video_items_from_index(
                     "bitrate": pt_bps_est,
                     "mime": "video/MP2T",
                     "dlna_pn": "HEVC_TS_NA_ISO",
-                    "frame_rate": passthrough_frame_rate(),
+                    "frame_rate": passthrough_frame_rate(source_fps),
                     "passthrough": True,
                     "passthrough_mode": mode,
-                    "op": "10",
-                    "ci": "1",
-                    "flags": DLNA_FLAGS_TIME_SEEK,
+                    "protocol_info": _live_passthrough_protocol_info(),
+                    "omit_duration": True,
+                    "omit_bitrate": True,
                 }
             )
     return items
@@ -433,18 +456,20 @@ def _live_chapter_items(path: Path, mode: str) -> list[dict]:
     base = f"http://{LAN_IP}:{HTTP_PORT}"
     rel = _rel_key(path)
     quoted = quote(rel)
-    parent_id = f"{_passthrough_live_prefix(mode)}{rel}"
+    parent_id = f"{_passthrough_live_prefix(mode)}{_versioned_rel(rel)}"
     query = _passthrough_live_query(mode)
     try:
         info = probe_cached(path)
         duration = info.duration
         width = int(info.width)
         height = int(info.height)
+        source_fps = float(getattr(info, "fps", 0.0) or 0.0)
     except Exception as e:
         log.warning("probe live chapters %s failed: %s", rel, e)
         duration = 0.0
         width = 0
         height = 0
+        source_fps = 0.0
     pt_bps = _parse_bitrate(PASSTHROUGH_BITRATE)
     if duration > 0:
         _, pt_bps_est, _ = estimate_for_media(path, duration, PYNV_OUTPUT_CODEC)
@@ -458,7 +483,7 @@ def _live_chapter_items(path: Path, mode: str) -> list[dict]:
         remain = max(0.0, duration - float(offset)) if duration > 0 else 0.0
         items.append(
             {
-                "id": f"lt{suffix[0]}_{rel}@{offset}",
+                "id": f"lt{suffix[0]}_{_versioned_rel(rel)}@{offset}",
                 "parent_id": parent_id,
                 "title": title,
                 "url": f"{base}/passthrough_live/{quoted}?t={offset}" + (f"&{query}" if query else ""),
@@ -469,12 +494,12 @@ def _live_chapter_items(path: Path, mode: str) -> list[dict]:
                 "bitrate": pt_bps_est,
                 "mime": "video/MP2T",
                 "dlna_pn": "HEVC_TS_NA_ISO",
-                "frame_rate": passthrough_frame_rate(),
+                "frame_rate": passthrough_frame_rate(source_fps),
                 "passthrough": True,
                 "passthrough_mode": mode,
-                "op": "10",
-                "ci": "1",
-                "flags": DLNA_FLAGS_TIME_SEEK,
+                "protocol_info": _live_passthrough_protocol_info(),
+                "omit_duration": True,
+                "omit_bitrate": True,
             }
         )
     return items
@@ -527,7 +552,7 @@ def _root_items() -> list[dict]:
     return [
         {
             "container": True,
-            "id": f"{FOLDER_PREFIX}{root.label}",
+            "id": f"{FOLDER_PREFIX}{_versioned_rel(root.label)}",
             "parent_id": ROOT_ID,
             "title": root.label,
             "child_count": _child_count(root.path),
@@ -570,10 +595,18 @@ def _didl_for(items: list[dict]) -> str:
         bitrate = it["bitrate"]
         mime = it["mime"]
 
-        if "op" in it:
+        if "protocol_info" in it:
+            proto = it["protocol_info"]
+        elif "op" in it:
             op = it["op"]
             ci = it.get("ci", "1")
             flags = it.get("flags", DLNA_FLAGS_BASE)
+            proto = (
+                f"http-get:*:{mime}:DLNA.ORG_PN={it['dlna_pn']};"
+                f"DLNA.ORG_OP={op};"
+                f"DLNA.ORG_CI={ci};"
+                f"DLNA.ORG_FLAGS={flags}"
+            )
         else:
             if it["passthrough"] and PASSTHROUGH_SEEK_MODE == "bytes":
                 op = "01"
@@ -584,18 +617,19 @@ def _didl_for(items: list[dict]) -> str:
                 flags = DLNA_FLAGS_BASE
             else:
                 flags = DLNA_FLAGS_TIME_SEEK if it["passthrough"] else DLNA_FLAGS_BASE
-        proto = (
-            f"http-get:*:{mime}:DLNA.ORG_PN={it['dlna_pn']};"
-            f"DLNA.ORG_OP={op};"
-            f"DLNA.ORG_CI={ci};"
-            f"DLNA.ORG_FLAGS={flags}"
-        )
+            proto = (
+                f"http-get:*:{mime}:DLNA.ORG_PN={it['dlna_pn']};"
+                f"DLNA.ORG_OP={op};"
+                f"DLNA.ORG_CI={ci};"
+                f"DLNA.ORG_FLAGS={flags}"
+            )
 
         attrs: list[str] = []
         if size > 0:
             attrs.append(f'size="{size}"')
-        attrs.append(f'duration="{duration}"')
-        if bitrate > 0:
+        if not it.get("omit_duration"):
+            attrs.append(f'duration="{duration}"')
+        if bitrate > 0 and not it.get("omit_bitrate"):
             attrs.append(f'bitrate="{bitrate}"')
         if resolution:
             attrs.append(f'resolution="{resolution}"')
@@ -704,7 +738,7 @@ def _metadata_didl_for_dir(directory: Path) -> str:
 
 def _metadata_didl_for_live(path: Path, mode: str) -> str:
     rel = _rel_key(path)
-    live_id = f"{_passthrough_live_prefix(mode)}{rel}"
+    live_id = f"{_passthrough_live_prefix(mode)}{_versioned_rel(rel)}"
     try:
         info = probe_cached(path)
         duration = info.duration

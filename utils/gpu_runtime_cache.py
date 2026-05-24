@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import os
 import subprocess
 import sys
@@ -18,8 +19,12 @@ from pathlib import Path
 from typing import Iterable
 
 import config
+from utils.logger import warmup_event
+from utils.startup_status import set_startup_phase
 from utils.subprocess_hidden import hidden_subprocess_kwargs
 
+
+log = logging.getLogger(__name__)
 
 RUNTIME_CACHE_DIR = config.RUNTIME_CACHE_DIR
 CUDA_CACHE_DIR = config.CUDA_CACHE_PATH
@@ -459,49 +464,84 @@ def warmup_gpu_runtime_cache(force: bool = False, timeout_sec: float = 300.0, ru
     env = configure_gpu_runtime_cache()
     marker_path = Path(env.marker_path)
     key = build_warmup_key()
-    if not force and marker_matches(key, marker_path):
-        count, size = _cache_stats(Path(env.cuda_cache_path))
-        return GpuWarmupMarker(
-            key=key,
-            cuda_cache_path=env.cuda_cache_path,
-            cupy_cache_dir=env.cupy_cache_dir,
-            cache_size_after_warmup=size,
-            cache_file_count_after_warmup=count,
-            elapsed_sec=0.0,
-            verified_second_pass_sec=0.0,
-            created_at=time.strftime("%Y-%m-%dT%H:%M:%S"),
-        )
-
     start = time.perf_counter()
-    with WarmupLock(LOCK_PATH, timeout_sec=timeout_sec):
-        key = build_warmup_key()
-        if not force and marker_matches(key, marker_path):
-            count, size = _cache_stats(Path(env.cuda_cache_path))
-            return GpuWarmupMarker(
-                key=key,
-                cuda_cache_path=env.cuda_cache_path,
-                cupy_cache_dir=env.cupy_cache_dir,
-                cache_size_after_warmup=size,
-                cache_file_count_after_warmup=count,
-                elapsed_sec=time.perf_counter() - start,
-                verified_second_pass_sec=0.0,
-                created_at=time.strftime("%Y-%m-%dT%H:%M:%S"),
-            )
-        from pipeline.matting import Matter
+    step_total = 5 + (1 if config.USE_PYNV and config.NVENC_PREFLIGHT_ENABLE else 0)
 
-        old_warmup = config.MATTING_WARMUP_RUNS
-        config.MATTING_WARMUP_RUNS = 0
-        try:
-            matter = Matter()
-        finally:
-            config.MATTING_WARMUP_RUNS = old_warmup
+    def _warmup_resident_matter_runtime(warmup_key: GpuWarmupKey) -> float:
+        from pipeline.matting import get_matter
+
+        set_startup_phase(
+            "warming",
+            "loading matting runtime",
+            step="matter_singleton",
+            step_index=1,
+            step_total=step_total,
+            progress=1.0 / step_total,
+        )
+        matter = get_matter(warmup_runs=0)
+        warmup_event(
+            log,
+            phase="matter_singleton",
+            id=id(matter),
+            static_trt_available=getattr(matter, "_rvm_static_trt_available", None),
+            providers=list(matter.sess.get_providers()),
+        )
 
         import cupy as cp
         import pipeline.matting as matting_mod
 
-        verify_start = 0.0
         verify_elapsed = 0.0
-        for shape in key.shapes:
+        stream = getattr(matting_mod, "_CUDA_STREAM", None)
+
+        set_startup_phase(
+            "warming",
+            "loading TensorRT engines",
+            step="static_trt_preload",
+            step_index=2,
+            step_total=step_total,
+            progress=2.0 / step_total,
+        )
+        for shape in warmup_key.shapes:
+            batch, channels, h, w = shape
+            if channels != 3:
+                continue
+            t_static = time.perf_counter()
+            sess = None
+            try:
+                sess = matter._get_trt_static_session(int(batch), int(h), int(w))
+            except Exception:
+                warmup_event(
+                    log,
+                    phase="static_trt_preload",
+                    status="failed",
+                    batch=int(batch),
+                    shape=[int(h), int(w)],
+                )
+                log.warning(
+                    "static_trt preload failed batch=%d shape=%dx%d",
+                    int(batch),
+                    int(h),
+                    int(w),
+                    exc_info=True,
+                )
+            warmup_event(
+                log,
+                phase="static_trt_preload",
+                batch=int(batch),
+                shape=[int(h), int(w)],
+                loaded=sess is not None,
+                elapsed_ms=round((time.perf_counter() - t_static) * 1000.0, 1),
+            )
+
+        set_startup_phase(
+            "warming",
+            "running GPU inference warmup",
+            step="ort_iobinding_runs",
+            step_index=3,
+            step_total=step_total,
+            progress=3.0 / step_total,
+        )
+        for shape in warmup_key.shapes:
             batch, channels, h, w = shape
             if channels != 3:
                 continue
@@ -510,13 +550,166 @@ def warmup_gpu_runtime_cache(force: bool = False, timeout_sec: float = 300.0, ru
             for i in range(max(1, runs_per_shape)):
                 t0 = time.perf_counter()
                 matter._run_rvm_iobinding_from_dev(x)
-                stream = getattr(matting_mod, "_CUDA_STREAM", None)
                 if stream is not None:
                     stream.synchronize()
                 else:
                     cp.cuda.Stream.null.synchronize()
                 if i == max(1, runs_per_shape) - 1:
                     verify_elapsed += time.perf_counter() - t0
+
+        if config.WARMUP_COMPOSITE_ENABLE:
+            from pipeline.alpha_packer import AlphaPacker
+
+            set_startup_phase(
+                "warming",
+                "warming composite kernels",
+                step="composite_jit",
+                step_index=4,
+                step_total=step_total,
+                progress=4.0 / step_total,
+            )
+            saved_call_count = getattr(matter, "_call_count", 0)
+            saved_preproc_diag_count = getattr(matter, "_preproc_diag_count", 0)
+            try:
+                for src_h, src_w in config.WARMUP_COMPOSITE_GEOMETRIES:
+                    src_h = max(2, int(src_h) & ~1)
+                    src_w = max(2, int(src_w) & ~1)
+                    out_h, out_w = src_h, src_w
+
+                    nv12_slot = None
+                    t_geom = time.perf_counter()
+                    try:
+                        nv12_frame = matting_mod.make_zero_gpu_frame(src_h, src_w, bit_depth=8)
+                        nv12_slot = matter.acquire_nv12_output_slot(out_h, out_w)
+                        matter.composite_green_gpu_nv12_frame_to_gpu_nv12_profile(
+                            nv12_frame,
+                            out_h=out_h,
+                            out_w=out_w,
+                            out_slot=nv12_slot,
+                        )
+                        if stream is not None:
+                            stream.synchronize()
+                        else:
+                            cp.cuda.Stream.null.synchronize()
+                        warmup_event(
+                            log,
+                            phase="composite_jit",
+                            kind="green_nv12",
+                            geometry=[src_w, src_h],
+                            elapsed_ms=round((time.perf_counter() - t_geom) * 1000.0, 1),
+                        )
+                    except Exception:
+                        warmup_event(log, phase="composite_jit", kind="green_nv12", geometry=[src_w, src_h], status="failed")
+                        log.warning("composite_green nv12 warmup failed geometry=%dx%d", src_w, src_h, exc_info=True)
+                    finally:
+                        matter.release_nv12_output_slot(nv12_slot)
+
+                    p016_slot = None
+                    t_geom = time.perf_counter()
+                    try:
+                        p016_frame = matting_mod.make_zero_gpu_frame(src_h, src_w, bit_depth=10)
+                        p016_slot = matter.acquire_nv12_output_slot(out_h, out_w)
+                        matter.composite_green_gpu_p016_frame_to_gpu_nv12_profile(
+                            p016_frame,
+                            shift_bits=8,
+                            out_h=out_h,
+                            out_w=out_w,
+                            out_slot=p016_slot,
+                        )
+                        if stream is not None:
+                            stream.synchronize()
+                        else:
+                            cp.cuda.Stream.null.synchronize()
+                        warmup_event(
+                            log,
+                            phase="composite_jit",
+                            kind="green_p016",
+                            geometry=[src_w, src_h],
+                            elapsed_ms=round((time.perf_counter() - t_geom) * 1000.0, 1),
+                        )
+                    except Exception:
+                        warmup_event(log, phase="composite_jit", kind="green_p016", geometry=[src_w, src_h], status="failed")
+                        log.warning("composite_green p016 warmup failed geometry=%dx%d", src_w, src_h, exc_info=True)
+                    finally:
+                        matter.release_nv12_output_slot(p016_slot)
+
+                    t_geom = time.perf_counter()
+                    try:
+                        nv12_frame = matting_mod.make_zero_gpu_frame(src_h, src_w, bit_depth=8)
+                        matter.upload_nv12_planes_gpu_scaled(
+                            nv12_frame.y.as_cupy(),
+                            nv12_frame.uv.as_cupy(),
+                            src_h,
+                            src_w,
+                            out_h,
+                            out_w,
+                        )
+                        alpha_h = max(2, int(config.MATTING_INPUT_SIZE))
+                        alpha_w = max(2, int(config.MATTING_INPUT_SIZE))
+                        fake_alpha = cp.zeros((alpha_h, alpha_w * 2), dtype=cp.float32)
+                        packer = AlphaPacker(matter)
+                        packer.pack_uploaded(fake_alpha, out_h, out_w, out_h=out_h, out_w=out_w)
+                        if stream is not None:
+                            stream.synchronize()
+                        else:
+                            cp.cuda.Stream.null.synchronize()
+                        warmup_event(
+                            log,
+                            phase="composite_jit",
+                            kind="alpha_packer",
+                            geometry=[src_w, src_h],
+                            elapsed_ms=round((time.perf_counter() - t_geom) * 1000.0, 1),
+                        )
+                    except Exception:
+                        warmup_event(log, phase="composite_jit", kind="alpha_packer", geometry=[src_w, src_h], status="failed")
+                        log.warning("alpha_packer warmup failed geometry=%dx%d", src_w, src_h, exc_info=True)
+            finally:
+                matter._call_count = saved_call_count
+                matter._preproc_diag_count = saved_preproc_diag_count
+            warmup_event(log, phase="composite_jit", status="complete")
+
+        set_startup_phase(
+            "warming",
+            "resetting warmup state",
+            step="reset_state",
+            step_index=5,
+            step_total=step_total,
+            progress=5.0 / step_total,
+        )
+        matter.reset_state()
+        warmup_event(log, phase="reset_state", step="after_warmup")
+        return verify_elapsed
+
+    if not force and marker_matches(key, marker_path):
+        verify_elapsed = _warmup_resident_matter_runtime(key)
+        count, size = _cache_stats(Path(env.cuda_cache_path))
+        return GpuWarmupMarker(
+            key=key,
+            cuda_cache_path=env.cuda_cache_path,
+            cupy_cache_dir=env.cupy_cache_dir,
+            cache_size_after_warmup=size,
+            cache_file_count_after_warmup=count,
+            elapsed_sec=time.perf_counter() - start,
+            verified_second_pass_sec=verify_elapsed,
+            created_at=time.strftime("%Y-%m-%dT%H:%M:%S"),
+        )
+
+    with WarmupLock(LOCK_PATH, timeout_sec=timeout_sec):
+        key = build_warmup_key()
+        if not force and marker_matches(key, marker_path):
+            verify_elapsed = _warmup_resident_matter_runtime(key)
+            count, size = _cache_stats(Path(env.cuda_cache_path))
+            return GpuWarmupMarker(
+                key=key,
+                cuda_cache_path=env.cuda_cache_path,
+                cupy_cache_dir=env.cupy_cache_dir,
+                cache_size_after_warmup=size,
+                cache_file_count_after_warmup=count,
+                elapsed_sec=time.perf_counter() - start,
+                verified_second_pass_sec=verify_elapsed,
+                created_at=time.strftime("%Y-%m-%dT%H:%M:%S"),
+            )
+        verify_elapsed = _warmup_resident_matter_runtime(key)
 
         count, size = _cache_stats(Path(env.cuda_cache_path))
         marker = GpuWarmupMarker(

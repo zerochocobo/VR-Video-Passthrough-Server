@@ -387,7 +387,7 @@ These directories are generated or environment-specific:
 | `PT_PASSTHROUGH_HEVC_BITRATE` | `50M` | PyNv HEVC output target bitrate. |
 | `PT_PASSTHROUGH_AUDIO_MPEGTS_OUTPUT_RATE` | `48000` | Live MPEG-TS AAC output sample rate. |
 | `PT_PASSTHROUGH_AUDIO_MPEGTS_OUTPUT_CHANNELS` | `2` | Live MPEG-TS AAC output channels, stereo. |
-| `PT_PASSTHROUGH_AUDIO_MPEGTS_SLATE` | `1` | Use green-screen slate while first AAC cache is built. |
+| `PT_PASSTHROUGH_AUDIO_MPEGTS_SLATE` | `1` | Use green-screen slate while first AAC cache is built. Slate video continues while the first real frame is prepared; source audio starts only after the first real video bitstream is written. |
 | `PT_PASSTHROUGH_AUDIO_MPEGTS_SLATE_DIRECT_AFTER` | `1.0` | On cache miss, stop waiting for full AAC cache after this many seconds and feed this playback from direct source demux while the full cache continues. |
 | `PT_PASSTHROUGH_GOP` | `60` | Encoder GOP size. |
 | `PT_PASSTHROUGH_MAX_CONCURRENT` | `1` | Concurrent passthrough stream limit. |

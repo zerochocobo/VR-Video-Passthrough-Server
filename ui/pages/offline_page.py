@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from PySide6.QtCore import QPoint, QSize, Qt
+from PySide6.QtCore import QFileSystemWatcher, QPoint, QSize, Qt
 from PySide6.QtGui import QColor, QFont, QIcon, QPainter, QPen, QPixmap
 from PySide6.QtWidgets import (
     QCheckBox,
@@ -25,12 +25,17 @@ from PySide6.QtWidgets import (
 from ui.log_limits import UI_LOG_MAX_BLOCKS
 from ui.log_sanitizer import clean_log_text
 from ui.page_icons import BACK_ICON_SIZE, back_icon
+from ui.resources import SWITCH_OFF_IMAGE_PATH, SWITCH_ON_IMAGE_PATH
 from ui.settings import quality_speed_preset, quality_speed_value
+from ui.widgets.trt_cache_dialog import TensorRTConfigDialog
+from utils.trt_manifest import TRT_MODEL_MATANYONE2, TRT_MODEL_RVM, cache_status, manifest_path
 
 
 OFFLINE_LABEL_WIDTH = 132
 ACTION_ICON_SIZE = 20
 HELP_ICON_SIZE = 20
+SWITCH_OFF_IMAGE = SWITCH_OFF_IMAGE_PATH.as_posix()
+SWITCH_ON_IMAGE = SWITCH_ON_IMAGE_PATH.as_posix()
 
 
 def _action_icon(kind: str) -> QIcon:
@@ -73,6 +78,22 @@ def _help_button() -> QPushButton:
     button.setFixedWidth(32)
     button.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
     return button
+
+
+def _apply_switch_style(widget: QCheckBox) -> None:
+    widget.setObjectName("Switch")
+    widget.setStyleSheet(
+        "QCheckBox#Switch { spacing: 8px; }"
+        "QCheckBox#Switch::indicator {"
+        "width: 38px; height: 20px;"
+        "}"
+        "QCheckBox#Switch::indicator:unchecked {"
+        f"image: url({SWITCH_OFF_IMAGE});"
+        "}"
+        "QCheckBox#Switch::indicator:checked {"
+        f"image: url({SWITCH_ON_IMAGE});"
+        "}"
+    )
 
 
 def _label() -> QLabel:
@@ -142,7 +163,6 @@ class OfflinePage(QWidget):
     def _engine_combo(self) -> QComboBox:
         combo = _fit_combo(QComboBox())
         combo.addItem("", "rvm_fast")
-        combo.addItem("", "rvm_balanced")
         combo.addItem("", "matanyone2")
         return combo
 
@@ -179,6 +199,29 @@ class OfflinePage(QWidget):
     def _performance_row(self, combo: QComboBox) -> QHBoxLayout:
         row = QHBoxLayout()
         row.addWidget(combo)
+        row.addStretch(1)
+        return row
+
+    def _trt_cache_row(self, scope: str) -> QHBoxLayout:
+        enabled = QCheckBox()
+        enabled.setText("")
+        _apply_switch_style(enabled)
+        button = QPushButton()
+        status = QLabel()
+        status.setStyleSheet("color: #5f6368;")
+        watcher = QFileSystemWatcher(self)
+        watcher.directoryChanged.connect(lambda _path: self._update_trt_cache_rows())
+        watcher.fileChanged.connect(lambda _path: self._update_trt_cache_rows())
+        enabled.toggled.connect(lambda checked, item=scope: self._save_trt_enabled(item, checked))
+        button.clicked.connect(lambda: self.show_trt_config(scope))
+        setattr(self, f"{scope}_trt_enabled", enabled)
+        setattr(self, f"{scope}_trt_configure_button", button)
+        setattr(self, f"{scope}_trt_status_label", status)
+        setattr(self, f"{scope}_trt_cache_watcher", watcher)
+        row = QHBoxLayout()
+        row.addWidget(enabled)
+        row.addWidget(button)
+        row.addWidget(status)
         row.addStretch(1)
         return row
 
@@ -219,6 +262,7 @@ class OfflinePage(QWidget):
         self.start_single.clicked.connect(self.run_single)
         self.single_engine.currentIndexChanged.connect(self._update_matanyone_help_visibility)
         self.single_engine.currentIndexChanged.connect(self._update_recognition_visibility)
+        self.single_engine.currentIndexChanged.connect(self._update_trt_cache_rows)
         self.single_recognition.currentIndexChanged.connect(self._update_recognition_visibility)
         self.single_matanyone_help.clicked.connect(self.show_matanyone_help)
         self.single_sam3_prompt_button.clicked.connect(self.show_sam3_prompt_dialog)
@@ -235,7 +279,7 @@ class OfflinePage(QWidget):
         grid = QGridLayout(page)
         grid.setColumnMinimumWidth(0, OFFLINE_LABEL_WIDTH)
         grid.setColumnStretch(1, 1)
-        self.single_labels = {key: _label() for key in ("video", "output", "mode", "engine", "recognition", "performance", "time")}
+        self.single_labels = {key: _label() for key in ("video", "output", "mode", "engine", "recognition", "trt", "performance", "time")}
         grid.addWidget(self.single_labels["video"], 0, 0)
         grid.addLayout(row_video, 0, 1)
         grid.addWidget(self.single_labels["output"], 1, 0)
@@ -255,12 +299,14 @@ class OfflinePage(QWidget):
         single_recognition_row.addWidget(self.single_sam3_prompt_label)
         single_recognition_row.addStretch(1)
         grid.addLayout(single_recognition_row, 4, 1)
-        grid.addWidget(self.single_labels["performance"], 5, 0)
-        grid.addLayout(self._performance_row(self.single_quality_speed), 5, 1)
-        grid.addWidget(self.single_labels["time"], 6, 0)
-        grid.addLayout(self._time_row(), 6, 1)
-        grid.addWidget(self.single_skip, 7, 1)
-        grid.addLayout(actions, 8, 1)
+        grid.addWidget(self.single_labels["trt"], 5, 0)
+        grid.addLayout(self._trt_cache_row("single"), 5, 1)
+        grid.addWidget(self.single_labels["performance"], 6, 0)
+        grid.addLayout(self._performance_row(self.single_quality_speed), 6, 1)
+        grid.addWidget(self.single_labels["time"], 7, 0)
+        grid.addLayout(self._time_row(), 7, 1)
+        grid.addWidget(self.single_skip, 8, 1)
+        grid.addLayout(actions, 9, 1)
         self.tabs.addTab(page, "")
         self._update_custom_duration_visibility()
 
@@ -283,6 +329,7 @@ class OfflinePage(QWidget):
         self.start_batch.clicked.connect(self.run_batch)
         self.batch_engine.currentIndexChanged.connect(self._update_matanyone_help_visibility)
         self.batch_engine.currentIndexChanged.connect(self._update_recognition_visibility)
+        self.batch_engine.currentIndexChanged.connect(self._update_trt_cache_rows)
         self.batch_recognition.currentIndexChanged.connect(self._update_recognition_visibility)
         self.batch_matanyone_help.clicked.connect(self.show_matanyone_help)
         self.batch_sam3_prompt_button.clicked.connect(self.show_sam3_prompt_dialog)
@@ -296,7 +343,7 @@ class OfflinePage(QWidget):
         grid = QGridLayout(page)
         grid.setColumnMinimumWidth(0, OFFLINE_LABEL_WIDTH)
         grid.setColumnStretch(1, 1)
-        self.batch_labels = {key: _label() for key in ("directory", "mode", "engine", "recognition", "performance")}
+        self.batch_labels = {key: _label() for key in ("directory", "mode", "engine", "recognition", "trt", "performance")}
         grid.addWidget(self.batch_labels["directory"], 0, 0)
         grid.addLayout(row_dir, 0, 1)
         grid.addWidget(self.batch_labels["mode"], 1, 0)
@@ -314,11 +361,13 @@ class OfflinePage(QWidget):
         batch_recognition_row.addWidget(self.batch_sam3_prompt_label)
         batch_recognition_row.addStretch(1)
         grid.addLayout(batch_recognition_row, 3, 1)
-        grid.addWidget(self.batch_labels["performance"], 4, 0)
-        grid.addLayout(self._performance_row(self.batch_quality_speed), 4, 1)
-        grid.addWidget(self.batch_recursive, 5, 1)
-        grid.addWidget(self.batch_skip, 6, 1)
-        grid.addLayout(actions, 7, 1)
+        grid.addWidget(self.batch_labels["trt"], 4, 0)
+        grid.addLayout(self._trt_cache_row("batch"), 4, 1)
+        grid.addWidget(self.batch_labels["performance"], 5, 0)
+        grid.addLayout(self._performance_row(self.batch_quality_speed), 5, 1)
+        grid.addWidget(self.batch_recursive, 6, 1)
+        grid.addWidget(self.batch_skip, 7, 1)
+        grid.addLayout(actions, 8, 1)
         self.tabs.addTab(page, "")
 
     def _browse_file(self, target: QLineEdit) -> None:
@@ -383,6 +432,65 @@ class OfflinePage(QWidget):
         self.batch_sam3_prompt_label.setVisible(batch_sam3_visible)
         self._update_sam3_prompt_labels()
         self._update_matanyone_help_visibility()
+
+    def _trt_model_key_for_scope(self, scope: str) -> str:
+        combo = self.single_engine if scope == "single" else self.batch_engine
+        return TRT_MODEL_MATANYONE2 if str(combo.currentData()) == "matanyone2" else TRT_MODEL_RVM
+
+    def _trt_setting_key(self, scope: str, model_key: str) -> str:
+        model_part = "matanyone2" if model_key == TRT_MODEL_MATANYONE2 else "rvm"
+        return f"offline_{scope}_trt_{model_part}_enabled"
+
+    def _offline_trt_enabled(self, scope: str, model_key: str) -> bool:
+        return bool(self.settings.data.get(self._trt_setting_key(scope, model_key), True))
+
+    def _save_trt_enabled(self, scope: str, checked: bool) -> None:
+        model_key = self._trt_model_key_for_scope(scope)
+        self.settings.data[self._trt_setting_key(scope, model_key)] = bool(checked)
+        self.settings.save()
+
+    def _trt_status(self, model_key: str) -> str:
+        try:
+            return cache_status(model_key=model_key)
+        except Exception:
+            return "failed"
+
+    def _refresh_trt_cache_watcher(self, scope: str, model_key: str) -> None:
+        watcher = getattr(self, f"{scope}_trt_cache_watcher", None)
+        if not isinstance(watcher, QFileSystemWatcher):
+            return
+        for path in watcher.files():
+            watcher.removePath(path)
+        for path in watcher.directories():
+            watcher.removePath(path)
+        cache_dir = manifest_path(model_key).parent
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        watcher.addPath(str(cache_dir))
+        manifest = manifest_path(model_key)
+        if manifest.exists():
+            watcher.addPath(str(manifest))
+
+    def _update_trt_cache_rows(self, *_args) -> None:
+        for scope in ("single", "batch"):
+            if not hasattr(self, f"{scope}_trt_status_label"):
+                continue
+            model_key = self._trt_model_key_for_scope(scope)
+            self._refresh_trt_cache_watcher(scope, model_key)
+            status = self._trt_status(model_key)
+            model_text = self.i18n.t("trt.model_matanyone2" if model_key == TRT_MODEL_MATANYONE2 else "trt.model_rvm")
+            switch = getattr(self, f"{scope}_trt_enabled")
+            switch.blockSignals(True)
+            switch.setEnabled(status == "ready")
+            switch.setChecked(status == "ready" and self._offline_trt_enabled(scope, model_key))
+            switch.blockSignals(False)
+            switch.setToolTip("" if status == "ready" else self.i18n.t("trt.build_first_tooltip"))
+            getattr(self, f"{scope}_trt_status_label").setText(f"{model_text}: {self.i18n.t('trt.status_' + status)}")
+
+    def show_trt_config(self, scope: str) -> None:
+        model_key = self._trt_model_key_for_scope(scope)
+        dialog = TensorRTConfigDialog(self.i18n, self, model_key=model_key)
+        dialog.exec()
+        self._update_trt_cache_rows()
 
     def _effective_engine(self, engine_combo: QComboBox, recognition_combo: QComboBox) -> str:
         engine = str(engine_combo.currentData())
@@ -490,6 +598,7 @@ class OfflinePage(QWidget):
         env = self.settings.server_env()
         env["PT_DECODE_MAX_SIDE"] = "0"
         env["PT_PASSTHROUGH_PYNV_PRESET"] = quality_speed_preset(self.settings.data.get("offline_quality_speed"), "medium")
+        self._apply_offline_trt_env(env, "single", engine)
         self.process.start(args, env)
 
     def run_batch(self) -> None:
@@ -513,13 +622,27 @@ class OfflinePage(QWidget):
         env = self.settings.server_env()
         env["PT_DECODE_MAX_SIDE"] = "0"
         env["PT_PASSTHROUGH_PYNV_PRESET"] = quality_speed_preset(self.settings.data.get("offline_quality_speed"), "medium")
+        self._apply_offline_trt_env(env, "batch", engine)
         self.process.start(args, env)
+
+    def _apply_offline_trt_env(self, env: dict[str, str], scope: str, engine: str) -> None:
+        model_key = TRT_MODEL_MATANYONE2 if engine in {"matanyone2", "matanyone2_medium"} else TRT_MODEL_RVM
+        enabled = self._offline_trt_enabled(scope, model_key)
+        env["PT_OFFLINE_RVM_TRT_ENABLE"] = "1" if model_key == TRT_MODEL_RVM and enabled else "0"
+        env["PT_OFFLINE_MATANYONE2_TRT_ENABLE"] = "1" if model_key == TRT_MODEL_MATANYONE2 and enabled else "0"
 
     def set_running(self, running: bool) -> None:
         self.start_single.setEnabled(not running)
         self.start_batch.setEnabled(not running)
         self.stop_single.setEnabled(running)
         self.stop_batch.setEnabled(running)
+        self.single_trt_configure_button.setEnabled(not running)
+        self.batch_trt_configure_button.setEnabled(not running)
+        if not running:
+            self._update_trt_cache_rows()
+        else:
+            self.single_trt_enabled.setEnabled(False)
+            self.batch_trt_enabled.setEnabled(False)
 
     def append_log(self, text: str) -> None:
         text = clean_log_text(text)
@@ -546,20 +669,21 @@ class OfflinePage(QWidget):
         self.single_labels["mode"].setText(self.i18n.t("offline.mode"))
         self.single_labels["engine"].setText(self.i18n.t("offline.engine"))
         self.single_labels["recognition"].setText(self.i18n.t("offline.recognition_model"))
+        self.single_labels["trt"].setText(self.i18n.t("trt.row_label"))
         self.single_labels["performance"].setText(self.i18n.t("performance.quality_speed"))
         self.single_labels["time"].setText(self.i18n.t("offline.time_range"))
         self.batch_labels["directory"].setText(self.i18n.t("offline.directory"))
         self.batch_labels["mode"].setText(self.i18n.t("offline.mode"))
         self.batch_labels["engine"].setText(self.i18n.t("offline.engine"))
         self.batch_labels["recognition"].setText(self.i18n.t("offline.recognition_model"))
+        self.batch_labels["trt"].setText(self.i18n.t("trt.row_label"))
         self.batch_labels["performance"].setText(self.i18n.t("performance.quality_speed"))
         for combo in (self.single_mode, self.batch_mode):
             combo.setItemText(0, self.i18n.t("mode.green"))
             combo.setItemText(1, self.i18n.t("mode.alpha"))
         for combo in (self.single_engine, self.batch_engine):
             combo.setItemText(0, self.i18n.t("engine.rvm_fast"))
-            combo.setItemText(1, self.i18n.t("engine.rvm_balanced"))
-            combo.setItemText(2, self.i18n.t("engine.matanyone2"))
+            combo.setItemText(1, self.i18n.t("engine.matanyone2"))
         for combo in (self.single_recognition, self.batch_recognition):
             combo.setItemText(0, self.i18n.t("recognition.yoloworld_efficientsam"))
             combo.setItemText(1, self.i18n.t("recognition.sam3"))
@@ -574,3 +698,6 @@ class OfflinePage(QWidget):
         for combo in (self.single_quality_speed, self.batch_quality_speed):
             for index, key in enumerate(("quality_speed.ultrafast", "quality_speed.medium", "quality_speed.veryslow")):
                 combo.setItemText(index, self.i18n.t(key))
+        self.single_trt_configure_button.setText(self.i18n.t("trt.configure"))
+        self.batch_trt_configure_button.setText(self.i18n.t("trt.configure"))
+        self._update_trt_cache_rows()

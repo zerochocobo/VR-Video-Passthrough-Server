@@ -1,8 +1,10 @@
 ﻿"""Shared logging setup for console and debug_output/server.log."""
 
+import json
 import logging
 import sys
 from pathlib import Path
+from typing import Any
 
 _FMT = "%(asctime)s [%(levelname)s] %(name)s: %(message)s"
 _ORIGINAL_STDOUT = sys.stdout
@@ -19,6 +21,15 @@ class _LoggerNameAliasFilter(logging.Filter):
         alias = self.aliases.get(record.name)
         if alias:
             record.name = alias
+        return True
+
+
+class _UvicornSocketSendNoiseFilter(logging.Filter):
+    _NOISE_MESSAGE = "socket.send() raised exception"
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        if record.name.startswith("uvicorn.") and record.getMessage() == self._NOISE_MESSAGE:
+            return False
         return True
 
 
@@ -79,6 +90,7 @@ def setup(level: int = logging.INFO) -> None:
         pass
     h = logging.StreamHandler(sys.stdout)
     h.setFormatter(formatter)
+    h.addFilter(_UvicornSocketSendNoiseFilter())
     h.addFilter(_LoggerNameAliasFilter({"uvicorn.error": "uvicorn.server"}))
     root.addHandler(h)
     root.setLevel(level)
@@ -87,3 +99,11 @@ def setup(level: int = logging.INFO) -> None:
 def get(name: str) -> logging.Logger:
     """Return a named logger using the shared project configuration."""
     return logging.getLogger(name)
+
+
+def warmup_event(logger: logging.Logger, **fields: Any) -> None:
+    """Write a structured warmup event while keeping the grep-friendly prefix."""
+    logger.info(
+        "[WARMUP] %s",
+        json.dumps(fields, ensure_ascii=False, separators=(",", ":"), sort_keys=True, default=str),
+    )

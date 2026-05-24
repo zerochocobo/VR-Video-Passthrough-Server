@@ -130,16 +130,18 @@ class AlphaPacker:
             return false;
         }
 
-        float theta = rr * 1.5707963267948966f;
-        float az = atan2f(-ny, nx);
-        float sin_t = sinf(theta);
-        float dir_x = sin_t * cosf(az);
-        float dir_y = sin_t * sinf(az);
-        float dir_z = cosf(theta);
-        float lon = atan2f(dir_x, dir_z);
-        float lat = asinf(dir_y);
-        float u = (lon / 3.141592653589793f + 0.5f) * (float)eye_w;
-        float v = (0.5f - lat / 3.141592653589793f) * (float)out_h;
+        // Match FFmpeg v360=input=hequirect:output=fisheye for the visible
+        // fisheye circle, while keeping the square corners black for alpha blocks.
+        float ff_theta = 1.5707963267948966f * (1.f - rr);
+        float ff_phi = atan2f(ny, nx);
+        float cos_t = cosf(ff_theta);
+        float dir_x = cos_t * cosf(ff_phi);
+        float dir_y = cos_t * sinf(ff_phi);
+        float dir_z = sinf(ff_theta);
+        float src_phi = atan2f(dir_x, dir_z) / 1.5707963267948966f;
+        float src_theta = asinf(dir_y) / 1.5707963267948966f;
+        float u = (0.5f * src_phi + 0.5f) * (float)(eye_w - 1);
+        float v = (0.5f * src_theta + 0.5f) * (float)(out_h - 1);
         u = u < 0.f ? 0.f : (u > (float)(eye_w - 1) ? (float)(eye_w - 1) : u);
         v = v < 0.f ? 0.f : (v > (float)(out_h - 1) ? (float)(out_h - 1) : v);
         *src_x = u + (float)(eye * eye_w);

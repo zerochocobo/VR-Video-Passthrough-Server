@@ -395,6 +395,37 @@ def copy_ort_cuda_ep_dependencies() -> None:
                 info(f"  {src}")
 
 
+def copy_ort_tensorrt_ep_dependencies() -> None:
+    trt_libs = SITE_PACKAGES / "tensorrt_libs"
+    if not trt_libs.exists():
+        fail(
+            "TensorRT wheel libraries not found under .venv\\Lib\\site-packages\\tensorrt_libs.\n"
+            "Run: uv sync"
+        )
+    target_dir = DIST_DIR / "_internal" / "tensorrt_libs"
+    excluded = {"nvinfer_10.dll"}
+    for pattern in ("nvinfer_10.dll", "nvinfer_builder_*.dll"):
+        for stale in target_dir.glob(pattern):
+            stale.unlink()
+    copy_tree(
+        trt_libs,
+        target_dir,
+        ignore=lambda item, rel: (
+            item.name == "__pycache__"
+            or item.suffix.lower() in {".pyc", ".lib", ".pdb"}
+            or item.name.lower() in excluded
+            or item.name.lower().startswith("nvinfer_builder_")
+        ),
+    )
+    for pattern in ("nvinfer_10.dll", "nvinfer_builder_*.dll"):
+        for stale in target_dir.glob(pattern):
+            stale.unlink()
+    for pattern in ("nvinfer_plugin*_10.dll", "nvonnxparser*_10.dll"):
+        matches = list(target_dir.glob(pattern))
+        if not matches:
+            fail(f"Missing TensorRT runtime DLL matching {pattern} under _internal\\tensorrt_libs.")
+
+
 def copy_clip_tokenizer_cache() -> None:
     src = ROOT / "runtime_cache" / "clip_text_onnx" / "bpe_simple_vocab_16e6.txt.gz"
     if not src.exists():
@@ -437,6 +468,20 @@ def verify_cuda_auxiliary_runtime() -> None:
 def verify_ort_cuda_ep_runtime() -> None:
     if not list((DIST_DIR / "_internal").glob("cudnn64_9.dll")):
         fail("Missing cudnn64_9.dll required by ONNX Runtime CUDAExecutionProvider.")
+
+
+def verify_ort_tensorrt_ep_runtime() -> None:
+    capi = DIST_DIR / "_internal" / "onnxruntime" / "capi"
+    if not (capi / "onnxruntime_providers_tensorrt.dll").exists():
+        fail("Missing onnxruntime_providers_tensorrt.dll.")
+    trt_dir = DIST_DIR / "_internal" / "tensorrt_libs"
+    required = (
+        "nvinfer_plugin_10.dll",
+        "nvonnxparser_10.dll",
+    )
+    for name in required:
+        if not (trt_dir / name).exists():
+            fail(f"Missing TensorRT DLL: {trt_dir / name}")
 
 
 def run_frozen_probe(env: dict[str, str]) -> None:
@@ -594,10 +639,12 @@ def main() -> int:
         copy_clip_tokenizer_cache()
         copy_cuda_auxiliary_dlls()
         copy_ort_cuda_ep_dependencies()
+        copy_ort_tensorrt_ep_dependencies()
         verify_base_runtime()
         verify_clip_tokenizer_runtime()
         verify_cuda_auxiliary_runtime()
         verify_ort_cuda_ep_runtime()
+        verify_ort_tensorrt_ep_runtime()
         run_frozen_probe(env)
         if args.compare:
             compare_dist(Path(args.compare).resolve())

@@ -335,6 +335,11 @@ ALPHA_2D_DISTANCE_M = max(0.1, float(_env("ALPHA_2D_DISTANCE_M", 4.0)))
 #   improves GPU throughput.
 RVM_IOBINDING = _env("RVM_IOBINDING", "1") == "1"
 
+# PT_TRT_RVM_IOBINDING:
+#   1 allows the experimental TensorRT + RVM IOBinding path. The default stays
+#   off because ORT TensorRT EP can hang in run_with_iobinding on this model.
+TRT_RVM_IOBINDING = _env("TRT_RVM_IOBINDING", "0") == "1"
+
 # PT_CUDA_SHARED_STREAM:
 #   1 reuses a shared CuPy CUDA stream for matting and composite kernels.
 CUDA_SHARED_STREAM = _env("CUDA_SHARED_STREAM", "1") == "1"
@@ -408,13 +413,70 @@ ONNX_TRT_ENGINE_CACHE_PATH: Path = Path(
     _env("ONNX_TRT_ENGINE_CACHE_PATH", ROOT / "runtime_cache" / "trt_engines")
 ).resolve()
 ONNX_TRT_FP16_ENABLE = _env("ONNX_TRT_FP16_ENABLE", "1") == "1"
-ONNX_TRT_CUDA_GRAPH_ENABLE = _env("ONNX_TRT_CUDA_GRAPH_ENABLE", "1") == "1"
+ONNX_TRT_CUDA_GRAPH_ENABLE = _env("ONNX_TRT_CUDA_GRAPH_ENABLE", "0") == "1"
+ONNX_TRT_DUMP_SUBGRAPHS = _env("ONNX_TRT_DUMP_SUBGRAPHS", "0") == "1"
+ONNX_TRT_DETAILED_BUILD_LOG = _env("ONNX_TRT_DETAILED_BUILD_LOG", "0") == "1"
 
 # PT_PASSTHROUGH_PYNV_SYNC_PROBE:
 #   1 enables extra CUDA synchronizations inside the PyNv green matting path to
 #   attribute the normal outer sync wait to upload, RVM/ORT, or composite. This
 #   is a diagnostic mode and intentionally changes timing.
 PASSTHROUGH_PYNV_SYNC_PROBE = _env("PASSTHROUGH_PYNV_SYNC_PROBE", "0") == "1"
+
+# PT_WARMUP_RAMPUP_DIAG_FRAMES:
+#   Number of first PyNv GPU composite calls to log with synchronous ramp-up
+#   timing. Diagnostic only; 0 keeps the hot path unchanged.
+WARMUP_RAMPUP_DIAG_FRAMES = max(0, int(_env("WARMUP_RAMPUP_DIAG_FRAMES", 0)))
+
+# PT_WARMUP_COMPOSITE_ENABLE:
+#   1 warms the CuPy upload/composite/alpha-pack kernels during startup GPU
+#   warmup so the first real stream does not pay their JIT/allocation cost.
+WARMUP_COMPOSITE_ENABLE = _env("WARMUP_COMPOSITE_ENABLE", "1") == "1"
+
+# PT_WARMUP_COMPOSITE_GEOMETRIES:
+#   Semicolon-separated HxW list of representative source geometries to warm.
+#   Defaults cover common SBS 8K and 4K VR180 sources.
+_WARMUP_COMPOSITE_GEOMETRIES_RAW = _env("WARMUP_COMPOSITE_GEOMETRIES", "4096x8192;2048x4096")
+WARMUP_COMPOSITE_GEOMETRIES: list[tuple[int, int]] = []
+for _warmup_geometry in _WARMUP_COMPOSITE_GEOMETRIES_RAW.replace(",", ";").split(";"):
+    _warmup_geometry = _warmup_geometry.strip().lower()
+    if not _warmup_geometry or "x" not in _warmup_geometry:
+        continue
+    try:
+        _gh, _gw = _warmup_geometry.split("x", 1)
+        _h = max(2, int(_gh) & ~1)
+        _w = max(2, int(_gw) & ~1)
+        WARMUP_COMPOSITE_GEOMETRIES.append((_h, _w))
+    except ValueError:
+        pass
+if not WARMUP_COMPOSITE_GEOMETRIES:
+    WARMUP_COMPOSITE_GEOMETRIES = [(4096, 8192)]
+
+# PT_NVENC_PREFLIGHT_ENABLE:
+#   1 creates and releases representative NVENC encoders during startup so the
+#   first real stream does not pay process-level NVENC SDK initialization.
+NVENC_PREFLIGHT_ENABLE = _env("NVENC_PREFLIGHT_ENABLE", "1") == "1"
+
+# PT_NVENC_PREFLIGHT_GEOMETRIES:
+#   Semicolon-separated WxH@FPS:BITRATE list. Defaults cover full 8K SBS alpha
+#   and downscaled 4K SBS alpha using the current low-latency encoder settings.
+_NVENC_PREFLIGHT_GEOMETRIES_RAW = _env("NVENC_PREFLIGHT_GEOMETRIES", "8192x4096@59.940060:50000000;4096x2048@59.940060:25000000")
+NVENC_PREFLIGHT_GEOMETRIES: list[tuple[int, int, str, str]] = []
+for _nvenc_geometry in _NVENC_PREFLIGHT_GEOMETRIES_RAW.replace(",", ";").split(";"):
+    _nvenc_geometry = _nvenc_geometry.strip().lower()
+    if not _nvenc_geometry or "x" not in _nvenc_geometry:
+        continue
+    try:
+        _size, _rest = _nvenc_geometry.split("@", 1)
+        _fps, _bitrate = _rest.split(":", 1)
+        _w_raw, _h_raw = _size.split("x", 1)
+        _w = max(2, int(_w_raw) & ~1)
+        _h = max(2, int(_h_raw) & ~1)
+        NVENC_PREFLIGHT_GEOMETRIES.append((_w, _h, str(float(_fps)), str(int(_bitrate))))
+    except ValueError:
+        pass
+if not NVENC_PREFLIGHT_GEOMETRIES:
+    NVENC_PREFLIGHT_GEOMETRIES = [(8192, 4096, "59.940060", "50000000")]
 
 # PT_PASSTHROUGH_RVM_BYPASS_ALPHA:
 #   Diagnostic only. 1 bypasses RVM inference on the PyNv/CuPy green path and
@@ -488,7 +550,7 @@ LIGHT_MATCH_EXPOSURE_EV = float(_env("LIGHT_MATCH_EXPOSURE_EV", "0.0"))
 LIGHT_MATCH_CONTRAST = float(_env("LIGHT_MATCH_CONTRAST", "1.0"))
 LIGHT_MATCH_GAMMA = float(_env("LIGHT_MATCH_GAMMA", "1.0"))
 LIGHT_MATCH_SATURATION = float(_env("LIGHT_MATCH_SATURATION", "1.0"))
-LIGHT_MATCH_PRESET = str(_env("LIGHT_MATCH_PRESET", "custom")).lower()
+LIGHT_MATCH_PRESET = str(_env("LIGHT_MATCH_PRESET", "daylight")).lower()
 LIGHT_MATCH_FLUSH_QUEUES = str(_env("LIGHT_MATCH_FLUSH_QUEUES", "0")).lower() in {"1", "true", "yes", "on"}
 LIGHT_MATCH_DICT = {
     "enabled": LIGHT_MATCH_ENABLED,
@@ -677,9 +739,11 @@ PASSTHROUGH_AUDIO_MPEGTS_SETTS = _env("PASSTHROUGH_AUDIO_MPEGTS_SETTS", "0") == 
 #                 audio input, but can be retested with AAC cache.
 #     pipe_ts   - two-stage experiment: first mux raw HEVC to video-only MPEG-TS
 #                 with CFR timestamps, then mux that timestamped video stream
-#                 with cached ADTS AAC.
+#                 with cached ADTS AAC. Current stable default despite first
+#                 chunk latency; single-stage setts was incompatible with
+#                 nPlayer/SKYBOX because output stalled after the first chunks.
 #   If unset, PT_PASSTHROUGH_AUDIO_MPEGTS_SETTS=1 maps to setts; otherwise the
-#   default is wallclock for backward compatibility.
+#   default uses the stable two-stage pipe_ts path.
 PASSTHROUGH_AUDIO_MPEGTS_TIMESTAMP_MODE = _env(
     "PASSTHROUGH_AUDIO_MPEGTS_TIMESTAMP_MODE",
     "pipe_ts",
@@ -696,6 +760,84 @@ PASSTHROUGH_AUDIO_MPEGTS_QUEUE_SIZE = max(0, int(_env("PASSTHROUGH_AUDIO_MPEGTS_
 #   65536 is a practical default for the current 8K S3D samples.
 PASSTHROUGH_AUDIO_MPEGTS_RAW_PACKET_SIZE = max(0, int(_env("PASSTHROUGH_AUDIO_MPEGTS_RAW_PACKET_SIZE", 65536)))
 
+# PT_MUX_LATENCY_DIAG:
+#   1 logs first-chunk mux timing marks for PyNv live streams. The log is
+#   lightweight and helps separate encoder latency from FFmpeg mux probing.
+MUX_LATENCY_DIAG = _env("MUX_LATENCY_DIAG", "1") == "1"
+
+# PT_MUX_LATENCY_DIAG_VERBOSE:
+#   1 enables extra FFmpeg stderr stage markers for first-chunk diagnostics.
+#   T2 first-stderr markers remain enabled whenever PT_MUX_LATENCY_DIAG=1.
+MUX_LATENCY_DIAG_VERBOSE = _env("MUX_LATENCY_DIAG_VERBOSE", "0") == "1"
+
+# PT_MUX_FFMPEG_LOGLEVEL:
+#   FFmpeg loglevel for PyNv live mux processes. Keep warning by default; set
+#   info only for temporary first-chunk diagnostics.
+MUX_FFMPEG_LOGLEVEL = _env("MUX_FFMPEG_LOGLEVEL", "warning").strip() or "warning"
+
+# PT_FORCE_AUDIO_OFF:
+#   Diagnostic override for PyNv live muxing. 1 forces video-only mux output to
+#   compare single-stage mux startup against audio/pipe_ts startup.
+FORCE_AUDIO_OFF = _env("FORCE_AUDIO_OFF", "0") == "1"
+
+# PT_MUX_PROBESIZE_OVERRIDE:
+#   Optional FFmpeg input probesize override for raw PyNv HEVC/H264 stdin.
+#   Empty string omits the option and restores FFmpeg defaults. Raw HEVC/H264
+#   inputs are explicitly declared, so the default 32 avoids stdin probe delay.
+MUX_PROBESIZE_OVERRIDE = _env("MUX_PROBESIZE_OVERRIDE", "32").strip()
+
+# PT_MUX_RAW_VIDEO_PROBESIZE:
+#   Optional probesize override for PyNv raw HEVC/H264 stdin. Defaults to the
+#   A8.P1.B 1MB winner. Do not test below 65536 because strict players
+#   previously regressed when raw video probing was too small.
+MUX_RAW_VIDEO_PROBESIZE = _env("MUX_RAW_VIDEO_PROBESIZE", "1000000").strip()
+
+# PT_MUX_RAW_VIDEO_ANALYZEDURATION:
+#   Optional analyzeduration override in microseconds for PyNv raw HEVC/H264
+#   stdin. Defaults to the A8.P1.B 1s winner.
+MUX_RAW_VIDEO_ANALYZEDURATION = _env("MUX_RAW_VIDEO_ANALYZEDURATION", "1000000").strip()
+
+# PT_MUX_INTERMEDIATE_TS_PROBESIZE:
+#   Optional probesize override for the intermediate MPEG-TS stdin used by the
+#   pipe_ts final mux. Defaults to the A8.P2.A.1 16KB winner; 8192 showed no
+#   nPlayer first-chunk gain and increased the post-output reader gap.
+#   diagnostics. Do not test below 4096 because strict players previously
+#   regressed to audio-only when intermediate TS probing was too small.
+MUX_INTERMEDIATE_TS_PROBESIZE = _env("MUX_INTERMEDIATE_TS_PROBESIZE", "16384").strip()
+
+# PT_MUX_INTERMEDIATE_TS_ANALYZEDURATION:
+#   Optional analyzeduration override in microseconds for the intermediate
+#   MPEG-TS stdin used by the pipe_ts final mux. Defaults to the A8.P2.A.1
+#   first-chunk latency setting.
+MUX_INTERMEDIATE_TS_ANALYZEDURATION = _env("MUX_INTERMEDIATE_TS_ANALYZEDURATION", "0").strip()
+
+# PT_MUX_CONTAINER_PROBESIZE_OVERRIDE:
+#   Optional FFmpeg input probesize override for already-muxed local container
+#   inputs, especially the pipe_ts final-stage MPEG-TS stdin. 32768 avoids the
+#   old 5MB default while leaving enough data for HEVC codec parameters.
+MUX_CONTAINER_PROBESIZE_OVERRIDE = _env("MUX_CONTAINER_PROBESIZE_OVERRIDE", "32768").strip()
+
+# PT_MUX_AUDIO_PROBESIZE_OVERRIDE:
+#   Optional FFmpeg input probesize override for AAC/file audio inputs.
+MUX_AUDIO_PROBESIZE_OVERRIDE = _env("MUX_AUDIO_PROBESIZE_OVERRIDE", "32768").strip()
+
+# PT_MUX_ANALYZEDURATION_US:
+#   Optional FFmpeg input analyzeduration override in microseconds. Empty string
+#   omits the option and restores FFmpeg defaults.
+MUX_ANALYZEDURATION_US = _env("MUX_ANALYZEDURATION_US", "0").strip()
+
+# PT_MUX_NOBUFFER_ENABLE:
+#   Historical first-chunk latency switch for raw HEVC/H264 FFmpeg mux inputs.
+#   Keep it disabled by default: `+nobuffer` can make FFmpeg discard the first
+#   GOP from raw HEVC before MPEG-TS muxing, shifting video content about one
+#   second ahead of audio when PT_PASSTHROUGH_GOP=60.
+MUX_NOBUFFER_ENABLE = _env("MUX_NOBUFFER_ENABLE", "0") == "1"
+
+# PT_FMP4_FRAG_DURATION_US:
+#   Fragment duration for fragmented MP4 output. Lower values reduce first
+#   fragment latency; 250000 restores the previous default.
+PASSTHROUGH_FMP4_FRAG_DURATION_US = max(1, int(_env("FMP4_FRAG_DURATION_US", 100000)))
+
 # PT_PASSTHROUGH_AUDIO_MPEGTS_READRATE:
 #   Optional FFmpeg audio input read rate. 0 leaves audio file reads unrestricted.
 #   Expert suggestion was 1, but local probes showed it can delay the first TS
@@ -704,9 +846,9 @@ PASSTHROUGH_AUDIO_MPEGTS_READRATE = max(0.0, float(_env("PASSTHROUGH_AUDIO_MPEGT
 
 # PT_PASSTHROUGH_AUDIO_MPEGTS_INTERLEAVE_DELTA:
 #   Optional override for FFmpeg -max_interleave_delta in the live MPEG-TS mux.
-#   Empty string omits the option and lets FFmpeg use its default. Avoid 0 for
-#   AAC live muxing because it can deadlock interleaving with raw HEVC stdin.
-#   A useful experimental override is 500000000.
+#   Empty string omits the option and lets FFmpeg use its default. The A8.2
+#   0-value experiment did not reduce T4-T3c and has historical stall risk, so
+#   the stable default remains 500000000.
 PASSTHROUGH_AUDIO_MPEGTS_INTERLEAVE_DELTA = _env("PASSTHROUGH_AUDIO_MPEGTS_INTERLEAVE_DELTA", "500000000").strip()
 
 # PT_PASSTHROUGH_AUDIO_MPEGTS_AAC_BITRATE:
@@ -728,14 +870,18 @@ PASSTHROUGH_AUDIO_MPEGTS_OUTPUT_CHANNELS = int(_env("PASSTHROUGH_AUDIO_MPEGTS_OU
 #   1 extracts the first source audio stream into an ADTS AAC cache file before
 #   live MPEG-TS muxing, then uses that cache for subsequent requests. This can
 #   remove per-request MP4 audio demux overhead and avoid source-container edit
-#   list differences while testing AAC sync behavior.
-PASSTHROUGH_AUDIO_MPEGTS_CACHE = _env("PASSTHROUGH_AUDIO_MPEGTS_CACHE", "1") == "1"
+#   list differences while testing AAC sync behavior. Default 0 disables disk
+#   cache reuse and lets the pipe_ts final mux read source audio directly.
+PASSTHROUGH_AUDIO_MPEGTS_CACHE = _env("PASSTHROUGH_AUDIO_MPEGTS_CACHE", "0") == "1"
 
-# PT_PASSTHROUGH_AUDIO_MPEGTS_SLATE:
-#   1 enables a green-screen slate during live MPEG-TS AAC cache misses. The
-#   stream starts immediately with the final video resolution/codec and a silent
-#   AAC input, then switches to real video/audio after the cache is ready.
-PASSTHROUGH_AUDIO_MPEGTS_SLATE = _env("PASSTHROUGH_AUDIO_MPEGTS_SLATE", "1") == "1"
+# PT_PASSTHROUGH_MPEGTS_VIDEO_SLATE:
+#   Total switch for the live MPEG-TS video slate. 1 starts a generated
+#   green/black video slate during AAC cache misses; 0 disables that video
+#   padding path. PT_PASSTHROUGH_AUDIO_MPEGTS_SLATE is kept as a legacy alias.
+PASSTHROUGH_MPEGTS_VIDEO_SLATE = (
+    _env_any(("PASSTHROUGH_MPEGTS_VIDEO_SLATE", "PASSTHROUGH_AUDIO_MPEGTS_SLATE"), "0") == "1"
+)
+PASSTHROUGH_AUDIO_MPEGTS_SLATE = PASSTHROUGH_MPEGTS_VIDEO_SLATE
 
 # PT_PASSTHROUGH_AUDIO_MPEGTS_SLATE_DIRECT_AFTER:
 #   On an AAC cache miss, keep building the full source-level AAC cache in the
@@ -748,11 +894,12 @@ PASSTHROUGH_AUDIO_MPEGTS_SLATE_DIRECT_AFTER = max(
 )
 
 # PT_PASSTHROUGH_AUDIO_MPEGTS_SLATE_BURST_FRAMES:
-#   Number of initial green-screen frames sent without realtime pacing so the
-#   MPEG-TS muxer can emit headers/data quickly.
+#   Number of initial green-screen frames sent immediately so the MPEG-TS muxer
+#   can see HEVC VPS/SPS/PPS quickly. Keep this low: every unpaced slate frame
+#   can advance video PTS ahead of wall-clock audio during seek startup.
 PASSTHROUGH_AUDIO_MPEGTS_SLATE_BURST_FRAMES = max(
     0,
-    int(_env("PASSTHROUGH_AUDIO_MPEGTS_SLATE_BURST_FRAMES", 90)),
+    int(_env("PASSTHROUGH_AUDIO_MPEGTS_SLATE_BURST_FRAMES", 1)),
 )
 
 # PT_PASSTHROUGH_AUDIO_MPEGTS_CACHE_DIR:
@@ -843,10 +990,10 @@ PASSTHROUGH_MPEGTS_COLOR_RANGE = _env("PASSTHROUGH_MPEGTS_COLOR_RANGE", "tv").lo
 
 # PT_PASSTHROUGH_MAX_FPS:
 #   Output/processing FPS cap. 0 keeps source FPS. Positive values cap output
-#   frames, encoder/mux FPS, and live producer pacing. Set 30 explicitly for
-#   client-compatibility diagnostics; the default keeps the source frame rate
-#   unthrottled.
-PASSTHROUGH_MAX_FPS = float(_env("PASSTHROUGH_MAX_FPS", 0))
+#   frames, encoder/mux FPS, and live producer pacing. If the source FPS is
+#   lower than the cap, realtime output keeps the source FPS. Set 0 to keep the
+#   source frame rate unthrottled.
+PASSTHROUGH_MAX_FPS = float(_env("PASSTHROUGH_MAX_FPS", 30))
 
 # PT_PASSTHROUGH_REALTIME_PACING:
 #   Backward-compatible alias for PT_PASSTHROUGH_SEND_REALTIME_PACING.
@@ -886,7 +1033,7 @@ DEBUG_LOGS = _env("DEBUG_LOGS", "0") == "1"
 # PT_PASSTHROUGH_LIVE_ADAPTIVE_FPS:
 #   1 enables live-only FPS lowering for extremely high source-bitrate files.
 #   This avoids visible buffering when decode/input bandwidth is the bottleneck.
-PASSTHROUGH_LIVE_ADAPTIVE_FPS = _env("PASSTHROUGH_LIVE_ADAPTIVE_FPS", "1") == "1"
+PASSTHROUGH_LIVE_ADAPTIVE_FPS = _env("PASSTHROUGH_LIVE_ADAPTIVE_FPS", "0") == "1"
 
 # PT_PASSTHROUGH_LIVE_HIGH_BITRATE_BPS:
 #   Source bitrate threshold for adaptive live FPS. Estimated from file size /

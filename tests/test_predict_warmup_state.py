@@ -7,10 +7,13 @@ the Blackwell sm_120 "known slow" combination from the marker JSON.
 from __future__ import annotations
 
 import json
+import logging
 import unittest
 from dataclasses import asdict
+from io import StringIO
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from unittest.mock import MagicMock, patch
 
 from utils import gpu_runtime_cache as grc
 from utils.startup_status import (
@@ -18,6 +21,7 @@ from utils.startup_status import (
     reset_startup_progress,
     set_startup_phase,
 )
+from utils.logger import warmup_event
 
 
 SAMPLE_KEY = {
@@ -100,6 +104,83 @@ class PredictWarmupStateTests(unittest.TestCase):
         self.assertIsInstance(report.is_known_slow, bool)
 
 
+class CompositeWarmupTests(unittest.TestCase):
+    def test_resident_warmup_runs_composite_and_alpha_pack_paths(self) -> None:
+        key = grc.GpuWarmupKey(
+            gpu_name="GPU",
+            compute_capability="8.9",
+            driver_version="1",
+            python_version="3",
+            onnxruntime_version="1",
+            onnxruntime_providers_cuda_dll_hash="x",
+            cupy_version="1",
+            cupy_cuda_runtime="1",
+            model_name="model.onnx",
+            model_sha256_16="abc",
+            input_size=1024,
+            providers=["CUDAExecutionProvider"],
+            shapes=[(1, 3, 32, 32)],
+        )
+
+        fake_matter = MagicMock()
+        fake_matter.input_dtype = "float32"
+        fake_matter.sess.get_providers.return_value = ["CUDAExecutionProvider"]
+        fake_matter._get_trt_static_session.return_value = object()
+        fake_matter.acquire_nv12_output_slot.return_value = MagicMock(buffer="slot-buffer")
+
+        fake_cp = MagicMock()
+        fake_cp.float32 = "float32"
+        fake_cp.zeros.return_value = "zeros"
+        fake_cp.cuda.Stream.null.synchronize = MagicMock()
+
+        fake_matting_mod = MagicMock()
+        fake_matting_mod._CUDA_STREAM = None
+        fake_matting_mod.make_zero_gpu_frame.return_value = MagicMock()
+
+        fake_packer = MagicMock()
+        fake_alpha_packer_cls = MagicMock(return_value=fake_packer)
+
+        real_import = __import__
+
+        def fake_import(name, globals=None, locals=None, fromlist=(), level=0):
+            if name == "cupy":
+                return fake_cp
+            if name == "pipeline.matting":
+                return fake_matting_mod
+            if name == "pipeline.alpha_packer":
+                module = MagicMock()
+                module.AlphaPacker = fake_alpha_packer_cls
+                return module
+            return real_import(name, globals, locals, fromlist, level)
+
+        fake_matting_mod.get_matter.return_value = fake_matter
+        with (
+            patch("builtins.__import__", side_effect=fake_import),
+            patch.object(
+                grc,
+                "configure_gpu_runtime_cache",
+                return_value=grc.GpuRuntimeCacheEnv(
+                    runtime_cache_dir=".",
+                    cuda_cache_path=".",
+                    cupy_cache_dir=".",
+                    ort_cache_dir=".",
+                    marker_path="marker.json",
+                ),
+            ),
+            patch.object(grc, "build_warmup_key", return_value=key),
+            patch.object(grc, "marker_matches", return_value=True),
+            patch.object(grc, "_cache_stats", return_value=(0, 0)),
+            patch.object(grc.config, "WARMUP_COMPOSITE_ENABLE", True),
+            patch.object(grc.config, "WARMUP_COMPOSITE_GEOMETRIES", [(64, 128)]),
+            patch.object(grc.config, "MATTING_INPUT_SIZE", 32),
+        ):
+            grc.warmup_gpu_runtime_cache(runs_per_shape=1)
+
+        fake_matter.composite_green_gpu_nv12_frame_to_gpu_nv12_profile.assert_called_once()
+        fake_matter.composite_green_gpu_p016_frame_to_gpu_nv12_profile.assert_called_once()
+        fake_packer.pack_uploaded.assert_called_once()
+
+
 class StartupStatusTests(unittest.TestCase):
     def test_only_true_terminal_startup_phases_stop_polling(self) -> None:
         poller_source = Path("ui/services/startup_status_poller.py").read_text(encoding="utf-8")
@@ -155,6 +236,47 @@ class StartupStatusTests(unittest.TestCase):
         self.assertEqual(state["step_index"], 0)
         self.assertAlmostEqual(state["progress"], 0.0)
         self.assertAlmostEqual(state["eta_sec"], 0.0)
+
+
+class WarmupLoggingTests(unittest.TestCase):
+    def test_warmup_event_writes_json_payload(self) -> None:
+        stream = StringIO()
+        handler = logging.StreamHandler(stream)
+        logger = logging.getLogger("test_warmup_event")
+        old_handlers = list(logger.handlers)
+        old_level = logger.level
+        logger.handlers = [handler]
+        logger.setLevel(logging.INFO)
+        logger.propagate = False
+        try:
+            warmup_event(logger, phase="static_trt_preload", batch=1, shape=[1024, 1024], loaded=True)
+        finally:
+            logger.handlers = old_handlers
+            logger.setLevel(old_level)
+            logger.propagate = True
+
+        line = stream.getvalue().strip()
+        self.assertTrue(line.startswith("[WARMUP] "))
+        payload = json.loads(line[len("[WARMUP] ") :])
+        self.assertEqual(payload["phase"], "static_trt_preload")
+        self.assertEqual(payload["shape"], [1024, 1024])
+        self.assertTrue(payload["loaded"])
+
+    def test_startup_steps_include_track_a_a5_phases(self) -> None:
+        overlay_source = Path("ui/widgets/startup_overlay.py").read_text(encoding="utf-8")
+        for step in (
+            "matter_singleton",
+            "static_trt_preload",
+            "ort_iobinding_runs",
+            "composite_jit",
+            "reset_state",
+            "nvenc_preflight",
+            "firewall",
+            "ssdp",
+            "http_starting",
+            "listening",
+        ):
+            self.assertIn(step, overlay_source)
 
 
 if __name__ == "__main__":

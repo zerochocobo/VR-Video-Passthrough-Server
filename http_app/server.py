@@ -1,6 +1,10 @@
 ﻿"""FastAPI application factory for DLNA control and media routes."""
 
 import asyncio
+import inspect
+from collections.abc import Awaitable, Callable
+from contextlib import asynccontextmanager
+from typing import Any
 
 from fastapi import FastAPI
 
@@ -11,6 +15,7 @@ from utils.logger import get
 
 
 log = get("server")
+StartupHook = Callable[[], Awaitable[Any] | Any]
 
 
 def _install_asyncio_noise_filter() -> None:
@@ -36,16 +41,21 @@ def _install_asyncio_noise_filter() -> None:
     loop.set_exception_handler(handler)
 
 
-def create_app() -> FastAPI:
+def create_app(startup_hook: StartupHook | None = None) -> FastAPI:
     """Create the HTTP app without starting network listeners."""
-    app = FastAPI(title="PT VR Passthrough Server", docs_url=None, redoc_url=None)
+    @asynccontextmanager
+    async def lifespan(app: FastAPI):
+        _install_asyncio_noise_filter()
+        if startup_hook is not None:
+            result = startup_hook()
+            if inspect.isawaitable(result):
+                await result
+        yield
+
+    app = FastAPI(title="PT VR Passthrough Server", docs_url=None, redoc_url=None, lifespan=lifespan)
     app.include_router(control_router)
     app.include_router(dlna_router)
     app.include_router(media_router)
-
-    @app.on_event("startup")
-    async def startup() -> None:
-        _install_asyncio_noise_filter()
 
     @app.get("/")
     async def index():

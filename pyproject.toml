@@ -19,6 +19,9 @@ dependencies = [
     "pynvvideocodec>=2.1.0",
     "pyinstaller>=6.20.0",
     "osam==0.4.0",
+    "tensorrt-cu12>=10.0",
+    "onnx>=1.16",
+    "py-spy>=0.4.2",
 ]
 
 [tool.uv]
@@ -32,4 +35,5 @@ override-dependencies = [
 [dependency-groups]
 dev = [
     "httpx>=0.28.1",
+    "pytest>=9.0.3",
 ]

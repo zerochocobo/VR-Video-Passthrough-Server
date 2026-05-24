@@ -28,9 +28,10 @@ _MARKER_RE = re.compile(
     re.IGNORECASE,
 )
 
-SBS_180_SOURCE_SUFFIX = "_LR_180"
+SBS_180_SOURCE_SUFFIX = "_LR_180_SBS"
+LEGACY_LR_180_SOURCE_SUFFIX = "_LR_180"
 GREEN_LIVE_PASSTHROUGH_SUFFIX = "_passthrough"
-GREEN_OFFLINE_PASSTHROUGH_SUFFIX = "_LR_180_passthrough"
+GREEN_OFFLINE_PASSTHROUGH_SUFFIX = "_LR_180_SBS_passthrough"
 ALPHA_PASSTHROUGH_SUFFIX = "_LR_180_FISHEYE_F180_alpha"
 _VIDEO_SUFFIXES = {".mp4", ".mkv", ".mov", ".m4v", ".avi", ".webm", ".ts", ".m2ts"}
 
@@ -68,6 +69,8 @@ def source_display_stem(stem_or_name: str, width: int = 0, height: int = 0) -> s
     stem = _as_stem(stem_or_name)
     if is_half_equirectangular_source(width, height) and not has_vr_filename_marker(stem):
         return f"{stem}{SBS_180_SOURCE_SUFFIX}"
+    if stem.lower().endswith(LEGACY_LR_180_SOURCE_SUFFIX.lower()):
+        return f"{stem}_SBS"
     return stem
 
 

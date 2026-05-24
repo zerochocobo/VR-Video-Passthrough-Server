@@ -5,7 +5,7 @@ import os
 import threading
 import urllib.request
 
-from PySide6.QtCore import QPoint, QSize, Qt, QTimer, QUrl
+from PySide6.QtCore import QFileSystemWatcher, QPoint, QSize, Qt, QTimer, QUrl
 from PySide6.QtGui import QColor, QDesktopServices, QFont, QIcon, QPainter, QPen, QPixmap
 from PySide6.QtWidgets import (
     QCheckBox,
@@ -36,7 +36,9 @@ from ui.log_limits import UI_LOG_MAX_BLOCKS
 from ui.log_sanitizer import clean_log_text
 from ui.player_support import load_player_support
 from ui.resources import SWITCH_OFF_IMAGE_PATH, SWITCH_ON_IMAGE_PATH
-from ui.settings import ROOT as UI_ROOT, quality_speed_value
+from ui.settings import DEFAULTS, ROOT as UI_ROOT, quality_speed_value
+from ui.widgets.trt_cache_dialog import TensorRTConfigDialog
+from utils.trt_manifest import cache_status, manifest_path
 
 
 SWITCH_OFF_IMAGE = SWITCH_OFF_IMAGE_PATH.as_posix()
@@ -49,8 +51,9 @@ SERVER_ICON_SIZE = 22
 PROJECT_URL = "https://wapok.com"
 PROJECT_LINK_HEIGHT = 28
 ICON_BUTTON_SIZE = 30
+LIGHT_MATCH_DEFAULT_PRESET = str(DEFAULTS["light_match_preset"])
 LIGHT_MATCH_PRESETS = {
-    "home_warm": {"temp_k": 3000, "tint": 0, "exposure_ev": 0.0, "contrast": 1.0, "gamma": 1.0, "saturation": 1.05},
+    "home_warm": {"temp_k": 4000, "tint": 0, "exposure_ev": 0.0, "contrast": 1.0, "gamma": 1.0, "saturation": 1.0},
     "daylight": {"temp_k": 5500, "tint": 0, "exposure_ev": 0.0, "contrast": 1.0, "gamma": 1.0, "saturation": 1.0},
     "night_cool": {"temp_k": 6500, "tint": 0, "exposure_ev": -0.1, "contrast": 1.0, "gamma": 1.0, "saturation": 0.95},
 }
@@ -676,6 +679,7 @@ class HomePage(QWidget):
         self.performance_fps.setFixedWidth(120)
         idx = self.performance_fps.findData(_int_setting(settings.data.get("passthrough_max_fps"), 0))
         self.performance_fps.setCurrentIndex(max(0, idx))
+        self.performance_fps_help = _icon_button(_question_icon())
         self.performance_output_size = QComboBox()
         self.performance_output_size.addItem("", 0)
         self.performance_output_size.addItem("", 4096)
@@ -683,6 +687,17 @@ class HomePage(QWidget):
         self.performance_output_size.setFixedWidth(150)
         idx = self.performance_output_size.findData(_int_setting(settings.data.get("decode_max_side"), 4096))
         self.performance_output_size.setCurrentIndex(max(0, idx))
+        self.trt_enabled_label = QLabel()
+        self.trt_enabled = QCheckBox()
+        self.trt_enabled.setChecked(str(settings.data.get("inference_backend") or "cuda").lower() == "tensorrt")
+        _apply_switch_style(self.trt_enabled)
+        self.trt_configure_button = QPushButton()
+        self.trt_status_label = QLabel()
+        self.trt_status_label.setStyleSheet("color: #5f6368;")
+        self.trt_cache_watcher = QFileSystemWatcher(self)
+        self.trt_cache_watcher.directoryChanged.connect(lambda _path: self._update_trt_state())
+        self.trt_cache_watcher.fileChanged.connect(lambda _path: self._update_trt_state())
+        self._refresh_trt_watcher()
         self.light_match_enabled = QCheckBox()
         self.light_match_enabled.setChecked(bool(settings.data.get("light_match_enabled")))
         _apply_switch_style(self.light_match_enabled)
@@ -693,7 +708,7 @@ class HomePage(QWidget):
         for key in ("home_warm", "daylight", "night_cool", "custom"):
             self.light_match_preset.addItem("", key)
         self.light_match_preset.setFixedWidth(150)
-        idx = self.light_match_preset.findData(settings.data.get("light_match_preset", "custom"))
+        idx = self.light_match_preset.findData(settings.data.get("light_match_preset") or LIGHT_MATCH_DEFAULT_PRESET)
         self.light_match_preset.setCurrentIndex(max(0, idx))
         self._light_match_live_timer = QTimer(self)
         self._light_match_live_timer.setSingleShot(True)
@@ -713,6 +728,7 @@ class HomePage(QWidget):
         fps_row.addWidget(self.performance_fps_label)
         fps_row.addWidget(self.performance_fps)
         fps_row.addStretch(1)
+        fps_row.addWidget(self.performance_fps_help)
         output_size_row_widget = QWidget()
         output_size_row_widget.setFixedHeight(CONFIG_ROW_HEIGHT)
         output_size_row = QHBoxLayout(output_size_row_widget)
@@ -720,9 +736,19 @@ class HomePage(QWidget):
         output_size_row.addWidget(self.performance_output_size_label)
         output_size_row.addWidget(self.performance_output_size)
         output_size_row.addStretch(1)
+        trt_row_widget = QWidget()
+        trt_row_widget.setFixedHeight(CONFIG_ROW_HEIGHT)
+        trt_row = QHBoxLayout(trt_row_widget)
+        trt_row.setContentsMargins(0, 0, 0, 0)
+        trt_row.addWidget(self.trt_enabled_label)
+        trt_row.addWidget(self.trt_enabled)
+        trt_row.addWidget(self.trt_configure_button)
+        trt_row.addWidget(self.trt_status_label)
+        trt_row.addStretch(1)
         performance_content_layout.addWidget(memory_row_widget)
         performance_content_layout.addWidget(fps_row_widget)
         performance_content_layout.addWidget(output_size_row_widget)
+        performance_content_layout.addWidget(trt_row_widget)
         performance_layout.addWidget(self.performance_header)
         performance_layout.addWidget(self.performance_content)
         self.performance_content.setVisible(False)
@@ -771,6 +797,7 @@ class HomePage(QWidget):
             self.performance_quality_label,
             self.performance_fps_label,
             self.performance_output_size_label,
+            self.trt_enabled_label,
             self.light_match_enabled_label,
         ):
             label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
@@ -825,9 +852,12 @@ class HomePage(QWidget):
         self.performance_quality.currentIndexChanged.connect(self._save)
         self.performance_fps.currentIndexChanged.connect(self._save)
         self.performance_output_size.currentIndexChanged.connect(self._save)
+        self.trt_enabled.toggled.connect(self._save)
+        self.trt_configure_button.clicked.connect(self.show_trt_config)
         self.light_match_enabled.toggled.connect(self._save_light_match)
         self.light_match_preset.currentIndexChanged.connect(self._preset_light_match)
         self.light_match_advanced_button.clicked.connect(self.show_light_match_advanced)
+        self.performance_fps_help.clicked.connect(self._show_fps_help)
         self.config_header.toggled.connect(self._toggle_quick_config)
         self.performance_header.toggled.connect(self._toggle_performance_config)
         self.light_match_header.toggled.connect(self._toggle_light_match_config)
@@ -841,6 +871,7 @@ class HomePage(QWidget):
         self.light_match_help.clicked.connect(self._show_light_match_help)
         self.problem_help_button.clicked.connect(self.show_problem_help)
         self._update_enabled()
+        self._update_trt_state()
         self._update_light_match_visibility()
         self.update_video_dirs_summary()
 
@@ -852,8 +883,43 @@ class HomePage(QWidget):
         self.settings.data["alpha_stride"] = 1
         self.settings.data["passthrough_max_fps"] = self.performance_fps.currentData()
         self.settings.data["decode_max_side"] = self.performance_output_size.currentData()
+        self.settings.data["inference_backend"] = "tensorrt" if self.trt_enabled.isChecked() else "cuda"
         self.settings.data["subtitle_enable"] = self.subtitle_enable.isChecked()
         self.settings.save()
+
+    def _refresh_trt_watcher(self) -> None:
+        for path in self.trt_cache_watcher.files():
+            self.trt_cache_watcher.removePath(path)
+        for path in self.trt_cache_watcher.directories():
+            self.trt_cache_watcher.removePath(path)
+        cache_dir = manifest_path().parent
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        self.trt_cache_watcher.addPath(str(cache_dir))
+        if manifest_path().exists():
+            self.trt_cache_watcher.addPath(str(manifest_path()))
+
+    def _trt_status(self) -> str:
+        try:
+            return cache_status()
+        except Exception:
+            return "failed"
+
+    def _update_trt_state(self) -> None:
+        self._refresh_trt_watcher()
+        status = self._trt_status()
+        ready = status == "ready"
+        self.trt_enabled.blockSignals(True)
+        self.trt_enabled.setEnabled(ready)
+        if not ready:
+            self.trt_enabled.setChecked(False)
+            if str(self.settings.data.get("inference_backend") or "cuda").lower() == "tensorrt":
+                self.settings.data["inference_backend"] = "cuda"
+                self.settings.save()
+        else:
+            self.trt_enabled.setChecked(str(self.settings.data.get("inference_backend") or "cuda").lower() == "tensorrt")
+        self.trt_enabled.blockSignals(False)
+        self.trt_status_label.setText(self.i18n.t("trt.status_" + status))
+        self.trt_enabled.setToolTip("" if ready else self.i18n.t("trt.build_first_tooltip"))
 
     def _light_match_payload(self) -> dict:
         return {
@@ -864,13 +930,13 @@ class HomePage(QWidget):
             "contrast": _float_setting(self.settings.data.get("light_match_contrast"), 1.0),
             "gamma": _float_setting(self.settings.data.get("light_match_gamma"), 1.0),
             "saturation": _float_setting(self.settings.data.get("light_match_saturation"), 1.0),
-            "preset": str(self.light_match_preset.currentData() or "custom"),
+            "preset": str(self.light_match_preset.currentData() or LIGHT_MATCH_DEFAULT_PRESET),
         }
 
     def _apply_light_match_payload(self, payload: dict, save: bool) -> None:
         for key, value in payload.items():
             self.settings.data[f"light_match_{key}"] = value
-        idx = self.light_match_preset.findData(payload.get("preset", "custom"))
+        idx = self.light_match_preset.findData(payload.get("preset", LIGHT_MATCH_DEFAULT_PRESET))
         if idx >= 0 and self.light_match_preset.currentIndex() != idx:
             self.light_match_preset.blockSignals(True)
             self.light_match_preset.setCurrentIndex(idx)
@@ -910,7 +976,7 @@ class HomePage(QWidget):
         threading.Thread(target=worker, name="light-match-live-update", daemon=True).start()
 
     def _preset_light_match(self) -> None:
-        preset = str(self.light_match_preset.currentData() or "custom")
+        preset = str(self.light_match_preset.currentData() or LIGHT_MATCH_DEFAULT_PRESET)
         self._update_light_match_visibility()
         payload = self._light_match_payload()
         values = LIGHT_MATCH_PRESETS.get(preset, {})
@@ -928,7 +994,7 @@ class HomePage(QWidget):
 
     def _update_light_match_visibility(self) -> None:
         enabled = self.light_match_enabled.isChecked()
-        preset = str(self.light_match_preset.currentData() or "custom")
+        preset = str(self.light_match_preset.currentData() or LIGHT_MATCH_DEFAULT_PRESET)
         self.light_match_preset.setVisible(enabled)
         self.light_match_advanced_button.setVisible(enabled and preset == "custom")
 
@@ -936,6 +1002,11 @@ class HomePage(QWidget):
         from PySide6.QtWidgets import QMessageBox
 
         QMessageBox.information(self, self.i18n.t("light_match.title"), self.i18n.t("light_match.help"))
+
+    def _show_fps_help(self) -> None:
+        from PySide6.QtWidgets import QMessageBox
+
+        QMessageBox.information(self, self.i18n.t("performance.output_fps"), self.i18n.t("performance.output_fps_help"))
 
     def sync_from_settings(self) -> None:
         value = quality_speed_value(self.settings.data.get("quality_speed"))
@@ -964,6 +1035,14 @@ class HomePage(QWidget):
         self.settings.data["alpha_2d_projection"] = dialog.selected_projection()
         self.settings.data["alpha_2d_distance_m"] = dialog.selected_distance_m()
         self.settings.save()
+
+    def show_trt_config(self) -> None:
+        dialog = TensorRTConfigDialog(self.i18n, self)
+        dialog.exec()
+        if self._trt_status() == "ready":
+            self.settings.data["inference_backend"] = "tensorrt"
+            self.settings.save()
+        self._update_trt_state()
 
     def show_problem_help(self) -> None:
         QMessageBox.information(
@@ -1110,6 +1189,7 @@ class HomePage(QWidget):
             self.performance_quality_label,
             self.performance_fps_label,
             self.performance_output_size_label,
+            self.trt_enabled_label,
             self.light_match_enabled_label,
         )
         width = max(label.sizeHint().width() for label in labels)
@@ -1145,7 +1225,11 @@ class HomePage(QWidget):
         self.debug_toggle_label.setText(self.i18n.t("log.debug"))
         self.performance_quality_label.setText(self.i18n.t("performance.quality_speed"))
         self.performance_fps_label.setText(self.i18n.t("performance.output_fps"))
+        self.performance_fps_help.setToolTip(self.i18n.t("performance.output_fps_help"))
         self.performance_output_size_label.setText(self.i18n.t("performance.output_size"))
+        self.trt_enabled.setText("")
+        self.trt_enabled_label.setText(self.i18n.t("trt.row_label"))
+        self.trt_configure_button.setText(self.i18n.t("trt.configure"))
         self.light_match_enabled.setText("")
         self.light_match_enabled_label.setText(self.i18n.t("light_match.enabled"))
         self.light_match_help.setToolTip(self.i18n.t("light_match.help"))
@@ -1167,3 +1251,4 @@ class HomePage(QWidget):
         for i, key in enumerate(("bg.neutral_gray", "bg.light_gray", "bg.soft_green", "bg.soft_blue")):
             self.bg_color.setItemText(i, self.i18n.t(key))
         self._sync_quick_label_widths()
+        self._update_trt_state()

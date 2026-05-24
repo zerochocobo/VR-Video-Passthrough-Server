@@ -13,9 +13,15 @@ def passthrough_dlna_pn(backend_verdict: str | None = None) -> str:
     return "HEVC_MP4_MAIN"
 
 
-def passthrough_frame_rate() -> str | None:
+def _fmt_fps(fps: float) -> str:
+    return str(int(fps)) if float(fps).is_integer() else f"{float(fps):.3f}".rstrip("0").rstrip(".")
+
+
+def passthrough_frame_rate(source_fps: float | None = None) -> str | None:
     """Return the advertised passthrough frame rate, or None for uncapped."""
     if PASSTHROUGH_MAX_FPS <= 0:
         return None
-    fps = PASSTHROUGH_MAX_FPS
-    return str(int(fps)) if fps.is_integer() else f"{fps:.3f}".rstrip("0").rstrip(".")
+    fps = float(PASSTHROUGH_MAX_FPS)
+    if source_fps and source_fps > 0:
+        fps = min(fps, float(source_fps))
+    return _fmt_fps(fps)

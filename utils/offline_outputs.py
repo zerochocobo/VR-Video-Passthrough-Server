@@ -10,6 +10,7 @@ import config
 
 OFFLINE_PASSTHROUGH_SUFFIXES = (
     "_passthrough",
+    "_LR_180_SBS_passthrough",
     "_LR_180_passthrough",
     "_SBS_180_passthrough",
     "_FISHEYE_alpha",

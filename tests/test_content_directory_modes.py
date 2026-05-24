@@ -1,6 +1,7 @@
 ﻿from __future__ import annotations
 
 import unittest
+import shutil
 from types import SimpleNamespace
 from pathlib import Path
 from unittest.mock import patch
@@ -52,6 +53,7 @@ class ContentDirectoryModeTests(unittest.TestCase):
             size=1024,
             video=SimpleNamespace(
                 duration=60.0,
+                fps=24.0,
                 resolution="3840x2160",
                 backend_verdict="pynv_hevc",
                 probe_error="",
@@ -67,10 +69,36 @@ class ContentDirectoryModeTests(unittest.TestCase):
             items = cds._video_items_from_index(Path("movie.mp4"), "0", child)
 
         passthrough = [item for item in items if item.get("passthrough")]
-        self.assertEqual([item["id"] for item in passthrough], ["lg_movie.mp4", "la_movie.mp4"])
+        self.assertEqual([item["id"] for item in passthrough], ["lg_ptv7_movie.mp4", "la_ptv7_movie.mp4"])
         self.assertIn("mode=green", passthrough[0]["url"])
         self.assertIn("mode=alpha", passthrough[1]["url"])
         self.assertEqual([item["passthrough_mode"] for item in passthrough], ["green", "alpha"])
+
+    def test_short_live_frame_rate_is_capped_by_source_fps(self) -> None:
+        child = SimpleNamespace(
+            size=1024,
+            video=SimpleNamespace(
+                duration=60.0,
+                fps=24.0,
+                width=3840,
+                height=2160,
+                resolution="3840x2160",
+                backend_verdict="pynv_hevc",
+                probe_error="",
+                mkv_needs_fix=False,
+            ),
+        )
+        with (
+            patch.object(cds, "_rel_key", return_value="movie.mp4"),
+            patch.object(cds, "PASSTHROUGH_OUTPUT_MODE", "green"),
+            patch.object(cds, "_uses_live_chapter_container", return_value=False),
+            patch.object(cds, "estimate_for_media", return_value=(0, 20_000_000, None)),
+            patch("dlna.profiles.PASSTHROUGH_MAX_FPS", 30.0),
+        ):
+            items = cds._video_items_from_index(Path("movie.mp4"), "0", child)
+
+        passthrough = [item for item in items if item.get("passthrough")]
+        self.assertEqual(passthrough[0]["frame_rate"], "24")
 
     def test_existing_offline_output_hides_virtual_modes(self) -> None:
         child = SimpleNamespace(
@@ -123,9 +151,14 @@ class ContentDirectoryModeTests(unittest.TestCase):
                 ][0]
             )
 
-        self.assertIn("la_movie.mp4", didl)
+        self.assertIn("la_ptv7_movie.mp4", didl)
         self.assertIn("mode=alpha", didl)
         self.assertNotIn("mode=green", didl)
+        self.assertIn("DLNA.ORG_OP=00", didl)
+        self.assertNotIn("DLNA.ORG_OP=10", didl)
+        self.assertNotIn("DLNA.ORG_FLAGS", didl)
+        self.assertNotIn("duration=", didl)
+        self.assertNotIn("bitrate=", didl)
 
     def test_alpha_virtual_title_uses_file_name(self) -> None:
         self.assertEqual(cds._passthrough_virtual_title(Path("movie.mp4"), "alpha"), "movie_LR_180_FISHEYE_F180_alpha_live")
@@ -133,7 +166,7 @@ class ContentDirectoryModeTests(unittest.TestCase):
     def test_green_virtual_title_uses_half_equirectangular_source_display_name(self) -> None:
         self.assertEqual(
             cds._passthrough_virtual_title(Path("movie.mp4"), "green", 3840, 1920),
-            "movie_LR_180_passthrough_live",
+            "movie_LR_180_SBS_passthrough_live",
         )
 
     def test_original_title_uses_half_equirectangular_source_display_name(self) -> None:
@@ -147,7 +180,7 @@ class ContentDirectoryModeTests(unittest.TestCase):
                 mkv_needs_fix=False,
             )
         )
-        self.assertEqual(cds._marked_original_title(Path("movie.mp4"), child), "movie_LR_180")
+        self.assertEqual(cds._marked_original_title(Path("movie.mp4"), child), "movie_LR_180_SBS")
 
     def test_mkv_needs_fix_hides_passthrough_and_marks_title(self) -> None:
         child = SimpleNamespace(
@@ -277,6 +310,24 @@ class ContentDirectoryModeTests(unittest.TestCase):
             ["00:00_movie_LR_180_FISHEYE_F180_alpha_live", "00:05_movie_LR_180_FISHEYE_F180_alpha_live"],
         )
 
+    def test_live_chapter_res_metadata_is_not_seekable_vod(self) -> None:
+        source = Path("movie.mp4")
+        info = SimpleNamespace(duration=720.0, width=3840, height=2160)
+        with (
+            patch.object(cds, "_rel_key", return_value="movie.mp4"),
+            patch.object(cds, "probe_cached", return_value=info),
+            patch.object(cds, "estimate_for_media", return_value=(0, 20_000_000, None)),
+            patch.object(cds, "_live_chapter_offsets", return_value=[0, 300]),
+        ):
+            didl = cds._didl_for(cds._live_chapter_items(source, "green"))
+
+        self.assertIn("DLNA.ORG_OP=00", didl)
+        self.assertNotIn("DLNA.ORG_OP=10", didl)
+        self.assertNotIn("DLNA.ORG_FLAGS", didl)
+        self.assertNotIn("duration=", didl)
+        self.assertNotIn("bitrate=", didl)
+        self.assertIn('resolution="3840x2160"', didl)
+
     def test_multi_root_items_are_virtual_folders(self) -> None:
         roots = build_media_roots([Path(r"D:\VR"), Path(r"E:\VR")])
         library = MediaLibrary(roots)
@@ -284,7 +335,7 @@ class ContentDirectoryModeTests(unittest.TestCase):
             items = cds._root_items()
 
         self.assertEqual([item["title"] for item in items], ["VR", "VR2"])
-        self.assertEqual([item["id"] for item in items], ["d_VR", "d_VR2"])
+        self.assertEqual([item["id"] for item in items], ["d_ptv7_VR", "d_ptv7_VR2"])
 
     def test_didl_namespace_has_trailing_slash(self) -> None:
         didl = cds._didl_for([])
@@ -365,6 +416,22 @@ class ContentDirectoryModeTests(unittest.TestCase):
         library = MediaLibrary(roots)
         with patch.object(cds, "MEDIA_LIBRARY", library):
             self.assertEqual(cds._id_to_dir("d:Movies"), Path(r"D:\VR\Movies").resolve())
+
+    def test_versioned_folder_id_resolves_without_visible_title_change(self) -> None:
+        roots = build_media_roots([Path(r"D:\VR")])
+        library = MediaLibrary(roots)
+        with patch.object(cds, "MEDIA_LIBRARY", library):
+            self.assertEqual(cds._id_to_dir("d_ptv7_Movies"), Path(r"D:\VR\Movies").resolve())
+
+    def test_versioned_live_id_resolves(self) -> None:
+        source = Path("runtime_cache/test_content_directory_versioned_live/movie.mp4")
+        source.parent.mkdir(parents=True, exist_ok=True)
+        source.write_text("video", encoding="utf-8")
+        self.addCleanup(lambda: shutil.rmtree(source.parent, ignore_errors=True))
+        roots = build_media_roots([source.parent])
+        library = MediaLibrary(roots)
+        with patch.object(cds, "MEDIA_LIBRARY", library):
+            self.assertEqual(cds._id_to_live("lg_ptv7_movie.mp4"), (source.resolve(), "green"))
 
     def test_soap_parser_rejects_entity_declarations(self) -> None:
         body = b"""<?xml version="1.0"?>

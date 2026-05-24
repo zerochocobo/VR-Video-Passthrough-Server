@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import shutil
 import statistics
 import subprocess
@@ -25,6 +26,15 @@ import config  # noqa: E402
 from utils.bitrate_estimator import effective_default_bitrate, parse_bitrate, source_video_bitrate  # noqa: E402
 from utils.gpu_runtime_cache import configure_gpu_runtime_cache  # noqa: E402
 from utils.subprocess_hidden import hidden_subprocess_kwargs  # noqa: E402
+from utils.trt_manifest import (  # noqa: E402
+    MATANYONE2_TRT_ONNX_NAME,
+    TRT_MODEL_MATANYONE2,
+    TRT_PROVIDER_CHAIN,
+    cache_dir_for_model,
+    cache_status,
+    matanyone2_model_dir,
+    original_rvm_model_path,
+)
 from utils.video_metadata import cfr_source_index, probe_color_metadata, probe_timing_metadata, probe_video_metadata, select_backend  # noqa: E402
 from utils.vr_naming import offline_passthrough_stem  # noqa: E402
 from offline.sam3_matanyone2 import (  # noqa: E402
@@ -39,12 +49,58 @@ from offline.decoded_frames import decoded_frame_to_bgr  # noqa: E402
 GPU_CACHE_ENV = configure_gpu_runtime_cache()
 
 
+def _configure_offline_rvm_tensorrt(model_path: Path) -> bool:
+    providers = [p.strip() for p in config.ONNX_PROVIDERS if p.strip()]
+    wants_trt = "TensorrtExecutionProvider" in providers
+    is_mobile = model_path.resolve() == original_rvm_model_path().resolve()
+    if wants_trt and is_mobile:
+        try:
+            if cache_status() == "ready":
+                config.ONNX_PROVIDERS = [p.strip() for p in TRT_PROVIDER_CHAIN.split(",") if p.strip()]
+                print(f"[offline-alpha] RVM TensorRT enabled providers={config.ONNX_PROVIDERS}")
+                return True
+        except Exception as exc:
+            print(f"[offline-alpha] RVM TensorRT unavailable, using CUDA providers ({type(exc).__name__}: {exc})")
+    if wants_trt:
+        config.ONNX_PROVIDERS = [p for p in providers if p != "TensorrtExecutionProvider"] or ["CUDAExecutionProvider", "CPUExecutionProvider"]
+        print(f"[offline-alpha] RVM TensorRT disabled for model={model_path.name}; providers={config.ONNX_PROVIDERS}")
+    return False
+
+
 def _available_onnx_providers():
     import onnxruntime as ort
 
     providers = ["CUDAExecutionProvider", "CPUExecutionProvider"]
     available = set(ort.get_available_providers())
     return [p for p in providers if p in available] or ["CPUExecutionProvider"]
+
+
+def _matanyone2_session_providers(name: str, model_dir: Path):
+    if os.environ.get("PT_OFFLINE_MATANYONE2_TRT") != "1":
+        return _available_onnx_providers()
+    if name != MATANYONE2_TRT_ONNX_NAME:
+        return _available_onnx_providers()
+    try:
+        if model_dir.resolve() != matanyone2_model_dir().resolve():
+            print(f"[offline-alpha] MatAnyone2 TensorRT disabled for custom model dir={model_dir}", flush=True)
+            return _available_onnx_providers()
+        if cache_status(model_key=TRT_MODEL_MATANYONE2) != "ready":
+            print("[offline-alpha] MatAnyone2 TensorRT cache is not ready; using CUDA providers", flush=True)
+            return _available_onnx_providers()
+        from pipeline.matting import _filter_available_providers, _provider_config
+
+        cache_dir = cache_dir_for_model(TRT_MODEL_MATANYONE2)
+        config.ONNX_TRT_ENGINE_CACHE_PATH = cache_dir
+        os.environ["PT_ONNX_TRT_ENGINE_CACHE_PATH"] = str(cache_dir)
+        providers = _filter_available_providers(["TensorrtExecutionProvider", "CUDAExecutionProvider", "CPUExecutionProvider"])
+        if "TensorrtExecutionProvider" not in providers:
+            print("[offline-alpha] MatAnyone2 TensorRT provider unavailable; using CUDA providers", flush=True)
+            return _available_onnx_providers()
+        print(f"[offline-alpha] MatAnyone2 TensorRT enabled model={name} cache={cache_dir}", flush=True)
+        return _provider_config(providers)
+    except Exception as exc:
+        print(f"[offline-alpha] MatAnyone2 TensorRT unavailable, using CUDA providers ({type(exc).__name__}: {exc})", flush=True)
+        return _available_onnx_providers()
 
 
 def _sam3_onnx_providers(provider: str, cuda_memory_limit_mb: int):
@@ -280,9 +336,22 @@ def _parse_bitrate(value: str, src: Path) -> str:
     return str(value)
 
 
-def _encoder_bitrate_kwargs(args: argparse.Namespace, src: Path) -> tuple[dict[str, str], int, int, int]:
+def _encoder_bitrate_kwargs(
+    args: argparse.Namespace,
+    src: Path,
+    src_w: int = 0,
+    src_h: int = 0,
+    out_w: int = 0,
+    out_h: int = 0,
+) -> tuple[dict[str, str], int, int, int]:
+    raw_bitrate = str(args.bitrate or "source").strip().lower()
     target_text = _parse_bitrate(args.bitrate, src)
     target_bps = parse_bitrate(target_text)
+    if raw_bitrate in {"", "source", "auto", "same"} and src_w > 0 and src_h > 0 and out_w > 0 and out_h > 0:
+        src_pixels = max(1, int(src_w) * int(src_h))
+        out_pixels = max(1, int(out_w) * int(out_h))
+        if out_pixels > src_pixels:
+            target_bps = int(target_bps * (out_pixels / src_pixels))
     max_bps = int(target_bps * max(1.0, float(args.maxrate_multiplier)))
     buf_bps = int(target_bps * max(1.0, float(args.bufsize_multiplier)))
     kwargs = {
@@ -377,9 +446,11 @@ class RvmOfflineEngine(OfflineMattingEngine):
     def __init__(self, model: Path | None = None, args=None):
         if model is not None:
             config.MODEL_PATH = model
+            _configure_offline_rvm_tensorrt(model)
         from pipeline.matting import Matter
 
         self.matter = Matter()
+        print(f"[offline-alpha] RVM runtime provider_diag={self.matter._rvm_provider_diag()}", file=sys.stderr)
         self.matter.reset_state()
         self.packer = _alpha_packer_from_args(self.matter, args) if args is not None else AlphaPacker(self.matter)
         self.profile: dict[str, list[float]] = defaultdict(list)
@@ -489,7 +560,7 @@ class MatAnyone2OnnxEngine(OfflineMattingEngine):
         self.batch_size = int(manifest.get("batch_size") or 1)
         if int(manifest.get("objects") or 1) != 1:
             raise RuntimeError("MatAnyone2 offline engine currently supports one object only")
-        providers = _available_onnx_providers()
+        provider_report: dict[str, list[str]] = {}
         sess_opts = ort.SessionOptions()
         sess_opts.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
 
@@ -497,7 +568,9 @@ class MatAnyone2OnnxEngine(OfflineMattingEngine):
             path = model_dir / name
             if not path.exists():
                 raise RuntimeError(f"MatAnyone2 ONNX file not found: {path}")
-            return ort.InferenceSession(str(path), sess_options=sess_opts, providers=providers)
+            session = ort.InferenceSession(str(path), sess_options=sess_opts, providers=_matanyone2_session_providers(name, model_dir))
+            provider_report[name] = list(session.get_providers())
+            return session
 
         self.image_key = sess("matanyone2_image_key.onnx")
         self.mask_memory = sess("matanyone2_mask_memory.onnx")
@@ -538,7 +611,7 @@ class MatAnyone2OnnxEngine(OfflineMattingEngine):
             f"bootstrap_soft={self.bootstrap_soft} segment_frames={self.segment_frames} alpha_stride={self.alpha_stride} "
             f"batch2={self.batch2_enabled} dtype={self.tensor_dtype.__name__} "
             f"fused_update={self.propagate_update is not None} step_update={self.step_update is not None} "
-            f"providers={providers}"
+            f"providers={provider_report}"
         )
 
     @staticmethod
@@ -1488,6 +1561,12 @@ def main() -> int:
         )
         decoder_mode = "simple"
     alpha_threaded_owned_copy = decoder_mode == "threaded_serial"
+    engine: OfflineMattingEngine | None = None
+    if args.engine == "rvm":
+        # Match the live path more closely: initialize Matter/ORT/TRT before
+        # constructing the PyNv decoder, so decoder state is not created under
+        # the heavy RVM session build.
+        engine = _make_engine(args)
     try:
         if decoder_mode == "ffmpeg_fallback":
             dec = FfmpegNv12SequentialDecoder(src)
@@ -1537,8 +1616,6 @@ def main() -> int:
         target = int(max(1, round(seconds * fps))) if seconds > 0 else len(dec)
     max_target = int((len(dec) - 1) * fps / source_fps) + 1 if source_fps > 0 else len(dec)
     target = min(target, max(1, max_target - start_out))
-    bitrate_kwargs, target_bps, max_bps, buf_bps = _encoder_bitrate_kwargs(args, src)
-
     if args.engine == "matanyone2_onnx":
         model_dir = _resolve_matanyone2_model_dir(args, info.width, info.height)
         args._matanyone2_model_dir = str(model_dir)
@@ -1562,13 +1639,16 @@ def main() -> int:
         _write_sam3_prepass_result(Path(args.sam3_prepass_out).resolve(), sam3_masks, segment_starts)
         dec.stop()
         return 0
-    engine = _make_engine(args)
+    if engine is None:
+        engine = _make_engine(args)
     enc_w, enc_h = alpha_output_size(info.width, info.height)
+    bitrate_kwargs, target_bps, max_bps, buf_bps = _encoder_bitrate_kwargs(args, src, info.width, info.height, enc_w, enc_h)
     projection_mode = AlphaPacker.projection_mode_static(info.width, info.height)
     if isinstance(engine, MatAnyone2OnnxEngine):
         engine.set_segment_plan(segment_starts)
         for segment_start, masks in sam3_masks.items():
             engine.set_segment_masks(segment_start, masks)
+    from pipeline import matting as matting_module
 
     enc = nvc.CreateEncoder(
         enc_w,
@@ -1617,14 +1697,21 @@ def main() -> int:
 
     t_dec: list[float] = []
     t_mat: list[float] = []
+    t_sync: list[float] = []
     t_enc: list[float] = []
     t_mux: list[float] = []
+    last_src_idx = -1
+    source_index_rewinds = 0
     bytes_written = 0
     started = time.perf_counter()
     used0, total0 = _mem_stats()
     try:
         for i in range(target):
             src_idx = min(len(dec) - 1, cfr_source_index(start_out + i, source_fps, fps))
+            if src_idx <= last_src_idx:
+                source_index_rewinds += 1
+                src_idx = min(len(dec) - 1, last_src_idx + 1)
+            last_src_idx = src_idx
             td0 = time.perf_counter()
             frame = dec.frame_at(src_idx)
             if alpha_threaded_owned_copy:
@@ -1637,6 +1724,10 @@ def main() -> int:
             else:
                 out_nv12, _ = engine.composite_nv12(frame)
             tm1 = time.perf_counter()
+            cuda_stream = getattr(matting_module, "_CUDA_STREAM", None)
+            if cuda_stream is not None:
+                cuda_stream.synchronize()
+            ts1 = time.perf_counter()
             app_frame = GpuNv12AppFrame(out_nv12, enc_w, enc_h)
             flags = 0
             if i == 0:
@@ -1646,6 +1737,7 @@ def main() -> int:
             te1 = time.perf_counter()
             t_dec.append((td1 - td0) * 1000)
             t_mat.append((tm1 - td1) * 1000)
+            t_sync.append((ts1 - tm1) * 1000)
             t_enc.append((te1 - te0) * 1000)
             if bitstream:
                 tw0 = time.perf_counter()
@@ -1655,9 +1747,13 @@ def main() -> int:
                 bytes_written += len(bitstream)
             if args.progress > 0 and (i + 1) % args.progress == 0:
                 elapsed = time.perf_counter() - started
+                dec_avg = statistics.fmean(t_dec)
+                mat_avg = statistics.fmean(t_mat)
+                sync_avg = statistics.fmean(t_sync)
                 print(
                     f"[offline] {i + 1:7d}/{target} fps={(i + 1) / elapsed:7.2f} "
-                    f"dec={statistics.fmean(t_dec):6.2f}ms mat={statistics.fmean(t_mat):6.2f}ms "
+                    f"dec={dec_avg:6.2f}ms mat={mat_avg:6.2f}ms sync={sync_avg:5.2f}ms "
+                    f"dec+mat+sync={dec_avg + mat_avg + sync_avg:6.2f}ms "
                     f"enc={statistics.fmean(t_enc):5.2f}ms mux={statistics.fmean(t_mux) if t_mux else 0:5.2f}ms"
                 )
         tail = enc.EndEncode()
@@ -1681,8 +1777,14 @@ def main() -> int:
     print(f"video_bytes = {bytes_written}")
     print(f"elapsed = {elapsed:.3f} s")
     print(f"throughput = {target / elapsed:.2f} fps")
+    print(f"source_index_rewinds = {source_index_rewinds}")
     for line in _summary("decode", t_dec): print(line)
     for line in _summary("matting", t_mat): print(line)
+    for line in _summary("sync", t_sync): print(line)
+    if t_dec and t_mat:
+        print(f"decode_matting_avg = {statistics.fmean([d + m for d, m in zip(t_dec, t_mat)]):.3f} ms")
+    if t_dec and t_mat and t_sync:
+        print(f"decode_matting_sync_avg = {statistics.fmean([d + m + s for d, m, s in zip(t_dec, t_mat, t_sync)]):.3f} ms")
     if hasattr(engine, "profile_lines"):
         for line in engine.profile_lines():
             print(line)

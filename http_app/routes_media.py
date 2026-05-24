@@ -1649,7 +1649,12 @@ async def passthrough_live_get(
         end_npt = _format_npt(info.duration)
         headers["TimeSeekRange.dlna.org"] = f"npt={start_npt}-{end_npt}/{end_npt}"
         headers["X-AvailableSeekRange.dlna.org"] = f"1 npt=0.000-{end_npt}"
-    response_fps = float(getattr(stream, "max_fps", 0.0) or live_max_fps or 0.0)
+    response_fps = float(getattr(stream, "output_fps", 0.0) or 0.0)
+    if response_fps <= 0:
+        try:
+            response_fps = float(live_meta.timing.effective_fps(live_max_fps))
+        except Exception:
+            response_fps = float(getattr(stream, "max_fps", 0.0) or live_max_fps or 0.0)
     frame_rate = _format_fps_header(response_fps) or passthrough_frame_rate()
     if frame_rate:
         headers["X-Passthrough-FrameRate"] = frame_rate
@@ -1957,6 +1962,9 @@ async def passthrough_live_get(
     await _put_live_session(live_key, session)
     await _clear_live_starting(live_key, live_starting_at)
     session.start(stream_iter)
+    effective_stall_timeout = PASSTHROUGH_LIVE_STALL_TIMEOUT_SEC
+    if is_nplayer and effective_stall_timeout <= 0:
+        effective_stall_timeout = 6.0
 
     async def gen():
         sent = 0
@@ -1979,9 +1987,9 @@ async def passthrough_live_get(
                     log.info("passthrough_live[%d] disconnect watchdog stopped response", rid)
                     return
                 if (
-                    PASSTHROUGH_LIVE_STALL_TIMEOUT_SEC > 0
+                    effective_stall_timeout > 0
                     and sent > 0
-                    and asyncio.get_running_loop().time() - last_send_wall > PASSTHROUGH_LIVE_STALL_TIMEOUT_SEC
+                    and asyncio.get_running_loop().time() - last_send_wall > effective_stall_timeout
                 ):
                     log.info(
                         "passthrough_live[%d] send stall watchdog closing stream: sent=%d stream_bytes=%d frames=%d idle=%.1fs",
@@ -1991,6 +1999,7 @@ async def passthrough_live_get(
                         getattr(stream, "frames_produced", -1),
                         asyncio.get_running_loop().time() - last_send_wall,
                     )
+                    await session.close("send stall watchdog")
                     if stream_task is not None and not stream_task.done():
                         stream_task.cancel()
                     return

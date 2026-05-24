@@ -5,6 +5,7 @@ import sys
 from pathlib import Path
 
 from ui.i18n import system_language
+from utils.trt_manifest import TRT_PROVIDER_CHAIN, cache_status
 
 ROOT = Path(sys.executable).resolve().parent if getattr(sys, "frozen", False) else Path(__file__).resolve().parents[1]
 SETTINGS_PATH = ROOT / "runtime_cache" / "ui_settings.json"
@@ -25,8 +26,13 @@ DEFAULTS = {
     "quality_speed": "ultrafast",
     "offline_quality_speed": "medium",
     "offline_sam3_prompt": "person",
+    "offline_single_trt_rvm_enabled": True,
+    "offline_single_trt_matanyone2_enabled": True,
+    "offline_batch_trt_rvm_enabled": True,
+    "offline_batch_trt_matanyone2_enabled": True,
     "passthrough_max_fps": 30,
     "decode_max_side": 4096,
+    "inference_backend": "cuda",
     "light_match_enabled": False,
     "light_match_temp_k": 5500,
     "light_match_tint": 0.0,
@@ -34,7 +40,7 @@ DEFAULTS = {
     "light_match_contrast": 1.0,
     "light_match_gamma": 1.0,
     "light_match_saturation": 1.0,
-    "light_match_preset": "custom",
+    "light_match_preset": "daylight",
     "alpha_2d_projection": "fisheye",
     "alpha_2d_distance_m": 4.0,
     "subtitle_enable": True,
@@ -123,9 +129,19 @@ class Settings:
                         self._mark_migration_done("20260517_fps_size")
                     elif "passthrough_max_fps" not in loaded:
                         self.data["passthrough_max_fps"] = DEFAULTS["passthrough_max_fps"]
+                    if not self._migration_done("20260524_fps_default_30", loaded):
+                        if int(loaded.get("passthrough_max_fps", DEFAULTS["passthrough_max_fps"]) or 0) == 0:
+                            self.data["passthrough_max_fps"] = DEFAULTS["passthrough_max_fps"]
+                        self._mark_migration_done("20260524_fps_default_30")
                     if not self._migration_done("20260519_light_match_off", loaded):
                         self.data["light_match_enabled"] = False
                         self._mark_migration_done("20260519_light_match_off")
+                    if not self._migration_done("20260524_light_match_daylight_default", loaded):
+                        preset = str(loaded.get("light_match_preset", "custom") or "custom").strip().lower()
+                        enabled = bool(loaded.get("light_match_enabled"))
+                        if not enabled and preset == "custom":
+                            self.data["light_match_preset"] = DEFAULTS["light_match_preset"]
+                        self._mark_migration_done("20260524_light_match_daylight_default")
             except Exception:
                 pass
 
@@ -160,7 +176,7 @@ class Settings:
             "PT_COMPOSITE_BG_RGB": str(self.data.get("background_color") or "00FF00"),
             "PT_ALPHA_STRIDE": str(_setting_value(self.data, "alpha_stride", 1)),
             "PT_PASSTHROUGH_MAX_FPS": str(passthrough_max_fps),
-            "PT_PASSTHROUGH_PRODUCER_REALTIME_PACING": "1" if float(passthrough_max_fps or 0) > 0 else "0",
+            "PT_PASSTHROUGH_PRODUCER_REALTIME_PACING": "1",
             "PT_DECODE_MAX_SIDE": str(_setting_value(self.data, "decode_max_side", 4096)),
             "PT_LIGHT_MATCH_ENABLED": "1" if self.data.get("light_match_enabled") else "0",
             "PT_LIGHT_MATCH_TEMP_K": str(_setting_value(self.data, "light_match_temp_k", 5500)),
@@ -169,7 +185,7 @@ class Settings:
             "PT_LIGHT_MATCH_CONTRAST": str(_setting_value(self.data, "light_match_contrast", 1.0)),
             "PT_LIGHT_MATCH_GAMMA": str(_setting_value(self.data, "light_match_gamma", 1.0)),
             "PT_LIGHT_MATCH_SATURATION": str(_setting_value(self.data, "light_match_saturation", 1.0)),
-            "PT_LIGHT_MATCH_PRESET": str(self.data.get("light_match_preset") or "custom"),
+            "PT_LIGHT_MATCH_PRESET": str(self.data.get("light_match_preset") or DEFAULTS["light_match_preset"]),
             "PT_ALPHA_2D_PROJECTION": str(self.data.get("alpha_2d_projection") or "fisheye"),
             "PT_ALPHA_2D_DISTANCE_M": str(_setting_value(self.data, "alpha_2d_distance_m", 4.0)),
             "PT_SUBTITLE_ENABLE": "1" if self.data.get("subtitle_enable") else "0",
@@ -185,6 +201,7 @@ class Settings:
             "PT_SUBTITLE_ALPHA": str(self.data.get("subtitle_alpha") or 1.0),
             "PT_SUBTITLE_OUTLINE_COLOR": str(self.data.get("subtitle_outline_color") or "000000"),
             "PT_SUBTITLE_V360": "1" if self.data.get("subtitle_v360") else "0",
+            "PT_ONNX_PROVIDERS": "CUDAExecutionProvider,CPUExecutionProvider",
         }
         env.update(quality_speed_env(self.data.get("quality_speed")))
         color = str(self.data.get("subtitle_color") or "").strip()
@@ -192,6 +209,12 @@ class Settings:
             env["PT_SUBTITLE_COLOR"] = color
         else:
             env.pop("PT_SUBTITLE_COLOR", None)
+        if str(self.data.get("inference_backend") or "cuda").lower() == "tensorrt":
+            try:
+                if cache_status() == "ready":
+                    env["PT_ONNX_PROVIDERS"] = TRT_PROVIDER_CHAIN
+            except Exception:
+                pass
         return env
 
     def video_dirs(self) -> list[str]:

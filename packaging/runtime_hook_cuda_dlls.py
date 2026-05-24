@@ -82,6 +82,7 @@ if sys.platform.startswith("win") and hasattr(os, "add_dll_directory"):
     dll_dirs: list[Path] = [
         bundled_cuda_bin,
         onnxruntime_capi_dir,
+        internal_dir / "tensorrt_libs",
         internal_dir / "cupy" / ".data" / "lib",
         internal_dir,
     ]

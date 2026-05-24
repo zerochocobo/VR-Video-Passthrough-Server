@@ -9,6 +9,7 @@ This file only keeps version releases, major bug fixes, major UI/UX updates, and
 
 - **v0.1.0-beta.4 patches and additions.**
 
+- **Major performance/UI update:** Added TensorRT acceleration cache management for realtime RVM inference, including a Performance-panel toggle, cache configure/build dialog, startup cache validation, CUDA fallback when the cache is missing or stale, and PyInstaller runtime DLL handling for TensorRT.
 - **Major bug fix:** Offline generation now targets the source video bitrate by default for all engines, including RVM fast/balanced and MatAnyone2 medium/slow. This keeps generated video size closer to the original source. If source bitrate is unavailable, offline generation falls back to 40 Mbps.
 - **Major bug fix:** Fixed lingering FFmpeg child processes after playback or server stop. PyNv streams now track and stop audio FFmpeg subprocesses, wait for slate audio/cache threads during close, clean up partially spawned pipe-TS muxers, remove stale temporary AAC files, and forced UI server stop now terminates child processes through `taskkill /T /F` on Windows.
 - **Major bug fix:** Fixed realtime 2D alpha blocks turning gray during playback by switching the default realtime RVM model back to FP32. The issue was caused by FP16 precision loss accumulating in RVM's recurrent `rec1`-`rec4` state across frames, not by alpha packing or realtime bitrate control.

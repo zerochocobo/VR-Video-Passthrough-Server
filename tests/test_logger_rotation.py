@@ -5,7 +5,7 @@ import unittest
 import logging
 from pathlib import Path
 
-from utils.logger import _LoggerNameAliasFilter, _rotate_server_logs
+from utils.logger import _LoggerNameAliasFilter, _UvicornSocketSendNoiseFilter, _rotate_server_logs
 
 
 class LoggerRotationTests(unittest.TestCase):
@@ -28,6 +28,24 @@ class LoggerRotationTests(unittest.TestCase):
         filt = _LoggerNameAliasFilter({"uvicorn.error": "uvicorn.server"})
         self.assertTrue(filt.filter(record))
         self.assertEqual(record.name, "uvicorn.server")
+
+    def test_uvicorn_socket_send_noise_is_dropped(self) -> None:
+        record = logging.LogRecord(
+            "uvicorn.error",
+            logging.WARNING,
+            __file__,
+            1,
+            "socket.send() raised exception",
+            (),
+            None,
+        )
+        filt = _UvicornSocketSendNoiseFilter()
+        self.assertFalse(filt.filter(record))
+
+    def test_uvicorn_other_messages_are_kept(self) -> None:
+        record = logging.LogRecord("uvicorn.error", logging.WARNING, __file__, 1, "real warning", (), None)
+        filt = _UvicornSocketSendNoiseFilter()
+        self.assertTrue(filt.filter(record))
 
 
 if __name__ == "__main__":

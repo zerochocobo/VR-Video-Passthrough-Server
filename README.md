@@ -114,6 +114,7 @@ Tested on Meta Quest 3.
 - `PT_VIDEO_DIR` supports multiple roots separated by `|`
 - `PT_PASSTHROUGH_OUTPUT_MODE` supports `none`, `green`, `alpha`, and `all`
 - `Alpha Passthrough` is the DLNA virtual title used in alpha mode
+- TensorRT acceleration is controlled from the desktop UI Performance panel. Build the cache first in `TensorRT -> Configure`; the first build can take several minutes. If the cache is missing or stale after a driver/CUDA/TensorRT/model change, the server falls back to CUDA automatically.
 - UI settings are stored separately from backend runtime configuration
 
 ## Project Layout

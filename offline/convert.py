@@ -20,6 +20,7 @@ if __package__ in (None, ""):
 import config
 from utils.gpu_requirements import detect_nvidia_gpu_requirement, unsupported_gpu_message
 from utils.subprocess_hidden import hidden_subprocess_kwargs
+from utils.trt_manifest import TRT_MODEL_MATANYONE2, TRT_MODEL_RVM, TRT_PROVIDER_CHAIN, cache_status
 from utils.video_metadata import probe_video_metadata, select_backend
 from utils.vr_naming import offline_passthrough_stem
 
@@ -49,6 +50,50 @@ RVM_DEFAULT_ARGS = {
     "preset": config.PASSTHROUGH_PYNV_PRESET,
     "cq": -1,
 }
+
+
+def _strip_tensorrt_provider(provider_text: str) -> str:
+    providers = [p.strip() for p in str(provider_text or "").split(",") if p.strip()]
+    providers = [p for p in providers if p != "TensorrtExecutionProvider"]
+    return ",".join(providers)
+
+
+def _env_flag_enabled(env: dict[str, str], key: str, default: bool = True) -> bool:
+    raw = str(env.get(key, "1" if default else "0")).strip().lower()
+    return raw not in {"0", "false", "no", "off", ""}
+
+
+def _offline_child_env(args: argparse.Namespace, base_env: dict[str, str] | None = None) -> dict[str, str]:
+    env = dict(os.environ if base_env is None else base_env)
+    env["PYTHONUNBUFFERED"] = "1"
+    provider_text = env.get("PT_ONNX_PROVIDERS", "")
+    wants_trt = "TensorrtExecutionProvider" in [p.strip() for p in provider_text.split(",") if p.strip()]
+    if getattr(args, "engine", "") == "rvm_fast" and _env_flag_enabled(env, "PT_OFFLINE_RVM_TRT_ENABLE"):
+        try:
+            if cache_status(model_key=TRT_MODEL_RVM) == "ready":
+                env["PT_ONNX_PROVIDERS"] = TRT_PROVIDER_CHAIN
+                env["PT_OFFLINE_RVM_TRT"] = "1"
+                return env
+        except Exception:
+            pass
+    if getattr(args, "engine", "") in {"matanyone2", "matanyone2_medium"} and _env_flag_enabled(env, "PT_OFFLINE_MATANYONE2_TRT_ENABLE"):
+        try:
+            if cache_status(model_key=TRT_MODEL_MATANYONE2) == "ready":
+                env["PT_ONNX_PROVIDERS"] = TRT_PROVIDER_CHAIN
+                env["PT_OFFLINE_MATANYONE2_TRT"] = "1"
+                return env
+        except Exception:
+            pass
+    if not wants_trt:
+        return env
+    stripped = _strip_tensorrt_provider(provider_text)
+    if stripped:
+        env["PT_ONNX_PROVIDERS"] = stripped
+    else:
+        env.pop("PT_ONNX_PROVIDERS", None)
+    env.pop("PT_OFFLINE_RVM_TRT", None)
+    env.pop("PT_OFFLINE_MATANYONE2_TRT", None)
+    return env
 
 
 def _script_for(mode: str) -> Path:
@@ -213,15 +258,19 @@ def _run_one(args: argparse.Namespace, src: Path) -> int:
     cmd = _base_cmd(args, src, out)
     print("[offline] run: " + subprocess.list2cmdline(cmd), flush=True)
     _print_warmup_notice()
-    env = dict(os.environ)
-    env["PYTHONUNBUFFERED"] = "1"
+    env = _offline_child_env(args)
     print(
         "[offline] env: "
         f"decoder={env.get('PT_PASSTHROUGH_PYNV_DECODER', '')} "
         f"batch={env.get('PT_PASSTHROUGH_PYNV_THREADED_BATCH_SIZE', '')} "
         f"buffer={env.get('PT_PASSTHROUGH_PYNV_THREADED_BUFFER_SIZE', '')} "
         f"preset={env.get('PT_PASSTHROUGH_PYNV_PRESET', '')} "
-        f"model={env.get('PT_MODEL_PATH', '')}",
+        f"model={env.get('PT_MODEL_PATH', '')} "
+        f"providers={env.get('PT_ONNX_PROVIDERS', '')} "
+        f"offline_rvm_trt_enable={env.get('PT_OFFLINE_RVM_TRT_ENABLE', '1')} "
+        f"offline_matanyone2_trt_enable={env.get('PT_OFFLINE_MATANYONE2_TRT_ENABLE', '1')} "
+        f"offline_rvm_trt={env.get('PT_OFFLINE_RVM_TRT', '0')} "
+        f"offline_matanyone2_trt={env.get('PT_OFFLINE_MATANYONE2_TRT', '0')}",
         flush=True,
     )
     return subprocess.run(cmd, env=env).returncode

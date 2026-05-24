@@ -42,7 +42,16 @@ from PySide6.QtWidgets import (
 # back to the current step_index from /status.
 _STEP_KEYS = (
     "predict",
-    "ort_session_and_runs",
+    "matter_singleton",
+    "static_trt_preload",
+    "ort_iobinding_runs",
+    "composite_jit",
+    "reset_state",
+    "nvenc_preflight",
+    "firewall",
+    "ssdp",
+    "http_starting",
+    "listening",
     "warmed",
 )
 
@@ -77,6 +86,9 @@ class StartupOverlay(QDialog):
         self.message_label = QLabel()
         self.message_label.setWordWrap(True)
         self.message_label.setMinimumHeight(48)
+
+        self.step_label = QLabel()
+        self.step_label.setStyleSheet("QLabel { color: #303133; font-weight: 600; }")
 
         self.eta_label = QLabel()
         self.eta_label.setStyleSheet("QLabel { color: #606266; }")
@@ -128,6 +140,7 @@ class StartupOverlay(QDialog):
         layout.setSpacing(10)
         layout.addWidget(self.title_label)
         layout.addWidget(self.message_label)
+        layout.addWidget(self.step_label)
         layout.addWidget(self.progress)
         layout.addWidget(self.eta_label)
         layout.addWidget(self.hint_label)
@@ -146,6 +159,7 @@ class StartupOverlay(QDialog):
         self._base_message = self.i18n.t("startup.connecting")
         self.title_label.setText(self.i18n.t("startup.title_starting"))
         self.message_label.setText(self._base_message)
+        self.step_label.setText("")
         self.eta_label.setText("")
         self.progress.setRange(0, 1000)
         self.progress.setValue(0)
@@ -164,6 +178,8 @@ class StartupOverlay(QDialog):
         phase = str(status.get("phase") or "")
         step = str(status.get("step") or "")
         progress_value = float(status.get("progress") or 0.0)
+        step_index = int(status.get("step_index") or 0)
+        step_total = int(status.get("step_total") or 0)
         eta = float(status.get("eta_sec") or 0.0)
         elapsed = float(status.get("elapsed_sec") or 0.0)
         cold = bool(status.get("cold"))
@@ -206,6 +222,15 @@ class StartupOverlay(QDialog):
             friendly.append(self.i18n.t("startup.gpu_label").format(gpu=gpu, cc=cc or "?"))
         self._base_message = "\n".join(friendly) if friendly else self.i18n.t("startup.connecting")
         self.message_label.setText(self._base_message)
+
+        step_text = self._step_text(step)
+        if step_text and step_total > 0:
+            shown_index = max(1, min(step_total, step_index or self._step_index_for(step)))
+            self.step_label.setText(f"{shown_index}/{step_total}  {step_text}")
+        elif step_text:
+            self.step_label.setText(step_text)
+        else:
+            self.step_label.setText("")
 
         # ----- ETA / elapsed line -----
         if phase == "listening":
@@ -250,6 +275,8 @@ class StartupOverlay(QDialog):
             # If progress is reported, use it; otherwise infer from elapsed/eta.
             if progress_value > 0:
                 value = int(max(0.0, min(1.0, progress_value)) * self.progress.maximum())
+            elif step_total > 0 and step_index > 0:
+                value = int(max(0.0, min(0.99, step_index / step_total)) * self.progress.maximum())
             elif eta > 0:
                 value = int(max(0.0, min(0.99, elapsed / eta)) * self.progress.maximum())
             else:
@@ -298,6 +325,19 @@ class StartupOverlay(QDialog):
         self.toggle_details_btn.setText(self.i18n.t("startup.show_details"))
         self.copy_report_btn.setText(self.i18n.t("startup.copy_report"))
         self.cancel_btn.setText(self.i18n.t("startup.cancel"))
+
+    def _step_text(self, step: str) -> str:
+        if not step:
+            return ""
+        key = f"startup.step.{step}"
+        translated = self.i18n.t(key)
+        return translated if translated != key else step.replace("_", " ")
+
+    def _step_index_for(self, step: str) -> int:
+        try:
+            return _STEP_KEYS.index(step) + 1
+        except ValueError:
+            return 0
 
     # ---- Internal handlers ----
 

@@ -40,6 +40,12 @@ class LightMatchCoeffTests(unittest.TestCase):
         self.assertGreaterEqual(y, 126)
         self.assertLessEqual(y, 130)
 
+    def test_soft_warm_temperature_keeps_chroma_shift_moderate(self) -> None:
+        tables = build_light_match_tables(LightMatchParams(enabled=True, temp_k=4000, saturation=1.0))
+        _y, u, v = apply_light_match_yuv(128, 128, 128, tables)
+        self.assertGreaterEqual(u, 114)
+        self.assertLessEqual(v, 142)
+
     def test_exposure_controls_luma(self) -> None:
         tables = build_light_match_tables(LightMatchParams(enabled=True, temp_k=6500, exposure_ev=1.0))
         y, u, v = apply_light_match_yuv(100, 128, 128, tables)
@@ -107,6 +113,7 @@ class LightMatchRuntimeTests(unittest.TestCase):
         runtime_settings.set_light_match({"enabled": True, "temp_k": 3000})
         reset = runtime_settings.reset_for_test()
         self.assertFalse(reset.enabled)
+        self.assertEqual(reset.preset, "daylight")
         self.assertEqual(reset.version, 0)
 
 

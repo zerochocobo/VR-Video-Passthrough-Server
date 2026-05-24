@@ -15,6 +15,7 @@ class OfflineOutputDetectionTests(unittest.TestCase):
         source = Path("movie.mp4")
 
         self.assertTrue(matches_offline_output_for_source(source, Path("movie_passthrough.mp4")))
+        self.assertTrue(matches_offline_output_for_source(source, Path("movie_LR_180_SBS_passthrough.mp4")))
         self.assertTrue(matches_offline_output_for_source(source, Path("movie_LR_180_passthrough.mp4")))
         self.assertTrue(matches_offline_output_for_source(source, Path("movie_SBS_180_passthrough.mp4")))
         self.assertTrue(matches_offline_output_for_source(source, Path("movie_FISHEYE_alpha.mp4")))

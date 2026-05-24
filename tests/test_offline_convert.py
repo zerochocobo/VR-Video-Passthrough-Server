@@ -14,7 +14,7 @@ class OfflineConvertTests(unittest.TestCase):
     def test_default_output_names(self) -> None:
         src = Path("sample.mp4")
         self.assertEqual(convert._default_out(src, "green", 1920, 1080), Path("sample_passthrough.mp4"))
-        self.assertEqual(convert._default_out(src, "green", 3840, 1920), Path("sample_LR_180_passthrough.mp4"))
+        self.assertEqual(convert._default_out(src, "green", 3840, 1920), Path("sample_LR_180_SBS_passthrough.mp4"))
         self.assertEqual(convert._default_out(src, "alpha"), Path("sample_LR_180_FISHEYE_F180_alpha.mp4"))
 
     def test_single_output_name_includes_mode_engine_start_and_duration(self) -> None:
@@ -25,7 +25,7 @@ class OfflineConvertTests(unittest.TestCase):
 
         self.assertEqual(
             convert._single_out(src, green_args, 3840, 1920),
-            Path("sample_rvm1_S000500_15S_LR_180_passthrough.mp4"),
+            Path("sample_rvm1_S000500_15S_LR_180_SBS_passthrough.mp4"),
         )
         self.assertEqual(convert._single_out(src, alpha_args), Path("sample_matanyone2_S000005_5M_LR_180_FISHEYE_F180_alpha.mp4"))
         self.assertEqual(convert._single_out(src, all_args, 1920, 1080), Path("sample_rvm2_S000000_ALL_passthrough.mp4"))
@@ -75,6 +75,46 @@ class OfflineConvertTests(unittest.TestCase):
         self.assertIn("-1", cmd)
         self.assertIn("--audio", cmd)
         self.assertIn("copy", cmd)
+
+    def test_rvm_fast_offline_env_keeps_tensorrt_when_cache_ready(self) -> None:
+        args = SimpleNamespace(engine="rvm_fast")
+        base = {"PT_ONNX_PROVIDERS": "TensorrtExecutionProvider,CUDAExecutionProvider,CPUExecutionProvider"}
+        with patch.object(convert, "cache_status", return_value="ready"):
+            env = convert._offline_child_env(args, base)
+        self.assertEqual(env["PT_ONNX_PROVIDERS"], convert.TRT_PROVIDER_CHAIN)
+        self.assertEqual(env["PT_OFFLINE_RVM_TRT"], "1")
+
+    def test_matanyone2_offline_env_keeps_tensorrt_when_cache_ready(self) -> None:
+        args = SimpleNamespace(engine="matanyone2")
+        base = {"PT_ONNX_PROVIDERS": "CUDAExecutionProvider,CPUExecutionProvider"}
+        with patch.object(convert, "cache_status", return_value="ready"):
+            env = convert._offline_child_env(args, base)
+        self.assertEqual(env["PT_ONNX_PROVIDERS"], convert.TRT_PROVIDER_CHAIN)
+        self.assertEqual(env["PT_OFFLINE_MATANYONE2_TRT"], "1")
+
+    def test_offline_env_honors_model_tensorrt_disable_flags(self) -> None:
+        base = {
+            "PT_ONNX_PROVIDERS": "TensorrtExecutionProvider,CUDAExecutionProvider,CPUExecutionProvider",
+            "PT_OFFLINE_RVM_TRT_ENABLE": "0",
+            "PT_OFFLINE_MATANYONE2_TRT_ENABLE": "0",
+        }
+        with patch.object(convert, "cache_status", return_value="ready"):
+            rvm_env = convert._offline_child_env(SimpleNamespace(engine="rvm_fast"), base)
+            mat_env = convert._offline_child_env(SimpleNamespace(engine="matanyone2"), base)
+        self.assertEqual(rvm_env["PT_ONNX_PROVIDERS"], "CUDAExecutionProvider,CPUExecutionProvider")
+        self.assertEqual(mat_env["PT_ONNX_PROVIDERS"], "CUDAExecutionProvider,CPUExecutionProvider")
+        self.assertNotIn("PT_OFFLINE_RVM_TRT", rvm_env)
+        self.assertNotIn("PT_OFFLINE_MATANYONE2_TRT", mat_env)
+
+    def test_non_fast_offline_env_strips_tensorrt(self) -> None:
+        base = {"PT_ONNX_PROVIDERS": "TensorrtExecutionProvider,CUDAExecutionProvider,CPUExecutionProvider"}
+        for engine in ("rvm_balanced", "matanyone2"):
+            with self.subTest(engine=engine):
+                with patch.object(convert, "cache_status", return_value="missing"):
+                    env = convert._offline_child_env(SimpleNamespace(engine=engine), base)
+                self.assertEqual(env["PT_ONNX_PROVIDERS"], "CUDAExecutionProvider,CPUExecutionProvider")
+                self.assertNotIn("PT_OFFLINE_RVM_TRT", env)
+                self.assertNotIn("PT_OFFLINE_MATANYONE2_TRT", env)
 
     def test_frozen_command_uses_internal_tool_subcommand(self) -> None:
         args = SimpleNamespace(

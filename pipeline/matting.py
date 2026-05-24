@@ -11,6 +11,7 @@ import os
 import sys
 import threading
 from contextlib import nullcontext
+from dataclasses import dataclass
 from pathlib import Path
 from typing import NamedTuple
 
@@ -40,6 +41,8 @@ from config import (
     MATTING_WARMUP_RUNS,
     MODEL_PATH,
     ONNX_TRT_CUDA_GRAPH_ENABLE,
+    ONNX_TRT_DETAILED_BUILD_LOG,
+    ONNX_TRT_DUMP_SUBGRAPHS,
     ONNX_TRT_ENGINE_CACHE_ENABLE,
     ONNX_TRT_ENGINE_CACHE_PATH,
     ONNX_TRT_FP16_ENABLE,
@@ -51,10 +54,18 @@ from config import (
     RVM_DOWNSAMPLE_RATIO,
     RVM_IOBINDING,
     SPLIT_NV12_COMPOSITE,
+    TRT_RVM_IOBINDING,
+    WARMUP_RAMPUP_DIAG_FRAMES,
 )
 from utils.logger import get
 
 log = get("matting")
+
+if not (ONNX_TRT_DUMP_SUBGRAPHS or ONNX_TRT_DETAILED_BUILD_LOG):
+    try:
+        ort.set_default_logger_severity(3)
+    except Exception:
+        pass
 
 
 _cp = None
@@ -68,6 +79,15 @@ _preprocess_nv12_kernel = None
 _preprocess_kernel_fp16 = None
 _preprocess_nv12_kernel_fp16 = None
 _GPU_OK = False
+
+
+def _should_enable_rvm_iobinding(active_providers: list[str]) -> bool:
+    if not RVM_IOBINDING:
+        return False
+    if "TensorrtExecutionProvider" in active_providers:
+        return TRT_RVM_IOBINDING
+    return "CUDAExecutionProvider" in active_providers
+
 
 _LIGHT_MATCH_DEVICE_SRC = LIGHT_MATCH_DEVICE_SRC
 
@@ -856,6 +876,37 @@ class Nv12OutputSlot(NamedTuple):
     buffer: object
 
 
+@dataclass(frozen=True)
+class _GpuPlane:
+    data: object
+
+    def as_cupy(self):
+        return self.data
+
+
+@dataclass(frozen=True)
+class ZeroGpuFrame:
+    height: int
+    width: int
+    y: _GpuPlane
+    uv: _GpuPlane
+
+
+def make_zero_gpu_frame(h: int, w: int, bit_depth: int = 8) -> ZeroGpuFrame:
+    """Return a duck-typed GPU NV12/P016 frame for startup warmup."""
+    if not _GPU_OK or _cp is None:
+        raise RuntimeError("make_zero_gpu_frame requires CuPy/GPU matting")
+    h = max(2, int(h) & ~1)
+    w = max(2, int(w) & ~1)
+    if int(bit_depth) > 8:
+        y = _cp.zeros((h, w), dtype=_cp.uint16)
+        uv = _cp.zeros((h // 2, w), dtype=_cp.uint16)
+    else:
+        y = _cp.zeros((h, w), dtype=_cp.uint8)
+        uv = _cp.full((h // 2, w), 128, dtype=_cp.uint8)
+    return ZeroGpuFrame(height=h, width=w, y=_GpuPlane(y), uv=_GpuPlane(uv))
+
+
 def _filter_available_providers(wanted: list[str]) -> list[str]:
     available_list = ort.get_available_providers()
     available = set(available_list)
@@ -879,13 +930,17 @@ def _provider_config(providers: list[str]):
     for provider in providers:
         if provider == "TensorrtExecutionProvider":
             trt_options = {
-                "trt_fp16_enable": "1" if ONNX_TRT_FP16_ENABLE else "0",
-                "trt_engine_cache_enable": "1" if ONNX_TRT_ENGINE_CACHE_ENABLE else "0",
-                "trt_cuda_graph_enable": "1" if ONNX_TRT_CUDA_GRAPH_ENABLE else "0",
+                "trt_fp16_enable": "True" if ONNX_TRT_FP16_ENABLE else "False",
+                "trt_engine_cache_enable": "True" if ONNX_TRT_ENGINE_CACHE_ENABLE else "False",
+                "trt_cuda_graph_enable": "True" if ONNX_TRT_CUDA_GRAPH_ENABLE else "False",
             }
             if ONNX_TRT_ENGINE_CACHE_ENABLE:
                 ONNX_TRT_ENGINE_CACHE_PATH.mkdir(parents=True, exist_ok=True)
                 trt_options["trt_engine_cache_path"] = str(ONNX_TRT_ENGINE_CACHE_PATH)
+            if ONNX_TRT_DUMP_SUBGRAPHS:
+                trt_options["trt_dump_subgraphs"] = "True"
+            if ONNX_TRT_DETAILED_BUILD_LOG:
+                trt_options["trt_detailed_build_log"] = "True"
             configured.append((provider, trt_options))
         elif provider == "CUDAExecutionProvider" and _CUDA_STREAM is not None and CUDA_SHARED_STREAM:
             cuda_options = {
@@ -905,7 +960,7 @@ def _provider_config(providers: list[str]):
 
 
 class Matter:
-    def __init__(self, model_path: Path = MODEL_PATH, load_model: bool = True):
+    def __init__(self, model_path: Path = MODEL_PATH, load_model: bool = True, warmup_runs: int | None = None):
         self.model_kind = "utility"
         self._norm_scale = 1.0 / 255.0
         self._norm_bias = 0.0
@@ -925,9 +980,15 @@ class Matter:
         self._rvm_io_outputs: dict[str, ort.OrtValue] = {}
         self._rvm_io_downsample: ort.OrtValue | None = None
         self._rvm_state_slots: dict[str, dict[str, object]] = {}
+        self._rvm_input_channels: dict[str, int] = {}
         self._rvm_output_channels: dict[str, int] = {}
+        self._rvm_trt_active = False
+        self._rvm_static_trt_available = False
         self._rvm_iobinding_enabled = False
         self._rvm_iobinding_failed = False
+        self._trt_static_sessions: dict[tuple[int, int, int], object] = {}
+        self._trt_static_states: dict[tuple[int, int, int], list[ort.OrtValue]] = {}
+        self._trt_static_outputs: dict[tuple[int, int, int], dict[str, ort.OrtValue]] = {}
         self._tmp_float: np.ndarray | None = None
         self._call_count = 0
         self._last_ort_shape = ""
@@ -953,6 +1014,7 @@ class Matter:
         self._h_out_nv12 = None
         self._h_out_nv12_mem = None
         self._sync_probe_count = 0
+        self._preproc_diag_count = 0
         self._light_match_version = -1
         self._light_match_identity = 1
         self._g_light_coeffs = None
@@ -976,11 +1038,22 @@ class Matter:
             self._norm_scale = 1.0 / 127.5
             self._norm_bias = -1.0
         providers = _filter_available_providers(ONNX_PROVIDERS)
+        self._rvm_static_trt_available = (
+            self.model_kind == "rvm"
+            and _GPU_OK
+            and "TensorrtExecutionProvider" in providers
+            and self._trt_static_model_path(1, MATTING_INPUT_SIZE, MATTING_INPUT_SIZE) is not None
+            and self._trt_static_model_path(2, MATTING_INPUT_SIZE, MATTING_INPUT_SIZE) is not None
+        )
+        session_providers = providers
+        if self._rvm_static_trt_available:
+            session_providers = [provider for provider in providers if provider != "TensorrtExecutionProvider"]
+            log.info("[DIAG] static TensorRT RVM cache detected; loading main RVM session without dynamic TensorRT EP")
         sess_opts = ort.SessionOptions()
         sess_opts.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
-        if "DmlExecutionProvider" in providers:
+        if "DmlExecutionProvider" in session_providers:
             sess_opts.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
-        provider_config = _provider_config(providers)
+        provider_config = _provider_config(session_providers)
         self.sess = ort.InferenceSession(
             str(model_path), sess_options=sess_opts, providers=provider_config
         )
@@ -988,6 +1061,11 @@ class Matter:
         self.output_metas = self.sess.get_outputs()
         self.input_names = [i.name for i in self.input_metas]
         self.output_names = [o.name for o in self.output_metas]
+        self._rvm_input_channels = {}
+        for meta in self.input_metas:
+            shape = list(meta.shape)
+            if len(shape) >= 2 and isinstance(shape[1], int):
+                self._rvm_input_channels[meta.name] = int(shape[1])
         self._rvm_output_channels = {}
         for meta in self.output_metas:
             shape = list(meta.shape)
@@ -1011,15 +1089,14 @@ class Matter:
         if self.rvm_downsample_dtype is None:
             self.rvm_downsample_dtype = np.float32
         self.output_name = self.output_metas[0].name
-        self._rvm_iobinding_enabled = (
-            RVM_IOBINDING
-            and self.model_kind == "rvm"
-            and _GPU_OK
-            and "CUDAExecutionProvider" in self.sess.get_providers()
-        )
+        active_providers = self.sess.get_providers()
+        self._rvm_trt_active = "TensorrtExecutionProvider" in active_providers
+        self._rvm_iobinding_enabled = self.model_kind == "rvm" and _GPU_OK and _should_enable_rvm_iobinding(active_providers)
+        if self._rvm_static_trt_available:
+            self._rvm_iobinding_enabled = True
         log.info(
             "Matting model loaded: kind=%s input=%s shape=%s type=%s output=%s wanted=%s active=%s composite_device=%s batch2=%s model_batch2=%s rvm_iobinding=%s",
-            self.model_kind, self.input_name, self.input_shape, self.input_type, self.output_name, providers, self.sess.get_providers(),
+            self.model_kind, self.input_name, self.input_shape, self.input_type, self.output_name, providers, active_providers,
             matter_device(),
             self._supports_batch2,
             self._model_supports_batch2,
@@ -1030,10 +1107,57 @@ class Matter:
             f"type={self.input_type} batch2={self._supports_batch2} "
             f"model_batch2={self._model_supports_batch2} "
             f"rvm_iobinding={self._rvm_iobinding_enabled} "
-            f"providers={self.sess.get_providers()} inputs={self.input_names} outputs={self.output_names}",
+            f"static_trt={self._rvm_static_trt_available} "
+            f"providers={active_providers} inputs={self.input_names} outputs={self.output_names}",
             file=sys.stderr,
         )
-        self.warmup(MATTING_WARMUP_RUNS)
+        self.warmup(MATTING_WARMUP_RUNS if warmup_runs is None else warmup_runs)
+
+    def _trt_static_model_path(self, batch: int, h: int, w: int) -> Path | None:
+        if self.model_kind != "rvm":
+            return None
+        if h != MATTING_INPUT_SIZE or w != MATTING_INPUT_SIZE:
+            return None
+        try:
+            from utils.rvm_static_onnx import static_rvm_model_path
+            from utils.trt_manifest import original_rvm_model_path
+
+            path = static_rvm_model_path(original_rvm_model_path(), ONNX_TRT_ENGINE_CACHE_PATH, batch, MATTING_INPUT_SIZE, RVM_DOWNSAMPLE_RATIO)
+        except Exception:
+            return None
+        return path if path.exists() else None
+
+    def _rvm_provider_diag(self) -> dict[str, object]:
+        return {
+            "main": self.sess.get_providers(),
+            "static_trt": self._rvm_static_trt_available,
+            "iobinding": self._rvm_iobinding_enabled and not self._rvm_iobinding_failed,
+        }
+
+    def _get_trt_static_session(self, batch: int, h: int, w: int):
+        if not self._rvm_static_trt_available:
+            return None
+        key = (batch, h, w)
+        session = self._trt_static_sessions.get(key)
+        if session is not None:
+            return session
+        path = self._trt_static_model_path(batch, h, w)
+        if path is None:
+            return None
+        providers = _filter_available_providers(ONNX_PROVIDERS)
+        sess_opts = ort.SessionOptions()
+        sess_opts.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+        if not (ONNX_TRT_DUMP_SUBGRAPHS or ONNX_TRT_DETAILED_BUILD_LOG):
+            sess_opts.log_severity_level = 3
+        session = ort.InferenceSession(str(path), sess_options=sess_opts, providers=_provider_config(providers))
+        if "TensorrtExecutionProvider" not in session.get_providers():
+            log.warning("[DIAG] static TensorRT RVM session did not activate TRT: %s", session.get_providers())
+            self._rvm_static_trt_available = False
+            self._rvm_iobinding_enabled = self.model_kind == "rvm" and _GPU_OK and _should_enable_rvm_iobinding(self.sess.get_providers())
+            return None
+        self._trt_static_sessions[key] = session
+        log.info("[DIAG] static TensorRT RVM session loaded: batch=%d shape=%dx%d model=%s", batch, w, h, path)
+        return session
 
     def _ensure_light_match_tables(self):
         cp = _cp
@@ -1086,6 +1210,8 @@ class Matter:
         self._rvm_io_sig = None
         self._rvm_io_outputs = {}
         self._rvm_io_downsample = None
+        self._trt_static_states = {}
+        self._trt_static_outputs = {}
         self._rvm_state_slots = {}
         self._rvm_iobinding_failed = False
         self._cached_alpha_small = None
@@ -1659,6 +1785,8 @@ class Matter:
             "io_sig": self._rvm_io_sig,
             "io_outputs": self._rvm_io_outputs,
             "io_downsample": self._rvm_io_downsample,
+            "trt_static_states": self._trt_static_states,
+            "trt_static_outputs": self._trt_static_outputs,
         }
 
     def _restore_rvm_state(self, state: dict[str, object] | None) -> None:
@@ -1669,6 +1797,8 @@ class Matter:
             self._rvm_io_sig = None
             self._rvm_io_outputs = {}
             self._rvm_io_downsample = None
+            self._trt_static_states = {}
+            self._trt_static_outputs = {}
             return
         self._rvm_rec = state.get("rec")  # type: ignore[assignment]
         self._rvm_rec_ort = state.get("rec_ort")  # type: ignore[assignment]
@@ -1676,6 +1806,8 @@ class Matter:
         self._rvm_io_sig = state.get("io_sig")  # type: ignore[assignment]
         self._rvm_io_outputs = state.get("io_outputs") or {}  # type: ignore[assignment]
         self._rvm_io_downsample = state.get("io_downsample")  # type: ignore[assignment]
+        self._trt_static_states = state.get("trt_static_states") or {}  # type: ignore[assignment]
+        self._trt_static_outputs = state.get("trt_static_outputs") or {}  # type: ignore[assignment]
 
     def _run_matting_in_rvm_slot(self, slot: str, x: np.ndarray) -> np.ndarray:
         if self.model_kind != "rvm":
@@ -1720,12 +1852,12 @@ class Matter:
         if self._rvm_rec_ort is None:
             self._rvm_rec_ort = [
                 ort.OrtValue.ortvalue_from_shape_and_type(
-                    (batch, 1, 1, 1), self.input_dtype, "cuda", 0
+                    self._rvm_initial_state_shape(name, batch, h, w), self.input_dtype, "cuda", 0
                 )
-                for _ in range(4)
+                for name in self.input_names[1:5]
             ]
-            zeros = np.zeros((batch, 1, 1, 1), dtype=self.input_dtype)
             for state in self._rvm_rec_ort:
+                zeros = np.zeros(tuple(int(v) for v in state.shape()), dtype=self.input_dtype)
                 self._copy_numpy_to_cuda_ortvalue(zeros, state)
         if self._rvm_io_downsample is None:
             self._rvm_io_downsample = ort.OrtValue.ortvalue_from_numpy(
@@ -1750,6 +1882,28 @@ class Matter:
             self._rvm_io_outputs[name] = value
         return value
 
+    def _rvm_initial_state_shape(self, name: str, batch: int, h: int, w: int) -> tuple[int, ...]:
+        rec_scale = {
+            "r1": 2,
+            "r2": 4,
+            "r3": 8,
+            "r4": 16,
+        }
+        scale = rec_scale.get(name.lower()[:2])
+        channels = self._rvm_input_channels.get(name)
+        if channels is None:
+            channels = {"r1": 16, "r2": 20, "r3": 40, "r4": 64}.get(name.lower()[:2])
+        if scale is None or channels is None:
+            return (batch, 1, 1, 1)
+        if not (self._rvm_trt_active or self._rvm_static_trt_available) and self.input_shape and self.input_shape[0] not in {1, 2}:
+            return (batch, 1, 1, 1)
+        return (
+            batch,
+            channels,
+            max(1, int(round(h * RVM_DOWNSAMPLE_RATIO / scale))),
+            max(1, int(round(w * RVM_DOWNSAMPLE_RATIO / scale))),
+        )
+
     def _rvm_output_shape_for(self, name: str, batch: int, h: int, w: int) -> tuple[int, ...] | None:
         lname = name.lower()
         if "pha" in lname or "alpha" in lname:
@@ -1766,6 +1920,8 @@ class Matter:
         prefix = lname[:2]
         scale = rec_scale.get(prefix)
         channels = self._rvm_output_channels.get(name)
+        if channels is None:
+            channels = {"r1": 16, "r2": 20, "r3": 40, "r4": 64}.get(prefix)
         if scale is not None and channels is not None:
             return (
                 batch,
@@ -1784,6 +1940,12 @@ class Matter:
         ptr = cp.cuda.MemoryPointer(mem, 0)
         return cp.ndarray(shape, dtype=dtype, memptr=ptr)
 
+    def _copy_cuda_ortvalue(self, value: ort.OrtValue) -> ort.OrtValue:
+        cp = _cp
+        arr = cp.ascontiguousarray(self._ortvalue_to_cupy(value))
+        host = cp.asnumpy(arr)
+        return ort.OrtValue.ortvalue_from_numpy(np.ascontiguousarray(host), "cuda", 0)
+
     def _rvm_rec_outputs_from(self, outputs_by_name: dict, outputs: list) -> list:
         if len(outputs) >= 6:
             return list(outputs[2:6])
@@ -1796,6 +1958,9 @@ class Matter:
     def _run_rvm_iobinding_from_dev(self, x_dev):
         cp = _cp
         batch, _, h, w = (int(v) for v in x_dev.shape)
+        static = self._run_rvm_static_trt_iobinding_from_dev(x_dev, batch, h, w)
+        if static is not None:
+            return static
         self._reset_rvm_rec_ort_if_needed(batch, h, w)
         assert self._rvm_rec_ort is not None
 
@@ -1813,8 +1978,9 @@ class Matter:
         if len(self.input_names) >= 6 and self._rvm_io_downsample is not None:
             binding.bind_ortvalue_input(self.input_names[5], self._rvm_io_downsample)
 
+        use_ort_allocated_outputs = "TensorrtExecutionProvider" in self.sess.get_providers()
         for meta in self.output_metas:
-            shape = self._rvm_output_shape_for(meta.name, batch, h, w)
+            shape = None if use_ort_allocated_outputs else self._rvm_output_shape_for(meta.name, batch, h, w)
             if shape is None:
                 binding.bind_output(meta.name, "cuda", 0)
             else:
@@ -1831,8 +1997,78 @@ class Matter:
 
         rec_outs = self._rvm_rec_outputs_from(out_by_name, outputs)
         if len(rec_outs) >= 4:
-            self._rvm_rec_ort = rec_outs[:4]
+            if use_ort_allocated_outputs:
+                self._rvm_rec_ort = [self._copy_cuda_ortvalue(v) for v in rec_outs[:4]]
+            else:
+                self._rvm_rec_ort = rec_outs[:4]
 
+        pha_cp = self._ortvalue_to_cupy(pha_ort)
+        if pha_cp.ndim == 4:
+            return pha_cp[:, 0]
+        if pha_cp.ndim == 3:
+            return pha_cp
+        squeezed = cp.squeeze(pha_cp)
+        if squeezed.ndim == 2:
+            return squeezed[None, ...]
+        return squeezed
+
+    def _run_rvm_static_trt_iobinding_from_dev(self, x_dev, batch: int, h: int, w: int):
+        session = self._get_trt_static_session(batch, h, w)
+        if session is None:
+            return None
+
+        key = (batch, h, w)
+        input_metas = session.get_inputs()
+        output_metas = session.get_outputs()
+        input_names = [meta.name for meta in input_metas]
+        output_names = [meta.name for meta in output_metas]
+        states = self._trt_static_states.get(key)
+        if states is None:
+            states = []
+            for name in input_names[1:5]:
+                state = ort.OrtValue.ortvalue_from_shape_and_type(
+                    self._rvm_initial_state_shape(name, batch, h, w), self.input_dtype, "cuda", 0
+                )
+                zeros = np.zeros(tuple(int(v) for v in state.shape()), dtype=self.input_dtype)
+                self._copy_numpy_to_cuda_ortvalue(zeros, state)
+                states.append(state)
+            self._trt_static_states[key] = states
+
+        outputs_cache = self._trt_static_outputs.setdefault(key, {})
+        binding = session.io_binding()
+        binding.bind_input(
+            input_names[0],
+            "cuda",
+            0,
+            self.input_dtype,
+            tuple(x_dev.shape),
+            int(x_dev.data.ptr),
+        )
+        for name, state in zip(input_names[1:5], states):
+            binding.bind_ortvalue_input(name, state)
+        for meta in output_metas:
+            shape = self._rvm_output_shape_for(meta.name, batch, h, w)
+            if shape is None:
+                binding.bind_output(meta.name, "cuda", 0)
+                continue
+            value = outputs_cache.get(meta.name)
+            if value is None or tuple(value.shape()) != shape:
+                value = ort.OrtValue.ortvalue_from_shape_and_type(shape, self.input_dtype, "cuda", 0)
+                outputs_cache[meta.name] = value
+            binding.bind_ortvalue_output(meta.name, value)
+
+        session.run_with_iobinding(binding)
+        outputs = binding.get_outputs()
+        out_by_name = dict(zip(output_names, outputs))
+        rec_outs = self._rvm_rec_outputs_from(out_by_name, outputs)
+        if len(rec_outs) >= 4:
+            self._trt_static_states[key] = rec_outs[:4]
+
+        pha_name = next(
+            (name for name in output_names if "pha" in name.lower() or "alpha" in name.lower()),
+            output_names[1] if len(output_names) > 1 else output_names[0],
+        )
+        pha_ort = out_by_name.get(pha_name, outputs[1] if len(outputs) > 1 else outputs[0])
         pha_cp = self._ortvalue_to_cupy(pha_ort)
         if pha_cp.ndim == 4:
             return pha_cp[:, 0]
@@ -1971,7 +2207,7 @@ class Matter:
                 self._call_count,
                 frame_bgr.shape[1], frame_bgr.shape[0], ort_shape,
                 (t1 - t0) * 1000, (t2 - t1) * 1000,
-                MATTING_SQUARE, MATTING_SPLIT_SBS, split_sbs_active, self.sess.get_providers(),
+                MATTING_SQUARE, MATTING_SPLIT_SBS, split_sbs_active, self._rvm_provider_diag(),
             )
         return a_small, MattingTiming((t1 - t0) * 1000, (t2 - t1) * 1000, 0.0, 0.0), ort_shape
 
@@ -2084,7 +2320,7 @@ class Matter:
                 "[DIAG] alpha #%d (gpu-pre): frame=%dx%d input_shape=%s preprocess=%.1fms ort_run=%.1fms "
                 "square=%s split_sbs=%s split_active=%s providers=%s",
                 self._call_count, w, h, ort_shape, pre_ms, ort_ms,
-                MATTING_SQUARE, MATTING_SPLIT_SBS, split_sbs_active, self.sess.get_providers(),
+                MATTING_SQUARE, MATTING_SPLIT_SBS, split_sbs_active, self._rvm_provider_diag(),
             )
         return a_small, MattingTiming(pre_ms, ort_ms, 0.0, 0.0), ort_shape
 
@@ -2499,15 +2735,17 @@ class Matter:
             w, h = int(out_w), int(out_h)
         stream = _CUDA_STREAM
         ctx = stream if stream is not None else nullcontext()
+        diag_enabled = WARMUP_RAMPUP_DIAG_FRAMES > 0 and self._preproc_diag_count < WARMUP_RAMPUP_DIAG_FRAMES
+        t_total0 = _time.perf_counter()
         with ctx:
             t_up0 = _time.perf_counter()
             self.upload_nv12_planes_gpu_scaled(frame_gpu_nv12.y.as_cupy(), frame_gpu_nv12.uv.as_cupy(), src_h, src_w, h, w)
-            if PASSTHROUGH_PYNV_SYNC_PROBE and stream is not None:
+            if (PASSTHROUGH_PYNV_SYNC_PROBE or diag_enabled) and stream is not None:
                 stream.synchronize()
             t_up1 = _time.perf_counter()
             a_small, timing, _ = self._alpha_low_res_gpu_temporal(h, w, use_nv12=True)
             t_alpha_done = _time.perf_counter()
-            if PASSTHROUGH_PYNV_SYNC_PROBE and stream is not None:
+            if (PASSTHROUGH_PYNV_SYNC_PROBE or diag_enabled) and stream is not None:
                 stream.synchronize()
             t_alpha_sync = _time.perf_counter()
             t0 = _time.perf_counter()
@@ -2517,9 +2755,29 @@ class Matter:
                 w,
                 out=out_slot.buffer if out_slot is not None else None,
             )
-            if PASSTHROUGH_PYNV_SYNC_PROBE and stream is not None:
+            if (PASSTHROUGH_PYNV_SYNC_PROBE or diag_enabled) and stream is not None:
                 stream.synchronize()
             t1 = _time.perf_counter()
+        if diag_enabled:
+            self._preproc_diag_count += 1
+            log.info(
+                "[DIAG][PREPROC] kind=nv12 frame=%d src=%dx%d out=%dx%d upload=%.2fms "
+                "alpha_call=%.2fms alpha_tail_sync=%.2fms composite=%.2fms total=%.2fms "
+                "mat_pre=%.2fms mat_ort=%.2fms mat_kernel=%.2fms",
+                self._preproc_diag_count,
+                src_w,
+                src_h,
+                w,
+                h,
+                (t_up1 - t_up0) * 1000.0,
+                (t_alpha_done - t_up1) * 1000.0,
+                (t_alpha_sync - t_alpha_done) * 1000.0,
+                (t1 - t0) * 1000.0,
+                (t1 - t_total0) * 1000.0,
+                timing.preprocess_ms,
+                timing.ort_ms,
+                timing.composite_ms,
+            )
         if PASSTHROUGH_PYNV_SYNC_PROBE:
             self._sync_probe_count += 1
             if self._sync_probe_count == 1 or self._sync_probe_count % 30 == 0:
@@ -2561,6 +2819,8 @@ class Matter:
             w, h = int(out_w), int(out_h)
         stream = _CUDA_STREAM
         ctx = stream if stream is not None else nullcontext()
+        diag_enabled = WARMUP_RAMPUP_DIAG_FRAMES > 0 and self._preproc_diag_count < WARMUP_RAMPUP_DIAG_FRAMES
+        t_total0 = _time.perf_counter()
         with ctx:
             t_up0 = _time.perf_counter()
             self.upload_p016_planes_as_nv12_gpu_scaled(
@@ -2572,12 +2832,12 @@ class Matter:
                 w,
                 shift_bits=shift_bits,
             )
-            if PASSTHROUGH_PYNV_SYNC_PROBE and stream is not None:
+            if (PASSTHROUGH_PYNV_SYNC_PROBE or diag_enabled) and stream is not None:
                 stream.synchronize()
             t_up1 = _time.perf_counter()
             a_small, timing, _ = self._alpha_low_res_gpu_temporal(h, w, use_nv12=True)
             t_alpha_done = _time.perf_counter()
-            if PASSTHROUGH_PYNV_SYNC_PROBE and stream is not None:
+            if (PASSTHROUGH_PYNV_SYNC_PROBE or diag_enabled) and stream is not None:
                 stream.synchronize()
             t_alpha_sync = _time.perf_counter()
             t0 = _time.perf_counter()
@@ -2587,9 +2847,29 @@ class Matter:
                 w,
                 out=out_slot.buffer if out_slot is not None else None,
             )
-            if PASSTHROUGH_PYNV_SYNC_PROBE and stream is not None:
+            if (PASSTHROUGH_PYNV_SYNC_PROBE or diag_enabled) and stream is not None:
                 stream.synchronize()
             t1 = _time.perf_counter()
+        if diag_enabled:
+            self._preproc_diag_count += 1
+            log.info(
+                "[DIAG][PREPROC] kind=p016 frame=%d src=%dx%d out=%dx%d upload=%.2fms "
+                "alpha_call=%.2fms alpha_tail_sync=%.2fms composite=%.2fms total=%.2fms "
+                "mat_pre=%.2fms mat_ort=%.2fms mat_kernel=%.2fms",
+                self._preproc_diag_count,
+                src_w,
+                src_h,
+                w,
+                h,
+                (t_up1 - t_up0) * 1000.0,
+                (t_alpha_done - t_up1) * 1000.0,
+                (t_alpha_sync - t_alpha_done) * 1000.0,
+                (t1 - t0) * 1000.0,
+                (t1 - t_total0) * 1000.0,
+                timing.preprocess_ms,
+                timing.ort_ms,
+                timing.composite_ms,
+            )
         if PASSTHROUGH_PYNV_SYNC_PROBE:
             self._sync_probe_count += 1
             if self._sync_probe_count == 1 or self._sync_probe_count % 30 == 0:
@@ -2658,8 +2938,10 @@ class Matter:
                     light_identity,
                 ),
             )
-            if debug:
-                log.info("[DIAG] nv12->nv12 y kernel returned in %.3fms", (_time.perf_counter() - t_kernel) * 1000.0)
+            # Per-frame kernel timing logs are too noisy for realtime playback.
+            # Re-enable locally only for focused CUDA kernel profiling.
+            # if debug:
+            #     log.info("[DIAG] nv12->nv12 y kernel returned in %.3fms", (_time.perf_counter() - t_kernel) * 1000.0)
             uv_grid = (((w >> 1) + block[0] - 1) // block[0], ((h >> 1) + block[1] - 1) // block[1], 1)
             t_kernel = _time.perf_counter()
             _composite_nv12_uv_kernel(
@@ -2676,8 +2958,8 @@ class Matter:
                     light_identity,
                 ),
             )
-            if debug:
-                log.info("[DIAG] nv12->nv12 uv kernel returned in %.3fms", (_time.perf_counter() - t_kernel) * 1000.0)
+            # if debug:
+            #     log.info("[DIAG] nv12->nv12 uv kernel returned in %.3fms", (_time.perf_counter() - t_kernel) * 1000.0)
         else:
             t_kernel = _time.perf_counter()
             _composite_nv12_to_nv12_kernel(
@@ -2695,8 +2977,8 @@ class Matter:
                     light_identity,
                 ),
             )
-            if debug:
-                log.info("[DIAG] nv12->nv12 mono kernel returned in %.3fms", (_time.perf_counter() - t_kernel) * 1000.0)
+            # if debug:
+            #     log.info("[DIAG] nv12->nv12 mono kernel returned in %.3fms", (_time.perf_counter() - t_kernel) * 1000.0)
         return out_nv12
 
     @staticmethod
@@ -2758,10 +3040,10 @@ _singleton: Matter | None = None
 _singleton_lock = threading.Lock()
 
 
-def get_matter() -> Matter:
+def get_matter(*, warmup_runs: int | None = None) -> Matter:
     global _singleton
     if _singleton is None:
         with _singleton_lock:
             if _singleton is None:
-                _singleton = Matter()
+                _singleton = Matter(warmup_runs=warmup_runs)
     return _singleton

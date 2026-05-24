@@ -113,6 +113,7 @@ netsh advfirewall firewall add rule name="PTServer SSDP Private" dir=in action=a
 - `PT_VIDEO_DIR` 支持用 `|` 分隔的多个目录
 - `PT_PASSTHROUGH_OUTPUT_MODE` 支持 `none`、`green`、`alpha`、`all`
 - Alpha 模式下虚拟条目标题为 `Alpha Passthrough`
+- TensorRT 加速在桌面 UI 的“性能配置”中控制。请先进入 `TensorRT -> 配置` 构建缓存；首次构建可能需要数分钟。如果驱动、CUDA、TensorRT 或模型变化导致缓存缺失/过期，服务器会自动回退到 CUDA。
 - UI 配置与后台运行配置分离保存
 
 ## 网盘整合包

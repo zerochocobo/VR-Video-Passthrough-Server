@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import shutil
 import statistics
 import subprocess
@@ -25,6 +26,15 @@ import config  # noqa: E402
 from utils.bitrate_estimator import effective_default_bitrate, parse_bitrate, source_video_bitrate  # noqa: E402
 from utils.gpu_runtime_cache import configure_gpu_runtime_cache  # noqa: E402
 from utils.subprocess_hidden import hidden_subprocess_kwargs  # noqa: E402
+from utils.trt_manifest import (  # noqa: E402
+    MATANYONE2_TRT_ONNX_NAME,
+    TRT_MODEL_MATANYONE2,
+    TRT_PROVIDER_CHAIN,
+    cache_dir_for_model,
+    cache_status,
+    matanyone2_model_dir,
+    original_rvm_model_path,
+)
 from utils.video_metadata import cfr_source_index, probe_color_metadata, probe_timing_metadata, probe_video_metadata, select_backend  # noqa: E402
 from utils.vr_naming import offline_passthrough_stem  # noqa: E402
 from offline.sam3_matanyone2 import (  # noqa: E402
@@ -39,12 +49,58 @@ from offline.decoded_frames import decoded_frame_to_bgr  # noqa: E402
 GPU_CACHE_ENV = configure_gpu_runtime_cache()
 
 
+def _configure_offline_rvm_tensorrt(model_path: Path) -> bool:
+    providers = [p.strip() for p in config.ONNX_PROVIDERS if p.strip()]
+    wants_trt = "TensorrtExecutionProvider" in providers
+    is_mobile = model_path.resolve() == original_rvm_model_path().resolve()
+    if wants_trt and is_mobile:
+        try:
+            if cache_status() == "ready":
+                config.ONNX_PROVIDERS = [p.strip() for p in TRT_PROVIDER_CHAIN.split(",") if p.strip()]
+                print(f"[offline] RVM TensorRT enabled providers={config.ONNX_PROVIDERS}")
+                return True
+        except Exception as exc:
+            print(f"[offline] RVM TensorRT unavailable, using CUDA providers ({type(exc).__name__}: {exc})")
+    if wants_trt:
+        config.ONNX_PROVIDERS = [p for p in providers if p != "TensorrtExecutionProvider"] or ["CUDAExecutionProvider", "CPUExecutionProvider"]
+        print(f"[offline] RVM TensorRT disabled for model={model_path.name}; providers={config.ONNX_PROVIDERS}")
+    return False
+
+
 def _available_onnx_providers():
     import onnxruntime as ort
 
     providers = ["CUDAExecutionProvider", "CPUExecutionProvider"]
     available = set(ort.get_available_providers())
     return [p for p in providers if p in available] or ["CPUExecutionProvider"]
+
+
+def _matanyone2_session_providers(name: str, model_dir: Path):
+    if os.environ.get("PT_OFFLINE_MATANYONE2_TRT") != "1":
+        return _available_onnx_providers()
+    if name != MATANYONE2_TRT_ONNX_NAME:
+        return _available_onnx_providers()
+    try:
+        if model_dir.resolve() != matanyone2_model_dir().resolve():
+            print(f"[offline] MatAnyone2 TensorRT disabled for custom model dir={model_dir}", flush=True)
+            return _available_onnx_providers()
+        if cache_status(model_key=TRT_MODEL_MATANYONE2) != "ready":
+            print("[offline] MatAnyone2 TensorRT cache is not ready; using CUDA providers", flush=True)
+            return _available_onnx_providers()
+        from pipeline.matting import _filter_available_providers, _provider_config
+
+        cache_dir = cache_dir_for_model(TRT_MODEL_MATANYONE2)
+        config.ONNX_TRT_ENGINE_CACHE_PATH = cache_dir
+        os.environ["PT_ONNX_TRT_ENGINE_CACHE_PATH"] = str(cache_dir)
+        providers = _filter_available_providers(["TensorrtExecutionProvider", "CUDAExecutionProvider", "CPUExecutionProvider"])
+        if "TensorrtExecutionProvider" not in providers:
+            print("[offline] MatAnyone2 TensorRT provider unavailable; using CUDA providers", flush=True)
+            return _available_onnx_providers()
+        print(f"[offline] MatAnyone2 TensorRT enabled model={name} cache={cache_dir}", flush=True)
+        return _provider_config(providers)
+    except Exception as exc:
+        print(f"[offline] MatAnyone2 TensorRT unavailable, using CUDA providers ({type(exc).__name__}: {exc})", flush=True)
+        return _available_onnx_providers()
 
 
 def _sam3_onnx_providers(provider: str, cuda_memory_limit_mb: int):
@@ -130,28 +186,9 @@ def _default_out(src: Path, width: int = 0, height: int = 0) -> Path:
     return src.with_name(f"{offline_passthrough_stem(src.stem, 'green', width, height)}.mp4")
 
 
-def _open_muxer(out: Path, fps: float, src: Path, codec: str, audio: str, duration: float, start_sec: float = 0.0):
+def _open_muxer(out: Path, fps: float, src: Path, codec: str):
     ffmpeg = shutil.which("ffmpeg") or "ffmpeg"
     input_format = "hevc" if codec.lower() in {"hevc", "h265"} else "h264"
-    audio_args: list[str] = ["-an"]
-    if audio != "off":
-        audio_args = [
-            *(
-                ["-ss", f"{start_sec:.6f}"]
-                if start_sec > 0
-                else []
-            ),
-            "-i",
-            str(src),
-            "-map",
-            "0:v:0",
-            "-map",
-            "1:a:0?",
-            "-c:a",
-            "copy" if audio == "copy" else "aac",
-        ]
-        if duration > 0:
-            audio_args += ["-t", f"{duration:.6f}"]
     cmd = [
         ffmpeg,
         "-hide_banner",
@@ -166,9 +203,11 @@ def _open_muxer(out: Path, fps: float, src: Path, codec: str, audio: str, durati
         f"{fps:.6f}",
         "-i",
         "-",
-        *audio_args,
+        "-map",
+        "0:v:0",
         "-c:v",
         "copy",
+        "-an",
         *probe_color_metadata(src).ffmpeg_args(),
         "-movflags",
         "+faststart",
@@ -177,6 +216,74 @@ def _open_muxer(out: Path, fps: float, src: Path, codec: str, audio: str, durati
         str(out),
     ]
     return cmd, subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+
+
+def _extract_audio_sidecar(src: Path, out: Path, audio: str, start_sec: float = 0.0, duration: float = 0.0) -> tuple[list[str], subprocess.CompletedProcess, Path]:
+    ffmpeg = shutil.which("ffmpeg") or "ffmpeg"
+    audio_path = out.with_name(f"{out.stem}._audio.aac")
+    codec_args = ["-c:a", "copy"] if audio == "copy" else ["-c:a", "aac", "-b:a", "192k"]
+    cmd = [
+        ffmpeg,
+        "-hide_banner",
+        "-loglevel",
+        "warning",
+        "-y",
+        *(
+            ["-ss", f"{start_sec:.6f}"]
+            if start_sec > 0
+            else []
+        ),
+        "-i",
+        str(src),
+        "-map",
+        "0:a:0?",
+        "-vn",
+        *codec_args,
+        *(
+            ["-t", f"{duration:.6f}"]
+            if duration > 0
+            else []
+        ),
+        "-f",
+        "adts",
+        str(audio_path),
+    ]
+    return cmd, subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, errors="replace"), audio_path
+
+
+def _mux_audio_sidecar_after(video_only: Path, out: Path, audio_path: Path, src: Path, duration: float = 0.0) -> tuple[list[str], subprocess.CompletedProcess]:
+    ffmpeg = shutil.which("ffmpeg") or "ffmpeg"
+    cmd = [
+        ffmpeg,
+        "-hide_banner",
+        "-loglevel",
+        "warning",
+        "-y",
+        "-i",
+        str(video_only),
+        "-f",
+        "aac",
+        "-i",
+        str(audio_path),
+        "-map",
+        "0:v:0",
+        "-map",
+        "1:a:0?",
+        "-c:v",
+        "copy",
+        "-c:a",
+        "copy",
+        *(
+            ["-t", f"{duration:.6f}"]
+            if duration > 0
+            else []
+        ),
+        *probe_color_metadata(src).ffmpeg_args(),
+        "-movflags",
+        "+faststart",
+        str(out),
+    ]
+    return cmd, subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, errors="replace")
 
 
 def _ffprobe(path: Path) -> str:
@@ -254,16 +361,15 @@ def _encoder_bitrate_kwargs(args: argparse.Namespace, src: Path) -> tuple[dict[s
     target_bps = parse_bitrate(target_text)
     max_bps = int(target_bps * max(1.0, float(args.maxrate_multiplier)))
     buf_bps = int(target_bps * max(1.0, float(args.bufsize_multiplier)))
-    kwargs = {"bitrate": str(target_bps)}
-    if not getattr(args, "realtime_encoder_args", False):
-        kwargs.update({
-            "maxbitrate": str(max_bps),
-            "vbvbufsize": str(buf_bps),
-            "rc": str(args.rc),
-        })
-    if args.cq >= 0 and not getattr(args, "realtime_encoder_args", False):
+    kwargs = {
+        "bitrate": str(target_bps),
+        "maxbitrate": str(max_bps),
+        "vbvbufsize": str(buf_bps),
+        "rc": str(args.rc),
+    }
+    if args.cq >= 0:
         kwargs["cq"] = str(int(args.cq))
-    if args.preset and not getattr(args, "realtime_encoder_args", False):
+    if args.preset:
         kwargs["preset"] = str(args.preset).upper()
     return kwargs, target_bps, max_bps, buf_bps
 
@@ -354,33 +460,47 @@ class RvmOfflineEngine(OfflineMattingEngine):
     def __init__(self, model: Path | None = None):
         if model is not None:
             config.MODEL_PATH = model
+            _configure_offline_rvm_tensorrt(model)
         from pipeline.matting import Matter
 
         self.matter = Matter()
+        print(f"[offline] RVM runtime provider_diag={self.matter._rvm_provider_diag()}", file=sys.stderr)
         self.matter.reset_state()
         self.profile: dict[str, list[float]] = defaultdict(list)
+        self._pending_nv12_slots = []
+        self._max_pending_nv12_slots = max(0, int(config.PASSTHROUGH_NV12_RING_SLOTS) - 1)
 
     def composite_nv12(self, frame):
         from pipeline.pynv_io import GpuP016Frame
 
         h, w = int(frame.height), int(frame.width)
+        out_slot = self.matter.acquire_nv12_output_slot(h, w)
         if isinstance(frame, GpuP016Frame):
             out, timing = self.matter.composite_green_gpu_p016_frame_to_gpu_nv12_profile(
                 frame,
                 shift_bits=int(config.PASSTHROUGH_PYNV_10BIT_SHIFT),
                 out_h=h,
                 out_w=w,
+                out_slot=out_slot,
             )
         else:
             out, timing = self.matter.composite_green_gpu_nv12_frame_to_gpu_nv12_profile(
                 frame,
                 out_h=h,
                 out_w=w,
+                out_slot=out_slot,
             )
+        self._pending_nv12_slots.append(out_slot)
+        while len(self._pending_nv12_slots) > self._max_pending_nv12_slots:
+            self.matter.release_nv12_output_slot(self._pending_nv12_slots.pop(0))
         self.profile["preprocess"].append(timing.preprocess_ms)
         self.profile["ort"].append(timing.ort_ms)
         self.profile["composite"].append(timing.composite_ms)
         return out, timing
+
+    def release_pending_outputs(self) -> None:
+        while self._pending_nv12_slots:
+            self.matter.release_nv12_output_slot(self._pending_nv12_slots.pop(0))
 
     def profile_lines(self) -> list[str]:
         lines = []
@@ -460,7 +580,7 @@ class MatAnyone2OnnxEngine(OfflineMattingEngine):
         self.batch_size = int(manifest.get("batch_size") or 1)
         if int(manifest.get("objects") or 1) != 1:
             raise RuntimeError("MatAnyone2 offline engine currently supports one object only")
-        providers = _available_onnx_providers()
+        provider_report: dict[str, list[str]] = {}
         sess_opts = ort.SessionOptions()
         sess_opts.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
 
@@ -468,7 +588,9 @@ class MatAnyone2OnnxEngine(OfflineMattingEngine):
             path = model_dir / name
             if not path.exists():
                 raise RuntimeError(f"MatAnyone2 ONNX file not found: {path}")
-            return ort.InferenceSession(str(path), sess_options=sess_opts, providers=providers)
+            session = ort.InferenceSession(str(path), sess_options=sess_opts, providers=_matanyone2_session_providers(name, model_dir))
+            provider_report[name] = list(session.get_providers())
+            return session
 
         self.image_key = sess("matanyone2_image_key.onnx")
         self.mask_memory = sess("matanyone2_mask_memory.onnx")
@@ -508,7 +630,7 @@ class MatAnyone2OnnxEngine(OfflineMattingEngine):
             f"bootstrap_soft={self.bootstrap_soft} segment_frames={self.segment_frames} alpha_stride={self.alpha_stride} "
             f"batch2={self.batch2_enabled} dtype={self.tensor_dtype.__name__} "
             f"fused_update={self.propagate_update is not None} step_update={self.step_update is not None} "
-            f"providers={providers}"
+            f"providers={provider_report}"
         )
 
     @staticmethod
@@ -1377,8 +1499,6 @@ def main() -> int:
     parser.add_argument("--rc", default="vbr", choices=["vbr", "vbr_hq", "cbr"], help="PyNv NVENC rate-control mode")
     parser.add_argument("--cq", type=int, default=-1, help="PyNv NVENC CQ value; set -1 to omit")
     parser.add_argument("--preset", default=config.PASSTHROUGH_PYNV_PRESET, help="PyNv NVENC preset, e.g. P1..P7")
-    parser.add_argument("--realtime-encoder-args", action="store_true",
-                        help="diagnostic: pass only bitrate/fps/gop/bf to PyNv encoder like realtime live mode")
     parser.add_argument("--codec", default="hevc", choices=["hevc", "h265", "h264"])
     parser.add_argument("--gop", type=int, default=int(config.PASSTHROUGH_GOP))
     parser.add_argument("--audio", default="copy", choices=["off", "copy", "aac"])
@@ -1427,6 +1547,11 @@ def main() -> int:
     if not out.is_absolute():
         out = (config.ROOT / out).resolve()
     out.parent.mkdir(parents=True, exist_ok=True)
+    final_out = out
+    video_only_out = out
+    if args.audio != "off":
+        suffix = "".join(out.suffixes[-1:]) or ".mp4"
+        video_only_out = out.with_name(f"{out.stem}._video_only{suffix}")
     print(
         f"[offline] input codec={meta.codec.codec_name} profile={meta.codec.profile} "
         f"pix_fmt={meta.codec.pix_fmt} bit_depth={meta.codec.bit_depth} "
@@ -1440,6 +1565,12 @@ def main() -> int:
         decoder_mode = "ffmpeg_fallback"
     elif backend_decision.verdict == "block":
         raise RuntimeError(f"unsupported offline source: {backend_decision.reason}")
+    engine: OfflineMattingEngine | None = None
+    if args.engine == "rvm":
+        # Match the live path more closely: initialize Matter/ORT/TRT before
+        # constructing the PyNv decoder, so decoder state is not created under
+        # the heavy RVM session build.
+        engine = _make_engine(args)
     try:
         if decoder_mode == "ffmpeg_fallback":
             dec = FfmpegNv12SequentialDecoder(src)
@@ -1489,6 +1620,27 @@ def main() -> int:
     max_target = int((len(dec) - 1) * fps / source_fps) + 1 if source_fps > 0 else len(dec)
     target = min(target, max(1, max_target - start_out))
     bitrate_kwargs, target_bps, max_bps, buf_bps = _encoder_bitrate_kwargs(args, src)
+    output_duration = target / fps if fps > 0 else 0.0
+    audio_sidecar: Path | None = None
+    if args.audio != "off":
+        ta0 = time.perf_counter()
+        audio_extract_cmd, audio_extract_proc, audio_sidecar = _extract_audio_sidecar(
+            src,
+            out,
+            args.audio,
+            max(0.0, float(args.start or 0.0)),
+            output_duration,
+        )
+        print("[offline] audio_extract=" + subprocess.list2cmdline(audio_extract_cmd))
+        print(f"audio_extract_rc = {audio_extract_proc.returncode}")
+        print(f"audio_extract_elapsed = {time.perf_counter() - ta0:.3f} s")
+        audio_extract_stderr = (audio_extract_proc.stdout or "") + (audio_extract_proc.stderr or "")
+        if audio_extract_stderr.strip():
+            print("[audio extract stderr]")
+            print(audio_extract_stderr.strip()[-2000:])
+        if audio_extract_proc.returncode != 0:
+            dec.stop()
+            return audio_extract_proc.returncode
 
     if args.engine == "matanyone2_onnx":
         model_dir = _resolve_matanyone2_model_dir(args, info.width, info.height)
@@ -1513,12 +1665,14 @@ def main() -> int:
         _write_sam3_prepass_result(Path(args.sam3_prepass_out).resolve(), sam3_masks, segment_starts)
         dec.stop()
         return 0
-    engine = _make_engine(args)
+    if engine is None:
+        engine = _make_engine(args)
     enc_w, enc_h = info.width, info.height
     if isinstance(engine, MatAnyone2OnnxEngine):
         engine.set_segment_plan(segment_starts)
         for segment_start, masks in sam3_masks.items():
             engine.set_segment_masks(segment_start, masks)
+    from pipeline import matting as matting_module
 
     enc = nvc.CreateEncoder(
         enc_w,
@@ -1531,11 +1685,10 @@ def main() -> int:
         bf="0",
         **bitrate_kwargs,
     )
-    output_duration = target / fps if fps > 0 else 0.0
-    cmd, mux = _open_muxer(out, fps, src, args.codec, args.audio, output_duration, max(0.0, float(args.start or 0.0)))
+    cmd, mux = _open_muxer(video_only_out, fps, src, args.codec)
     assert mux.stdin is not None
     print(
-        f"[offline] src={src} out={out} engine={args.engine} {info.width}x{info.height} "
+        f"[offline] src={src} out={final_out} engine={args.engine} {info.width}x{info.height} "
         f"source_fps={source_fps:.6f} output_fps={fps:.6f} target={target} audio={args.audio} "
         f"bitrate={target_bps} maxbitrate={max_bps} vbvbufsize={buf_bps} rc={args.rc} cq={args.cq} preset={args.preset}"
     )
@@ -1543,17 +1696,24 @@ def main() -> int:
 
     t_dec: list[float] = []
     t_mat: list[float] = []
+    t_sync: list[float] = []
     t_enc: list[float] = []
     t_mux: list[float] = []
     t_sync_after_dec: list[float] = []
     t_sync_after_mat: list[float] = []
     t_sync_after_enc: list[float] = []
+    last_src_idx = -1
+    source_index_rewinds = 0
     bytes_written = 0
     started = time.perf_counter()
     used0, total0 = _mem_stats()
     try:
         for i in range(target):
             src_idx = min(len(dec) - 1, cfr_source_index(start_out + i, source_fps, fps))
+            if src_idx <= last_src_idx:
+                source_index_rewinds += 1
+                src_idx = min(len(dec) - 1, last_src_idx + 1)
+            last_src_idx = src_idx
             td0 = time.perf_counter()
             frame = dec.frame_at(src_idx)
             td1 = time.perf_counter()
@@ -1566,6 +1726,10 @@ def main() -> int:
             else:
                 out_nv12, _ = engine.composite_nv12(frame)
             tm1 = time.perf_counter()
+            cuda_stream = getattr(matting_module, "_CUDA_STREAM", None)
+            if cuda_stream is not None:
+                cuda_stream.synchronize()
+            ts1 = time.perf_counter()
             if args.sync_profile:
                 t_sync_after_mat.append(_cuda_sync_ms(args.device_sync_profile))
             app_frame = GpuNv12AppFrame(out_nv12, enc_w, enc_h)
@@ -1579,6 +1743,7 @@ def main() -> int:
                 t_sync_after_enc.append(_cuda_sync_ms(args.device_sync_profile))
             t_dec.append((td1 - td0) * 1000)
             t_mat.append((tm1 - td1) * 1000)
+            t_sync.append((ts1 - tm1) * 1000)
             t_enc.append((te1 - te0) * 1000)
             if bitstream:
                 tw0 = time.perf_counter()
@@ -1588,9 +1753,13 @@ def main() -> int:
                 bytes_written += len(bitstream)
             if args.progress > 0 and (i + 1) % args.progress == 0:
                 elapsed = time.perf_counter() - started
+                dec_avg = statistics.fmean(t_dec)
+                mat_avg = statistics.fmean(t_mat)
+                sync_avg = statistics.fmean(t_sync)
                 print(
                     f"[offline] {i + 1:7d}/{target} fps={(i + 1) / elapsed:7.2f} "
-                    f"dec={statistics.fmean(t_dec):6.2f}ms mat={statistics.fmean(t_mat):6.2f}ms "
+                    f"dec={dec_avg:6.2f}ms mat={mat_avg:6.2f}ms sync={sync_avg:5.2f}ms "
+                    f"dec+mat+sync={dec_avg + mat_avg + sync_avg:6.2f}ms "
                     f"enc={statistics.fmean(t_enc):5.2f}ms mux={statistics.fmean(t_mux) if t_mux else 0:5.2f}ms"
                 )
         tail = enc.EndEncode()
@@ -1598,6 +1767,9 @@ def main() -> int:
             mux.stdin.write(tail)
             bytes_written += len(tail)
     finally:
+        release_pending = getattr(engine, "release_pending_outputs", None) if "engine" in locals() else None
+        if callable(release_pending):
+            release_pending()
         try:
             mux.stdin.close()
         except Exception:
@@ -1614,8 +1786,14 @@ def main() -> int:
     print(f"video_bytes = {bytes_written}")
     print(f"elapsed = {elapsed:.3f} s")
     print(f"throughput = {target / elapsed:.2f} fps")
+    print(f"source_index_rewinds = {source_index_rewinds}")
     for line in _summary("decode", t_dec): print(line)
     for line in _summary("matting", t_mat): print(line)
+    for line in _summary("sync", t_sync): print(line)
+    if t_dec and t_mat:
+        print(f"decode_matting_avg = {statistics.fmean([d + m for d, m in zip(t_dec, t_mat)]):.3f} ms")
+    if t_dec and t_mat and t_sync:
+        print(f"decode_matting_sync_avg = {statistics.fmean([d + m + s for d, m, s in zip(t_dec, t_mat, t_sync)]):.3f} ms")
     if hasattr(engine, "profile_lines"):
         for line in engine.profile_lines():
             print(line)
@@ -1630,8 +1808,30 @@ def main() -> int:
     if stderr.strip():
         print("[ffmpeg stderr]")
         print(stderr.strip()[-2000:])
+    audio_mux_proc = None
+    if rc == 0 and args.audio != "off" and audio_sidecar is not None:
+        ta0 = time.perf_counter()
+        audio_mux_cmd, audio_mux_proc = _mux_audio_sidecar_after(video_only_out, final_out, audio_sidecar, src, output_duration)
+        print("[offline] audio_mux=" + subprocess.list2cmdline(audio_mux_cmd))
+        print(f"audio_mux_rc = {audio_mux_proc.returncode}")
+        print(f"audio_mux_elapsed = {time.perf_counter() - ta0:.3f} s")
+        audio_mux_stderr = (audio_mux_proc.stdout or "") + (audio_mux_proc.stderr or "")
+        if audio_mux_stderr.strip():
+            print("[audio mux stderr]")
+            print(audio_mux_stderr.strip()[-2000:])
+        if audio_mux_proc.returncode != 0:
+            rc = audio_mux_proc.returncode
+        else:
+            try:
+                video_only_out.unlink(missing_ok=True)
+            except Exception:
+                pass
+            try:
+                audio_sidecar.unlink(missing_ok=True)
+            except Exception:
+                pass
     print("[ffprobe]")
-    print(_ffprobe(out))
+    print(_ffprobe(final_out if rc == 0 else video_only_out))
     return 0 if rc == 0 else rc
 
 

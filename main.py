@@ -10,15 +10,25 @@ from __future__ import annotations
 import argparse
 import os
 import runpy
+import threading
 import sys
 import time
 
 import config
+from utils.trt_manifest import (
+    TRT_PROVIDER_CHAIN,
+    cache_status,
+    collect_fingerprint,
+    load_manifest,
+    stale_reasons,
+    trt_runtime_model_path,
+)
 from utils.gpu_runtime_cache import (
     configure_gpu_runtime_cache,
     predict_warmup_state,
     warmup_gpu_runtime_cache,
 )
+from utils.runtime_dll_paths import apply_runtime_dll_paths
 from utils.gpu_requirements import (
     MIN_NVIDIA_COMPUTE_CAPABILITY,
     parse_compute_capability,
@@ -27,11 +37,28 @@ from utils.gpu_requirements import (
 )
 from utils.logger import get, setup
 from utils.startup_status import (
-    reset_startup_progress,
     set_startup_phase,
     start_startup_status_server,
     stop_startup_status_server,
 )
+
+
+class _StartupReadySignal:
+    def __init__(self, step_total: int) -> None:
+        self.done = threading.Event()
+        self.step_total = step_total
+
+    async def __call__(self) -> None:
+        set_startup_phase(
+            "listening",
+            "server ready",
+            step="listening",
+            step_index=self.step_total,
+            step_total=self.step_total,
+            progress=1.0,
+            eta_sec=0.0,
+        )
+        self.done.set()
 
 
 def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -57,6 +84,38 @@ def _force_line_buffered_stdio() -> None:
             reconfigure(line_buffering=True, write_through=True)
         except Exception:
             pass
+
+
+def _validate_tensorrt_provider(log) -> None:
+    providers = [p.strip() for p in config.ONNX_PROVIDERS if p.strip()]
+    if "TensorrtExecutionProvider" not in providers:
+        return
+    try:
+        actual_fp = collect_fingerprint()
+        manifest = load_manifest()
+        status = cache_status(actual_fp=actual_fp, manifest=manifest)
+    except Exception as exc:
+        status = "failed"
+        manifest = None
+        actual_fp = {}
+        log.warning("trt cache validation failed: %s; falling back to CUDA EP", exc)
+    if status == "ready":
+        config.ONNX_PROVIDERS = [p.strip() for p in TRT_PROVIDER_CHAIN.split(",") if p.strip()]
+        runtime_model = trt_runtime_model_path()
+        if runtime_model.exists() and runtime_model != config.MODEL_PATH:
+            config.MODEL_PATH = runtime_model.resolve()
+        log.info("trt cache ready; ONNX providers=%s runtime_model=%s", config.ONNX_PROVIDERS, config.MODEL_PATH)
+        return
+    reasons: list[str] = []
+    if status == "stale" and isinstance(manifest, dict):
+        saved_fp = manifest.get("fingerprint")
+        if isinstance(saved_fp, dict) and actual_fp:
+            reasons = stale_reasons(saved_fp, actual_fp)
+    config.ONNX_PROVIDERS = [p for p in providers if p != "TensorrtExecutionProvider"]
+    if not config.ONNX_PROVIDERS:
+        config.ONNX_PROVIDERS = ["CUDAExecutionProvider", "CPUExecutionProvider"]
+    reason_text = "; ".join(reasons) if reasons else status
+    log.warning("trt cache invalid (%s); falling back to ONNX providers=%s", reason_text, config.ONNX_PROVIDERS)
 
 
 def _run_legacy_tool(tool_main, tool_name: str, tool_args: list[str]) -> int:
@@ -118,6 +177,11 @@ def main(argv: list[str] | None = None) -> int:
         from offline.convert import main as offline_main
 
         return offline_main(argv[1:])
+    if argv and argv[0] == "trt_warmup":
+        _force_line_buffered_stdio()
+        from ui.services.trt_warmup_process import main as trt_warmup_main
+
+        return trt_warmup_main(argv[1:])
     if argv and argv[0] == "tool":
         if len(argv) < 2:
             raise SystemExit("tool name required")
@@ -133,15 +197,20 @@ def main(argv: list[str] | None = None) -> int:
 
     args = _parse_args(argv)
     _apply_debug_arg(args)
+    apply_runtime_dll_paths()
     cache_env = configure_gpu_runtime_cache()
     setup()
     log = get("main")
     start_startup_status_server(config.STARTUP_STATUS_PORT)
     set_startup_phase("starting", "process started")
+    startup_step_total = 5 + (1 if config.USE_PYNV and config.NVENC_PREFLIGHT_ENABLE else 0)
     log.info("LAN_IP=%s HTTP_PORT=%d UUID=%s", config.LAN_IP, config.HTTP_PORT, config.DEVICE_UUID)
     log.info("VIDEO_DIRS=%s", "|".join(str(path) for path in config.VIDEO_DIRS))
     log.info("MODEL_PATH=%s (exists=%s)", config.MODEL_PATH, config.MODEL_PATH.exists())
+    log.info("ONNX providers requested=%s env=%s", config.ONNX_PROVIDERS, os.environ.get("PT_ONNX_PROVIDERS"))
     log.info("GPU_RUNTIME_CACHE=%s", cache_env)
+    _validate_tensorrt_provider(log)
+    log.info("ONNX providers active_after_validation=%s MODEL_PATH=%s", config.ONNX_PROVIDERS, config.MODEL_PATH)
     if config.STARTUP_GPU_WARMUP:
         # Publish a prediction first so the UI can show the expected duration
         # before any heavy CUDA work begins. Failure to predict is non-fatal.
@@ -152,7 +221,7 @@ def main(argv: list[str] | None = None) -> int:
                 ("first-time GPU initialization" if prediction.cold else "verifying GPU cache"),
                 step="predict",
                 step_index=0,
-                step_total=4,
+                step_total=startup_step_total,
                 progress=0.0,
                 eta_sec=prediction.estimate_sec,
                 elapsed_sec=0.0,
@@ -190,7 +259,7 @@ def main(argv: list[str] | None = None) -> int:
                     message,
                     step="gpu_requirement",
                     step_index=0,
-                    step_total=4,
+                    step_total=startup_step_total,
                     progress=0.0,
                     eta_sec=0.0,
                     cold=prediction.cold,
@@ -218,16 +287,12 @@ def main(argv: list[str] | None = None) -> int:
         )
         warmup_start = time.perf_counter()
         try:
-            # Note: warmup_gpu_runtime_cache is a single blocking call. We can't
-            # currently emit per-substep events without restructuring it, but we
-            # do report the "running" sub-step so the UI knows the ORT session
-            # is loading and JIT compilation is in progress.
             set_startup_phase(
                 "warming",
-                "loading ONNX Runtime CUDA and running warmup",
-                step="ort_session_and_runs",
+                "starting GPU warmup",
+                step="matter_singleton",
                 step_index=1,
-                step_total=4,
+                step_total=startup_step_total,
                 progress=0.1,
             )
             marker = warmup_gpu_runtime_cache(
@@ -257,9 +322,9 @@ def main(argv: list[str] | None = None) -> int:
             "warmed",
             "GPU runtime warmup complete",
             step="warmed",
-            step_index=4,
-            step_total=4,
-            progress=1.0,
+            step_index=5,
+            step_total=startup_step_total,
+            progress=5.0 / startup_step_total,
             eta_sec=0.0,
             elapsed_sec=warmup_elapsed,
         )
@@ -276,11 +341,27 @@ def main(argv: list[str] | None = None) -> int:
             "warmed",
             "startup GPU warmup disabled",
             step="warmed",
+            step_index=5,
+            step_total=startup_step_total,
             progress=1.0,
             eta_sec=0.0,
         )
         log.info("startup GPU warmup disabled")
-    reset_startup_progress()
+    if config.USE_PYNV and config.NVENC_PREFLIGHT_ENABLE:
+        set_startup_phase(
+            "warming",
+            "warming NVENC encoder",
+            step="nvenc_preflight",
+            step_index=startup_step_total,
+            step_total=startup_step_total,
+            progress=0.95,
+        )
+        try:
+            from pipeline.pynv_stream import PyNvPassthroughStream
+
+            PyNvPassthroughStream.startup_preflight()
+        except Exception as e:
+            log.warning("nvenc startup preflight failed; first request will pay it lazily: %s", e, exc_info=True)
     from pipeline.matting import matter_device
     log.info(
         "PIPELINE: HWACCEL=%s DECODE_MAX_SIDE=%d DECODE_PIX_FMT=%s PASSTHROUGH_MAX_FPS=%.2f "
@@ -309,12 +390,26 @@ def main(argv: list[str] | None = None) -> int:
         config.PASSTHROUGH_PYNV_10BIT_SHIFT,
     )
 
-    set_startup_phase("firewall", "ensuring firewall rules")
+    set_startup_phase(
+        "firewall",
+        "ensuring firewall rules",
+        step="firewall",
+        step_index=startup_step_total,
+        step_total=startup_step_total,
+        progress=0.97,
+    )
     from utils.firewall import ensure_rules
 
     ensure_rules()
 
-    set_startup_phase("ssdp", "starting SSDP")
+    set_startup_phase(
+        "ssdp",
+        "starting SSDP",
+        step="ssdp",
+        step_index=startup_step_total,
+        step_total=startup_step_total,
+        progress=0.98,
+    )
     from dlna.ssdp import SSDPServer
 
     ssdp = SSDPServer()
@@ -322,8 +417,16 @@ def main(argv: list[str] | None = None) -> int:
 
     from http_app.server import create_app
 
-    app = create_app()
-    set_startup_phase("http_starting", f"uvicorn starting on 0.0.0.0:{config.HTTP_PORT}")
+    ready_signal = _StartupReadySignal(startup_step_total)
+    app = create_app(startup_hook=ready_signal)
+    set_startup_phase(
+        "http_starting",
+        f"uvicorn starting on 0.0.0.0:{config.HTTP_PORT}",
+        step="http_starting",
+        step_index=startup_step_total,
+        step_total=startup_step_total,
+        progress=0.99,
+    )
     try:
         import uvicorn
 
@@ -339,7 +442,8 @@ def main(argv: list[str] | None = None) -> int:
     except KeyboardInterrupt:
         log.info("keyboard interrupt received")
     finally:
-        set_startup_phase("shutting_down", "uvicorn stopped")
+        if ready_signal.done.is_set():
+            set_startup_phase("shutting_down", "uvicorn stopped")
         log.info("shutting down...")
         ssdp.stop()
         stop_startup_status_server()

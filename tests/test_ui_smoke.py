@@ -1,9 +1,13 @@
 ﻿from __future__ import annotations
 
+import contextlib
 import os
+import shutil
 import site
+import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 _DLL_HANDLES = []
@@ -24,10 +28,18 @@ if hasattr(os, "add_dll_directory"):
 class UiSmokeTests(unittest.TestCase):
     def test_main_window_constructs(self) -> None:
         from PySide6.QtWidgets import QApplication
+        from ui import settings as settings_module
         from ui.main_window import MainWindow
         from ui.log_limits import UI_LOG_MAX_BLOCKS
 
         app = QApplication.instance() or QApplication([])
+        settings_root = Path(tempfile.mkdtemp(prefix="pt_ui_smoke_"))
+        self.addCleanup(lambda: shutil.rmtree(settings_root, ignore_errors=True))
+        patch_stack = contextlib.ExitStack()
+        patch_stack.enter_context(patch.object(settings_module, "SETTINGS_PATH", settings_root / "ui_settings.json"))
+        patch_stack.enter_context(patch.object(settings_module, "SETTINGS_META_PATH", settings_root / "ui_settings_meta.json"))
+        patch_stack.enter_context(patch("ui.pages.home_page.cache_status", return_value="missing"))
+        patch_stack.enter_context(patch("ui.pages.offline_page.cache_status", return_value="missing"))
         window = MainWindow()
         try:
             self.assertTrue(window.windowTitle())
@@ -48,7 +60,7 @@ class UiSmokeTests(unittest.TestCase):
             self.assertIn("font-size: 9pt", window.version_label.styleSheet())
             self.assertIn("font-size: 8pt", window.home.log.styleSheet())
             self.assertEqual(window.home.log.document().maximumBlockCount(), UI_LOG_MAX_BLOCKS)
-            self.assertIn("github.com/zerochocobo/VR-Video-Passthrough-Server", window.home.project_link.text())
+            self.assertIn("https://wapok.com", window.home.project_link.text())
             self.assertIn(window.i18n.t("project.url_label"), window.home.project_link.text())
             self.assertTrue(window.home.project_link.openExternalLinks() is False)
             self.assertEqual(window.home.project_link.height(), 28)
@@ -79,6 +91,7 @@ class UiSmokeTests(unittest.TestCase):
                 window.home.performance_quality_label.width(),
                 window.home.performance_fps_label.width(),
                 window.home.performance_output_size_label.width(),
+                window.home.trt_enabled_label.width(),
                 window.home.light_match_enabled_label.width(),
             }
             self.assertEqual(len(quick_label_widths), 1)
@@ -92,6 +105,7 @@ class UiSmokeTests(unittest.TestCase):
             self.assertEqual(window.home.performance_quality.itemData(0), "ultrafast")
             self.assertEqual(window.home.light_match_preset.itemData(0), "home_warm")
             self.assertEqual(window.home.light_match_preset.itemData(3), "custom")
+            self.assertEqual(window.home.light_match_preset.currentData(), "daylight")
             self.assertTrue(window.home.light_match_advanced_button.text())
             self.assertGreaterEqual(window.home.light_match_header.minimumHeight(), 42)
             window.home.light_match_enabled.setChecked(False)
@@ -102,6 +116,8 @@ class UiSmokeTests(unittest.TestCase):
             window.home.light_match_enabled.setChecked(True)
             window.home.light_match_preset.setCurrentIndex(window.home.light_match_preset.findData("home_warm"))
             app.processEvents()
+            self.assertEqual(window.settings.data["light_match_temp_k"], 4000)
+            self.assertEqual(window.settings.data["light_match_saturation"], 1.0)
             self.assertFalse(window.home.light_match_preset.isHidden())
             self.assertTrue(window.home.light_match_advanced_button.isHidden())
             window.home.light_match_preset.setCurrentIndex(window.home.light_match_preset.findData("custom"))
@@ -110,6 +126,9 @@ class UiSmokeTests(unittest.TestCase):
             self.assertEqual(window.home.performance_fps.itemData(2), 30)
             self.assertEqual(window.home.performance_output_size.itemData(0), 0)
             self.assertEqual(window.home.performance_output_size.itemData(1), 4096)
+            self.assertTrue(window.home.trt_enabled_label.text())
+            self.assertTrue(window.home.trt_configure_button.text())
+            self.assertFalse(window.home.trt_enabled.isEnabled())
             window.home.performance_output_size.setCurrentIndex(0)
             app.processEvents()
             self.assertEqual(window.settings.data["decode_max_side"], 0)
@@ -180,12 +199,19 @@ class UiSmokeTests(unittest.TestCase):
             self.assertEqual(window.offline.single_labels["time"].text(), window.i18n.t("offline.time_range"))
             self.assertEqual(window.offline.single_labels["output"].text(), window.i18n.t("offline.output"))
             self.assertEqual(window.offline.single_labels["performance"].text(), window.i18n.t("performance.quality_speed"))
+            self.assertEqual(window.offline.single_labels["trt"].text(), window.i18n.t("trt.row_label"))
             self.assertEqual(window.offline.single_quality_speed.count(), 3)
             self.assertIn(window.offline.single_quality_speed.currentData(), {"ultrafast", "medium", "veryslow"})
             self.assertEqual(window.offline.batch_quality_speed.count(), 3)
+            self.assertEqual(window.offline.single_engine.count(), 2)
+            self.assertEqual(window.offline.single_engine.itemData(0), "rvm_fast")
+            self.assertEqual(window.offline.single_engine.itemData(1), "matanyone2")
+            self.assertTrue(window.offline.single_trt_configure_button.text())
+            self.assertEqual(window.offline.single_trt_enabled.text(), "")
+            self.assertFalse(window.offline.single_trt_enabled.isEnabled())
             self.assertTrue(window.offline.single_matanyone_help.isHidden())
             self.assertTrue(window.offline.batch_matanyone_help.isHidden())
-            window.offline.single_engine.setCurrentIndex(2)
+            window.offline.single_engine.setCurrentIndex(1)
             app.processEvents()
             self.assertFalse(window.offline.single_matanyone_help.isHidden())
             self.assertEqual(window.offline.log.document().maximumBlockCount(), UI_LOG_MAX_BLOCKS)
@@ -203,6 +229,7 @@ class UiSmokeTests(unittest.TestCase):
         finally:
             window.close()
             app.processEvents()
+            patch_stack.close()
 
 
 if __name__ == "__main__":

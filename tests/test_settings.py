@@ -44,7 +44,9 @@ class SettingsTests(unittest.TestCase):
         self.assertEqual(env["PT_COMPOSITE_BG_RGB"], "00FF00")
         self.assertEqual(env["PT_ALPHA_STRIDE"], "1")
         self.assertEqual(env["PT_PASSTHROUGH_MAX_FPS"], "30")
+        self.assertEqual(env["PT_PASSTHROUGH_PRODUCER_REALTIME_PACING"], "1")
         self.assertEqual(env["PT_DECODE_MAX_SIDE"], "4096")
+        self.assertEqual(env["PT_LIGHT_MATCH_PRESET"], "daylight")
 
     def test_server_env_contains_video_dirs(self) -> None:
         s = self._settings()
@@ -59,6 +61,23 @@ class SettingsTests(unittest.TestCase):
         s.data["decode_max_side"] = 0
         env = s.server_env()
         self.assertEqual(env["PT_DECODE_MAX_SIDE"], "0")
+
+    def test_server_env_enables_tensorrt_only_when_cache_ready(self) -> None:
+        s = self._settings()
+        s.data["inference_backend"] = "tensorrt"
+        with patch.object(settings_module, "cache_status", return_value="missing"):
+            self.assertEqual(s.server_env()["PT_ONNX_PROVIDERS"], "CUDAExecutionProvider,CPUExecutionProvider")
+        with patch.object(settings_module, "cache_status", return_value="ready"):
+            self.assertEqual(
+                s.server_env()["PT_ONNX_PROVIDERS"],
+                "TensorrtExecutionProvider,CUDAExecutionProvider,CPUExecutionProvider",
+            )
+
+    def test_server_env_disables_tensorrt_explicitly(self) -> None:
+        s = self._settings()
+        s.data["inference_backend"] = "cuda"
+        env = s.server_env()
+        self.assertEqual(env["PT_ONNX_PROVIDERS"], "CUDAExecutionProvider,CPUExecutionProvider")
 
     def test_restore_default_subtitle_style(self) -> None:
         s = self._settings()
@@ -96,6 +115,75 @@ class SettingsTests(unittest.TestCase):
             saved = settings_path.read_text(encoding="utf-8")
             self.assertNotIn("defaults_migrated_", saved)
             self.assertTrue(meta_path.exists())
+
+    def test_light_match_default_preset_is_daylight(self) -> None:
+        s = self._settings()
+        self.assertEqual(s.data["light_match_preset"], "daylight")
+        self.assertEqual(s.server_env()["PT_LIGHT_MATCH_PRESET"], "daylight")
+
+    def test_legacy_disabled_custom_light_match_migrates_to_daylight(self) -> None:
+        root = Path("runtime_cache/test_ui_settings_light_match_default")
+        root.mkdir(parents=True, exist_ok=True)
+        self.addCleanup(lambda: shutil.rmtree(root, ignore_errors=True))
+        settings_path = root / "ui_settings.json"
+        meta_path = root / "ui_settings_meta.json"
+        settings_path.write_text('{"light_match_enabled": false, "light_match_preset": "custom"}', encoding="utf-8")
+
+        with (
+            patch.object(settings_module, "SETTINGS_PATH", settings_path),
+            patch.object(settings_module, "SETTINGS_META_PATH", meta_path),
+        ):
+            s = settings_module.Settings()
+            self.assertEqual(s.data["light_match_preset"], "daylight")
+
+    def test_legacy_30fps_default_stays_default(self) -> None:
+        root = Path("runtime_cache/test_ui_settings_fps_migration")
+        root.mkdir(parents=True, exist_ok=True)
+        self.addCleanup(lambda: shutil.rmtree(root, ignore_errors=True))
+        settings_path = root / "ui_settings.json"
+        meta_path = root / "ui_settings_meta.json"
+        settings_path.write_text('{"passthrough_max_fps": 30}', encoding="utf-8")
+
+        with (
+            patch.object(settings_module, "SETTINGS_PATH", settings_path),
+            patch.object(settings_module, "SETTINGS_META_PATH", meta_path),
+        ):
+            s = settings_module.Settings()
+            self.assertEqual(s.data["passthrough_max_fps"], 30)
+
+    def test_legacy_zero_fps_default_migrates_to_30fps_once(self) -> None:
+        root = Path("runtime_cache/test_ui_settings_fps_zero_migration")
+        root.mkdir(parents=True, exist_ok=True)
+        self.addCleanup(lambda: shutil.rmtree(root, ignore_errors=True))
+        settings_path = root / "ui_settings.json"
+        meta_path = root / "ui_settings_meta.json"
+        settings_path.write_text('{"passthrough_max_fps": 0}', encoding="utf-8")
+
+        with (
+            patch.object(settings_module, "SETTINGS_PATH", settings_path),
+            patch.object(settings_module, "SETTINGS_META_PATH", meta_path),
+        ):
+            s = settings_module.Settings()
+            self.assertEqual(s.data["passthrough_max_fps"], 30)
+            s.data["passthrough_max_fps"] = 0
+            s.save()
+            reloaded = settings_module.Settings()
+            self.assertEqual(reloaded.data["passthrough_max_fps"], 0)
+
+    def test_explicit_non_default_fps_survives_migration(self) -> None:
+        root = Path("runtime_cache/test_ui_settings_fps_custom")
+        root.mkdir(parents=True, exist_ok=True)
+        self.addCleanup(lambda: shutil.rmtree(root, ignore_errors=True))
+        settings_path = root / "ui_settings.json"
+        meta_path = root / "ui_settings_meta.json"
+        settings_path.write_text('{"passthrough_max_fps": 24}', encoding="utf-8")
+
+        with (
+            patch.object(settings_module, "SETTINGS_PATH", settings_path),
+            patch.object(settings_module, "SETTINGS_META_PATH", meta_path),
+        ):
+            s = settings_module.Settings()
+            self.assertEqual(s.data["passthrough_max_fps"], 24)
 
 
 if __name__ == "__main__":
