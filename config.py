@@ -266,6 +266,33 @@ MATTING_MODEL_KIND = _env("MATTING_MODEL_KIND", "rvm").lower()
 #   resolution. Lower values reduce cost but can soften masks.
 RVM_DOWNSAMPLE_RATIO = float(_env("RVM_DOWNSAMPLE_RATIO", 0.5))
 
+# PT_RVM_SCENE_RESET:
+#   1 detects scene cuts via HSV (H,S) histogram Bhattacharyya distance and
+#   resets RVM recurrent state across scene boundaries. Default off globally;
+#   offline tools enable it explicitly.
+RVM_SCENE_RESET = _env("RVM_SCENE_RESET", "0") == "1"
+
+# PT_RVM_SCENE_THRESHOLD:
+#   Bhattacharyya distance threshold; above this value triggers a scene cut.
+RVM_SCENE_THRESHOLD = float(_env("RVM_SCENE_THRESHOLD", 0.4))
+
+# PT_RVM_SCENE_COOLDOWN:
+#   Minimum frames between two scene-cut resets.
+RVM_SCENE_COOLDOWN = int(_env("RVM_SCENE_COOLDOWN", 24))
+
+# PT_RVM_SCENE_REF_EMA:
+#   EMA weight on the reference histogram for slow within-scene drift tracking.
+RVM_SCENE_REF_EMA = float(_env("RVM_SCENE_REF_EMA", 0.95))
+
+# PT_RVM_ALPHA_SMOOTH:
+#   1 enables temporal EMA smoothing on RVM alpha output. Default off globally;
+#   offline tools enable it explicitly.
+RVM_ALPHA_SMOOTH = _env("RVM_ALPHA_SMOOTH", "0") == "1"
+
+# PT_RVM_ALPHA_SMOOTH_WEIGHT:
+#   EMA weight for historical alpha. 0.6 = 60% history + 40% new frame.
+RVM_ALPHA_SMOOTH_WEIGHT = float(_env("RVM_ALPHA_SMOOTH_WEIGHT", 0.6))
+
 # PT_ALPHA_STRIDE:
 #   Reuse the previous alpha mask for N-1 frames and recompute every Nth frame.
 #   Production default 1 recomputes every frame for temporal fidelity.
@@ -544,7 +571,7 @@ GREEN_BGR = (COMPOSITE_BG_RGB[2], COMPOSITE_BG_RGB[1], COMPOSITE_BG_RGB[0])
 # PT_LIGHT_MATCH_ENABLED:
 #   Enables foreground-only color/luma correction for passthrough output.
 LIGHT_MATCH_ENABLED = str(_env("LIGHT_MATCH_ENABLED", "0")).lower() in {"1", "true", "yes", "on"}
-LIGHT_MATCH_TEMP_K = int(float(_env("LIGHT_MATCH_TEMP_K", "5500")))
+LIGHT_MATCH_TEMP_K = int(float(_env("LIGHT_MATCH_TEMP_K", "6500")))
 LIGHT_MATCH_TINT = float(_env("LIGHT_MATCH_TINT", "0"))
 LIGHT_MATCH_EXPOSURE_EV = float(_env("LIGHT_MATCH_EXPOSURE_EV", "0.0"))
 LIGHT_MATCH_CONTRAST = float(_env("LIGHT_MATCH_CONTRAST", "1.0"))

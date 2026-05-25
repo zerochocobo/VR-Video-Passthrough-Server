@@ -20,7 +20,7 @@ if __package__ in (None, ""):
 import config
 from utils.gpu_requirements import detect_nvidia_gpu_requirement, unsupported_gpu_message
 from utils.subprocess_hidden import hidden_subprocess_kwargs, run_hidden_streaming
-from utils.trt_manifest import TRT_MODEL_MATANYONE2, TRT_MODEL_RVM, TRT_PROVIDER_CHAIN, cache_status
+from utils.trt_manifest import TRT_MODEL_MATANYONE2, TRT_MODEL_RVM, TRT_PROVIDER_CHAIN, cache_dir_for_model, cache_status
 from utils.video_metadata import probe_video_metadata, select_backend
 from utils.vr_naming import offline_passthrough_stem
 
@@ -30,20 +30,19 @@ _WARMUP_NOTICE_PRINTED = False
 
 ENGINES = {
     "rvm_fast": ("rvm", ROOT / "models" / "rvm_mobilenetv3_fp32.onnx"),
-    "rvm_balanced": ("rvm", ROOT / "models" / "rvm_resnet50_fp32.onnx"),
     "matanyone2_medium": ("matanyone2_onnx", None),
     "matanyone2": ("matanyone2_onnx", None),
 }
 
 ENGINE_TAGS = {
     "rvm_fast": "rvm1",
-    "rvm_balanced": "rvm2",
     "matanyone2_medium": "matanyone2m",
     "matanyone2": "matanyone2",
 }
 
 RVM_DEFAULT_ARGS = {
-    "input_size": 1024,
+    "input_size": 2048,
+    "downsample_ratio": 0.25,
     "skip_frames": 0,
     "fps": 0.0,
     "bitrate": "source",
@@ -72,7 +71,8 @@ def _offline_child_env(args: argparse.Namespace, base_env: dict[str, str] | None
     wants_trt = "TensorrtExecutionProvider" in [p.strip() for p in provider_text.split(",") if p.strip()]
     if getattr(args, "engine", "") == "rvm_fast" and _env_flag_enabled(env, "PT_OFFLINE_RVM_TRT_ENABLE"):
         try:
-            if cache_status(model_key=TRT_MODEL_RVM) == "ready":
+            rvm_cache_dir = cache_dir_for_model(TRT_MODEL_RVM, scope="offline")
+            if cache_status(model_key=TRT_MODEL_RVM, scope="offline") == "ready":
                 env["PT_ONNX_PROVIDERS"] = TRT_PROVIDER_CHAIN
                 env["PT_OFFLINE_RVM_TRT"] = "1"
                 return env
@@ -188,6 +188,7 @@ def _base_cmd(args: argparse.Namespace, src: Path, out: Path) -> list[str]:
     cmd.extend(["--cq", str(getattr(args, "cq", RVM_DEFAULT_ARGS["cq"]))])
     if engine == "rvm":
         cmd.extend(["--input-size", str(args.input_size)])
+        cmd.extend(["--rvm-downsample-ratio", str(args.rvm_downsample_ratio)])
         cmd.append("--sbs-batch")
     return cmd
 
@@ -309,6 +310,7 @@ def main(argv: list[str] | None = None) -> int:
     single.add_argument("--duration", type=float, default=0.0)
     single.add_argument("--fps", type=float, default=RVM_DEFAULT_ARGS["fps"])
     single.add_argument("--input-size", type=int, default=RVM_DEFAULT_ARGS["input_size"])
+    single.add_argument("--rvm-downsample-ratio", type=float, default=RVM_DEFAULT_ARGS["downsample_ratio"])
     single.add_argument("--skip-frames", type=int, choices=[0, 1, 2], default=RVM_DEFAULT_ARGS["skip_frames"])
     single.add_argument("--bitrate", default=RVM_DEFAULT_ARGS["bitrate"])
     single.add_argument("--preset", default=RVM_DEFAULT_ARGS["preset"])
@@ -324,6 +326,7 @@ def main(argv: list[str] | None = None) -> int:
     batch.add_argument("--skip-existing", action="store_true")
     batch.add_argument("--fps", type=float, default=RVM_DEFAULT_ARGS["fps"])
     batch.add_argument("--input-size", type=int, default=RVM_DEFAULT_ARGS["input_size"])
+    batch.add_argument("--rvm-downsample-ratio", type=float, default=RVM_DEFAULT_ARGS["downsample_ratio"])
     batch.add_argument("--skip-frames", type=int, choices=[0, 1, 2], default=RVM_DEFAULT_ARGS["skip_frames"])
     batch.add_argument("--bitrate", default=RVM_DEFAULT_ARGS["bitrate"])
     batch.add_argument("--preset", default=RVM_DEFAULT_ARGS["preset"])

@@ -16,6 +16,12 @@ def _setting_value(data: dict, key: str, default):
     value = data.get(key)
     return default if value is None or value == "" else value
 
+LIGHT_MATCH_PRESETS = {
+    "home_warm": {"temp_k": 4000, "tint": 0, "exposure_ev": 0.0, "contrast": 1.0, "gamma": 1.0, "saturation": 1.0},
+    "daylight": {"temp_k": 6500, "tint": 0, "exposure_ev": 0.0, "contrast": 1.0, "gamma": 1.0, "saturation": 1.0},
+    "night_cool": {"temp_k": 8000, "tint": 0, "exposure_ev": 0.0, "contrast": 1.0, "gamma": 1.0, "saturation": 1.0},
+}
+
 DEFAULTS = {
     "language": system_language(),
     "video_dirs": [str(ROOT / "videos")],
@@ -34,7 +40,7 @@ DEFAULTS = {
     "decode_max_side": 4096,
     "inference_backend": "cuda",
     "light_match_enabled": False,
-    "light_match_temp_k": 5500,
+    "light_match_temp_k": 6500,
     "light_match_tint": 0.0,
     "light_match_exposure_ev": 0.0,
     "light_match_contrast": 1.0,
@@ -142,6 +148,13 @@ class Settings:
                         if not enabled and preset == "custom":
                             self.data["light_match_preset"] = DEFAULTS["light_match_preset"]
                         self._mark_migration_done("20260524_light_match_daylight_default")
+                    if not self._migration_done("20260525_light_match_temps_recalibrated", loaded):
+                        preset = str(self.data.get("light_match_preset", "custom") or "custom").strip().lower()
+                        values = LIGHT_MATCH_PRESETS.get(preset)
+                        if values is not None:
+                            for key, value in values.items():
+                                self.data[f"light_match_{key}"] = value
+                        self._mark_migration_done("20260525_light_match_temps_recalibrated")
             except Exception:
                 pass
 
@@ -179,7 +192,7 @@ class Settings:
             "PT_PASSTHROUGH_PRODUCER_REALTIME_PACING": "1",
             "PT_DECODE_MAX_SIDE": str(_setting_value(self.data, "decode_max_side", 4096)),
             "PT_LIGHT_MATCH_ENABLED": "1" if self.data.get("light_match_enabled") else "0",
-            "PT_LIGHT_MATCH_TEMP_K": str(_setting_value(self.data, "light_match_temp_k", 5500)),
+            "PT_LIGHT_MATCH_TEMP_K": str(_setting_value(self.data, "light_match_temp_k", DEFAULTS["light_match_temp_k"])),
             "PT_LIGHT_MATCH_TINT": str(_setting_value(self.data, "light_match_tint", 0.0)),
             "PT_LIGHT_MATCH_EXPOSURE_EV": str(_setting_value(self.data, "light_match_exposure_ev", 0.0)),
             "PT_LIGHT_MATCH_CONTRAST": str(_setting_value(self.data, "light_match_contrast", 1.0)),

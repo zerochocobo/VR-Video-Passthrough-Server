@@ -4,6 +4,10 @@ This file only keeps version releases, major bug fixes, major UI/UX updates, and
 
 ## English
 
+### 2026-05-25
+
+- **Major UI/color fix:** Recalibrated Light Matching presets to the D65 display white point. `daylight` is now neutral 6500K, `night_cool` is now a visibly cool 8000K preset, and existing built-in preset settings are migrated so the default no longer appears yellow.
+
 ### 2026-05-24
 
 - **v0.1.0-beta.5 released.**
@@ -149,6 +153,10 @@ This file only keeps version releases, major bug fixes, major UI/UX updates, and
 - **Major core update:** Added initial DLNA time-seek metadata, passthrough HEAD support, and `PT_CONTAINER` support for MP4 and MPEG-TS passthrough output.
 
 ## 中文
+
+### 2026-05-25
+
+- **重大 UI/色彩修复：** 将光照匹配预设重新校准到 D65 显示白点。`daylight` 现在是中性的 6500K，`night_cool` 现在是明显偏冷的 8000K，并迁移现有内置预设设置，避免默认自然日光继续偏黄。
 
 ### 2026-05-24
 

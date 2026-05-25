@@ -237,6 +237,20 @@ class StartupStatusTests(unittest.TestCase):
         self.assertAlmostEqual(state["progress"], 0.0)
         self.assertAlmostEqual(state["eta_sec"], 0.0)
 
+    def test_monotonic_progress_flag_does_not_lower_same_phase(self) -> None:
+        set_startup_phase("warming", "first", progress=0.6)
+        set_startup_phase("warming", "older substep", progress=0.4, monotonic_progress=True)
+        state = get_startup_state()
+        self.assertAlmostEqual(state["progress"], 0.6)
+
+        set_startup_phase("warming", "newer substep", progress=0.7, monotonic_progress=True)
+        state = get_startup_state()
+        self.assertAlmostEqual(state["progress"], 0.7)
+
+        set_startup_phase("failed", "new phase may reset", progress=0.0, monotonic_progress=True)
+        state = get_startup_state()
+        self.assertAlmostEqual(state["progress"], 0.0)
+
 
 class WarmupLoggingTests(unittest.TestCase):
     def test_warmup_event_writes_json_payload(self) -> None:

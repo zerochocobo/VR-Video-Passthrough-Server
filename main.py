@@ -26,6 +26,8 @@ from utils.trt_manifest import (
 from utils.gpu_runtime_cache import (
     configure_gpu_runtime_cache,
     predict_warmup_state,
+    provider_kind_from_config,
+    startup_warmup_step_total,
     warmup_gpu_runtime_cache,
 )
 from utils.runtime_dll_paths import apply_runtime_dll_paths
@@ -37,7 +39,10 @@ from utils.gpu_requirements import (
 )
 from utils.logger import get, setup
 from utils.startup_status import (
+    get_startup_state,
     set_startup_phase,
+    start_heartbeat,
+    stop_heartbeat,
     start_startup_status_server,
     stop_startup_status_server,
 )
@@ -86,10 +91,10 @@ def _force_line_buffered_stdio() -> None:
             pass
 
 
-def _validate_tensorrt_provider(log) -> None:
+def _validate_tensorrt_provider(log) -> bool:
     providers = [p.strip() for p in config.ONNX_PROVIDERS if p.strip()]
     if "TensorrtExecutionProvider" not in providers:
-        return
+        return False
     try:
         actual_fp = collect_fingerprint()
         manifest = load_manifest()
@@ -105,7 +110,7 @@ def _validate_tensorrt_provider(log) -> None:
         if runtime_model.exists() and runtime_model != config.MODEL_PATH:
             config.MODEL_PATH = runtime_model.resolve()
         log.info("trt cache ready; ONNX providers=%s runtime_model=%s", config.ONNX_PROVIDERS, config.MODEL_PATH)
-        return
+        return True
     reasons: list[str] = []
     if status == "stale" and isinstance(manifest, dict):
         saved_fp = manifest.get("fingerprint")
@@ -116,6 +121,7 @@ def _validate_tensorrt_provider(log) -> None:
         config.ONNX_PROVIDERS = ["CUDAExecutionProvider", "CPUExecutionProvider"]
     reason_text = "; ".join(reasons) if reasons else status
     log.warning("trt cache invalid (%s); falling back to ONNX providers=%s", reason_text, config.ONNX_PROVIDERS)
+    return False
 
 
 def _run_legacy_tool(tool_main, tool_name: str, tool_args: list[str]) -> int:
@@ -191,6 +197,8 @@ def main(argv: list[str] | None = None) -> int:
             from tools.offline_passthrough import main as tool_main
         elif tool_name == "offline_alpha_passthrough":
             from tools.offline_alpha_passthrough import main as tool_main
+        elif tool_name == "warmup_offline_trt":
+            from tools.warmup_offline_trt import main as tool_main
         else:
             raise SystemExit(f"unknown tool: {tool_name}")
         return _run_legacy_tool(tool_main, tool_name, tool_args)
@@ -203,7 +211,6 @@ def main(argv: list[str] | None = None) -> int:
     log = get("main")
     start_startup_status_server(config.STARTUP_STATUS_PORT)
     set_startup_phase("starting", "process started")
-    startup_step_total = 5 + (1 if config.USE_PYNV and config.NVENC_PREFLIGHT_ENABLE else 0)
     log.info("LAN_IP=%s HTTP_PORT=%d UUID=%s", config.LAN_IP, config.HTTP_PORT, config.DEVICE_UUID)
     log.info("VIDEO_DIRS=%s", "|".join(str(path) for path in config.VIDEO_DIRS))
     log.info("MODEL_PATH=%s (exists=%s)", config.MODEL_PATH, config.MODEL_PATH.exists())
@@ -211,11 +218,27 @@ def main(argv: list[str] | None = None) -> int:
     log.info("GPU_RUNTIME_CACHE=%s", cache_env)
     _validate_tensorrt_provider(log)
     log.info("ONNX providers active_after_validation=%s MODEL_PATH=%s", config.ONNX_PROVIDERS, config.MODEL_PATH)
+    provider_kind = provider_kind_from_config()
+    startup_step_total = startup_warmup_step_total(provider_kind)
+    nvenc_step_enabled = bool(config.USE_PYNV and config.NVENC_PREFLIGHT_ENABLE)
     if config.STARTUP_GPU_WARMUP:
         # Publish a prediction first so the UI can show the expected duration
         # before any heavy CUDA work begins. Failure to predict is non-fatal.
         try:
+            set_startup_phase(
+                "warming",
+                "detecting GPU and ORT versions",
+                step="predict_probe",
+                step_index=0,
+                step_total=0,
+                progress=0.02,
+                provider_kind=provider_kind,
+                monotonic_progress=True,
+            )
             prediction = predict_warmup_state()
+            provider_kind = prediction.provider_kind or provider_kind_from_config()
+            startup_step_total = startup_warmup_step_total(provider_kind)
+            nvenc_step_enabled = bool(config.USE_PYNV and config.NVENC_PREFLIGHT_ENABLE)
             set_startup_phase(
                 "warming",
                 ("first-time GPU initialization" if prediction.cold else "verifying GPU cache"),
@@ -231,14 +254,21 @@ def main(argv: list[str] | None = None) -> int:
                 compute_capability=prediction.compute_capability,
                 driver_version=prediction.driver_version,
                 onnxruntime_version=prediction.onnxruntime_version,
+                provider_kind=provider_kind,
                 reason=prediction.reason,
                 detail=prediction.detail,
             )
+            start_heartbeat(
+                prediction.estimate_sec,
+                baseline_progress=0.1,
+                ceiling_progress=0.95,
+            )
             log.info(
-                "warmup prediction: cold=%s reason=%s known_slow=%s eta=%.1fs gpu=%s cc=%s ort=%s",
+                "warmup prediction: cold=%s reason=%s known_slow=%s provider=%s eta=%.1fs gpu=%s cc=%s ort=%s",
                 prediction.cold,
                 prediction.reason,
                 prediction.is_known_slow,
+                provider_kind,
                 prediction.estimate_sec,
                 prediction.gpu_name,
                 prediction.compute_capability,
@@ -246,6 +276,7 @@ def main(argv: list[str] | None = None) -> int:
             )
             cc = parse_compute_capability(prediction.compute_capability)
             if cc is not None and cc < MIN_NVIDIA_COMPUTE_CAPABILITY:
+                stop_heartbeat()
                 message = unsupported_gpu_message(
                     GpuRequirementResult(
                         detected=True,
@@ -268,6 +299,7 @@ def main(argv: list[str] | None = None) -> int:
                     compute_capability=prediction.compute_capability,
                     driver_version=prediction.driver_version,
                     onnxruntime_version=prediction.onnxruntime_version,
+                    provider_kind=provider_kind,
                     reason="unsupported_gpu",
                     detail=message,
                 )
@@ -277,7 +309,16 @@ def main(argv: list[str] | None = None) -> int:
                 return 1
         except Exception as e:
             log.warning("warmup prediction failed (non-fatal): %s", e)
-            set_startup_phase("warming", "GPU runtime warmup")
+            set_startup_phase(
+                "warming",
+                "GPU runtime warmup",
+                step="predict",
+                step_index=0,
+                step_total=startup_step_total,
+                progress=0.0,
+                provider_kind=provider_kind,
+                detail=str(e),
+            )
 
         log.info(
             "startup GPU warmup begin: force=%s timeout=%.1fs runs_per_shape=%d",
@@ -287,13 +328,16 @@ def main(argv: list[str] | None = None) -> int:
         )
         warmup_start = time.perf_counter()
         try:
+            stop_heartbeat()
             set_startup_phase(
                 "warming",
                 "starting GPU warmup",
-                step="matter_singleton",
-                step_index=1,
-                step_total=startup_step_total,
+                step="warmup_start",
+                step_index=0,
+                step_total=0,
                 progress=0.1,
+                provider_kind=provider_kind,
+                monotonic_progress=True,
             )
             marker = warmup_gpu_runtime_cache(
                 force=config.STARTUP_GPU_WARMUP_FORCE,
@@ -301,12 +345,14 @@ def main(argv: list[str] | None = None) -> int:
                 runs_per_shape=max(1, config.STARTUP_GPU_WARMUP_RUNS_PER_SHAPE),
             )
         except Exception as e:
+            stop_heartbeat()
             set_startup_phase(
                 "failed",
                 f"startup GPU warmup failed: {e}",
                 step="failed",
                 progress=0.0,
                 detail=str(e),
+                provider_kind=provider_kind,
             )
             log.exception("startup GPU warmup failed; server will not start: %s", e)
             # Give the UI poller (500 ms interval) one more chance to read the
@@ -317,16 +363,25 @@ def main(argv: list[str] | None = None) -> int:
             time.sleep(0.8)
             stop_startup_status_server()
             return 1
+        stop_heartbeat()
         warmup_elapsed = time.perf_counter() - warmup_start
+        warmup_status = get_startup_state()
+        provider_kind = str(warmup_status.get("provider_kind") or provider_kind)
+        try:
+            startup_step_total = int(warmup_status.get("step_total") or startup_step_total)
+        except (TypeError, ValueError):
+            pass
+        warmup_done_step = startup_step_total - (1 if nvenc_step_enabled else 0)
         set_startup_phase(
             "warmed",
             "GPU runtime warmup complete",
             step="warmed",
-            step_index=5,
+            step_index=warmup_done_step,
             step_total=startup_step_total,
-            progress=5.0 / startup_step_total,
+            progress=warmup_done_step / startup_step_total,
             eta_sec=0.0,
             elapsed_sec=warmup_elapsed,
+            provider_kind=provider_kind,
         )
         log.info(
             "startup GPU warmup done: elapsed=%.3fs marker_elapsed=%.3fs verified_second_pass=%.3fs cache_files=%d cache_size=%d",
@@ -337,17 +392,20 @@ def main(argv: list[str] | None = None) -> int:
             marker.cache_size_after_warmup,
         )
     else:
+        stop_heartbeat()
+        warmup_done_step = startup_step_total - (1 if nvenc_step_enabled else 0)
         set_startup_phase(
             "warmed",
             "startup GPU warmup disabled",
             step="warmed",
-            step_index=5,
+            step_index=warmup_done_step,
             step_total=startup_step_total,
-            progress=1.0,
+            progress=warmup_done_step / startup_step_total,
             eta_sec=0.0,
+            provider_kind=provider_kind,
         )
         log.info("startup GPU warmup disabled")
-    if config.USE_PYNV and config.NVENC_PREFLIGHT_ENABLE:
+    if nvenc_step_enabled:
         set_startup_phase(
             "warming",
             "warming NVENC encoder",
@@ -355,6 +413,7 @@ def main(argv: list[str] | None = None) -> int:
             step_index=startup_step_total,
             step_total=startup_step_total,
             progress=0.95,
+            provider_kind=provider_kind,
         )
         try:
             from pipeline.pynv_stream import PyNvPassthroughStream
@@ -397,6 +456,7 @@ def main(argv: list[str] | None = None) -> int:
         step_index=startup_step_total,
         step_total=startup_step_total,
         progress=0.97,
+        provider_kind=provider_kind,
     )
     from utils.firewall import ensure_rules
 
@@ -409,6 +469,7 @@ def main(argv: list[str] | None = None) -> int:
         step_index=startup_step_total,
         step_total=startup_step_total,
         progress=0.98,
+        provider_kind=provider_kind,
     )
     from dlna.ssdp import SSDPServer
 
@@ -426,6 +487,7 @@ def main(argv: list[str] | None = None) -> int:
         step_index=startup_step_total,
         step_total=startup_step_total,
         progress=0.99,
+        provider_kind=provider_kind,
     )
     try:
         import uvicorn

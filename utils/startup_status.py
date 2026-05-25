@@ -42,6 +42,8 @@ _state: dict[str, Any] = {
 }
 _server: ThreadingHTTPServer | None = None
 _thread: threading.Thread | None = None
+_heartbeat_thread: threading.Thread | None = None
+_heartbeat_stop: threading.Event | None = None
 
 
 def set_startup_phase(phase: str, message: str = "", **fields: Any) -> None:
@@ -55,12 +57,59 @@ def set_startup_phase(phase: str, message: str = "", **fields: Any) -> None:
     Unknown keys are stored verbatim so the endpoint stays forward-compatible.
     """
     now = time.time()
+    monotonic_progress = bool(fields.pop("monotonic_progress", False))
     with _lock:
+        previous_phase = str(_state.get("phase") or "")
         _state["phase"] = phase
         _state["message"] = message
         _state["updated_at"] = now
         for key, value in fields.items():
+            if key == "progress" and monotonic_progress and previous_phase == phase:
+                try:
+                    value = max(float(value), float(_state.get("progress") or 0.0))
+                except (TypeError, ValueError):
+                    pass
             _state[key] = value
+
+
+def start_heartbeat(eta_sec: float, baseline_progress: float, ceiling_progress: float = 0.95) -> None:
+    """Advance elapsed/progress while startup is inside a long blocking call."""
+    global _heartbeat_thread, _heartbeat_stop
+    stop_heartbeat()
+
+    eta = max(0.1, float(eta_sec or 0.1))
+    baseline = max(0.0, min(1.0, float(baseline_progress)))
+    ceiling = max(baseline, min(1.0, float(ceiling_progress)))
+    started_at = time.time()
+    stop_event = threading.Event()
+
+    def _run() -> None:
+        while not stop_event.wait(0.5):
+            now = time.time()
+            elapsed = max(0.0, now - started_at)
+            progress = min(ceiling, baseline + (ceiling - baseline) * min(1.0, elapsed / eta))
+            with _lock:
+                _state["elapsed_sec"] = round(elapsed, 3)
+                _state["updated_at"] = now
+                if progress > float(_state.get("progress") or 0.0):
+                    _state["progress"] = progress
+
+    _heartbeat_stop = stop_event
+    _heartbeat_thread = threading.Thread(target=_run, name="startup-status-heartbeat", daemon=True)
+    _heartbeat_thread.start()
+
+
+def stop_heartbeat() -> None:
+    """Stop the startup heartbeat thread if one is active."""
+    global _heartbeat_thread, _heartbeat_stop
+    stop_event = _heartbeat_stop
+    thread = _heartbeat_thread
+    _heartbeat_stop = None
+    _heartbeat_thread = None
+    if stop_event is not None:
+        stop_event.set()
+    if thread is not None and thread.is_alive():
+        thread.join(timeout=1.0)
 
 
 def reset_startup_progress() -> None:
@@ -138,6 +187,7 @@ def start_startup_status_server(port: int) -> None:
 
 def stop_startup_status_server() -> None:
     global _server, _thread
+    stop_heartbeat()
     server = _server
     thread = _thread
     _server = None

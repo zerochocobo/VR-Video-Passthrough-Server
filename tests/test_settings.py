@@ -119,7 +119,9 @@ class SettingsTests(unittest.TestCase):
     def test_light_match_default_preset_is_daylight(self) -> None:
         s = self._settings()
         self.assertEqual(s.data["light_match_preset"], "daylight")
+        self.assertEqual(s.data["light_match_temp_k"], 6500)
         self.assertEqual(s.server_env()["PT_LIGHT_MATCH_PRESET"], "daylight")
+        self.assertEqual(s.server_env()["PT_LIGHT_MATCH_TEMP_K"], "6500")
 
     def test_legacy_disabled_custom_light_match_migrates_to_daylight(self) -> None:
         root = Path("runtime_cache/test_ui_settings_light_match_default")
@@ -135,6 +137,67 @@ class SettingsTests(unittest.TestCase):
         ):
             s = settings_module.Settings()
             self.assertEqual(s.data["light_match_preset"], "daylight")
+            self.assertEqual(s.data["light_match_temp_k"], 6500)
+
+    def test_legacy_daylight_light_match_recalibrates_to_d65(self) -> None:
+        root = Path("runtime_cache/test_ui_settings_light_match_recalibration")
+        root.mkdir(parents=True, exist_ok=True)
+        self.addCleanup(lambda: shutil.rmtree(root, ignore_errors=True))
+        settings_path = root / "ui_settings.json"
+        meta_path = root / "ui_settings_meta.json"
+        settings_path.write_text(
+            '{"light_match_enabled": true, "light_match_preset": "daylight", "light_match_temp_k": 5500}',
+            encoding="utf-8",
+        )
+
+        with (
+            patch.object(settings_module, "SETTINGS_PATH", settings_path),
+            patch.object(settings_module, "SETTINGS_META_PATH", meta_path),
+        ):
+            s = settings_module.Settings()
+            self.assertEqual(s.data["light_match_preset"], "daylight")
+            self.assertEqual(s.data["light_match_temp_k"], 6500)
+            self.assertEqual(s.data["light_match_saturation"], 1.0)
+
+    def test_legacy_night_cool_light_match_recalibrates_to_8000k(self) -> None:
+        root = Path("runtime_cache/test_ui_settings_light_match_night_recalibration")
+        root.mkdir(parents=True, exist_ok=True)
+        self.addCleanup(lambda: shutil.rmtree(root, ignore_errors=True))
+        settings_path = root / "ui_settings.json"
+        meta_path = root / "ui_settings_meta.json"
+        settings_path.write_text(
+            '{"light_match_enabled": true, "light_match_preset": "night_cool", "light_match_temp_k": 6500, "light_match_exposure_ev": -0.1, "light_match_saturation": 0.95}',
+            encoding="utf-8",
+        )
+
+        with (
+            patch.object(settings_module, "SETTINGS_PATH", settings_path),
+            patch.object(settings_module, "SETTINGS_META_PATH", meta_path),
+        ):
+            s = settings_module.Settings()
+            self.assertEqual(s.data["light_match_preset"], "night_cool")
+            self.assertEqual(s.data["light_match_temp_k"], 8000)
+            self.assertEqual(s.data["light_match_exposure_ev"], 0.0)
+            self.assertEqual(s.data["light_match_saturation"], 1.0)
+
+    def test_custom_light_match_survives_recalibration_migration(self) -> None:
+        root = Path("runtime_cache/test_ui_settings_light_match_custom_recalibration")
+        root.mkdir(parents=True, exist_ok=True)
+        self.addCleanup(lambda: shutil.rmtree(root, ignore_errors=True))
+        settings_path = root / "ui_settings.json"
+        meta_path = root / "ui_settings_meta.json"
+        settings_path.write_text(
+            '{"light_match_enabled": true, "light_match_preset": "custom", "light_match_temp_k": 5400}',
+            encoding="utf-8",
+        )
+
+        with (
+            patch.object(settings_module, "SETTINGS_PATH", settings_path),
+            patch.object(settings_module, "SETTINGS_META_PATH", meta_path),
+        ):
+            s = settings_module.Settings()
+            self.assertEqual(s.data["light_match_preset"], "custom")
+            self.assertEqual(s.data["light_match_temp_k"], 5400)
 
     def test_legacy_30fps_default_stays_default(self) -> None:
         root = Path("runtime_cache/test_ui_settings_fps_migration")

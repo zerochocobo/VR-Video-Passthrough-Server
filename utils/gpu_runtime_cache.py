@@ -20,7 +20,7 @@ from typing import Iterable
 
 import config
 from utils.logger import warmup_event
-from utils.startup_status import set_startup_phase
+from utils.startup_status import set_startup_phase, start_heartbeat, stop_heartbeat
 from utils.subprocess_hidden import hidden_subprocess_kwargs
 
 
@@ -87,6 +87,7 @@ class ColdStartReport:
     onnxruntime_version: str
     is_known_slow: bool   # True for Blackwell (sm_120+) without bundled cubin
     estimate_sec: float
+    provider_kind: str
     marker_exists: bool
     previous_elapsed_sec: float
     changed_fields: list[str]
@@ -286,6 +287,31 @@ _ETA_CACHE_HIT_SEC = 4.0
 _ETA_KEY_CHANGED_SEC = 30.0
 _ETA_FIRST_RUN_NORMAL_SEC = 45.0
 _ETA_FIRST_RUN_KNOWN_SLOW_SEC = 150.0
+_ETA_TRT_ENGINE_LOAD_SEC = 12.0
+
+
+def provider_kind_from_config() -> str:
+    providers = [p.strip() for p in config.ONNX_PROVIDERS if p.strip()]
+    first = providers[0] if providers else ""
+    if first == "TensorrtExecutionProvider":
+        return "trt"
+    if first == "CUDAExecutionProvider":
+        return "cuda"
+    if first == "CPUExecutionProvider":
+        return "cpu"
+    return ""
+
+
+def startup_warmup_step_total(provider_kind: str | None = None) -> int:
+    kind = provider_kind if provider_kind is not None else provider_kind_from_config()
+    total = 3  # matter runtime, inference runs, reset state
+    if kind == "trt":
+        total += 1  # static TensorRT engine preload
+    if config.WARMUP_COMPOSITE_ENABLE:
+        total += 1
+    if config.USE_PYNV and config.NVENC_PREFLIGHT_ENABLE:
+        total += 1
+    return total
 
 
 def _parse_ort_version(text: str) -> tuple[int, ...]:
@@ -352,6 +378,7 @@ def predict_warmup_state(marker_path: Path | None = None) -> ColdStartReport:
     onnxruntime_version = ""
     inspect_failed = False
     detail = ""
+    provider_kind = provider_kind_from_config()
 
     try:
         import cupy as cp  # type: ignore
@@ -396,6 +423,8 @@ def predict_warmup_state(marker_path: Path | None = None) -> ColdStartReport:
         cold = True
         reason = "inspect_failed"
         estimate = _ETA_FIRST_RUN_KNOWN_SLOW_SEC if is_known_slow else _ETA_FIRST_RUN_NORMAL_SEC
+        if provider_kind == "trt":
+            estimate = _ETA_TRT_ENGINE_LOAD_SEC
         return ColdStartReport(
             cold=cold,
             reason=reason,
@@ -405,6 +434,7 @@ def predict_warmup_state(marker_path: Path | None = None) -> ColdStartReport:
             onnxruntime_version=onnxruntime_version,
             is_known_slow=is_known_slow,
             estimate_sec=estimate,
+            provider_kind=provider_kind,
             marker_exists=marker_exists,
             previous_elapsed_sec=previous_elapsed_sec,
             changed_fields=changed_fields,
@@ -443,6 +473,8 @@ def predict_warmup_state(marker_path: Path | None = None) -> ColdStartReport:
         estimate = _ETA_FIRST_RUN_KNOWN_SLOW_SEC
     else:
         estimate = _ETA_FIRST_RUN_NORMAL_SEC
+    if provider_kind == "trt":
+        estimate = _ETA_TRT_ENGINE_LOAD_SEC
 
     return ColdStartReport(
         cold=cold,
@@ -453,6 +485,7 @@ def predict_warmup_state(marker_path: Path | None = None) -> ColdStartReport:
         onnxruntime_version=onnxruntime_version,
         is_known_slow=is_known_slow,
         estimate_sec=float(estimate),
+        provider_kind=provider_kind,
         marker_exists=marker_exists,
         previous_elapsed_sec=previous_elapsed_sec,
         changed_fields=changed_fields,
@@ -465,20 +498,41 @@ def warmup_gpu_runtime_cache(force: bool = False, timeout_sec: float = 300.0, ru
     marker_path = Path(env.marker_path)
     key = build_warmup_key()
     start = time.perf_counter()
-    step_total = 5 + (1 if config.USE_PYNV and config.NVENC_PREFLIGHT_ENABLE else 0)
+    provider_kind = provider_kind_from_config()
+    step_total = startup_warmup_step_total(provider_kind)
 
     def _warmup_resident_matter_runtime(warmup_key: GpuWarmupKey) -> float:
         from pipeline.matting import get_matter
 
+        def _step_start_progress(index: int, total: int) -> float:
+            return max(0.0, (float(index) - 1.0) / float(total)) if total > 0 else 0.0
+
+        def _step_end_progress(index: int, total: int) -> float:
+            return min(1.0, float(index) / float(total)) if total > 0 else 0.0
+
+        step_index = 1
         set_startup_phase(
             "warming",
             "loading matting runtime",
             step="matter_singleton",
-            step_index=1,
-            step_total=step_total,
-            progress=1.0 / step_total,
+            step_index=0,
+            step_total=0,
+            progress=0.1,
+            provider_kind=provider_kind,
+            elapsed_sec=0.0,
+            run_done=0,
+            run_total=0,
+            monotonic_progress=True,
         )
-        matter = get_matter(warmup_runs=0)
+        start_heartbeat(
+            eta_sec=30.0,
+            baseline_progress=0.1,
+            ceiling_progress=0.25,
+        )
+        try:
+            matter = get_matter(warmup_runs=0)
+        finally:
+            stop_heartbeat()
         warmup_event(
             log,
             phase="matter_singleton",
@@ -492,81 +546,145 @@ def warmup_gpu_runtime_cache(force: bool = False, timeout_sec: float = 300.0, ru
 
         verify_elapsed = 0.0
         stream = getattr(matting_mod, "_CUDA_STREAM", None)
+        has_static_trt = bool(getattr(matter, "_rvm_static_trt_available", False))
+        actual_provider_kind = "trt" if has_static_trt else ("cuda" if provider_kind == "trt" else provider_kind)
+        actual_step_total = startup_warmup_step_total(actual_provider_kind)
+        known_slow = _is_known_slow_combo(warmup_key.compute_capability, warmup_key.onnxruntime_version)
 
-        set_startup_phase(
-            "warming",
-            "loading TensorRT engines",
-            step="static_trt_preload",
-            step_index=2,
-            step_total=step_total,
-            progress=2.0 / step_total,
-        )
-        for shape in warmup_key.shapes:
-            batch, channels, h, w = shape
-            if channels != 3:
-                continue
-            t_static = time.perf_counter()
-            sess = None
-            try:
-                sess = matter._get_trt_static_session(int(batch), int(h), int(w))
-            except Exception:
-                warmup_event(
-                    log,
-                    phase="static_trt_preload",
-                    status="failed",
-                    batch=int(batch),
-                    shape=[int(h), int(w)],
-                )
-                log.warning(
-                    "static_trt preload failed batch=%d shape=%dx%d",
-                    int(batch),
-                    int(h),
-                    int(w),
-                    exc_info=True,
-                )
-            warmup_event(
-                log,
-                phase="static_trt_preload",
-                batch=int(batch),
-                shape=[int(h), int(w)],
-                loaded=sess is not None,
-                elapsed_ms=round((time.perf_counter() - t_static) * 1000.0, 1),
+        if has_static_trt:
+            step_index += 1
+            step_progress = _step_start_progress(step_index, actual_step_total)
+            set_startup_phase(
+                "warming",
+                "loading TensorRT engine cache",
+                step="static_trt_preload",
+                step_index=step_index,
+                step_total=actual_step_total,
+                progress=step_progress,
+                provider_kind=actual_provider_kind,
+                elapsed_sec=0.0,
+                run_done=0,
+                run_total=0,
+                monotonic_progress=True,
             )
+            start_heartbeat(
+                eta_sec=12.0,
+                baseline_progress=step_progress,
+                ceiling_progress=min(0.95, _step_end_progress(step_index, actual_step_total)),
+            )
+            try:
+                for shape in warmup_key.shapes:
+                    batch, channels, h, w = shape
+                    if channels != 3:
+                        continue
+                    t_static = time.perf_counter()
+                    sess = None
+                    try:
+                        sess = matter._get_trt_static_session(int(batch), int(h), int(w))
+                    except Exception:
+                        warmup_event(
+                            log,
+                            phase="static_trt_preload",
+                            status="failed",
+                            batch=int(batch),
+                            shape=[int(h), int(w)],
+                        )
+                        log.warning(
+                            "static_trt preload failed batch=%d shape=%dx%d",
+                            int(batch),
+                            int(h),
+                            int(w),
+                            exc_info=True,
+                        )
+                    warmup_event(
+                        log,
+                        phase="static_trt_preload",
+                        batch=int(batch),
+                        shape=[int(h), int(w)],
+                        loaded=sess is not None,
+                        elapsed_ms=round((time.perf_counter() - t_static) * 1000.0, 1),
+                    )
+            finally:
+                stop_heartbeat()
 
+        step_index += 1
+        step_progress = _step_start_progress(step_index, actual_step_total)
         set_startup_phase(
             "warming",
             "running GPU inference warmup",
             step="ort_iobinding_runs",
-            step_index=3,
-            step_total=step_total,
-            progress=3.0 / step_total,
+            step_index=step_index,
+            step_total=actual_step_total,
+            progress=step_progress,
+            provider_kind=actual_provider_kind,
+            elapsed_sec=0.0,
+            run_done=0,
+            run_total=0,
+            monotonic_progress=True,
         )
-        for shape in warmup_key.shapes:
-            batch, channels, h, w = shape
-            if channels != 3:
-                continue
-            x = cp.zeros((batch, channels, h, w), dtype=matter.input_dtype)
-            matter.reset_state()
-            for i in range(max(1, runs_per_shape)):
-                t0 = time.perf_counter()
-                matter._run_rvm_iobinding_from_dev(x)
-                if stream is not None:
-                    stream.synchronize()
-                else:
-                    cp.cuda.Stream.null.synchronize()
-                if i == max(1, runs_per_shape) - 1:
-                    verify_elapsed += time.perf_counter() - t0
+        valid_shapes = [shape for shape in warmup_key.shapes if int(shape[1]) == 3]
+        total_runs = max(1, len(valid_shapes) * max(1, runs_per_shape))
+        done_runs = 0
+        run_eta = 8.0 if actual_provider_kind == "trt" else (180.0 if known_slow else 90.0)
+        start_heartbeat(
+            eta_sec=run_eta,
+            baseline_progress=step_progress,
+            ceiling_progress=min(0.95, _step_end_progress(step_index, actual_step_total)),
+        )
+        try:
+            for shape in warmup_key.shapes:
+                batch, channels, h, w = shape
+                if channels != 3:
+                    continue
+                x = cp.zeros((batch, channels, h, w), dtype=matter.input_dtype)
+                matter.reset_state()
+                for i in range(max(1, runs_per_shape)):
+                    t0 = time.perf_counter()
+                    matter._run_rvm_iobinding_from_dev(x)
+                    if stream is not None:
+                        stream.synchronize()
+                    else:
+                        cp.cuda.Stream.null.synchronize()
+                    if i == max(1, runs_per_shape) - 1:
+                        verify_elapsed += time.perf_counter() - t0
+                    done_runs += 1
+                    set_startup_phase(
+                        "warming",
+                        "running GPU inference warmup",
+                        step="ort_iobinding_runs",
+                        step_index=step_index,
+                        step_total=actual_step_total,
+                        progress=step_progress + (1.0 / actual_step_total) * (done_runs / total_runs),
+                        run_done=done_runs,
+                        run_total=total_runs,
+                        provider_kind=actual_provider_kind,
+                        monotonic_progress=True,
+                    )
+        finally:
+            stop_heartbeat()
 
         if config.WARMUP_COMPOSITE_ENABLE:
             from pipeline.alpha_packer import AlphaPacker
 
+            step_index += 1
+            step_progress = _step_start_progress(step_index, actual_step_total)
             set_startup_phase(
                 "warming",
                 "warming composite kernels",
                 step="composite_jit",
-                step_index=4,
-                step_total=step_total,
-                progress=4.0 / step_total,
+                step_index=step_index,
+                step_total=actual_step_total,
+                progress=step_progress,
+                provider_kind=actual_provider_kind,
+                elapsed_sec=0.0,
+                run_done=0,
+                run_total=0,
+                monotonic_progress=True,
+            )
+            start_heartbeat(
+                eta_sec=12.0,
+                baseline_progress=step_progress,
+                ceiling_progress=min(0.95, _step_end_progress(step_index, actual_step_total)),
             )
             saved_call_count = getattr(matter, "_call_count", 0)
             saved_preproc_diag_count = getattr(matter, "_preproc_diag_count", 0)
@@ -666,15 +784,23 @@ def warmup_gpu_runtime_cache(force: bool = False, timeout_sec: float = 300.0, ru
             finally:
                 matter._call_count = saved_call_count
                 matter._preproc_diag_count = saved_preproc_diag_count
+                stop_heartbeat()
             warmup_event(log, phase="composite_jit", status="complete")
 
+        step_index += 1
+        step_progress = _step_start_progress(step_index, actual_step_total)
         set_startup_phase(
             "warming",
             "resetting warmup state",
             step="reset_state",
-            step_index=5,
-            step_total=step_total,
-            progress=5.0 / step_total,
+            step_index=step_index,
+            step_total=actual_step_total,
+            progress=step_progress,
+            provider_kind=actual_provider_kind,
+            elapsed_sec=0.0,
+            run_done=0,
+            run_total=0,
+            monotonic_progress=True,
         )
         matter.reset_state()
         warmup_event(log, phase="reset_state", step="after_warmup")

@@ -36,7 +36,7 @@ from ui.log_limits import UI_LOG_MAX_BLOCKS
 from ui.log_sanitizer import clean_log_text
 from ui.player_support import load_player_support
 from ui.resources import SWITCH_OFF_IMAGE_PATH, SWITCH_ON_IMAGE_PATH
-from ui.settings import DEFAULTS, ROOT as UI_ROOT, quality_speed_value
+from ui.settings import DEFAULTS, LIGHT_MATCH_PRESETS, ROOT as UI_ROOT, quality_speed_value
 from ui.widgets.trt_cache_dialog import TensorRTConfigDialog
 from utils.trt_manifest import cache_status, manifest_path
 
@@ -52,11 +52,6 @@ PROJECT_URL = "https://wapok.com"
 PROJECT_LINK_HEIGHT = 28
 ICON_BUTTON_SIZE = 30
 LIGHT_MATCH_DEFAULT_PRESET = str(DEFAULTS["light_match_preset"])
-LIGHT_MATCH_PRESETS = {
-    "home_warm": {"temp_k": 4000, "tint": 0, "exposure_ev": 0.0, "contrast": 1.0, "gamma": 1.0, "saturation": 1.0},
-    "daylight": {"temp_k": 5500, "tint": 0, "exposure_ev": 0.0, "contrast": 1.0, "gamma": 1.0, "saturation": 1.0},
-    "night_cool": {"temp_k": 6500, "tint": 0, "exposure_ev": -0.1, "contrast": 1.0, "gamma": 1.0, "saturation": 0.95},
-}
 
 
 def _retain_size_when_hidden(widget: QWidget) -> None:
@@ -335,7 +330,7 @@ class LightMatchAdvancedDialog(QDialog):
         self.setModal(True)
         self.setWindowTitle(self.i18n.t("light_match.custom_title"))
 
-        self.temp = self._slider(2700, 9000, _int_setting(payload.get("temp_k"), 5500))
+        self.temp = self._slider(2700, 9000, _int_setting(payload.get("temp_k"), DEFAULTS["light_match_temp_k"]))
         self.tint = self._slider(-50, 50, _int_setting(payload.get("tint"), 0))
         self.exposure = self._slider(-100, 100, int(round(_float_setting(payload.get("exposure_ev"), 0.0) * 100)))
         self.contrast = self._slider(80, 120, int(round(_float_setting(payload.get("contrast"), 1.0) * 100)))
@@ -423,7 +418,7 @@ class LightMatchAdvancedDialog(QDialog):
     def _restore_defaults(self) -> None:
         self._updating = True
         for slider, value in (
-            (self.temp, 5500),
+            (self.temp, DEFAULTS["light_match_temp_k"]),
             (self.tint, 0),
             (self.exposure, 0),
             (self.contrast, 100),
@@ -892,15 +887,16 @@ class HomePage(QWidget):
             self.trt_cache_watcher.removePath(path)
         for path in self.trt_cache_watcher.directories():
             self.trt_cache_watcher.removePath(path)
-        cache_dir = manifest_path().parent
+        cache_dir = manifest_path(scope="realtime").parent
         cache_dir.mkdir(parents=True, exist_ok=True)
         self.trt_cache_watcher.addPath(str(cache_dir))
-        if manifest_path().exists():
-            self.trt_cache_watcher.addPath(str(manifest_path()))
+        manifest = manifest_path(scope="realtime")
+        if manifest.exists():
+            self.trt_cache_watcher.addPath(str(manifest))
 
     def _trt_status(self) -> str:
         try:
-            return cache_status()
+            return cache_status(scope="realtime")
         except Exception:
             return "failed"
 
@@ -924,7 +920,7 @@ class HomePage(QWidget):
     def _light_match_payload(self) -> dict:
         return {
             "enabled": self.light_match_enabled.isChecked(),
-            "temp_k": _int_setting(self.settings.data.get("light_match_temp_k"), 5500),
+            "temp_k": _int_setting(self.settings.data.get("light_match_temp_k"), DEFAULTS["light_match_temp_k"]),
             "tint": _float_setting(self.settings.data.get("light_match_tint"), 0.0),
             "exposure_ev": _float_setting(self.settings.data.get("light_match_exposure_ev"), 0.0),
             "contrast": _float_setting(self.settings.data.get("light_match_contrast"), 1.0),
@@ -1037,7 +1033,7 @@ class HomePage(QWidget):
         self.settings.save()
 
     def show_trt_config(self) -> None:
-        dialog = TensorRTConfigDialog(self.i18n, self)
+        dialog = TensorRTConfigDialog(self.i18n, self, scope="realtime")
         dialog.exec()
         if self._trt_status() == "ready":
             self.settings.data["inference_backend"] = "tensorrt"

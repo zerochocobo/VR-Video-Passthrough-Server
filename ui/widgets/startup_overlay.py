@@ -41,7 +41,9 @@ from PySide6.QtWidgets import (
 # Server-side `step` strings map into these indices; unknown values fall
 # back to the current step_index from /status.
 _STEP_KEYS = (
+    "predict_probe",
     "predict",
+    "warmup_start",
     "matter_singleton",
     "static_trt_preload",
     "ort_iobinding_runs",
@@ -53,6 +55,22 @@ _STEP_KEYS = (
     "http_starting",
     "listening",
     "warmed",
+)
+
+_REASSURANCE_TIERS = (
+    (20.0, "startup.reassure.t20", "info"),
+    (45.0, "startup.reassure.t45", "info"),
+    (90.0, "startup.reassure.t90", "warn"),
+    (180.0, "startup.reassure.t180", "warn"),
+)
+
+_HINT_STYLE_INFO = (
+    "QLabel { color: #444; font-size: 9pt; background: #FFF7E0;"
+    " border: 1px solid #EBC97A; border-radius: 6px; padding: 8px; }"
+)
+_HINT_STYLE_WARN = (
+    "QLabel { color: #3D2B00; font-size: 9pt; background: #FFF0D6;"
+    " border: 2px solid #E59A2F; border-radius: 6px; padding: 8px; }"
 )
 
 
@@ -101,10 +119,7 @@ class StartupOverlay(QDialog):
 
         self.hint_label = QLabel()
         self.hint_label.setWordWrap(True)
-        self.hint_label.setStyleSheet(
-            "QLabel { color: #444; font-size: 9pt; background: #FFF7E0;"
-            " border: 1px solid #EBC97A; border-radius: 6px; padding: 8px; }"
-        )
+        self.hint_label.setStyleSheet(_HINT_STYLE_INFO)
         self.hint_label.setVisible(False)
 
         self.details_text = QTextEdit()
@@ -156,6 +171,7 @@ class StartupOverlay(QDialog):
 
     def reset(self) -> None:
         self._last_status = None
+        self._ellipsis_phase = 0
         self._base_message = self.i18n.t("startup.connecting")
         self.title_label.setText(self.i18n.t("startup.title_starting"))
         self.message_label.setText(self._base_message)
@@ -164,6 +180,7 @@ class StartupOverlay(QDialog):
         self.progress.setRange(0, 1000)
         self.progress.setValue(0)
         self.hint_label.setText("")
+        self.hint_label.setStyleSheet(_HINT_STYLE_INFO)
         self.hint_label.setVisible(False)
         self.details_text.setVisible(False)
         self.details_text.clear()
@@ -188,6 +205,9 @@ class StartupOverlay(QDialog):
         cc = str(status.get("compute_capability") or "")
         reason = str(status.get("reason") or "")
         message = str(status.get("message") or "")
+        provider_kind = str(status.get("provider_kind") or "")
+        step_text = self._step_text(step, status)
+        step_translated = self._step_has_translation(step, status)
 
         # ----- Title (phase friendly name) -----
         if phase == "listening":
@@ -205,7 +225,9 @@ class StartupOverlay(QDialog):
         elif phase in {"firewall", "ssdp", "http_starting"}:
             self.title_label.setText(self.i18n.t("startup.title_starting"))
         elif phase == "warming":
-            if cold and known_slow:
+            if provider_kind == "trt":
+                self.title_label.setText(self.i18n.t("startup.title_trt_loading"))
+            elif cold and known_slow:
                 self.title_label.setText(self.i18n.t("startup.title_first_run_slow"))
             elif cold:
                 self.title_label.setText(self.i18n.t("startup.title_first_run"))
@@ -216,14 +238,15 @@ class StartupOverlay(QDialog):
 
         # ----- Friendly message body -----
         friendly: list[str] = []
-        if message:
+        if step_text and step_translated:
+            friendly.append(step_text)
+        elif message:
             friendly.append(message)
         if gpu:
             friendly.append(self.i18n.t("startup.gpu_label").format(gpu=gpu, cc=cc or "?"))
         self._base_message = "\n".join(friendly) if friendly else self.i18n.t("startup.connecting")
         self.message_label.setText(self._base_message)
 
-        step_text = self._step_text(step)
         if step_text and step_total > 0:
             shown_index = max(1, min(step_total, step_index or self._step_index_for(step)))
             self.step_label.setText(f"{shown_index}/{step_total}  {step_text}")
@@ -285,15 +308,8 @@ class StartupOverlay(QDialog):
             value = max(value, 30 if phase == "warming" else 0)
             self.progress.setValue(value)
 
-        # ----- Known-slow advisory -----
-        if phase == "warming" and known_slow and cold:
-            self.hint_label.setText(self.i18n.t("startup.hint_known_slow"))
-            self.hint_label.setVisible(True)
-        elif phase == "failed":
-            self.hint_label.setText(self.i18n.t("startup.hint_failed"))
-            self.hint_label.setVisible(True)
-        else:
-            self.hint_label.setVisible(False)
+        # ----- Advisory / reassurance -----
+        self._apply_hint(status, phase, cold, known_slow, provider_kind, elapsed)
 
         # ----- Details panel content (raw status) -----
         if self.details_text.isVisible():
@@ -316,6 +332,12 @@ class StartupOverlay(QDialog):
     def last_status(self) -> dict | None:
         return self._last_status
 
+    def show_bootstrapping_hint(self) -> None:
+        self._show_bootstrapping_text("startup.bootstrapping")
+
+    def show_bootstrapping_hint_long(self) -> None:
+        self._show_bootstrapping_text("startup.bootstrapping_long")
+
     # ---- i18n ----
 
     def retranslate(self) -> None:
@@ -326,12 +348,34 @@ class StartupOverlay(QDialog):
         self.copy_report_btn.setText(self.i18n.t("startup.copy_report"))
         self.cancel_btn.setText(self.i18n.t("startup.cancel"))
 
-    def _step_text(self, step: str) -> str:
+    def _step_key(self, step: str, status: dict | None = None) -> str:
+        provider_kind = str((status or {}).get("provider_kind") or "")
+        if step == "ort_iobinding_runs" and provider_kind == "trt":
+            return "startup.step.ort_iobinding_runs_trt"
+        return f"startup.step.{step}"
+
+    def _step_has_translation(self, step: str, status: dict | None = None) -> bool:
+        if not step:
+            return False
+        key = self._step_key(step, status)
+        return self.i18n.t(key) != key
+
+    def _step_text(self, step: str, status: dict | None = None) -> str:
         if not step:
             return ""
-        key = f"startup.step.{step}"
+        key = self._step_key(step, status)
         translated = self.i18n.t(key)
-        return translated if translated != key else step.replace("_", " ")
+        text = translated if translated != key else step.replace("_", " ")
+        if step == "ort_iobinding_runs" and status is not None:
+            try:
+                done = int(status.get("run_done") or 0)
+                total = int(status.get("run_total") or 0)
+            except (TypeError, ValueError):
+                done = 0
+                total = 0
+            if done > 0 and total > 0:
+                text = f"{text} ({min(done, total)}/{total})"
+        return text
 
     def _step_index_for(self, step: str) -> int:
         try:
@@ -353,6 +397,9 @@ class StartupOverlay(QDialog):
             "elapsed_sec",
             "cold",
             "is_known_slow",
+            "provider_kind",
+            "run_done",
+            "run_total",
             "gpu_name",
             "compute_capability",
             "driver_version",
@@ -363,6 +410,63 @@ class StartupOverlay(QDialog):
         ):
             rows.append(f"{key:24s}: {status.get(key, '')}")
         return "\n".join(rows)
+
+    def _apply_hint(
+        self,
+        status: dict,
+        phase: str,
+        cold: bool,
+        known_slow: bool,
+        provider_kind: str,
+        elapsed: float,
+    ) -> None:
+        if phase == "failed":
+            self._set_hint(self.i18n.t("startup.hint_failed"), "warn")
+            return
+        if phase != "warming":
+            self.hint_label.setVisible(False)
+            return
+
+        tier: tuple[float, str, str] | None = None
+        for candidate in _REASSURANCE_TIERS:
+            if elapsed >= candidate[0]:
+                tier = candidate
+        if provider_kind == "trt" and (tier is None or tier[0] < 90.0):
+            self.hint_label.setVisible(False)
+        elif tier is not None and tier[0] >= 90.0:
+            self._set_hint(self._format_hint(tier[1], status, elapsed), tier[2])
+        elif known_slow and cold:
+            self._set_hint(self.i18n.t("startup.hint_known_slow"), "info")
+        elif tier is not None:
+            self._set_hint(self._format_hint(tier[1], status, elapsed), tier[2])
+        else:
+            self.hint_label.setVisible(False)
+
+    def _format_hint(self, key: str, status: dict, elapsed: float) -> str:
+        template = self.i18n.t(key)
+        values = {
+            "gpu": str(status.get("gpu_name") or "GPU"),
+            "cc": str(status.get("compute_capability") or "?"),
+            "ort": str(status.get("onnxruntime_version") or "?"),
+            "elapsed": int(elapsed),
+        }
+        try:
+            return template.format(**values)
+        except Exception:
+            return template
+
+    def _set_hint(self, text: str, severity: str) -> None:
+        self.hint_label.setStyleSheet(_HINT_STYLE_WARN if severity == "warn" else _HINT_STYLE_INFO)
+        self.hint_label.setText(text)
+        self.hint_label.setVisible(bool(text))
+
+    def _show_bootstrapping_text(self, key: str) -> None:
+        text = self.i18n.t(key)
+        self._base_message = text
+        self.message_label.setText(text)
+        self.progress.setRange(0, 0)
+        if not self._ellipsis_timer.isActive():
+            self._ellipsis_timer.start()
 
     def _tick_ellipsis(self) -> None:
         self._ellipsis_phase = (self._ellipsis_phase + 1) % 4

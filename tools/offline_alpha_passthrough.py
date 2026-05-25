@@ -29,6 +29,7 @@ from utils.subprocess_hidden import hidden_subprocess_kwargs, run_hidden_streami
 from utils.trt_manifest import (  # noqa: E402
     MATANYONE2_TRT_ONNX_NAME,
     TRT_MODEL_MATANYONE2,
+    TRT_MODEL_RVM,
     TRT_PROVIDER_CHAIN,
     cache_dir_for_model,
     cache_status,
@@ -55,7 +56,10 @@ def _configure_offline_rvm_tensorrt(model_path: Path) -> bool:
     is_mobile = model_path.resolve() == original_rvm_model_path().resolve()
     if wants_trt and is_mobile:
         try:
-            if cache_status() == "ready":
+            if cache_status(model_key=TRT_MODEL_RVM, scope="offline") == "ready":
+                cache_dir = cache_dir_for_model(TRT_MODEL_RVM, scope="offline")
+                config.ONNX_TRT_ENGINE_CACHE_PATH = cache_dir
+                os.environ["PT_ONNX_TRT_ENGINE_CACHE_PATH"] = str(cache_dir)
                 config.ONNX_PROVIDERS = [p.strip() for p in TRT_PROVIDER_CHAIN.split(",") if p.strip()]
                 print(f"[offline-alpha] RVM TensorRT enabled providers={config.ONNX_PROVIDERS}")
                 return True
@@ -615,7 +619,7 @@ class MatAnyone2OnnxEngine(OfflineMattingEngine):
         self.sensory_single_shape = tuple([1, *sensory_shape[1:]])
         # SAM3 provides the bootstrap mask. Matter is used here only for its
         # NV12 GPU upload/preprocess/composite helpers, not for RVM inference.
-        self.matter = Matter(config.ROOT / "models" / "rvm_resnet50_fp32.onnx", load_model=False)
+        self.matter = Matter(config.ROOT / "models" / "rvm_mobilenetv3_fp32.onnx", load_model=False)
         self.matter.reset_state()
         self.packer = _alpha_packer_from_args(self.matter, args) if args is not None else AlphaPacker(self.matter)
         self.eyes = [self._EyeState(), self._EyeState()]
@@ -1511,8 +1515,8 @@ def main() -> int:
     parser.add_argument("--audio", default="copy", choices=["off", "copy", "aac"])
     parser.add_argument("--progress", type=int, default=30)
     parser.add_argument("--no-warmup", action="store_true", help="disable matting warmup for quick offline tests")
-    parser.add_argument("--input-size", type=int, default=1024, help="override PT_MATTING_INPUT_SIZE before loading Matter")
-    parser.add_argument("--rvm-downsample-ratio", type=float, default=0.5,
+    parser.add_argument("--input-size", type=int, default=2048, help="override PT_MATTING_INPUT_SIZE before loading Matter")
+    parser.add_argument("--rvm-downsample-ratio", type=float, default=0.25,
                         help="override PT_RVM_DOWNSAMPLE_RATIO before loading RVM Matter")
     parser.add_argument("--alpha-stride", type=int, default=1, help="override PT_ALPHA_STRIDE before loading Matter")
     parser.add_argument("--sbs-batch", action=argparse.BooleanOptionalAction, default=False,
@@ -1537,6 +1541,9 @@ def main() -> int:
         config.MATTING_INPUT_SIZE = int(args.input_size)
     if args.rvm_downsample_ratio > 0:
         config.RVM_DOWNSAMPLE_RATIO = float(args.rvm_downsample_ratio)
+    if args.engine == "rvm":
+        config.RVM_SCENE_RESET = True
+        config.RVM_ALPHA_SMOOTH = True
     if args.alpha_stride > 0:
         config.ALPHA_STRIDE = int(args.alpha_stride)
     config.MATTING_SBS_BATCH = bool(args.sbs_batch)

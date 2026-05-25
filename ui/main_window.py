@@ -19,6 +19,7 @@ from ui.pages.subtitle_page import SUBTITLE_PAGE_HEIGHT, SUBTITLE_PAGE_WIDTH, Su
 from ui.resources import app_icon
 from ui.services.offline_process import OfflineProcess
 from ui.services.server_process import ServerProcess
+from ui.services.startup_diagnostics import LOG_PATH as UI_STARTUP_LOG_PATH, log_startup_event
 from ui.services.startup_status_poller import DEFAULT_PORT as STATUS_DEFAULT_PORT, StartupStatusPoller
 from ui.settings import ROOT as UI_ROOT, Settings
 from ui.styles import font_for_language
@@ -33,6 +34,8 @@ SUPPORTED_LANGUAGES = ("zh_CN", "en_US", "ja_JP")
 QT_MAX_WIDGET_SIZE = 16777215
 OFFLINE_PAGE_WIDTH = 600
 OFFLINE_PAGE_HEIGHT = 600
+STARTUP_BOOTSTRAP_HINT_ERRORS = 4      # 500 ms poll interval * 4 ~= 2 seconds.
+STARTUP_BOOTSTRAP_LONG_ERRORS = 60     # 500 ms poll interval * 60 ~= 30 seconds.
 
 
 class MainWindow(QMainWindow):
@@ -87,6 +90,10 @@ class MainWindow(QMainWindow):
         self.status_poller = StartupStatusPoller(port=STATUS_DEFAULT_PORT, parent=self)
         self.status_poller.updated.connect(self._on_startup_status)
         self.status_poller.finished.connect(self._on_startup_finished)
+        self.status_poller.error.connect(self._on_startup_error)
+        self._poll_error_streak = 0
+        self._poll_first_success = False
+        log_startup_event("main_window_init", status_port=STATUS_DEFAULT_PORT)
         self.runtime_status_timer = QTimer(self)
         self.runtime_status_timer.setInterval(1500)
         self.runtime_status_timer.timeout.connect(self._poll_runtime_status)
@@ -165,9 +172,18 @@ class MainWindow(QMainWindow):
         self.settings.save()
         env = self.settings.server_env()
         env["PT_DEBUG_LOGS"] = "1" if self.home.debug_toggle.isChecked() else "0"
+        log_startup_event(
+            "server_start_requested",
+            status_port=STATUS_DEFAULT_PORT,
+            pt_startup_status_port=env.get("PT_STARTUP_STATUS_PORT"),
+            providers=env.get("PT_ONNX_PROVIDERS"),
+            debug_logs=env.get("PT_DEBUG_LOGS"),
+            ui_startup_log=str(UI_STARTUP_LOG_PATH),
+        )
         self.home.clear_log()
         self._set_server_action_pending("starting")
         self.server.start(env)
+        log_startup_event("server_start_called", server_running=self.server.is_running(), pid=self.server.process.process_id())
         # Show the startup overlay so non-technical users see a friendly
         # progress dialog while the server warms up the GPU (potentially
         # 2+ minutes on first run with sm_120 GPUs).
@@ -215,17 +231,52 @@ class MainWindow(QMainWindow):
             self.startup_overlay.cancelRequested.connect(self._cancel_startup)
             self.startup_overlay.copyReportRequested.connect(self._copy_startup_report)
         overlay = self.startup_overlay
+        self._poll_error_streak = 0
+        self._poll_first_success = False
+        log_startup_event("overlay_open")
         overlay.reset()
         overlay.show()
         overlay.raise_()
         overlay.activateWindow()
 
     def _on_startup_status(self, status: dict) -> None:
+        self._poll_first_success = True
+        self._poll_error_streak = 0
+        log_startup_event(
+            "ui_status_received",
+            phase=status.get("phase"),
+            step=status.get("step"),
+            progress=status.get("progress"),
+            elapsed_sec=status.get("elapsed_sec"),
+            provider_kind=status.get("provider_kind"),
+            visible=bool(self.startup_overlay is not None and self.startup_overlay.isVisible()),
+        )
         if self.startup_overlay is None or not self.startup_overlay.isVisible():
             return
         self.startup_overlay.apply_status(status)
 
+    def _on_startup_error(self, message: str) -> None:
+        log_startup_event(
+            "ui_status_error",
+            message=message,
+            streak=self._poll_error_streak + 1,
+            first_success=self._poll_first_success,
+            visible=bool(self.startup_overlay is not None and self.startup_overlay.isVisible()),
+        )
+        if self._poll_first_success:
+            return
+        if self.startup_overlay is None or not self.startup_overlay.isVisible():
+            return
+        self._poll_error_streak += 1
+        if self._poll_error_streak >= STARTUP_BOOTSTRAP_LONG_ERRORS:
+            log_startup_event("overlay_bootstrapping_long", streak=self._poll_error_streak)
+            self.startup_overlay.show_bootstrapping_hint_long()
+        elif self._poll_error_streak >= STARTUP_BOOTSTRAP_HINT_ERRORS:
+            log_startup_event("overlay_bootstrapping", streak=self._poll_error_streak)
+            self.startup_overlay.show_bootstrapping_hint()
+
     def _on_startup_finished(self, phase: str) -> None:
+        log_startup_event("ui_startup_finished", phase=phase)
         if self.startup_overlay is None:
             return
         if phase == "listening":
@@ -237,6 +288,7 @@ class MainWindow(QMainWindow):
             merged["phase"] = phase
             merged["progress"] = 1.0
             self.startup_overlay.apply_status(merged)
+            log_startup_event("overlay_close_finished", phase=phase, via="poller")
             self.startup_overlay.close()
         elif phase == "failed":
             self._set_server_action_pending(None)
@@ -255,6 +307,7 @@ class MainWindow(QMainWindow):
         # server process so resources are released cleanly.
         self.status_poller.stop()
         self._set_server_action_pending("stopping")
+        log_startup_event("startup_cancel_requested")
         self.server.stop()
         if self.startup_overlay is not None:
             self.startup_overlay.close()
@@ -305,12 +358,19 @@ class MainWindow(QMainWindow):
         merged["phase"] = "listening"
         merged["progress"] = 1.0
         merged["message"] = (merged.get("message") or "").strip() or self.i18n.t("startup.complete")
+        log_startup_event(
+            "stdout_ready_fallback",
+            last_phase=(last or {}).get("phase") if isinstance(last, dict) else None,
+            text=text.strip()[:200],
+        )
         self.status_poller.stop()
         self.startup_overlay.apply_status(merged)
+        log_startup_event("overlay_close_finished", phase="listening", via="stdout_fallback")
         self.startup_overlay.close()
         self._set_server_action_pending(None)
 
     def _server_state_changed(self, running: bool) -> None:
+        log_startup_event("server_state_changed", running=running, pid=self.server.process.process_id())
         if running:
             self.runtime_status_timer.start()
             self._poll_runtime_status()
@@ -330,6 +390,7 @@ class MainWindow(QMainWindow):
                     # here. After warmed the server still has to install
                     # firewall rules, start SSDP, and bind the DLNA HTTP port.
                     # A process that died at ``warmed`` is a failure.
+                    log_startup_event("overlay_close_server_stopped", last_phase=phase)
                     self.startup_overlay.close()
                 else:
                     # Server process exited before becoming ready. The 8299
@@ -346,6 +407,7 @@ class MainWindow(QMainWindow):
                         merged["message"] = self.i18n.t("startup.failed_generic")
                     if not merged.get("detail"):
                         merged["detail"] = "server process exited before warmup completed"
+                    log_startup_event("overlay_failed_server_stopped", last_phase=phase, detail=merged.get("detail"))
                     self.startup_overlay.apply_status(merged)
 
     def _set_server_action_pending(self, action: str | None) -> None:

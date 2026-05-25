@@ -54,10 +54,11 @@ def _utc_now() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
 
-def _clean_cache_dir(cache_dir: Path) -> None:
+def _clean_cache_dir(cache_dir: Path, preserve_names: set[str] | None = None) -> None:
+    preserve_names = preserve_names or set()
     cache_dir.mkdir(parents=True, exist_ok=True)
     for path in cache_dir.iterdir():
-        if path.name == "build.log":
+        if path.name == "build.log" or path.name in preserve_names:
             continue
         if path.is_dir():
             shutil.rmtree(path, ignore_errors=True)
@@ -66,6 +67,61 @@ def _clean_cache_dir(cache_dir: Path) -> None:
                 path.unlink()
             except OSError:
                 pass
+
+
+def _copy_file_if_usable(source: Path, target: Path) -> bool:
+    try:
+        if not source.is_file() or source.stat().st_size <= 0:
+            return False
+        target.parent.mkdir(parents=True, exist_ok=True)
+        if target.exists() and target.stat().st_size == source.stat().st_size:
+            return False
+        shutil.copy2(source, target)
+        return True
+    except OSError:
+        return False
+
+
+def _copy_rvm_shared_1024_artifacts(source_cache: Path, target_cache: Path, source_model: Path) -> int:
+    from utils.rvm_static_onnx import static_rvm_model_path
+    from utils.trt_manifest import is_engine_artifact, shape_inferred_model_path
+
+    if not source_cache.exists():
+        return 0
+    required = [
+        shape_inferred_model_path(source_model, source_cache),
+        static_rvm_model_path(source_model, source_cache, 1, 1024, 0.5),
+        static_rvm_model_path(source_model, source_cache, 2, 1024, 0.5),
+    ]
+    engines = [path for path in source_cache.iterdir() if is_engine_artifact(path)]
+    if not all(path.is_file() for path in required) or not engines:
+        return 0
+
+    copied = 0
+    for source in required:
+        if _copy_file_if_usable(source, target_cache / source.name):
+            copied += 1
+    for engine in engines:
+        if _copy_file_if_usable(engine, target_cache / engine.name):
+            copied += 1
+        profile = engine.with_suffix(".profile")
+        if profile.exists() and _copy_file_if_usable(profile, target_cache / profile.name):
+            copied += 1
+    return copied
+
+
+def _rvm_shared_1024_artifacts_available(cache_dir: Path, source_model: Path) -> bool:
+    from utils.rvm_static_onnx import static_rvm_model_path
+    from utils.trt_manifest import is_engine_artifact, shape_inferred_model_path
+
+    if not cache_dir.exists():
+        return False
+    required = [
+        shape_inferred_model_path(source_model, cache_dir),
+        static_rvm_model_path(source_model, cache_dir, 1, 1024, 0.5),
+        static_rvm_model_path(source_model, cache_dir, 2, 1024, 0.5),
+    ]
+    return all(path.is_file() for path in required) and any(is_engine_artifact(path) for path in cache_dir.iterdir())
 
 
 def _shape_inferred_model_path(model_path: Path, cache_dir: Path) -> Path:
@@ -239,6 +295,7 @@ def main(argv: list[str] | None = None) -> int:
         os.environ.update(base_environment())
         configure_gpu_runtime_cache()
         from utils.trt_manifest import (
+            MATANYONE2_MODEL_KEY,
             TRT_MODEL_MATANYONE2,
             TRT_MODEL_RVM,
             build_manifest,
@@ -255,7 +312,8 @@ def main(argv: list[str] | None = None) -> int:
             cache_dir = cache_dir_for_model(model_key)
             config.ONNX_TRT_ENGINE_CACHE_PATH = cache_dir
             os.environ["PT_ONNX_TRT_ENGINE_CACHE_PATH"] = str(cache_dir)
-        _clean_cache_dir(cache_dir)
+        preserve_names = {"offline", MATANYONE2_MODEL_KEY} if model_key == TRT_MODEL_RVM and cache_dir.name != "offline" else set()
+        _clean_cache_dir(cache_dir, preserve_names=preserve_names)
         if model_key == TRT_MODEL_MATANYONE2:
             source_model_path = matanyone2_trt_source_model_path()
             if not source_model_path.is_file():
@@ -283,18 +341,33 @@ def main(argv: list[str] | None = None) -> int:
             return 0
 
         source_model_path = original_rvm_model_path()
+        if int(args.input_size) == 1024 and float(args.downsample) == 0.5:
+            offline_cache_dir = cache_dir_for_model(TRT_MODEL_RVM, scope="offline")
+            from utils.trt_manifest import cache_status
+
+            if cache_status(model_key=TRT_MODEL_RVM, scope="offline") == "ready":
+                copied = _copy_rvm_shared_1024_artifacts(offline_cache_dir, cache_dir, source_model_path)
+                if copied:
+                    _print_event(f"INFO:Reused {copied} offline TensorRT cache artifacts for realtime 1024")
         trt_model_path = _shape_inferred_model_path(source_model_path, cache_dir)
         static_b1_path = _static_model_path(source_model_path, cache_dir, 1, int(args.input_size), float(args.downsample))
         static_b2_path = _static_model_path(source_model_path, cache_dir, 2, int(args.input_size), float(args.downsample))
 
         _print_event("STAGE:1:start:Building single-eye engine")
         stage_start = time.perf_counter()
-        _run_static_shape(static_b1_path, 1, int(args.input_size), float(args.downsample))
+        reused_shared_1024 = int(args.input_size) == 1024 and float(args.downsample) == 0.5 and _rvm_shared_1024_artifacts_available(cache_dir, source_model_path)
+        if reused_shared_1024:
+            _print_event("INFO:Realtime RVM 1024 cache already available; skipping single-eye TensorRT build")
+        else:
+            _run_static_shape(static_b1_path, 1, int(args.input_size), float(args.downsample))
         _print_event(f"STAGE:1:done:{int(round(time.perf_counter() - stage_start))}")
 
         _print_event("STAGE:2:start:Building SBS dual-eye engine")
         stage_start = time.perf_counter()
-        _run_static_shape(static_b2_path, 2, int(args.input_size), float(args.downsample))
+        if reused_shared_1024:
+            _print_event("INFO:Realtime RVM 1024 cache already available; skipping SBS TensorRT build")
+        else:
+            _run_static_shape(static_b2_path, 2, int(args.input_size), float(args.downsample))
         _print_event(f"STAGE:2:done:{int(round(time.perf_counter() - stage_start))}")
 
         _print_event("STAGE:3:start:Solidifying runtime cache")

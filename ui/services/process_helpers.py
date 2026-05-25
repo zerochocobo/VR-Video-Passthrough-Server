@@ -40,6 +40,13 @@ def trt_warmup_command() -> tuple[str, list[str]]:
     return python_executable(), ["-m", "ui.services.trt_warmup_process"]
 
 
+def offline_trt_warmup_command() -> tuple[str, list[str]]:
+    if getattr(sys, "frozen", False):
+        server, args = server_command()
+        return server, [*args, "tool", "warmup_offline_trt"]
+    return python_executable(), [str(ROOT / "tools" / "warmup_offline_trt.py")]
+
+
 def base_environment(extra: dict[str, str] | None = None) -> dict[str, str]:
     env = dict(os.environ)
     if extra:

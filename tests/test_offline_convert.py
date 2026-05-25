@@ -23,14 +23,14 @@ class OfflineConvertTests(unittest.TestCase):
         src = Path("sample.mp4")
         green_args = SimpleNamespace(command="single", mode="green", engine="rvm_fast", start=300.0, duration=15.0)
         alpha_args = SimpleNamespace(command="single", mode="alpha", engine="matanyone2", start=5.0, duration=300.0)
-        all_args = SimpleNamespace(command="single", mode="green", engine="rvm_balanced", start=0.0, duration=0.0)
+        all_args = SimpleNamespace(command="single", mode="green", engine="rvm_fast", start=0.0, duration=0.0)
 
         self.assertEqual(
             convert._single_out(src, green_args, 3840, 1920),
             Path("sample_rvm1_S000500_15S_LR_180_SBS_passthrough.mp4"),
         )
         self.assertEqual(convert._single_out(src, alpha_args), Path("sample_matanyone2_S000005_5M_LR_180_FISHEYE_F180_alpha.mp4"))
-        self.assertEqual(convert._single_out(src, all_args, 1920, 1080), Path("sample_rvm2_S000000_ALL_passthrough.mp4"))
+        self.assertEqual(convert._single_out(src, all_args, 1920, 1080), Path("sample_rvm1_S000000_ALL_passthrough.mp4"))
 
     def test_batch_video_files_skip_passthrough(self) -> None:
         root = Path("runtime_cache/test_offline_convert")
@@ -51,6 +51,7 @@ class OfflineConvertTests(unittest.TestCase):
             duration=30.0,
             fps=0.0,
             input_size=1024,
+            rvm_downsample_ratio=0.5,
             skip_frames=2,
             bitrate="source",
             preset="P5",
@@ -62,10 +63,11 @@ class OfflineConvertTests(unittest.TestCase):
         self.assertIn("30.0", cmd)
         self.assertIn("--model", cmd)
         self.assertIn(str(convert.ROOT / "models" / "rvm_mobilenetv3_fp32.onnx"), cmd)
-        self.assertNotIn(str(convert.ROOT / "models" / "rvm_resnet50_fp32.onnx"), cmd)
         self.assertNotIn("--fps", cmd)
         self.assertIn("--input-size", cmd)
         self.assertIn("1024", cmd)
+        self.assertIn("--rvm-downsample-ratio", cmd)
+        self.assertIn("0.5", cmd)
         self.assertIn("--alpha-stride", cmd)
         self.assertIn("1", cmd)
         self.assertIn("--sbs-batch", cmd)
@@ -108,9 +110,9 @@ class OfflineConvertTests(unittest.TestCase):
         self.assertNotIn("PT_OFFLINE_RVM_TRT", rvm_env)
         self.assertNotIn("PT_OFFLINE_MATANYONE2_TRT", mat_env)
 
-    def test_non_fast_offline_env_strips_tensorrt(self) -> None:
+    def test_matanyone2_offline_env_strips_tensorrt_when_cache_missing(self) -> None:
         base = {"PT_ONNX_PROVIDERS": "TensorrtExecutionProvider,CUDAExecutionProvider,CPUExecutionProvider"}
-        for engine in ("rvm_balanced", "matanyone2"):
+        for engine in ("matanyone2",):
             with self.subTest(engine=engine):
                 with patch.object(convert, "cache_status", return_value="missing"):
                     env = convert._offline_child_env(SimpleNamespace(engine=engine), base)
@@ -126,6 +128,7 @@ class OfflineConvertTests(unittest.TestCase):
             duration=0.0,
             fps=30.0,
             input_size=1024,
+            rvm_downsample_ratio=0.5,
             skip_frames=0,
             bitrate="source",
             preset="P5",
@@ -136,21 +139,6 @@ class OfflineConvertTests(unittest.TestCase):
         self.assertEqual(cmd[:3], [r"C:\App\pt_core.exe", "tool", "offline_passthrough"])
         self.assertNotIn("offline_passthrough.py", cmd[1:3])
 
-    def test_balanced_engine_uses_resnet_model(self) -> None:
-        args = SimpleNamespace(
-            mode="alpha",
-            engine="rvm_balanced",
-            start=0.0,
-            duration=0.0,
-            fps=0.0,
-            input_size=1024,
-            skip_frames=0,
-            bitrate="source",
-            preset="P4",
-        )
-        cmd = convert._base_cmd(args, Path("input.mp4"), Path("out.mp4"))
-        self.assertIn(str(convert.ROOT / "models" / "rvm_resnet50_fp32.onnx"), cmd)
-
     def test_matanyone2_command_does_not_receive_rvm_speed_args(self) -> None:
         args = SimpleNamespace(
             mode="alpha",
@@ -159,6 +147,7 @@ class OfflineConvertTests(unittest.TestCase):
             duration=0.0,
             fps=30.0,
             input_size=1024,
+            rvm_downsample_ratio=0.5,
             skip_frames=2,
             bitrate="source",
             preset="P4",
@@ -172,6 +161,7 @@ class OfflineConvertTests(unittest.TestCase):
         self.assertIn("--cq", cmd)
         self.assertIn("-1", cmd)
         self.assertNotIn("--input-size", cmd)
+        self.assertNotIn("--rvm-downsample-ratio", cmd)
         self.assertIn("--alpha-stride", cmd)
         self.assertIn("1", cmd)
 
@@ -218,11 +208,12 @@ class OfflineConvertTests(unittest.TestCase):
                 out_dir=str(root / "out"),
                 out="",
                 mode="alpha",
-                engine="rvm_balanced",
+                engine="rvm_fast",
                 start=300.0,
                 duration=15.0,
                 fps=0.0,
                 input_size=1024,
+                rvm_downsample_ratio=0.5,
                 skip_frames=0,
                 bitrate="source",
                 preset="P4",
@@ -236,7 +227,7 @@ class OfflineConvertTests(unittest.TestCase):
         finally:
             convert._base_cmd = original_base_cmd
 
-        self.assertEqual(seen["out"], (root / "out" / "demo_rvm2_S000500_15S_LR_180_FISHEYE_F180_alpha.mp4").resolve())
+        self.assertEqual(seen["out"], (root / "out" / "demo_rvm1_S000500_15S_LR_180_FISHEYE_F180_alpha.mp4").resolve())
 
 
 if __name__ == "__main__":

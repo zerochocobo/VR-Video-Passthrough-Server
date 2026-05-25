@@ -28,9 +28,11 @@ import threading
 import time
 from typing import Any
 from urllib.error import URLError
-from urllib.request import urlopen
+from urllib.request import ProxyHandler, Request, build_opener
 
 from PySide6.QtCore import QObject, QTimer, Signal
+
+from ui.services.startup_diagnostics import log_startup_event
 
 
 DEFAULT_PORT = 8299
@@ -39,6 +41,7 @@ DEFAULT_PORT = 8299
 # install firewall rules, start SSDP, and bind the DLNA HTTP port before the
 # product is actually usable. The overlay must wait for ``listening``.
 TERMINAL_PHASES = frozenset({"listening", "failed", "shutting_down"})
+_DIRECT_OPENER = build_opener(ProxyHandler({}))
 
 
 class StartupStatusPoller(QObject):
@@ -88,6 +91,14 @@ class StartupStatusPoller(QObject):
         self._inflight = False
         self._generation += 1
         self._started_at = time.monotonic()
+        log_startup_event(
+            "poller_start",
+            port=self.port,
+            interval_ms=self._timer.interval(),
+            timeout_sec=self.timeout_sec,
+            max_duration_sec=self.max_duration_sec,
+            generation=self._generation,
+        )
         # First tick immediately so the UI does not wait one interval to react.
         self._tick()
         self._timer.start()
@@ -98,6 +109,7 @@ class StartupStatusPoller(QObject):
         self._running = False
         self._timer.stop()
         self._generation += 1
+        log_startup_event("poller_stop", generation=self._generation)
 
     def is_running(self) -> bool:
         return self._running
@@ -113,6 +125,7 @@ class StartupStatusPoller(QObject):
         if self._inflight:
             # Previous request has not returned yet. Skip this slot to avoid
             # piling up worker threads against a hanging endpoint.
+            log_startup_event("poller_tick_skipped_inflight", generation=self._generation)
             return
         self._inflight = True
         url = f"http://127.0.0.1:{self.port}/status"
@@ -128,14 +141,18 @@ class StartupStatusPoller(QObject):
     def _fetch_worker(self, generation: int, url: str, timeout: float) -> None:
         """Run in a daemon thread. Must never touch Qt widgets directly."""
         try:
-            with urlopen(url, timeout=timeout) as resp:
+            request = Request(url, headers={"Cache-Control": "no-cache"})
+            with _DIRECT_OPENER.open(request, timeout=timeout) as resp:
                 raw = resp.read()
         except URLError as e:
+            log_startup_event("poller_fetch_error", generation=generation, url=url, error=f"unreachable: {e.reason}")
             self._gotError.emit(generation, f"unreachable: {e.reason}")
             return
         except Exception as e:  # pragma: no cover - defensive
+            log_startup_event("poller_fetch_error", generation=generation, url=url, error=f"poll failed: {e}")
             self._gotError.emit(generation, f"poll failed: {e}")
             return
+        log_startup_event("poller_fetch_ok", generation=generation, url=url, bytes=len(raw))
         self._gotResponse.emit(generation, raw)
 
     def _handle_error(self, generation: int, message: str) -> None:
@@ -144,6 +161,7 @@ class StartupStatusPoller(QObject):
         self._inflight = False
         if not self._running:
             return
+        log_startup_event("poller_error", generation=generation, message=message)
         self.error.emit(message)
 
     def _handle_response(self, generation: int, raw: bytes) -> None:
@@ -155,14 +173,25 @@ class StartupStatusPoller(QObject):
         try:
             data: dict[str, Any] = json.loads(raw.decode("utf-8", "replace"))
         except Exception as e:
+            log_startup_event("poller_decode_error", generation=generation, error=str(e), bytes=len(raw))
             self.error.emit(f"decode failed: {e}")
             return
 
+        log_startup_event(
+            "poller_update",
+            generation=generation,
+            phase=data.get("phase"),
+            step=data.get("step"),
+            progress=data.get("progress"),
+            elapsed_sec=data.get("elapsed_sec"),
+            provider_kind=data.get("provider_kind"),
+        )
         self.updated.emit(data)
         phase = str(data.get("phase") or "")
         if phase and phase in TERMINAL_PHASES and phase != self._last_phase:
             self._last_phase = phase
             self.stop()
+            log_startup_event("poller_finished", generation=generation, phase=phase)
             self.finished.emit(phase)
 
     def _finish_timeout(self, elapsed: float) -> None:
@@ -175,6 +204,7 @@ class StartupStatusPoller(QObject):
             "reason": "startup_status_timeout",
             "elapsed_sec": elapsed,
         }
+        log_startup_event("poller_timeout", elapsed_sec=elapsed)
         self.updated.emit(data)
         self.stop()
         self.finished.emit("failed")

@@ -19,6 +19,40 @@ class LightMatchCoeffTests(unittest.TestCase):
         self.assertTrue(tables.identity)
         self.assertEqual(apply_light_match_yuv(100, 120, 130, tables), (100, 120, 130))
 
+    def test_daylight_preset_is_d65_identity(self) -> None:
+        tables = build_light_match_tables(
+            LightMatchParams(
+                enabled=True,
+                temp_k=6500,
+                tint=0,
+                exposure_ev=0.0,
+                contrast=1.0,
+                gamma=1.0,
+                saturation=1.0,
+                preset="daylight",
+            )
+        )
+        self.assertTrue(tables.identity)
+        self.assertEqual(apply_light_match_yuv(128, 90, 200, tables), (128, 90, 200))
+
+    def test_night_cool_preset_shifts_toward_blue(self) -> None:
+        tables = build_light_match_tables(
+            LightMatchParams(
+                enabled=True,
+                temp_k=8000,
+                tint=0,
+                exposure_ev=0.0,
+                contrast=1.0,
+                gamma=1.0,
+                saturation=1.0,
+                preset="night_cool",
+            )
+        )
+        self.assertFalse(tables.identity)
+        _y, u, v = apply_light_match_yuv(128, 128, 128, tables)
+        self.assertGreater(u, 128)
+        self.assertLess(v, 128)
+
     def test_warm_temperature_shifts_white_warm(self) -> None:
         tables = build_light_match_tables(LightMatchParams(enabled=True, temp_k=3000))
         self.assertFalse(tables.identity)
@@ -113,6 +147,7 @@ class LightMatchRuntimeTests(unittest.TestCase):
         runtime_settings.set_light_match({"enabled": True, "temp_k": 3000})
         reset = runtime_settings.reset_for_test()
         self.assertFalse(reset.enabled)
+        self.assertEqual(reset.temp_k, 6500)
         self.assertEqual(reset.preset, "daylight")
         self.assertEqual(reset.version, 0)
 

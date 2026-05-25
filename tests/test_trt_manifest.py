@@ -8,6 +8,7 @@ from unittest.mock import patch
 
 import config
 from utils import trt_manifest
+from utils.rvm_static_onnx import static_rvm_model_path
 
 
 class TrtManifestTests(unittest.TestCase):
@@ -50,6 +51,57 @@ class TrtManifestTests(unittest.TestCase):
         trt_manifest.shape_inferred_model_path(cache_dir=self.root).write_bytes(b"onnx")
         (self.root / "rvm.engine").write_bytes(b"e" * (1024 * 1024))
         self.assertEqual(trt_manifest.cache_status(actual_fp=fp), "ready")
+
+    def test_rvm_ready_requires_all_offline_precision_tier_artifacts(self) -> None:
+        fp = self._fingerprint()
+        fp["offline_precision_tiers"] = True
+        fp["offline_shapes"] = [
+            {"input_size": input_size, "batch": batch, "downsample_ratio": downsample}
+            for input_size, batch, downsample in trt_manifest.RVM_OFFLINE_TRT_SHAPES
+        ]
+        manifest = trt_manifest.build_manifest(
+            fp,
+            [{"shape": f"shape_{idx}", "size_mb": 1, "built_at": "2026-05-20T00:00:00Z"} for idx in range(6)],
+            3,
+        )
+        offline_cache = trt_manifest.cache_dir_for_model(trt_manifest.TRT_MODEL_RVM, scope="offline")
+        trt_manifest.save_manifest(manifest, scope="offline")
+        trt_manifest.shape_inferred_model_path(cache_dir=offline_cache).write_bytes(b"onnx")
+        source = trt_manifest.original_rvm_model_path()
+        for input_size, batch, downsample in trt_manifest.RVM_OFFLINE_TRT_SHAPES[:-1]:
+            static_rvm_model_path(source, offline_cache, batch, input_size, downsample).write_bytes(b"onnx")
+        (offline_cache / "rvm.engine").write_bytes(b"e" * (1024 * 1024))
+        self.assertEqual(trt_manifest.cache_status(actual_fp=self._fingerprint(), scope="offline"), "stale")
+
+        input_size, batch, downsample = trt_manifest.RVM_OFFLINE_TRT_SHAPES[-1]
+        static_rvm_model_path(source, offline_cache, batch, input_size, downsample).write_bytes(b"onnx")
+        self.assertEqual(trt_manifest.cache_status(actual_fp=self._fingerprint(), scope="offline"), "ready")
+        self.assertEqual(trt_manifest.cache_status(actual_fp=self._fingerprint()), "missing")
+
+    def test_clearing_realtime_rvm_cache_preserves_offline_scope(self) -> None:
+        (self.root / "manifest.json").write_text("{}", encoding="utf-8")
+        (self.root / "runtime.engine").write_bytes(b"e" * (1024 * 1024))
+        offline_cache = self.root / "offline"
+        offline_cache.mkdir()
+        (offline_cache / "manifest.json").write_text("{}", encoding="utf-8")
+        matanyone_cache = self.root / trt_manifest.MATANYONE2_MODEL_KEY
+        matanyone_cache.mkdir()
+        (matanyone_cache / "manifest.json").write_text("{}", encoding="utf-8")
+
+        trt_manifest.clear_cache(trt_manifest.TRT_MODEL_RVM)
+
+        self.assertFalse((self.root / "manifest.json").exists())
+        self.assertFalse((self.root / "runtime.engine").exists())
+        self.assertTrue((offline_cache / "manifest.json").exists())
+        self.assertTrue((matanyone_cache / "manifest.json").exists())
+
+    def test_offline_scope_is_idempotent_when_base_is_already_offline(self) -> None:
+        offline_base = self.root / "offline"
+        with patch.object(config, "ONNX_TRT_ENGINE_CACHE_PATH", offline_base):
+            self.assertEqual(
+                trt_manifest.cache_dir_for_model(trt_manifest.TRT_MODEL_RVM, scope="offline"),
+                offline_base.resolve(),
+            )
 
     def test_shape_inferred_model_and_tiny_engine_are_not_ready_cache(self) -> None:
         fp = self._fingerprint()

@@ -22,10 +22,10 @@ class OfflineOutputDetectionTests(unittest.TestCase):
         self.assertTrue(matches_offline_output_for_source(source, Path("movie_LR_180_FISHEYE_alpha.mp4")))
         self.assertTrue(matches_offline_output_for_source(source, Path("movie_LR_180_FISHEYE_F180_alpha.mp4")))
         self.assertTrue(matches_offline_output_for_source(source, Path("movie_SBS_F180_alpha.mp4")))
-        self.assertTrue(matches_offline_output_for_source(source, Path("movie_rvm2_S000000_ALL_FISHEYE_alpha.mp4")))
-        self.assertTrue(matches_offline_output_for_source(source, Path("movie_rvm2_S000000_ALL_LR_180_FISHEYE_alpha.mp4")))
-        self.assertTrue(matches_offline_output_for_source(source, Path("movie_rvm2_S000000_ALL_LR_180_FISHEYE_F180_alpha.mp4")))
-        self.assertTrue(matches_offline_output_for_source(source, Path("movie_rvm2_S000000_ALL_SBS_F180_alpha.mp4")))
+        self.assertTrue(matches_offline_output_for_source(source, Path("movie_rvm1_S000000_ALL_FISHEYE_alpha.mp4")))
+        self.assertTrue(matches_offline_output_for_source(source, Path("movie_rvm1_S000000_ALL_LR_180_FISHEYE_alpha.mp4")))
+        self.assertTrue(matches_offline_output_for_source(source, Path("movie_rvm1_S000000_ALL_LR_180_FISHEYE_F180_alpha.mp4")))
+        self.assertTrue(matches_offline_output_for_source(source, Path("movie_rvm1_S000000_ALL_SBS_F180_alpha.mp4")))
         self.assertTrue(matches_offline_output_for_source(source, Path("movie_matanyone2_S000005_5M_3D_alpha.mp4")))
 
     def test_rejects_unrelated_names(self) -> None:

@@ -1,13 +1,14 @@
 from __future__ import annotations
 
 import threading
+from pathlib import Path
 
 from PySide6.QtCore import QObject, Qt, QUrl, Signal
 from PySide6.QtGui import QDesktopServices
-from PySide6.QtWidgets import QDialog, QHBoxLayout, QLabel, QProgressBar, QPushButton, QVBoxLayout
+from PySide6.QtWidgets import QDialog, QHBoxLayout, QLabel, QProgressBar, QPushButton, QSizePolicy, QVBoxLayout
 
 from ui.services.hidden_process import HiddenProcess
-from ui.services.process_helpers import base_environment, trt_warmup_command
+from ui.services.process_helpers import base_environment, offline_trt_warmup_command, trt_warmup_command
 from utils.tensorrt_runtime_libs import (
     TENSORRT_CU12_LIBS_WHL_URL,
     TENSORRT_CU12_LIBS_WHL_SIZE_BYTES,
@@ -34,10 +35,11 @@ class _TensorRTDownloadSignals(QObject):
 
 
 class TensorRTConfigDialog(QDialog):
-    def __init__(self, i18n, parent=None, model_key: str | None = None) -> None:
+    def __init__(self, i18n, parent=None, model_key: str | None = None, scope: str | None = None) -> None:
         super().__init__(parent)
         self.i18n = i18n
         self.model_key = normalized_model_key(model_key)
+        self.scope = "offline" if self.model_key == TRT_MODEL_RVM and str(scope or "").lower() == "offline" else None
         self.process: HiddenProcess | None = None
         self.download_signals = _TensorRTDownloadSignals(self)
         self.downloading = False
@@ -47,6 +49,9 @@ class TensorRTConfigDialog(QDialog):
         self.setWindowTitle(self.i18n.t("trt.title"))
 
         self.info = QLabel()
+        self.info.setWordWrap(True)
+        self.info.setMinimumWidth(0)
+        self.info.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
         self.info.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         self.status_label = QLabel()
         self.status_label.setStyleSheet("font-weight: 700;")
@@ -54,14 +59,17 @@ class TensorRTConfigDialog(QDialog):
         self.fps_hint_label.setWordWrap(True)
         self.fps_hint_label.setStyleSheet("color: #1677c7; font-weight: 600;")
         self.progress = QProgressBar()
-        self.progress.setRange(0, 3)
+        self.progress.setRange(0, 6 if self.scope == "offline" else 3)
         self.progress.setValue(0)
         self.progress.setTextVisible(True)
         self.progress.setVisible(False)
         self.stage_label = QLabel("")
         self.stage_label.setWordWrap(True)
+        self.stage_label.setMinimumWidth(0)
         self.stage_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         self.engines_label = QLabel("")
+        self.engines_label.setWordWrap(True)
+        self.engines_label.setMinimumWidth(0)
 
         self.download_button = QPushButton()
         self.manual_download_button = QPushButton()
@@ -97,12 +105,13 @@ class TensorRTConfigDialog(QDialog):
         layout.addWidget(self.stage_label)
         layout.addWidget(self.engines_label)
         layout.addLayout(buttons)
+        self.setMinimumWidth(560)
         self.resize(560, 340)
         self._refresh()
 
     def _status(self) -> str:
         try:
-            return cache_status(model_key=self.model_key)
+            return cache_status(model_key=self.model_key, scope=self.scope)
         except Exception:
             return "failed"
 
@@ -115,10 +124,29 @@ class TensorRTConfigDialog(QDialog):
             return self.i18n.t("trt.description_matanyone2")
         return self.i18n.t("trt.description")
 
+    def _manifest_path(self):
+        if self.scope is None:
+            return manifest_path(self.model_key)
+        return manifest_path(self.model_key, scope=self.scope)
+
+    @staticmethod
+    def _compact_path(path: Path, max_chars: int = 76) -> str:
+        text = str(path)
+        if len(text) <= max_chars:
+            return text
+        parts = path.parts
+        if len(parts) >= 3:
+            suffix = str(Path(*parts[-3:]))
+            drive = parts[0]
+            compact = f"{drive}\\...\\{suffix}" if drive.endswith("\\") or drive.endswith(":\\") else f"...\\{suffix}"
+            if len(compact) <= max_chars:
+                return compact
+        return "..." + text[-max(0, max_chars - 3):]
+
     def _refresh(self, reset_progress: bool = True) -> None:
         libs = check_tensorrt_runtime_libs()
         status = self._status()
-        manifest = load_manifest_for_model(self.model_key) or {}
+        manifest = load_manifest_for_model(self.model_key, scope=self.scope) or {}
         saved_fp = manifest.get("fingerprint") if isinstance(manifest.get("fingerprint"), dict) else {}
         try:
             actual_fp = collect_fingerprint(self.model_key)
@@ -146,10 +174,10 @@ class TensorRTConfigDialog(QDialog):
             f"{self.i18n.t('trt.gpu')}: {fp.get('gpu_name') or libs.gpu_name or '-'}",
             f"{self.i18n.t('trt.driver')}: {fp.get('driver_version') or '-'}",
             f"{self.i18n.t('trt.tensorrt')}: {fp.get('trt_version') or '-'}",
-            f"{self.i18n.t('trt.cache_path')}: {manifest_path(self.model_key).parent}",
+            f"{self.i18n.t('trt.cache_path')}: {self._compact_path(self._manifest_path().parent)}",
         ]
         if libs.frozen:
-            details.append(f"{self.i18n.t('trt.runtime_lib_path')}: {libs.lib_dir}")
+            details.append(f"{self.i18n.t('trt.runtime_lib_path')}: {self._compact_path(Path(libs.lib_dir))}")
             if libs.compute_capability:
                 details.append(f"{self.i18n.t('trt.sm_library')}: {libs.sm_dll or '-'}")
             if not libs.ready:
@@ -168,7 +196,7 @@ class TensorRTConfigDialog(QDialog):
         else:
             self.status_label.setText(f"{self.i18n.t('trt.cache_status')}: {self.i18n.t('trt.status_' + status)}")
         if reset_progress:
-            self.progress.setRange(0, 3)
+            self.progress.setRange(0, 6 if self.scope == "offline" else 3)
             self.progress.setFormat("%p%")
             self.progress.setVisible(False)
             self.stage_label.setText(self.i18n.t("trt.download_hint") if libs.frozen and not libs.ready else self._description_text())
@@ -203,10 +231,15 @@ class TensorRTConfigDialog(QDialog):
             return
         self.build_error_text = ""
         self.stage = 0
-        self.progress.setRange(0, 3)
+        self.progress.setRange(0, 6 if self.scope == "offline" else 3)
         self.progress.setVisible(True)
         self.progress.setValue(0)
-        self.stage_label.setText(self.i18n.t("trt.building_model").format(model=self._model_display_name()))
+        self.stage_label.setText(
+            self.i18n.t("trt.building_model").format(
+                model=self._model_display_name(),
+                precision="FP16",
+            )
+        )
         self.engines_label.setText("")
         self.build_button.setVisible(False)
         self.close_button.setVisible(False)
@@ -218,23 +251,27 @@ class TensorRTConfigDialog(QDialog):
         process.stdout.connect(self._read_process_output)
         process.stderr.connect(self._read_process_output)
         process.finished.connect(self._build_finished)
-        exe, base_args = trt_warmup_command()
-        args = [
-            *base_args,
-            "--model",
-            self.model_key if self.model_key in {TRT_MODEL_RVM, TRT_MODEL_MATANYONE2} else TRT_MODEL_RVM,
-            "--input-size",
-            "1024" if self.model_key == TRT_MODEL_RVM else "512",
-            "--downsample",
-            "0.5",
-            "--fp16",
-            "1",
-            "--cuda-graph",
-            "0",
-            "--cache-dir",
-            str(manifest_path(self.model_key).parent),
-            "--progress-stdout",
-        ]
+        if self.scope == "offline":
+            exe, args = offline_trt_warmup_command()
+        else:
+            exe, base_args = trt_warmup_command()
+            is_matanyone2 = self.model_key == TRT_MODEL_MATANYONE2
+            args = [
+                *base_args,
+                "--model",
+                TRT_MODEL_MATANYONE2 if is_matanyone2 else TRT_MODEL_RVM,
+                "--input-size",
+                "512" if is_matanyone2 else "1024",
+                "--downsample",
+                "0.5",
+                "--fp16",
+                "1",
+                "--cuda-graph",
+                "0",
+                "--cache-dir",
+                str(self._manifest_path().parent),
+                "--progress-stdout",
+            ]
         process.start(exe, args, env=base_environment())
 
     def _manual_download(self) -> None:
@@ -297,7 +334,7 @@ class TensorRTConfigDialog(QDialog):
 
     def _append_build_log(self, text: str) -> None:
         try:
-            path = manifest_path(self.model_key).parent / "build.log"
+            path = self._manifest_path().parent / "build.log"
             path.parent.mkdir(parents=True, exist_ok=True)
             with path.open("a", encoding="utf-8", errors="replace") as f:
                 f.write(text)
@@ -314,15 +351,15 @@ class TensorRTConfigDialog(QDialog):
                         self.stage = max(self.stage, int(parts[1]))
                     except ValueError:
                         pass
-                    self.progress.setValue(min(3, self.stage - (0 if parts[2] != "done" else 0)))
+                    self.progress.setValue(min(self.progress.maximum(), self.stage - (0 if parts[2] != "done" else 0)))
                     if len(parts) == 4 and parts[2] == "start":
                         self.stage_label.setText(parts[3])
                     elif parts[2] == "done":
-                        self.progress.setValue(min(3, self.stage))
+                        self.progress.setValue(min(self.progress.maximum(), self.stage))
             elif line.startswith("ERROR:"):
                 self.build_error_text = line
                 self.stage_label.setText(line)
-        cache_dir = manifest_path(self.model_key).parent
+        cache_dir = self._manifest_path().parent
         count = len([
             path
             for path in cache_dir.iterdir()
@@ -334,7 +371,7 @@ class TensorRTConfigDialog(QDialog):
         self.process = None
         if exit_code == 0:
             self.build_error_text = ""
-            self.progress.setValue(3)
+            self.progress.setValue(self.progress.maximum())
             self._refresh()
             return
         if not self.build_error_text:
@@ -351,7 +388,7 @@ class TensorRTConfigDialog(QDialog):
         self._refresh()
 
     def _delete_cache(self) -> None:
-        clear_cache(self.model_key)
+        clear_cache(self.model_key, scope=self.scope)
         self._refresh()
 
     def closeEvent(self, event) -> None:

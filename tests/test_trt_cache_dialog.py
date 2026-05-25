@@ -155,6 +155,107 @@ class TensorRTCacheDialogTests(unittest.TestCase):
                 finally:
                     dialog.close()
 
+    def test_realtime_rvm_build_uses_rvm_1024_warmup(self) -> None:
+        from ui.widgets import trt_cache_dialog
+        from utils.tensorrt_runtime_libs import TensorRTRuntimeLibStatus
+
+        class _Signal:
+            def connect(self, _callback):
+                pass
+
+        class _Process:
+            stdout = _Signal()
+            stderr = _Signal()
+            finished = _Signal()
+
+            def __init__(self, *_args, **_kwargs):
+                pass
+
+            def start(self, exe, args, env=None):
+                captured["exe"] = exe
+                captured["args"] = args
+                captured["env"] = env or {}
+                return True
+
+            def kill(self):
+                pass
+
+        self._app()
+        captured: dict[str, object] = {}
+        with tempfile.TemporaryDirectory() as raw:
+            cache_root = Path(raw)
+            model_path = cache_root / "model.onnx"
+            model_path.write_bytes(b"onnx")
+            runtime_status = TensorRTRuntimeLibStatus(frozen=False, lib_dir=cache_root)
+            with (
+                patch.object(trt_cache_dialog, "check_tensorrt_runtime_libs", return_value=runtime_status),
+                patch.object(trt_cache_dialog, "cache_status", return_value="missing"),
+                patch.object(trt_cache_dialog, "load_manifest_for_model", return_value={}),
+                patch.object(trt_cache_dialog, "collect_fingerprint", return_value={}),
+                patch.object(trt_cache_dialog, "manifest_path", side_effect=lambda model_key=None: cache_root / str(model_key or "rvm") / "manifest.json"),
+                patch.object(trt_cache_dialog, "source_model_path", return_value=model_path),
+                patch.object(trt_cache_dialog, "trt_warmup_command", return_value=("python", ["-m", "ui.services.trt_warmup_process"])),
+                patch.object(trt_cache_dialog, "HiddenProcess", _Process),
+            ):
+                dialog = trt_cache_dialog.TensorRTConfigDialog(FakeI18n(), model_key="rvm", scope="realtime")
+                try:
+                    dialog._start_build()
+                finally:
+                    dialog.close()
+
+        args = captured["args"]
+        self.assertEqual(args[args.index("--model") + 1], "rvm")
+        self.assertEqual(args[args.index("--input-size") + 1], "1024")
+
+    def test_offline_rvm_build_uses_offline_warmup(self) -> None:
+        from ui.widgets import trt_cache_dialog
+        from utils.tensorrt_runtime_libs import TensorRTRuntimeLibStatus
+
+        class _Signal:
+            def connect(self, _callback):
+                pass
+
+        class _Process:
+            stdout = _Signal()
+            stderr = _Signal()
+            finished = _Signal()
+
+            def __init__(self, *_args, **_kwargs):
+                pass
+
+            def start(self, exe, args, env=None):
+                captured["exe"] = exe
+                captured["args"] = args
+                return True
+
+            def kill(self):
+                pass
+
+        self._app()
+        captured: dict[str, object] = {}
+        with tempfile.TemporaryDirectory() as raw:
+            cache_root = Path(raw)
+            model_path = cache_root / "model.onnx"
+            model_path.write_bytes(b"onnx")
+            runtime_status = TensorRTRuntimeLibStatus(frozen=False, lib_dir=cache_root)
+            with (
+                patch.object(trt_cache_dialog, "check_tensorrt_runtime_libs", return_value=runtime_status),
+                patch.object(trt_cache_dialog, "cache_status", return_value="missing"),
+                patch.object(trt_cache_dialog, "load_manifest_for_model", return_value={}),
+                patch.object(trt_cache_dialog, "collect_fingerprint", return_value={}),
+                patch.object(trt_cache_dialog, "manifest_path", side_effect=lambda model_key=None, scope=None: cache_root / str(scope or model_key or "rvm") / "manifest.json"),
+                patch.object(trt_cache_dialog, "source_model_path", return_value=model_path),
+                patch.object(trt_cache_dialog, "offline_trt_warmup_command", return_value=("python", ["tools/warmup_offline_trt.py"])),
+                patch.object(trt_cache_dialog, "HiddenProcess", _Process),
+            ):
+                dialog = trt_cache_dialog.TensorRTConfigDialog(FakeI18n(), model_key="rvm", scope="offline")
+                try:
+                    dialog._start_build()
+                finally:
+                    dialog.close()
+
+        self.assertEqual(captured["args"], ["tools/warmup_offline_trt.py"])
+
 
 if __name__ == "__main__":
     unittest.main()

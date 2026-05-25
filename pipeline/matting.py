@@ -52,7 +52,13 @@ from config import (
     PASSTHROUGH_NV12_RING_SLOTS,
     DECODE_MAX_SIDE,
     RVM_DOWNSAMPLE_RATIO,
+    RVM_ALPHA_SMOOTH,
+    RVM_ALPHA_SMOOTH_WEIGHT,
     RVM_IOBINDING,
+    RVM_SCENE_COOLDOWN,
+    RVM_SCENE_REF_EMA,
+    RVM_SCENE_RESET,
+    RVM_SCENE_THRESHOLD,
     SPLIT_NV12_COMPOSITE,
     TRT_RVM_IOBINDING,
     WARMUP_RAMPUP_DIAG_FRAMES,
@@ -87,6 +93,75 @@ def _should_enable_rvm_iobinding(active_providers: list[str]) -> bool:
     if "TensorrtExecutionProvider" in active_providers:
         return TRT_RVM_IOBINDING
     return "CUDAExecutionProvider" in active_providers
+
+
+class _SceneCutDetector:
+    """HSV-Bhattacharyya scene cut detector with reference EMA and cooldown."""
+
+    def __init__(
+        self,
+        threshold: float = 0.4,
+        cooldown_frames: int = 24,
+        ref_ema_alpha: float = 0.95,
+        downsample_height: int = 540,
+    ) -> None:
+        self.threshold = float(threshold)
+        self.cooldown = max(0, int(cooldown_frames))
+        self.ref_ema_alpha = float(ref_ema_alpha)
+        self.downsample_height = max(2, int(downsample_height))
+        self._ref_hist: np.ndarray | None = None
+        self._cooldown_left = 0
+
+    def step(self, frame_bgr: np.ndarray) -> bool:
+        h, w = frame_bgr.shape[:2]
+        if h > self.downsample_height:
+            new_w = max(2, int(w * self.downsample_height / h))
+            frame_bgr = cv2.resize(frame_bgr, (new_w, self.downsample_height), interpolation=cv2.INTER_AREA)
+        hsv = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2HSV)
+        hist = cv2.calcHist([hsv], [0, 1], None, [30, 32], [0, 180, 0, 256])
+        cv2.normalize(hist, hist, alpha=1.0, norm_type=cv2.NORM_L1)
+
+        if self._ref_hist is None:
+            self._ref_hist = hist
+            return False
+
+        if self._cooldown_left > 0:
+            self._cooldown_left -= 1
+            self._update_ref(hist)
+            return False
+
+        dist = float(cv2.compareHist(self._ref_hist, hist, cv2.HISTCMP_BHATTACHARYYA))
+        if dist > self.threshold:
+            self._ref_hist = hist
+            self._cooldown_left = self.cooldown
+            return True
+        self._update_ref(hist)
+        return False
+
+    def _update_ref(self, hist: np.ndarray) -> None:
+        assert self._ref_hist is not None
+        self._ref_hist = self._ref_hist * self.ref_ema_alpha + hist * (1.0 - self.ref_ema_alpha)
+
+    def reset(self) -> None:
+        self._ref_hist = None
+        self._cooldown_left = 0
+
+
+class _AlphaSmoother:
+    def __init__(self, alpha_weight: float = 0.6) -> None:
+        self.alpha_weight = float(alpha_weight)
+        self._prev = None
+
+    def step(self, alpha_batch):
+        if self._prev is None or self._prev.shape != alpha_batch.shape:
+            self._prev = alpha_batch.copy()
+            return alpha_batch
+        out = self._prev * self.alpha_weight + alpha_batch * (1.0 - self.alpha_weight)
+        self._prev = out
+        return out
+
+    def reset(self) -> None:
+        self._prev = None
 
 
 _LIGHT_MATCH_DEVICE_SRC = LIGHT_MATCH_DEVICE_SRC
@@ -989,6 +1064,12 @@ class Matter:
         self._trt_static_sessions: dict[tuple[int, int, int], object] = {}
         self._trt_static_states: dict[tuple[int, int, int], list[ort.OrtValue]] = {}
         self._trt_static_outputs: dict[tuple[int, int, int], dict[str, ort.OrtValue]] = {}
+        self._scene_detector = _SceneCutDetector(
+            threshold=RVM_SCENE_THRESHOLD,
+            cooldown_frames=RVM_SCENE_COOLDOWN,
+            ref_ema_alpha=RVM_SCENE_REF_EMA,
+        ) if RVM_SCENE_RESET else None
+        self._alpha_smoother = _AlphaSmoother(RVM_ALPHA_SMOOTH_WEIGHT) if RVM_ALPHA_SMOOTH else None
         self._tmp_float: np.ndarray | None = None
         self._call_count = 0
         self._last_ort_shape = ""
@@ -1214,6 +1295,10 @@ class Matter:
         self._trt_static_outputs = {}
         self._rvm_state_slots = {}
         self._rvm_iobinding_failed = False
+        if self._scene_detector is not None:
+            self._scene_detector.reset()
+        if self._alpha_smoother is not None:
+            self._alpha_smoother.reset()
         self._cached_alpha_small = None
         self._cached_alpha_shape = None
         self._cached_alpha_ort_shape = ""
@@ -1787,6 +1872,7 @@ class Matter:
             "io_downsample": self._rvm_io_downsample,
             "trt_static_states": self._trt_static_states,
             "trt_static_outputs": self._trt_static_outputs,
+            "alpha_smooth_prev": self._alpha_smoother._prev if self._alpha_smoother is not None else None,
         }
 
     def _restore_rvm_state(self, state: dict[str, object] | None) -> None:
@@ -1799,6 +1885,8 @@ class Matter:
             self._rvm_io_downsample = None
             self._trt_static_states = {}
             self._trt_static_outputs = {}
+            if self._alpha_smoother is not None:
+                self._alpha_smoother._prev = None
             return
         self._rvm_rec = state.get("rec")  # type: ignore[assignment]
         self._rvm_rec_ort = state.get("rec_ort")  # type: ignore[assignment]
@@ -1808,6 +1896,8 @@ class Matter:
         self._rvm_io_downsample = state.get("io_downsample")  # type: ignore[assignment]
         self._trt_static_states = state.get("trt_static_states") or {}  # type: ignore[assignment]
         self._trt_static_outputs = state.get("trt_static_outputs") or {}  # type: ignore[assignment]
+        if self._alpha_smoother is not None:
+            self._alpha_smoother._prev = state.get("alpha_smooth_prev")
 
     def _run_matting_in_rvm_slot(self, slot: str, x: np.ndarray) -> np.ndarray:
         if self.model_kind != "rvm":
@@ -1830,6 +1920,61 @@ class Matter:
             return out
         finally:
             self._restore_rvm_state(current)
+
+    def _clear_rvm_temporal_state(self) -> None:
+        self._rvm_rec = None
+        self._rvm_rec_ort = None
+        self._rvm_rec_sig = None
+        self._rvm_io_sig = None
+        self._rvm_io_outputs = {}
+        self._rvm_io_downsample = None
+        self._trt_static_states = {}
+        self._trt_static_outputs = {}
+        self._rvm_state_slots = {}
+        self._cached_alpha_small = None
+        self._cached_alpha_shape = None
+        self._cached_alpha_ort_shape = ""
+        if self._alpha_smoother is not None:
+            self._alpha_smoother.reset()
+
+    def _smooth_rvm_alpha_batch(self, alpha_batch):
+        if self._alpha_smoother is None:
+            return alpha_batch
+        return self._alpha_smoother.step(alpha_batch)
+
+    def _maybe_reset_rvm_for_scene(self, frame_bgr: np.ndarray) -> None:
+        if self.model_kind != "rvm" or self._scene_detector is None:
+            return
+        if self._scene_detector.step(frame_bgr):
+            self._clear_rvm_temporal_state()
+            log.debug("scene cut detected, RVM rec reset, frame_idx=%d", self._call_count)
+
+    def _scene_bgr_from_nv12(self, frame_nv12: np.ndarray, h: int, w: int) -> np.ndarray | None:
+        if self._scene_detector is None:
+            return None
+        try:
+            split_sbs_active = MATTING_SPLIT_SBS and w >= 2 * h
+            src_w = w // 2 if split_sbs_active else w
+            src_w -= src_w % 2
+            src_h = h - (h % 2)
+            if src_w <= 0 or src_h <= 0:
+                return None
+            target_h = min(self._scene_detector.downsample_height, src_h)
+            target_h -= target_h % 2
+            target_h = max(2, target_h)
+            target_w = max(2, int(src_w * target_h / src_h))
+            target_w -= target_w % 2
+            target_w = max(2, target_w)
+            nv12 = frame_nv12.reshape((h * 3 // 2, w))
+            y = nv12[:h, :src_w]
+            uv = nv12[h:h + h // 2, :src_w].reshape((h // 2, src_w // 2, 2))
+            y_small = cv2.resize(y, (target_w, target_h), interpolation=cv2.INTER_AREA)
+            uv_small = cv2.resize(uv, (target_w // 2, target_h // 2), interpolation=cv2.INTER_AREA)
+            yuv_small = np.vstack((y_small, uv_small.reshape((target_h // 2, target_w))))
+            return cv2.cvtColor(yuv_small, cv2.COLOR_YUV2BGR_NV12)
+        except Exception as exc:
+            log.debug("scene detector NV12 sample failed: %s", exc)
+            return None
 
     def _reset_rvm_rec_if_needed(self, batch: int, h: int, w: int) -> None:
         sig = (batch, h, w)
@@ -2004,13 +2149,13 @@ class Matter:
 
         pha_cp = self._ortvalue_to_cupy(pha_ort)
         if pha_cp.ndim == 4:
-            return pha_cp[:, 0]
+            return self._smooth_rvm_alpha_batch(pha_cp[:, 0])
         if pha_cp.ndim == 3:
-            return pha_cp
+            return self._smooth_rvm_alpha_batch(pha_cp)
         squeezed = cp.squeeze(pha_cp)
         if squeezed.ndim == 2:
-            return squeezed[None, ...]
-        return squeezed
+            return self._smooth_rvm_alpha_batch(squeezed[None, ...])
+        return self._smooth_rvm_alpha_batch(squeezed)
 
     def _run_rvm_static_trt_iobinding_from_dev(self, x_dev, batch: int, h: int, w: int):
         session = self._get_trt_static_session(batch, h, w)
@@ -2071,13 +2216,13 @@ class Matter:
         pha_ort = out_by_name.get(pha_name, outputs[1] if len(outputs) > 1 else outputs[0])
         pha_cp = self._ortvalue_to_cupy(pha_ort)
         if pha_cp.ndim == 4:
-            return pha_cp[:, 0]
+            return self._smooth_rvm_alpha_batch(pha_cp[:, 0])
         if pha_cp.ndim == 3:
-            return pha_cp
+            return self._smooth_rvm_alpha_batch(pha_cp)
         squeezed = cp.squeeze(pha_cp)
         if squeezed.ndim == 2:
-            return squeezed[None, ...]
-        return squeezed
+            return self._smooth_rvm_alpha_batch(squeezed[None, ...])
+        return self._smooth_rvm_alpha_batch(squeezed)
 
     def _run_rvm(self, x: np.ndarray) -> np.ndarray:
         if x.dtype != self.input_dtype:
@@ -2105,7 +2250,7 @@ class Matter:
             self._rvm_rec = [np.ascontiguousarray(r.astype(self.input_dtype, copy=False)) for r in rec_outs[:4]]
         elif len(outputs) >= 6:
             self._rvm_rec = [np.ascontiguousarray(r.astype(self.input_dtype, copy=False)) for r in outputs[-4:]]
-        return self._postprocess_alpha_batch(self._extract_alpha_batch(pha))
+        return self._smooth_rvm_alpha_batch(self._postprocess_alpha_batch(self._extract_alpha_batch(pha)))
 
     @staticmethod
     def _extract_alpha(out: np.ndarray) -> np.ndarray:
@@ -2176,6 +2321,7 @@ class Matter:
             half = frame_bgr.shape[1] // 2
             left = frame_bgr[:, :half]
             right = frame_bgr[:, half:half * 2]
+            self._maybe_reset_rvm_for_scene(left)
             xL = self._resize_to_matting_input(left)
             xR = self._resize_to_matting_input(right)
             t1 = _time.perf_counter()
@@ -2192,6 +2338,7 @@ class Matter:
             t2 = _time.perf_counter()
             a_small = np.concatenate([aL_small, aR_small], axis=1)
         else:
+            self._maybe_reset_rvm_for_scene(frame_bgr)
             x = self._resize_to_matting_input(frame_bgr)
             t1 = _time.perf_counter()
             a_small = self._run_matting(x)
@@ -2448,6 +2595,9 @@ class Matter:
             raise RuntimeError("NV12 matting path requires CuPy/GPU composite")
         stream = _CUDA_STREAM
         ctx = stream if stream is not None else nullcontext()
+        scene_bgr = self._scene_bgr_from_nv12(frame_nv12, h, w)
+        if scene_bgr is not None:
+            self._maybe_reset_rvm_for_scene(scene_bgr)
         with ctx:
             t_up0 = _time.perf_counter()
             self._upload_nv12_gpu(frame_nv12, h, w)
@@ -2477,6 +2627,9 @@ class Matter:
             raise RuntimeError("NV12 matting path requires CuPy/GPU composite")
         stream = _CUDA_STREAM
         ctx = stream if stream is not None else nullcontext()
+        scene_bgr = self._scene_bgr_from_nv12(frame_nv12, h, w)
+        if scene_bgr is not None:
+            self._maybe_reset_rvm_for_scene(scene_bgr)
         with ctx:
             t_up0 = _time.perf_counter()
             self._upload_nv12_gpu(frame_nv12, h, w)

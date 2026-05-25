@@ -25,6 +25,14 @@ MATANYONE2_MODEL_KEY = "matanyone2_onnx_512_bs1"
 MATANYONE2_MODEL_LABEL = "MatAnyone2 ONNX 512 bs1"
 MATANYONE2_TRT_ONNX_NAME = "matanyone2_step_update.onnx"
 TRT_PROVIDER_CHAIN = "TensorrtExecutionProvider,CUDAExecutionProvider,CPUExecutionProvider"
+RVM_OFFLINE_TRT_SHAPES = (
+    (1024, 1, 0.5),
+    (1024, 2, 0.5),
+    (2048, 1, 0.25),
+    (2048, 2, 0.25),
+    (2048, 1, 0.5),
+    (2048, 2, 0.5),
+)
 _CACHE_METADATA_NAMES = {"manifest.json", "build.log"}
 _ENGINE_SUFFIXES = {".engine"}
 _MIN_ENGINE_BYTES = 1024 * 1024
@@ -39,18 +47,22 @@ def normalized_model_key(model_key: str | None = None) -> str:
     return key
 
 
-def cache_dir_for_model(model_key: str | None = None, cache_dir: Path | None = None) -> Path:
+def cache_dir_for_model(model_key: str | None = None, cache_dir: Path | None = None, scope: str | None = None) -> Path:
     if cache_dir is not None:
         return Path(cache_dir).resolve()
     key = normalized_model_key(model_key)
     base = config.ONNX_TRT_ENGINE_CACHE_PATH.resolve()
+    if key == TRT_MODEL_RVM and str(scope or "").strip().lower() == "offline":
+        if base.name == "offline":
+            return base
+        return base / "offline"
     if key == TRT_MODEL_MATANYONE2:
         return base if base.name == MATANYONE2_MODEL_KEY else base / MATANYONE2_MODEL_KEY
     return base
 
 
-def manifest_path(model_key: str | None = None, cache_dir: Path | None = None) -> Path:
-    return cache_dir_for_model(model_key, cache_dir) / "manifest.json"
+def manifest_path(model_key: str | None = None, cache_dir: Path | None = None, scope: str | None = None) -> Path:
+    return cache_dir_for_model(model_key, cache_dir, scope) / "manifest.json"
 
 
 def shape_inferred_model_path(model_path: Path | None = None, cache_dir: Path | None = None) -> Path:
@@ -117,22 +129,35 @@ def load_manifest() -> dict | None:
     return _read_json(path)
 
 
-def load_manifest_for_model(model_key: str | None = None, cache_dir: Path | None = None) -> dict | None:
-    path = manifest_path(model_key, cache_dir)
+def load_manifest_for_model(model_key: str | None = None, cache_dir: Path | None = None, scope: str | None = None) -> dict | None:
+    path = manifest_path(model_key, cache_dir, scope)
     if not path.exists():
         return None
     return _read_json(path)
 
 
-def save_manifest(manifest: dict, model_key: str | None = None, cache_dir: Path | None = None) -> None:
-    path = manifest_path(model_key, cache_dir)
+def save_manifest(manifest: dict, model_key: str | None = None, cache_dir: Path | None = None, scope: str | None = None) -> None:
+    path = manifest_path(model_key, cache_dir, scope)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
-def clear_cache(model_key: str | None = None, cache_dir: Path | None = None) -> None:
-    cache_dir = cache_dir_for_model(model_key, cache_dir)
-    if cache_dir.exists():
+def clear_cache(model_key: str | None = None, cache_dir: Path | None = None, scope: str | None = None) -> None:
+    cache_dir = cache_dir_for_model(model_key, cache_dir, scope)
+    key = normalized_model_key(model_key)
+    offline_scope = str(scope or "").strip().lower() == "offline"
+    if key == TRT_MODEL_RVM and not offline_scope and cache_dir.exists():
+        for path in cache_dir.iterdir():
+            if path.name in {"offline", MATANYONE2_MODEL_KEY}:
+                continue
+            if path.is_dir():
+                shutil.rmtree(path, ignore_errors=True)
+            else:
+                try:
+                    path.unlink()
+                except OSError:
+                    pass
+    elif cache_dir.exists():
         shutil.rmtree(cache_dir)
     cache_dir.mkdir(parents=True, exist_ok=True)
 
@@ -313,9 +338,14 @@ def _ready_models(manifest: dict) -> list[dict]:
     return [model for model in models if isinstance(model, dict) and model.get("status") == "ready"] if isinstance(models, list) else []
 
 
-def _manifest_engine_files_exist(manifest: dict, model_key: str | None = None, cache_dir: Path | None = None) -> bool:
+def _manifest_engine_files_exist(
+    manifest: dict,
+    model_key: str | None = None,
+    cache_dir: Path | None = None,
+    scope: str | None = None,
+) -> bool:
     key = normalized_model_key(model_key)
-    cache_dir = cache_dir_for_model(key, cache_dir)
+    cache_dir = cache_dir_for_model(key, cache_dir, scope)
     ready = _ready_models(manifest)
     if not ready:
         return False
@@ -330,25 +360,74 @@ def _manifest_engine_files_exist(manifest: dict, model_key: str | None = None, c
     return any(is_engine_artifact(path) for path in cache_dir.iterdir()) if cache_dir.exists() else False
 
 
+def _rvm_offline_cache_complete(manifest: dict, cache_dir: Path | None = None, scope: str | None = None) -> bool:
+    fingerprint = manifest.get("fingerprint")
+    if not isinstance(fingerprint, dict) or not fingerprint.get("offline_precision_tiers"):
+        return False
+    saved_shapes = fingerprint.get("offline_shapes")
+    if not isinstance(saved_shapes, list):
+        return False
+    saved_shape_keys = set()
+    for shape in saved_shapes:
+        if not isinstance(shape, dict):
+            continue
+        try:
+            saved_shape_keys.add((
+                int(shape.get("input_size")),
+                int(shape.get("batch")),
+                float(shape.get("downsample_ratio")),
+            ))
+        except (TypeError, ValueError):
+            continue
+    expected_shape_keys = {(int(size), int(batch), float(downsample)) for size, batch, downsample in RVM_OFFLINE_TRT_SHAPES}
+    if not expected_shape_keys.issubset(saved_shape_keys):
+        return False
+
+    from utils.rvm_static_onnx import static_rvm_model_path
+
+    source = original_rvm_model_path()
+    cache_root = cache_dir_for_model(TRT_MODEL_RVM, cache_dir, scope)
+    static_models = [
+        static_rvm_model_path(source, cache_root, batch, input_size, downsample)
+        for input_size, batch, downsample in RVM_OFFLINE_TRT_SHAPES
+    ]
+    if not all(path.is_file() for path in static_models):
+        return False
+    return any(is_engine_artifact(path) for path in cache_root.iterdir()) if cache_root.exists() else False
+
+
 def cache_status(
     actual_fp: dict | None = None,
     manifest: dict | None = None,
     model_key: str | None = None,
     cache_dir: Path | None = None,
+    scope: str | None = None,
 ) -> CacheStatus:
     key = normalized_model_key(model_key)
-    manifest = load_manifest_for_model(key, cache_dir) if manifest is None else manifest
+    manifest = load_manifest_for_model(key, cache_dir, scope) if manifest is None else manifest
     if not manifest:
         return "missing"
     if int(manifest.get("version", 0) or 0) != MANIFEST_VERSION:
         return "stale"
     if any(model.get("status") == "failed" for model in manifest.get("models", []) if isinstance(model, dict)):
         return "failed"
-    if not _manifest_engine_files_exist(manifest, key, cache_dir):
+    if not _manifest_engine_files_exist(manifest, key, cache_dir, scope):
         return "failed"
+    offline_scope = str(scope or "").strip().lower() == "offline"
+    if key == TRT_MODEL_RVM and offline_scope and not _rvm_offline_cache_complete(manifest, cache_dir, scope):
+        return "stale"
     actual = collect_fingerprint(key) if actual_fp is None else actual_fp
     saved = manifest.get("fingerprint")
-    if not isinstance(saved, dict) or stale_reasons(saved, actual):
+    if not isinstance(saved, dict):
+        return "stale"
+    if key == TRT_MODEL_RVM and offline_scope and saved.get("offline_precision_tiers"):
+        tier_keys = {"matting_input_size", "rvm_downsample_ratio", "offline_precision_tiers", "offline_shapes"}
+        saved_common = {k: v for k, v in saved.items() if k not in tier_keys}
+        actual_common = {k: v for k, v in actual.items() if k not in tier_keys}
+        if stale_reasons(saved_common, actual_common):
+            return "stale"
+        return "ready"
+    if stale_reasons(saved, actual):
         return "stale"
     return "ready"
 
