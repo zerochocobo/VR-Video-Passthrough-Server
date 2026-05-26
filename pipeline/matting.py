@@ -84,6 +84,9 @@ _composite_nv12_uv_kernel = None
 _preprocess_nv12_kernel = None
 _preprocess_kernel_fp16 = None
 _preprocess_nv12_kernel_fp16 = None
+_preprocess_nv12_roi_kernel = None
+_preprocess_nv12_roi_kernel_fp16 = None
+_alpha_roi_unwarp_kernel = None
 _GPU_OK = False
 
 
@@ -540,6 +543,173 @@ if MATTING_DEVICE in ("auto", "gpu"):
         """
         _preprocess_nv12_kernel_fp16 = _cp.RawKernel(
             _PREPROCESS_NV12_KERNEL_FP16_SRC, "preprocess_nv12_chw_norm_fp16"
+        )
+
+        _PREPROCESS_NV12_ROI_KERNEL_SRC = r"""
+        extern "C" __global__
+        void preprocess_nv12_roi_chw_norm(
+            const unsigned char* __restrict__ nv12,
+            int in_w, int in_h,
+            int roi_x0, int roi_y0, int roi_w, int roi_h,
+            int model_x0, int model_y0, int model_w, int model_h,
+            int out_w, int out_h,
+            float norm_scale, float norm_bias,
+            float* __restrict__ out
+        ) {
+            int x = blockIdx.x * blockDim.x + threadIdx.x;
+            int y = blockIdx.y * blockDim.y + threadIdx.y;
+            if (x >= out_w || y >= out_h) return;
+
+            int plane = out_w * out_h;
+            int idx = y * out_w + x;
+            float nR = norm_bias;
+            float nG = norm_bias;
+            float nB = norm_bias;
+            if (x >= model_x0 && x < model_x0 + model_w && y >= model_y0 && y < model_y0 + model_h) {
+                float sx = (float)(x - model_x0) * (float)roi_w / (float)model_w;
+                float sy = (float)(y - model_y0) * (float)roi_h / (float)model_h;
+                int px = roi_x0 + (int)floorf(sx);
+                int py = roi_y0 + (int)floorf(sy);
+                if (px < 0) px = 0; if (px > in_w - 1) px = in_w - 1;
+                if (py < 0) py = 0; if (py > in_h - 1) py = in_h - 1;
+                int uvx = px & ~1;
+                int uv_row = (py >> 1) * in_w;
+                const unsigned char* y_plane = nv12;
+                const unsigned char* uv_plane = nv12 + in_w * in_h;
+                float Y = (float)y_plane[py * in_w + px];
+                float U = (float)uv_plane[uv_row + uvx];
+                float V = (float)uv_plane[uv_row + uvx + 1];
+                float C = Y - 16.f; if (C < 0.f) C = 0.f;
+                float D = U - 128.f;
+                float E = V - 128.f;
+                float R = 1.16438356f * C + 1.59602678f * E;
+                float G = 1.16438356f * C - 0.39176229f * D - 0.81296765f * E;
+                float B = 1.16438356f * C + 2.01723214f * D;
+                if (R < 0.f) R = 0.f; if (R > 255.f) R = 255.f;
+                if (G < 0.f) G = 0.f; if (G > 255.f) G = 255.f;
+                if (B < 0.f) B = 0.f; if (B > 255.f) B = 255.f;
+                nR = R * norm_scale + norm_bias;
+                nG = G * norm_scale + norm_bias;
+                nB = B * norm_scale + norm_bias;
+            }
+            out[0 * plane + idx] = nR;
+            out[1 * plane + idx] = nG;
+            out[2 * plane + idx] = nB;
+        }
+        """
+        _preprocess_nv12_roi_kernel = _cp.RawKernel(
+            _PREPROCESS_NV12_ROI_KERNEL_SRC, "preprocess_nv12_roi_chw_norm"
+        )
+
+        _PREPROCESS_NV12_ROI_KERNEL_FP16_SRC = r"""
+        #include <cuda_fp16.h>
+        extern "C" __global__
+        void preprocess_nv12_roi_chw_norm_fp16(
+            const unsigned char* __restrict__ nv12,
+            int in_w, int in_h,
+            int roi_x0, int roi_y0, int roi_w, int roi_h,
+            int model_x0, int model_y0, int model_w, int model_h,
+            int out_w, int out_h,
+            float norm_scale, float norm_bias,
+            __half* __restrict__ out
+        ) {
+            int x = blockIdx.x * blockDim.x + threadIdx.x;
+            int y = blockIdx.y * blockDim.y + threadIdx.y;
+            if (x >= out_w || y >= out_h) return;
+
+            int plane = out_w * out_h;
+            int idx = y * out_w + x;
+            float nR = norm_bias;
+            float nG = norm_bias;
+            float nB = norm_bias;
+            if (x >= model_x0 && x < model_x0 + model_w && y >= model_y0 && y < model_y0 + model_h) {
+                float sx = (float)(x - model_x0) * (float)roi_w / (float)model_w;
+                float sy = (float)(y - model_y0) * (float)roi_h / (float)model_h;
+                int px = roi_x0 + (int)floorf(sx);
+                int py = roi_y0 + (int)floorf(sy);
+                if (px < 0) px = 0; if (px > in_w - 1) px = in_w - 1;
+                if (py < 0) py = 0; if (py > in_h - 1) py = in_h - 1;
+                int uvx = px & ~1;
+                int uv_row = (py >> 1) * in_w;
+                const unsigned char* y_plane = nv12;
+                const unsigned char* uv_plane = nv12 + in_w * in_h;
+                float Y = (float)y_plane[py * in_w + px];
+                float U = (float)uv_plane[uv_row + uvx];
+                float V = (float)uv_plane[uv_row + uvx + 1];
+                float C = Y - 16.f; if (C < 0.f) C = 0.f;
+                float D = U - 128.f;
+                float E = V - 128.f;
+                float R = 1.16438356f * C + 1.59602678f * E;
+                float G = 1.16438356f * C - 0.39176229f * D - 0.81296765f * E;
+                float B = 1.16438356f * C + 2.01723214f * D;
+                if (R < 0.f) R = 0.f; if (R > 255.f) R = 255.f;
+                if (G < 0.f) G = 0.f; if (G > 255.f) G = 255.f;
+                if (B < 0.f) B = 0.f; if (B > 255.f) B = 255.f;
+                nR = R * norm_scale + norm_bias;
+                nG = G * norm_scale + norm_bias;
+                nB = B * norm_scale + norm_bias;
+            }
+            out[0 * plane + idx] = __float2half_rn(nR);
+            out[1 * plane + idx] = __float2half_rn(nG);
+            out[2 * plane + idx] = __float2half_rn(nB);
+        }
+        """
+        _preprocess_nv12_roi_kernel_fp16 = _cp.RawKernel(
+            _PREPROCESS_NV12_ROI_KERNEL_FP16_SRC, "preprocess_nv12_roi_chw_norm_fp16"
+        )
+
+        _ALPHA_ROI_UNWARP_KERNEL_SRC = r"""
+        extern "C" __global__
+        void alpha_roi_unwarp(
+            const float* __restrict__ alpha_roi,
+            float* __restrict__ alpha_eye,
+            int eye_w, int eye_h,
+            int roi_x0, int roi_y0, int roi_w, int roi_h,
+            int model_x0, int model_y0, int model_w, int model_h,
+            int src_w, int src_h,
+            int feather
+        ) {
+            int x = blockIdx.x * blockDim.x + threadIdx.x;
+            int y = blockIdx.y * blockDim.y + threadIdx.y;
+            if (x >= eye_w || y >= eye_h) return;
+            float out = 0.f;
+            if (x >= roi_x0 && x < roi_x0 + roi_w && y >= roi_y0 && y < roi_y0 + roi_h) {
+                float mx = ((float)(x - roi_x0) + 0.5f) * (float)model_w / (float)roi_w + (float)model_x0 - 0.5f;
+                float my = ((float)(y - roi_y0) + 0.5f) * (float)model_h / (float)roi_h + (float)model_y0 - 0.5f;
+                int x0 = (int)floorf(mx); if (x0 < 0) x0 = 0; if (x0 > src_w - 1) x0 = src_w - 1;
+                int y0 = (int)floorf(my); if (y0 < 0) y0 = 0; if (y0 > src_h - 1) y0 = src_h - 1;
+                int x1 = x0 + 1; if (x1 > src_w - 1) x1 = src_w - 1;
+                int y1 = y0 + 1; if (y1 > src_h - 1) y1 = src_h - 1;
+                float dx = mx - floorf(mx); if (dx < 0.f) dx = 0.f; if (dx > 1.f) dx = 1.f;
+                float dy = my - floorf(my); if (dy < 0.f) dy = 0.f; if (dy > 1.f) dy = 1.f;
+                float a00 = alpha_roi[y0 * src_w + x0];
+                float a01 = alpha_roi[y0 * src_w + x1];
+                float a10 = alpha_roi[y1 * src_w + x0];
+                float a11 = alpha_roi[y1 * src_w + x1];
+                out = (1.f - dy) * ((1.f - dx) * a00 + dx * a01)
+                    +        dy  * ((1.f - dx) * a10 + dx * a11);
+                if (feather > 0) {
+                    int dl = x - roi_x0;
+                    int dr = roi_x0 + roi_w - 1 - x;
+                    int dt = y - roi_y0;
+                    int db = roi_y0 + roi_h - 1 - y;
+                    int d = dl;
+                    if (dr < d) d = dr;
+                    if (dt < d) d = dt;
+                    if (db < d) d = db;
+                    float edge = ((float)d + 1.f) / (float)feather;
+                    if (edge < 0.f) edge = 0.f;
+                    if (edge > 1.f) edge = 1.f;
+                    out *= edge;
+                }
+            }
+            if (out < 0.f) out = 0.f;
+            if (out > 1.f) out = 1.f;
+            alpha_eye[y * eye_w + x] = out;
+        }
+        """
+        _alpha_roi_unwarp_kernel = _cp.RawKernel(
+            _ALPHA_ROI_UNWARP_KERNEL_SRC, "alpha_roi_unwarp"
         )
 
         _COMPOSITE_NV12_UPSAMPLE_KERNEL_SRC = _LIGHT_MATCH_DEVICE_SRC + r"""
@@ -1829,6 +1999,70 @@ class Matter:
         chw_host = self._ensure_pinned_chw(out_w, out_h, batch)
         cp.asnumpy(chw_dev_one, out=chw_host[batch_idx])
         return chw_host[batch_idx:batch_idx + 1]
+
+    def _gpu_preprocess_nv12_roi_one(
+        self,
+        roi,
+        out_w: int,
+        out_h: int,
+        batch: int = 1,
+        batch_idx: int = 0,
+        source_x0: int = 0,
+        copy_to_host: bool = True,
+    ) -> np.ndarray:
+        cp = _cp
+        in_h = self._g_frame.shape[0] * 2 // 3
+        in_w = self._g_frame.shape[1]
+        chw_dev = self._ensure_dev_chw(out_w, out_h, batch)
+        chw_dev_one = chw_dev[batch_idx]
+        kernel = _preprocess_nv12_roi_kernel_fp16 if self.input_dtype == np.float16 else _preprocess_nv12_roi_kernel
+        block = (16, 16, 1)
+        grid = ((out_w + 15) // 16, (out_h + 15) // 16, 1)
+        kernel(
+            grid,
+            block,
+            (
+                self._g_frame,
+                np.int32(in_w), np.int32(in_h),
+                np.int32(int(source_x0) + roi.x0), np.int32(roi.y0), np.int32(roi.roi_w), np.int32(roi.roi_h),
+                np.int32(roi.model_x0), np.int32(roi.model_y0), np.int32(roi.model_w), np.int32(roi.model_h),
+                np.int32(out_w), np.int32(out_h),
+                np.float32(self._norm_scale), np.float32(self._norm_bias),
+                chw_dev_one,
+            ),
+        )
+        if not copy_to_host:
+            return chw_dev[batch_idx:batch_idx + 1]
+        chw_host = self._ensure_pinned_chw(out_w, out_h, batch)
+        cp.asnumpy(chw_dev_one, out=chw_host[batch_idx])
+        return chw_host[batch_idx:batch_idx + 1]
+
+    def _gpu_unwarp_roi_alpha_to_eye(self, alpha_roi, roi, eye_w: int, eye_h: int, feather: int = 0):
+        cp = _cp
+        if hasattr(alpha_roi, "data") and hasattr(alpha_roi.data, "ptr"):
+            alpha_dev = alpha_roi.astype(cp.float32, copy=False)
+        else:
+            alpha_dev = cp.asarray(alpha_roi, dtype=cp.float32)
+        if alpha_dev.ndim != 2:
+            raise RuntimeError(f"ROI alpha must be 2D, got shape={tuple(alpha_dev.shape)}")
+        out = cp.empty((int(eye_h), int(eye_w)), dtype=cp.float32)
+        src_h, src_w = (int(v) for v in alpha_dev.shape[:2])
+        block = (16, 16, 1)
+        grid = ((int(eye_w) + 15) // 16, (int(eye_h) + 15) // 16, 1)
+        _alpha_roi_unwarp_kernel(
+            grid,
+            block,
+            (
+                alpha_dev,
+                out,
+                np.int32(eye_w), np.int32(eye_h),
+                np.int32(roi.x0), np.int32(roi.y0), np.int32(roi.roi_w), np.int32(roi.roi_h),
+                np.int32(roi.model_x0), np.int32(roi.model_y0), np.int32(roi.model_w), np.int32(roi.model_h),
+                np.int32(src_w), np.int32(src_h),
+                np.int32(max(0, int(feather))),
+            ),
+        )
+        return out
 
     def _resize_to_matting_input(self, frame_bgr: np.ndarray) -> np.ndarray:
         """CPU matting """

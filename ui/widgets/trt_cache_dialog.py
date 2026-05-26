@@ -8,6 +8,7 @@ from PySide6.QtGui import QDesktopServices
 from PySide6.QtWidgets import QDialog, QHBoxLayout, QLabel, QProgressBar, QPushButton, QSizePolicy, QVBoxLayout
 
 from ui.services.hidden_process import HiddenProcess
+from ui.log_sanitizer import clean_log_text
 from ui.services.process_helpers import base_environment, offline_trt_warmup_command, trt_warmup_command
 from utils.tensorrt_runtime_libs import (
     TENSORRT_CU12_LIBS_WHL_URL,
@@ -16,6 +17,7 @@ from utils.tensorrt_runtime_libs import (
     download_and_install_tensorrt_libs,
 )
 from utils.trt_manifest import (
+    MATANYONE2_MODEL_KEYS,
     TRT_MODEL_MATANYONE2,
     TRT_MODEL_RVM,
     cache_status,
@@ -59,7 +61,7 @@ class TensorRTConfigDialog(QDialog):
         self.fps_hint_label.setWordWrap(True)
         self.fps_hint_label.setStyleSheet("color: #1677c7; font-weight: 600;")
         self.progress = QProgressBar()
-        self.progress.setRange(0, 6 if self.scope == "offline" else 3)
+        self.progress.setRange(0, self._build_stage_count())
         self.progress.setValue(0)
         self.progress.setTextVisible(True)
         self.progress.setVisible(False)
@@ -114,6 +116,13 @@ class TensorRTConfigDialog(QDialog):
             return cache_status(model_key=self.model_key, scope=self.scope)
         except Exception:
             return "failed"
+
+    def _build_stage_count(self) -> int:
+        if self.scope == "offline":
+            return 6
+        if self.model_key == TRT_MODEL_MATANYONE2:
+            return len(MATANYONE2_MODEL_KEYS) + 2
+        return 3
 
     def _model_display_name(self) -> str:
         path = source_model_path(self.model_key)
@@ -196,7 +205,7 @@ class TensorRTConfigDialog(QDialog):
         else:
             self.status_label.setText(f"{self.i18n.t('trt.cache_status')}: {self.i18n.t('trt.status_' + status)}")
         if reset_progress:
-            self.progress.setRange(0, 6 if self.scope == "offline" else 3)
+            self.progress.setRange(0, self._build_stage_count())
             self.progress.setFormat("%p%")
             self.progress.setVisible(False)
             self.stage_label.setText(self.i18n.t("trt.download_hint") if libs.frozen and not libs.ready else self._description_text())
@@ -231,7 +240,7 @@ class TensorRTConfigDialog(QDialog):
             return
         self.build_error_text = ""
         self.stage = 0
-        self.progress.setRange(0, 6 if self.scope == "offline" else 3)
+        self.progress.setRange(0, self._build_stage_count())
         self.progress.setVisible(True)
         self.progress.setValue(0)
         self.stage_label.setText(
@@ -261,7 +270,7 @@ class TensorRTConfigDialog(QDialog):
                 "--model",
                 TRT_MODEL_MATANYONE2 if is_matanyone2 else TRT_MODEL_RVM,
                 "--input-size",
-                "512" if is_matanyone2 else "1024",
+                "1024",
                 "--downsample",
                 "0.5",
                 "--fp16",
@@ -334,6 +343,9 @@ class TensorRTConfigDialog(QDialog):
 
     def _append_build_log(self, text: str) -> None:
         try:
+            text = clean_log_text(text)
+            if not text:
+                return
             path = self._manifest_path().parent / "build.log"
             path.parent.mkdir(parents=True, exist_ok=True)
             with path.open("a", encoding="utf-8", errors="replace") as f:
@@ -342,6 +354,9 @@ class TensorRTConfigDialog(QDialog):
             pass
 
     def _read_process_output(self, text: str) -> None:
+        text = clean_log_text(text)
+        if not text:
+            return
         self._append_build_log(text)
         for line in text.splitlines():
             if line.startswith("STAGE:"):

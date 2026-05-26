@@ -293,6 +293,94 @@ RVM_ALPHA_SMOOTH = _env("RVM_ALPHA_SMOOTH", "0") == "1"
 #   EMA weight for historical alpha. 0.6 = 60% history + 40% new frame.
 RVM_ALPHA_SMOOTH_WEIGHT = float(_env("RVM_ALPHA_SMOOTH_WEIGHT", 0.6))
 
+# PT_MATANYONE2_SCENE_RESET:
+#   1 detects scene cuts during MatAnyone2 offline prepass and merges detected
+#   cuts into the segment plan when a bootstrap mask is available. This avoids
+#   carrying propagation state across hard scene boundaries.
+MATANYONE2_SCENE_RESET = _env("MATANYONE2_SCENE_RESET", "1") == "1"
+
+# PT_MATANYONE2_SCENE_THRESHOLD:
+#   HSV Bhattacharyya distance threshold; above this value triggers a scene cut.
+MATANYONE2_SCENE_THRESHOLD = float(_env("MATANYONE2_SCENE_THRESHOLD", 0.4))
+
+# PT_MATANYONE2_SCENE_COOLDOWN:
+#   Minimum scanned frames between two MatAnyone2 scene-cut triggers.
+MATANYONE2_SCENE_COOLDOWN = int(_env("MATANYONE2_SCENE_COOLDOWN", 24))
+
+# PT_MATANYONE2_SCENE_REF_EMA:
+#   EMA weight on the reference histogram for slow within-scene drift tracking.
+MATANYONE2_SCENE_REF_EMA = float(_env("MATANYONE2_SCENE_REF_EMA", 0.95))
+
+# PT_MATANYONE2_SCENE_MIN_SEGMENT_SEC:
+#   Minimum spacing between two MatAnyone2 segment starts caused by scene cuts.
+MATANYONE2_SCENE_MIN_SEGMENT_SEC = float(_env("MATANYONE2_SCENE_MIN_SEGMENT_SEC", 3.0))
+
+# PT_MATANYONE2_ALPHA_SMOOTH:
+#   1 enables temporal EMA smoothing on MatAnyone2 alpha output. Smoothers reset
+#   whenever the MatAnyone2 segment plan resets.
+MATANYONE2_ALPHA_SMOOTH = _env("MATANYONE2_ALPHA_SMOOTH", "1") == "1"
+
+# PT_MATANYONE2_ALPHA_SMOOTH_WEIGHT:
+#   EMA weight for historical alpha. 0.6 = 60% history + 40% new alpha.
+MATANYONE2_ALPHA_SMOOTH_WEIGHT = float(_env("MATANYONE2_ALPHA_SMOOTH_WEIGHT", 0.6))
+
+# PT_MATANYONE2_EDGE_AWARE_UPSAMPLE:
+#   1 refines MatAnyone2 low-res alpha with a fast guided filter using the
+#   uploaded NV12 Y plane as guide before green/alpha output. Default off after
+#   smoke testing showed visible background halos on some foregrounds.
+MATANYONE2_EDGE_AWARE_UPSAMPLE = _env("MATANYONE2_EDGE_AWARE_UPSAMPLE", "0") == "1"
+
+# PT_MATANYONE2_GUIDED_RADIUS:
+#   Box radius used by the MatAnyone2 guided alpha upsampler.
+MATANYONE2_GUIDED_RADIUS = int(_env("MATANYONE2_GUIDED_RADIUS", 8))
+
+# PT_MATANYONE2_GUIDED_EPS:
+#   Regularization epsilon for the MatAnyone2 guided alpha upsampler.
+MATANYONE2_GUIDED_EPS = float(_env("MATANYONE2_GUIDED_EPS", 0.0025))
+
+# PT_MATANYONE2_GUIDED_FULLRES_SCALE:
+#   Output scale for guided alpha refinement. 1.0 returns source-resolution
+#   alpha; the default 0.5 keeps 8K cost bounded and lets the composite kernel
+#   finish the remaining bilinear upscale.
+MATANYONE2_GUIDED_FULLRES_SCALE = max(0.05, min(1.0, float(_env("MATANYONE2_GUIDED_FULLRES_SCALE", 0.5))))
+
+# PT_MATANYONE2_GUIDED_SUPPORT_FLOOR:
+#   Suppress guided-refine pixels where the original bilinear alpha has almost
+#   no support. This prevents luma-guided background halos around the subject.
+MATANYONE2_GUIDED_SUPPORT_FLOOR = max(0.0, min(1.0, float(_env("MATANYONE2_GUIDED_SUPPORT_FLOOR", 0.02))))
+
+# PT_MATANYONE2_GUIDED_MAX_DELTA:
+#   Clamp guided alpha growth over the original bilinear alpha. Negative values
+#   disable the clamp. Default is conservative to avoid visible background rings.
+MATANYONE2_GUIDED_MAX_DELTA = float(_env("MATANYONE2_GUIDED_MAX_DELTA", 0.08))
+
+# PT_MATANYONE2_GUIDED_BAND_LO / PT_MATANYONE2_GUIDED_BAND_HI:
+#   Only allow guided refinement in this base-alpha confidence band. Outside
+#   the band, keep the original bilinear alpha to avoid luma-guided halos.
+MATANYONE2_GUIDED_BAND_LO = max(0.0, min(1.0, float(_env("MATANYONE2_GUIDED_BAND_LO", 0.05))))
+MATANYONE2_GUIDED_BAND_HI = max(0.0, min(1.0, float(_env("MATANYONE2_GUIDED_BAND_HI", 0.95))))
+if MATANYONE2_GUIDED_BAND_HI < MATANYONE2_GUIDED_BAND_LO:
+    MATANYONE2_GUIDED_BAND_LO, MATANYONE2_GUIDED_BAND_HI = MATANYONE2_GUIDED_BAND_HI, MATANYONE2_GUIDED_BAND_LO
+
+# PT_MATANYONE2_ROI_CROP:
+#   Experimental quality mode: crop/letterbox the segment foreground ROI to
+#   the fixed MatAnyone2 input size. This can improve far-subject quality but
+#   does not reduce ONNX token count or guarantee speedup.
+MATANYONE2_ROI_CROP = _env("MATANYONE2_ROI_CROP", "0") == "1"
+
+# PT_MATANYONE2_ROI_EXPAND:
+#   Fraction of bbox size added to each side of the detected bootstrap mask ROI.
+MATANYONE2_ROI_EXPAND = float(_env("MATANYONE2_ROI_EXPAND", 0.30))
+
+# PT_MATANYONE2_ROI_MAX_EYE_FRACTION:
+#   Fallback to full-eye path when the expanded ROI covers more than this
+#   fraction of the eye area.
+MATANYONE2_ROI_MAX_EYE_FRACTION = float(_env("MATANYONE2_ROI_MAX_EYE_FRACTION", 0.70))
+
+# PT_MATANYONE2_ROI_FEATHER:
+#   Feather width in full-eye pixels when pasting ROI alpha back to the eye.
+MATANYONE2_ROI_FEATHER = int(_env("MATANYONE2_ROI_FEATHER", 16))
+
 # PT_ALPHA_STRIDE:
 #   Reuse the previous alpha mask for N-1 frames and recompute every Nth frame.
 #   Production default 1 recomputes every frame for temporal fidelity.
@@ -366,6 +454,12 @@ RVM_IOBINDING = _env("RVM_IOBINDING", "1") == "1"
 #   1 allows the experimental TensorRT + RVM IOBinding path. The default stays
 #   off because ORT TensorRT EP can hang in run_with_iobinding on this model.
 TRT_RVM_IOBINDING = _env("TRT_RVM_IOBINDING", "0") == "1"
+
+# PT_MATANYONE2_IOBINDING:
+#   1 enables ORT IOBinding for the MatAnyone2 offline step_update hot path.
+#   The implementation is limited to batch=1 and automatically falls back to
+#   the NumPy path on the first runtime failure.
+MATANYONE2_IOBINDING = _env("MATANYONE2_IOBINDING", "1") == "1"
 
 # PT_CUDA_SHARED_STREAM:
 #   1 reuses a shared CuPy CUDA stream for matting and composite kernels.

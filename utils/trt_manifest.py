@@ -21,8 +21,10 @@ TRT_MODEL_RVM = "rvm"
 TRT_MODEL_MATANYONE2 = "matanyone2"
 MODEL_KEY = "rvm_mobilenetv3"
 MODEL_LABEL = "Robust Video Matting"
-MATANYONE2_MODEL_KEY = "matanyone2_onnx_512_bs1"
-MATANYONE2_MODEL_LABEL = "MatAnyone2 ONNX 512 bs1"
+MATANYONE2_MODEL_KEYS = ("matanyone2_onnx_1024_bs1",)
+MATANYONE2_MODEL_KEY = MATANYONE2_MODEL_KEYS[0]
+MATANYONE2_CACHE_KEY = MATANYONE2_MODEL_KEY
+MATANYONE2_MODEL_LABEL = "MatAnyone2 ONNX 1024 bs1"
 MATANYONE2_TRT_ONNX_NAME = "matanyone2_step_update.onnx"
 TRT_PROVIDER_CHAIN = "TensorrtExecutionProvider,CUDAExecutionProvider,CPUExecutionProvider"
 RVM_OFFLINE_TRT_SHAPES = (
@@ -42,7 +44,7 @@ def normalized_model_key(model_key: str | None = None) -> str:
     key = str(model_key or TRT_MODEL_RVM).strip().lower()
     if key in {"", "rvm", MODEL_KEY}:
         return TRT_MODEL_RVM
-    if key in {"matanyone2", MATANYONE2_MODEL_KEY}:
+    if key in {"matanyone2", MATANYONE2_CACHE_KEY, *MATANYONE2_MODEL_KEYS}:
         return TRT_MODEL_MATANYONE2
     return key
 
@@ -57,7 +59,7 @@ def cache_dir_for_model(model_key: str | None = None, cache_dir: Path | None = N
             return base
         return base / "offline"
     if key == TRT_MODEL_MATANYONE2:
-        return base if base.name == MATANYONE2_MODEL_KEY else base / MATANYONE2_MODEL_KEY
+        return base if base.name == MATANYONE2_CACHE_KEY else base / MATANYONE2_CACHE_KEY
     return base
 
 
@@ -76,12 +78,30 @@ def original_rvm_model_path() -> Path:
     return candidate if candidate.exists() else Path(config.MODEL_PATH).resolve()
 
 
-def matanyone2_model_dir() -> Path:
-    return (config.ROOT / "models" / MATANYONE2_MODEL_KEY).resolve()
+def matanyone2_model_dir(size: int | None = None) -> Path:
+    if size is None:
+        key = MATANYONE2_MODEL_KEY
+    else:
+        if int(size) != 1024:
+            raise ValueError("only MatAnyone2 1024 is supported")
+        key = f"matanyone2_onnx_{int(size)}_bs1"
+    return (config.ROOT / "models" / key).resolve()
 
 
-def matanyone2_trt_source_model_path() -> Path:
-    return matanyone2_model_dir() / MATANYONE2_TRT_ONNX_NAME
+def matanyone2_trt_source_model_path(size: int | None = None) -> Path:
+    return matanyone2_model_dir(size) / MATANYONE2_TRT_ONNX_NAME
+
+
+def matanyone2_trt_source_model_paths() -> dict[str, Path]:
+    return {key: (config.ROOT / "models" / key / MATANYONE2_TRT_ONNX_NAME).resolve() for key in MATANYONE2_MODEL_KEYS}
+
+
+def is_matanyone2_trt_model_dir(model_dir: Path) -> bool:
+    try:
+        resolved = model_dir.resolve()
+    except OSError:
+        resolved = Path(model_dir)
+    return any(resolved == (config.ROOT / "models" / key).resolve() for key in MATANYONE2_MODEL_KEYS)
 
 
 def source_model_path(model_key: str | None = None) -> Path:
@@ -112,6 +132,13 @@ def is_engine_artifact(path: Path) -> bool:
         return path.stat().st_size >= _MIN_ENGINE_BYTES
     except OSError:
         return False
+
+
+def engine_artifact_paths(cache_dir: Path, recursive: bool = False) -> list[Path]:
+    if not cache_dir.exists():
+        return []
+    iterator = cache_dir.rglob("*") if recursive else cache_dir.iterdir()
+    return [path for path in iterator if is_engine_artifact(path)]
 
 
 def _read_json(path: Path) -> dict | None:
@@ -148,7 +175,7 @@ def clear_cache(model_key: str | None = None, cache_dir: Path | None = None, sco
     offline_scope = str(scope or "").strip().lower() == "offline"
     if key == TRT_MODEL_RVM and not offline_scope and cache_dir.exists():
         for path in cache_dir.iterdir():
-            if path.name in {"offline", MATANYONE2_MODEL_KEY}:
+            if path.name in {"offline", MATANYONE2_CACHE_KEY, *MATANYONE2_MODEL_KEYS}:
                 continue
             if path.is_dir():
                 shutil.rmtree(path, ignore_errors=True)
@@ -297,13 +324,21 @@ def collect_fingerprint(model_key: str | None = None, model_path: Path | None = 
     gpu = _nvml_info()
     key = normalized_model_key(model_key)
     model_path = Path(model_path or source_model_path(key))
+    if key == TRT_MODEL_MATANYONE2 and model_path == source_model_path(key):
+        source_paths = matanyone2_trt_source_model_paths()
+        model_sha256 = {
+            model_key: _sha256(path) if path.exists() else "missing"
+            for model_key, path in source_paths.items()
+        }
+    else:
+        model_sha256 = _sha256(model_path) if model_path.exists() else "missing"
     fingerprint = {
         **gpu,
         "trt_model_key": key,
         "cuda_runtime": _cuda_runtime_version(),
         "trt_version": _trt_version(),
         "ort_version": _onnxruntime_version(),
-        "model_sha256": _sha256(model_path) if model_path.exists() else "missing",
+        "model_sha256": model_sha256,
         "trt_fp16": bool(config.ONNX_TRT_FP16_ENABLE),
         "trt_cuda_graph": bool(config.ONNX_TRT_CUDA_GRAPH_ENABLE),
     }
@@ -311,6 +346,7 @@ def collect_fingerprint(model_key: str | None = None, model_path: Path | None = 
         fingerprint.update(
             {
                 "matanyone2_model_key": MATANYONE2_MODEL_KEY,
+                "matanyone2_model_keys": list(MATANYONE2_MODEL_KEYS),
                 "matanyone2_onnx": MATANYONE2_TRT_ONNX_NAME,
             }
         )
@@ -357,7 +393,17 @@ def _manifest_engine_files_exist(
         return False
     if key == TRT_MODEL_MATANYONE2 and not matanyone2_trt_source_model_path().is_file():
         return False
-    return any(is_engine_artifact(path) for path in cache_dir.iterdir()) if cache_dir.exists() else False
+    if key == TRT_MODEL_MATANYONE2:
+        paths = matanyone2_trt_source_model_paths()
+        if not all(path.is_file() for path in paths.values()):
+            return False
+        fingerprint = manifest.get("fingerprint")
+        if not isinstance(fingerprint, dict):
+            return False
+        saved_keys = fingerprint.get("matanyone2_model_keys")
+        if saved_keys != list(MATANYONE2_MODEL_KEYS):
+            return False
+    return bool(engine_artifact_paths(cache_dir, recursive=False))
 
 
 def _rvm_offline_cache_complete(manifest: dict, cache_dir: Path | None = None, scope: str | None = None) -> bool:
@@ -440,7 +486,7 @@ def build_manifest(
     label: str | None = None,
 ) -> dict:
     key = normalized_model_key(model_key)
-    manifest_model_key = MATANYONE2_MODEL_KEY if key == TRT_MODEL_MATANYONE2 else MODEL_KEY
+    manifest_model_key = MATANYONE2_CACHE_KEY if key == TRT_MODEL_MATANYONE2 else MODEL_KEY
     built_at = datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
     return {
         "version": MANIFEST_VERSION,

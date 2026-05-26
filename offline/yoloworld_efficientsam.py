@@ -15,6 +15,7 @@ import onnxruntime as ort
 
 import config
 from offline.decoded_frames import decoded_frame_to_bgr
+from utils.scene_detection import SceneCutDetector
 from utils.subprocess_hidden import hidden_subprocess_kwargs, run_hidden_streaming
 
 
@@ -342,7 +343,15 @@ def _probe_keyframe_indices(path: Path, source_fps: float, target: int, output_f
     return sorted(set(indices))
 
 
-def _planned_starts(records: list[dict], target: int, max_frames: int, min_frames: int, cut_on_count_change: bool, cut_every_active_sample: bool) -> list[int]:
+def _planned_starts(
+    records: list[dict],
+    target: int,
+    max_frames: int,
+    min_frames: int,
+    cut_on_count_change: bool,
+    cut_every_active_sample: bool,
+    scene_min_frames: int = 0,
+) -> list[int]:
     if not records:
         return [0]
     starts = [int(records[0]["frame"])]
@@ -357,6 +366,8 @@ def _planned_starts(records: list[dict], target: int, max_frames: int, min_frame
         if active and cut_on_count_change and count != last_count:
             force_cut = True
         if active and cut_every_active_sample:
+            force_cut = True
+        if active and bool(record.get("scene_cut")) and (scene_min_frames <= 0 or idx - last >= scene_min_frames):
             force_cut = True
         timed_cut = (min_frames > 0 and idx - last >= min_frames) or (max_frames > 0 and idx - last >= max_frames)
         if force_cut or timed_cut:
@@ -445,6 +456,20 @@ def precompute_segment_masks(args, src: Path, dec, source_fps: float, fps: float
     scan_points = sample_points(args, src, source_fps, fps, target)
     max_segment_frames = max(1, int(getattr(args, "matanyone2_segment_frames", 300) or target))
     min_segment_frames = max(1, int(round(max(0.0, getattr(args, "matanyone2_min_segment_sec", 3.0)) * fps)))
+    scene_detector = (
+        SceneCutDetector(
+            threshold=config.MATANYONE2_SCENE_THRESHOLD,
+            cooldown_frames=config.MATANYONE2_SCENE_COOLDOWN,
+            ref_ema_alpha=config.MATANYONE2_SCENE_REF_EMA,
+        )
+        if config.MATANYONE2_SCENE_RESET
+        else None
+    )
+    scene_min_frames = (
+        max(1, int(round(max(0.0, config.MATANYONE2_SCENE_MIN_SEGMENT_SEC) * fps)))
+        if scene_detector is not None
+        else 0
+    )
     masker = YoloWorldEfficientSamMasker(
         Path(getattr(args, "ywes_model_dir", config.ROOT / "models" / "yoloworld_efficientsam")).resolve(),
         Path(getattr(args, "ywes_txt_feats", config.ROOT / "models" / "person_txt_feats.npy")).resolve(),
@@ -462,7 +487,8 @@ def precompute_segment_masks(args, src: Path, dec, source_fps: float, fps: float
         debug_dir.mkdir(parents=True, exist_ok=True)
     print(
         f"[offline] YOLO-World+EfficientSAM prepass samples={len(scan_points)} "
-        f"scan={getattr(args, 'ywes_scan', 'hybrid')} max_segment_frames={max_segment_frames}"
+        f"scan={getattr(args, 'ywes_scan', 'hybrid')} max_segment_frames={max_segment_frames} "
+        f"scene_reset={int(scene_detector is not None)}"
     )
     masks_by_start: dict[int, list[np.ndarray]] = {}
     records: list[dict] = []
@@ -471,6 +497,11 @@ def precompute_segment_masks(args, src: Path, dec, source_fps: float, fps: float
         frame = dec.frame_at(src_idx)
         bgr = decoded_frame_to_bgr(frame)
         half = frame.width // 2
+        scene_cut = False
+        scene_distance = 0.0
+        if scene_detector is not None:
+            scene_cut = scene_detector.step(bgr[:, :half] if half > 0 else bgr)
+            scene_distance = scene_detector.last_distance
         eye_images = [
             cv2.cvtColor(bgr[:, :half], cv2.COLOR_BGR2RGB),
             cv2.cvtColor(bgr[:, half:half * 2], cv2.COLOR_BGR2RGB),
@@ -502,7 +533,15 @@ def precompute_segment_masks(args, src: Path, dec, source_fps: float, fps: float
         object_count = max((len(info.get("selected") or []) for info in infos), default=0) if active else 0
         if active:
             masks_by_start[start] = masks
-        records.append({"frame": int(start), "src_idx": int(src_idx), "active": bool(active), "object_count": int(object_count)})
+        records.append(
+            {
+                "frame": int(start),
+                "src_idx": int(src_idx),
+                "active": bool(active),
+                "object_count": int(object_count),
+                "scene_cut": bool(scene_cut),
+            }
+        )
         if debug_dir is not None:
             (debug_dir / f"seg_{start:06d}_info.json").write_text(json.dumps(infos, indent=2), encoding="utf-8")
         print(
@@ -512,7 +551,8 @@ def precompute_segment_masks(args, src: Path, dec, source_fps: float, fps: float
             f"R={infos[1]['selected']} score={float(infos[1].get('top_score') or 0.0):.4f} area={infos[1]['union_area_ratio']:.4f} "
             f"stereo={infos[0].get('stereo_mode', '-')} "
             f"cand=L{infos[0].get('left_candidates', '?')}/R{infos[0].get('right_candidates', '?')} "
-            f"plaus=L{infos[0].get('left_plausible', '?')}/R{infos[0].get('right_plausible', '?')}",
+            f"plaus=L{infos[0].get('left_plausible', '?')}/R{infos[0].get('right_plausible', '?')}"
+            + (f" scene_cut=1 dist={scene_distance:.3f}" if scene_cut else ""),
             flush=True,
         )
     gap_fill_frames = int(getattr(args, "ywes_gap_fill_frames", max_segment_frames) or 0)
@@ -530,7 +570,17 @@ def precompute_segment_masks(args, src: Path, dec, source_fps: float, fps: float
         min_segment_frames,
         bool(getattr(args, "ywes_cut_on_count_change", True)),
         bool(getattr(args, "ywes_cut_every_active_sample", False)),
+        scene_min_frames,
     )
+    scene_cut_frames = [int(record["frame"]) for record in records if record.get("scene_cut")]
+    if scene_cut_frames:
+        scene_with_masks = [frame for frame in scene_cut_frames if frame in masks_by_start]
+        scene_included = [frame for frame in scene_with_masks if frame in starts]
+        scene_ignored = [frame for frame in scene_cut_frames if frame not in scene_included]
+        print(
+            f"[offline] MatAnyone2 scene cuts detected={scene_cut_frames} "
+            f"included={scene_included} ignored={scene_ignored}"
+        )
     masks_by_start = {start: masks_by_start[start] for start in starts if start in masks_by_start}
     print(f"[offline] MatAnyone2 segment plan starts={starts} active={sorted(masks_by_start)}")
     if not masks_by_start and bool(getattr(args, "ywes_fail_on_empty", True)):

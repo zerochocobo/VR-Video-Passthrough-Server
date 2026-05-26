@@ -1,10 +1,18 @@
 ﻿from __future__ import annotations
 
+import subprocess
+import sys
+
 from PySide6.QtCore import QObject, Signal
 
 from ui.log_sanitizer import clean_log_text
 from ui.services.hidden_process import HiddenProcess
 from ui.services.process_helpers import ROOT, base_environment, offline_command
+from utils.subprocess_hidden import hidden_subprocess_kwargs
+
+_TERMINATE_WAIT_MS = 3000
+_TASKKILL_WAIT_MS = 5000
+_KILL_WAIT_MS = 3000
 
 
 class OfflineProcess(QObject):
@@ -49,10 +57,30 @@ class OfflineProcess(QObject):
             return
         self._stop_requested = True
         self.output.emit("[offline] stop requested; terminating process\n")
+        pid = self.process.process_id()
         self.process.terminate()
-        if not self.process.wait_for_finished(3000):
-            self.output.emit("[offline] process did not exit after terminate; killing process\n")
-            self.process.kill()
+        if self.process.wait_for_finished(_TERMINATE_WAIT_MS):
+            return
+        taskkill_ok = False
+        if sys.platform.startswith("win") and pid > 0:
+            self.output.emit("[offline] process did not exit after terminate; killing process tree\n")
+            try:
+                result = subprocess.run(
+                    ["taskkill", "/PID", str(pid), "/T", "/F"],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    timeout=5,
+                    check=False,
+                    **hidden_subprocess_kwargs(),
+                )
+                taskkill_ok = result.returncode == 0
+            except Exception as exc:
+                self.output.emit(f"[offline] process tree taskkill failed: {type(exc).__name__}: {exc}\n")
+        if taskkill_ok and self.process.wait_for_finished(_TASKKILL_WAIT_MS):
+            return
+        self.output.emit("[offline] process did not exit after tree kill; killing parent process\n")
+        self.process.kill()
+        self.process.wait_for_finished(_KILL_WAIT_MS)
 
     def _read_stdout(self, text: str) -> None:
         data = clean_log_text(text)

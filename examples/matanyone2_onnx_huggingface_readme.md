@@ -11,13 +11,11 @@ Upstream model: https://github.com/pq-yang/MatAnyone2
 Each folder is self-contained and includes `manifest.json`.
 
 ```text
-matanyone2_onnx_512_bs1
-matanyone2_onnx_512_bs2
 matanyone2_onnx_1024_bs1
 matanyone2_onnx_1024_bs2
 ```
 
-Use `512` for faster processing and lower VRAM. Use `1024` for higher-resolution masks when your GPU can handle the extra cost.
+PTMediaServer currently enables only the 1024 precision tier for MatAnyone2. The 2048 export is not used because it is too slow for the offline VR workflow.
 
 Use `bs1` for normal single-view video or sequential left/right-eye processing.
 
@@ -87,7 +85,7 @@ Single-view alpha-mask output:
 
 ```bash
 python matanyone2_onnx_video_infer.py \
-  --model-dir matanyone2_onnx_512_bs1 \
+  --model-dir matanyone2_onnx_1024_bs1 \
   --video input.mp4 \
   --mask first_frame_mask.png \
   --output-mode alpha \
@@ -98,7 +96,7 @@ Side-by-side VR180 green-background preview:
 
 ```bash
 python matanyone2_onnx_video_infer.py \
-  --model-dir matanyone2_onnx_512_bs2 \
+  --model-dir matanyone2_onnx_1024_bs1 \
   --video sbs_vr180.mp4 \
   --mask first_frame_mask_sbs.png \
   --sbs \
@@ -106,11 +104,11 @@ python matanyone2_onnx_video_infer.py \
   --out green_preview.mp4
 ```
 
-Use a 1024 model:
+Use the optional batch-2 1024 model:
 
 ```bash
 python matanyone2_onnx_video_infer.py \
-  --model-dir matanyone2_onnx_1024_bs1 \
+  --model-dir matanyone2_onnx_1024_bs2 \
   --video input.mp4 \
   --mask first_frame_mask.png \
   --out alpha_1024.mp4

@@ -374,6 +374,19 @@ These directories are generated or environment-specific:
 | `PT_MATTING_INPUT_SIZE` | RVM `1024`, other models `512` | Matting reference input size. |
 | `PT_MATTING_SPLIT_SBS` | `1` | Split side-by-side VR frames before matting. |
 | `PT_ALPHA_STRIDE` | `3` | Run matting once every N output frames, reuse alpha otherwise. |
+| `PT_MATANYONE2_IOBINDING` | `1` | Enable MatAnyone2 offline `step_update` IOBinding for batch-1 hot path, with automatic fallback. |
+| `PT_MATANYONE2_EDGE_AWARE_UPSAMPLE` | `0` | Experimental MatAnyone2 offline guided alpha refinement using the uploaded NV12 Y plane; default off because it can create background halos on some subjects. |
+| `PT_MATANYONE2_GUIDED_FULLRES_SCALE` | `0.5` | Guided alpha refinement output scale; default half-res keeps 8K cost bounded before final composite upsample. |
+| `PT_MATANYONE2_GUIDED_SUPPORT_FLOOR` | `0.02` | Suppress guided refinement where the original alpha has almost no support, preventing background halos. |
+| `PT_MATANYONE2_GUIDED_MAX_DELTA` | `0.08` | Limit guided alpha growth over the original bilinear alpha; set negative to disable. |
+| `PT_MATANYONE2_GUIDED_BAND_LO` | `0.05` | Lower base-alpha confidence threshold; guided refinement is bypassed below this value. |
+| `PT_MATANYONE2_GUIDED_BAND_HI` | `0.95` | Upper base-alpha confidence threshold; guided refinement is bypassed above this value. |
+| `PT_MATANYONE2_ROI_CROP` | `0` | Experimental MatAnyone2 offline ROI crop/letterbox quality mode; default off and not a token/FLOP speedup with the fixed 1024 model. |
+| `PT_MATANYONE2_ROI_EXPAND` | `0.30` | Expand the bootstrap-mask ROI by this bbox fraction before crop/letterbox preprocessing. |
+| `PT_MATANYONE2_ROI_MAX_EYE_FRACTION` | `0.70` | Disable ROI and fall back to full-eye processing when the expanded ROI covers too much of an eye. |
+| `PT_MATANYONE2_ROI_FEATHER` | `16` | Feather ROI alpha edges in full-eye pixels when pasting the ROI result back into the SBS alpha. |
+| `PT_MATANYONE2_SCENE_RESET` | `1` | Merge detected scene cuts into MatAnyone2 offline segment planning when a bootstrap mask is available. |
+| `PT_MATANYONE2_ALPHA_SMOOTH` | `1` | Apply per-eye EMA smoothing to MatAnyone2 offline alpha and reset with segment changes. |
 | `PT_USE_PYNV` | `1` | Enable PyNv backend for eligible sources. |
 | `PT_PASSTHROUGH_MAX_FPS` | `30` | Output FPS cap. |
 | `PT_PASSTHROUGH_OUTPUT_MODE` | `green` | Generated passthrough layout: `none`, `green`, `alpha`, or `all` to expose both passthrough entries. |

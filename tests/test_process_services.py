@@ -18,8 +18,9 @@ if hasattr(os, "add_dll_directory"):
 
 from PySide6.QtCore import QCoreApplication
 
-from ui.services import server_process
+from ui.services import offline_process, server_process
 from ui.services.hidden_process import HiddenProcess
+from ui.services.offline_process import OfflineProcess
 from ui.services.server_process import ServerProcess
 
 
@@ -114,6 +115,46 @@ class ServerProcessStopTests(unittest.TestCase):
         with (
             patch.object(server_process.sys, "platform", "win32"),
             patch.object(server_process.subprocess, "run", return_value=result),
+        ):
+            service.stop()
+
+        self.assertTrue(fake_process.terminated)
+        self.assertTrue(fake_process.killed)
+        self.assertEqual(fake_process.wait_ms, [3000, 3000])
+
+
+class OfflineProcessStopTests(unittest.TestCase):
+    def test_stop_waits_after_successful_taskkill(self) -> None:
+        _app()
+        service = OfflineProcess()
+        fake_process = _FakeHiddenProcess([False, True])
+        service.process = fake_process  # type: ignore[assignment]
+        result = subprocess.CompletedProcess(["taskkill"], 0)
+        output: list[str] = []
+        service.output.connect(lambda text: output.append(str(text)))
+
+        with (
+            patch.object(offline_process.sys, "platform", "win32"),
+            patch.object(offline_process.subprocess, "run", return_value=result) as run,
+        ):
+            service.stop()
+
+        run.assert_called_once()
+        self.assertTrue(fake_process.terminated)
+        self.assertFalse(fake_process.killed)
+        self.assertEqual(fake_process.wait_ms, [3000, 5000])
+        self.assertTrue(any("killing process tree" in line for line in output))
+
+    def test_stop_kills_when_taskkill_fails(self) -> None:
+        _app()
+        service = OfflineProcess()
+        fake_process = _FakeHiddenProcess([False, False])
+        service.process = fake_process  # type: ignore[assignment]
+        result = subprocess.CompletedProcess(["taskkill"], 1)
+
+        with (
+            patch.object(offline_process.sys, "platform", "win32"),
+            patch.object(offline_process.subprocess, "run", return_value=result),
         ):
             service.stop()
 

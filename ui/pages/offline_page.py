@@ -172,11 +172,25 @@ class OfflinePage(QWidget):
 
     def _precision_combo(self) -> QComboBox:
         combo = _fit_combo(QComboBox())
-        combo.addItem("", ("fast", 1024, 0.5))
-        combo.addItem("", ("balanced", 2048, 0.25))
-        combo.addItem("", ("hq", 2048, 0.5))
-        combo.setCurrentIndex(1)
+        self._configure_precision_combo(combo, "rvm_fast")
         return combo
+
+    def _configure_precision_combo(self, combo: QComboBox, engine: str) -> None:
+        previous = combo.currentData()
+        combo.blockSignals(True)
+        combo.clear()
+        if engine == "matanyone2":
+            combo.addItem(self.i18n.t("offline.matanyone2_precision_high"), ("matanyone2", 1024))
+            default_index = 0
+        else:
+            combo.addItem(self.i18n.t("offline.precision_low"), ("rvm", 1024, 0.5))
+            combo.addItem(self.i18n.t("offline.precision_balanced"), ("rvm", 2048, 0.25))
+            combo.addItem(self.i18n.t("offline.precision_hq"), ("rvm", 2048, 0.5))
+            default_index = 1
+        index = combo.findData(previous)
+        combo.setCurrentIndex(index if index >= 0 else default_index)
+        combo.setEnabled(engine != "matanyone2")
+        combo.blockSignals(False)
 
     def _recognition_combo(self) -> QComboBox:
         combo = _fit_combo(QComboBox())
@@ -455,8 +469,12 @@ class OfflinePage(QWidget):
         self._update_precision_visibility()
 
     def _update_precision_visibility(self) -> None:
-        single_visible = str(self.single_engine.currentData()) == "rvm_fast"
-        batch_visible = str(self.batch_engine.currentData()) == "rvm_fast"
+        single_engine = str(self.single_engine.currentData())
+        batch_engine = str(self.batch_engine.currentData())
+        self._configure_precision_combo(self.single_precision, single_engine)
+        self._configure_precision_combo(self.batch_precision, batch_engine)
+        single_visible = single_engine in {"rvm_fast", "matanyone2"}
+        batch_visible = batch_engine in {"rvm_fast", "matanyone2"}
         self.single_labels["precision"].setVisible(single_visible)
         self.single_precision.setVisible(single_visible)
         self.batch_labels["precision"].setVisible(batch_visible)
@@ -544,11 +562,18 @@ class OfflinePage(QWidget):
         return prompt or "person"
 
     @staticmethod
-    def _precision_args(combo: QComboBox) -> list[str]:
+    def _rvm_precision_args(combo: QComboBox) -> list[str]:
         data = combo.currentData()
-        if isinstance(data, tuple) and len(data) >= 3:
+        if isinstance(data, tuple) and len(data) >= 3 and data[0] == "rvm":
             return ["--input-size", str(int(data[1])), "--rvm-downsample-ratio", str(float(data[2]))]
         return []
+
+    @staticmethod
+    def _matanyone2_precision_args(combo: QComboBox) -> list[str]:
+        data = combo.currentData()
+        if isinstance(data, tuple) and len(data) >= 2 and data[0] == "matanyone2":
+            return ["--matanyone2-size", str(int(data[1]))]
+        return ["--matanyone2-size", "1024"]
 
     def _update_sam3_prompt_labels(self) -> None:
         prompt = self._sam3_prompt()
@@ -640,7 +665,9 @@ class OfflinePage(QWidget):
         if self.single_skip.isChecked():
             args.append("--skip-existing")
         if engine == "rvm_fast":
-            args.extend(self._precision_args(self.single_precision))
+            args.extend(self._rvm_precision_args(self.single_precision))
+        if engine in {"matanyone2", "matanyone2_medium"}:
+            args.extend(self._matanyone2_precision_args(self.single_precision))
         if engine == "matanyone2":
             args.extend(["--sam3-prompt", self._sam3_prompt()])
         self.settings.save()
@@ -666,7 +693,9 @@ class OfflinePage(QWidget):
         if self.batch_skip.isChecked():
             args.append("--skip-existing")
         if engine == "rvm_fast":
-            args.extend(self._precision_args(self.batch_precision))
+            args.extend(self._rvm_precision_args(self.batch_precision))
+        if engine in {"matanyone2", "matanyone2_medium"}:
+            args.extend(self._matanyone2_precision_args(self.batch_precision))
         if engine == "matanyone2":
             args.extend(["--sam3-prompt", self._sam3_prompt()])
         self.settings.save()
@@ -689,8 +718,8 @@ class OfflinePage(QWidget):
         self.stop_batch.setEnabled(running)
         self.single_trt_configure_button.setEnabled(not running)
         self.batch_trt_configure_button.setEnabled(not running)
-        self.single_precision.setEnabled(not running)
-        self.batch_precision.setEnabled(not running)
+        self.single_precision.setEnabled(not running and str(self.single_engine.currentData()) != "matanyone2")
+        self.batch_precision.setEnabled(not running and str(self.batch_engine.currentData()) != "matanyone2")
         if not running:
             self._update_trt_cache_rows()
         else:
@@ -742,10 +771,8 @@ class OfflinePage(QWidget):
         for combo in (self.single_recognition, self.batch_recognition):
             combo.setItemText(0, self.i18n.t("recognition.yoloworld_efficientsam"))
             combo.setItemText(1, self.i18n.t("recognition.sam3"))
-        for combo in (self.single_precision, self.batch_precision):
-            combo.setItemText(0, self.i18n.t("offline.precision_low"))
-            combo.setItemText(1, self.i18n.t("offline.precision_balanced"))
-            combo.setItemText(2, self.i18n.t("offline.precision_hq"))
+        self._configure_precision_combo(self.single_precision, str(self.single_engine.currentData()))
+        self._configure_precision_combo(self.batch_precision, str(self.batch_engine.currentData()))
         self.single_sam3_prompt_button.setText(self.i18n.t("offline.sam3_prompt_button"))
         self.batch_sam3_prompt_button.setText(self.i18n.t("offline.sam3_prompt_button"))
         self.single_matanyone_help.setToolTip(self.i18n.t("offline.matanyone_help_title"))

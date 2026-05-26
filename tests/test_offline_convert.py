@@ -151,6 +151,7 @@ class OfflineConvertTests(unittest.TestCase):
             skip_frames=2,
             bitrate="source",
             preset="P4",
+            matanyone2_size=1024,
         )
         cmd = convert._base_cmd(args, Path("input.mp4"), Path("out.mp4"))
         self.assertIn("--fps", cmd)
@@ -162,8 +163,27 @@ class OfflineConvertTests(unittest.TestCase):
         self.assertIn("-1", cmd)
         self.assertNotIn("--input-size", cmd)
         self.assertNotIn("--rvm-downsample-ratio", cmd)
+        self.assertIn("--matanyone2-size", cmd)
+        self.assertIn("1024", cmd)
         self.assertIn("--alpha-stride", cmd)
         self.assertIn("1", cmd)
+
+    def test_matanyone2_command_rejects_unsupported_size(self) -> None:
+        args = SimpleNamespace(
+            mode="alpha",
+            engine="matanyone2",
+            start=0.0,
+            duration=0.0,
+            fps=0.0,
+            input_size=1024,
+            rvm_downsample_ratio=0.5,
+            skip_frames=0,
+            bitrate="source",
+            preset="P4",
+            matanyone2_size=2048,
+        )
+        with self.assertRaises(ValueError):
+            convert._base_cmd(args, Path("input.mp4"), Path("out.mp4"))
 
     def test_run_hidden_streaming_forwards_output_and_return_code(self) -> None:
         out = io.StringIO()

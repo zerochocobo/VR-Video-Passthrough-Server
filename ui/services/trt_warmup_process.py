@@ -14,21 +14,23 @@ def _print_event(line: str) -> None:
     print(line, flush=True)
 
 
-def _engine_entries(cache_dir: Path) -> list[dict]:
-    from utils.trt_manifest import is_engine_artifact
+def _engine_entries(cache_dir: Path, recursive: bool = False) -> list[dict]:
+    from utils.trt_manifest import engine_artifact_paths
 
     entries: list[dict] = []
-    cache_files = [
-        path
-        for path in cache_dir.iterdir()
-        if is_engine_artifact(path)
-    ] if cache_dir.exists() else []
+    cache_files = engine_artifact_paths(cache_dir, recursive=recursive)
     for path in sorted(cache_files):
         try:
             size_mb = round(path.stat().st_size / (1024 * 1024), 1)
         except OSError:
             size_mb = 0.0
-        entries.append({"shape": path.stem, "size_mb": size_mb, "built_at": _utc_now()})
+        shape = path.stem
+        if recursive:
+            try:
+                shape = str(path.relative_to(cache_dir).with_suffix(""))
+            except ValueError:
+                pass
+        entries.append({"shape": shape, "size_mb": size_mb, "built_at": _utc_now()})
     return entries
 
 
@@ -239,6 +241,43 @@ def _run_matanyone2_step_update(model_path: Path) -> None:
         raise RuntimeError(f"TensorRT provider fell back during warmup; active providers={active}")
 
 
+def _run_matanyone2_step_update_isolated(model_key: str, model_path: Path, cache_dir: Path) -> None:
+    from ui.services.process_helpers import base_environment, trt_warmup_command
+    from utils.subprocess_hidden import run_hidden_streaming
+
+    exe, base_args = trt_warmup_command()
+    env = base_environment(
+        {
+            "PT_MATTING_MODEL_KIND": "matanyone2",
+            "PT_MATTING_WARMUP_RUNS": "0",
+            "PT_ONNX_PROVIDERS": "TensorrtExecutionProvider,CUDAExecutionProvider,CPUExecutionProvider",
+            "PT_ONNX_TRT_FP16_ENABLE": "1",
+            "PT_ONNX_TRT_CUDA_GRAPH_ENABLE": "0",
+            "PT_ONNX_TRT_ENGINE_CACHE_PATH": str(cache_dir.resolve()),
+        }
+    )
+    rc = run_hidden_streaming(
+        [
+            exe,
+            *base_args,
+            "--model",
+            "matanyone2",
+            "--matanyone2-model-key",
+            model_key,
+            "--cache-dir",
+            str(cache_dir.resolve()),
+            "--fp16",
+            "1",
+            "--cuda-graph",
+            "0",
+        ],
+        env=env,
+        exit_label=f"matanyone2-trt-{model_key}",
+    )
+    if rc != 0:
+        raise RuntimeError(f"MatAnyone2 TensorRT subprocess failed for {model_key}: exit code {rc}")
+
+
 def _require_tensorrt_active(matter) -> None:
     providers = list(getattr(matter.sess, "get_providers")())
     if "TensorrtExecutionProvider" not in providers:
@@ -260,6 +299,7 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--cuda-graph", type=int, default=0)
     parser.add_argument("--cache-dir", type=Path, default=None)
     parser.add_argument("--progress-stdout", action="store_true")
+    parser.add_argument("--matanyone2-model-key", default="", choices=["", "matanyone2_onnx_1024_bs1"])
     return parser.parse_args(argv)
 
 
@@ -295,13 +335,14 @@ def main(argv: list[str] | None = None) -> int:
         os.environ.update(base_environment())
         configure_gpu_runtime_cache()
         from utils.trt_manifest import (
-            MATANYONE2_MODEL_KEY,
+            MATANYONE2_CACHE_KEY,
+            MATANYONE2_MODEL_KEYS,
             TRT_MODEL_MATANYONE2,
             TRT_MODEL_RVM,
             build_manifest,
             cache_dir_for_model,
             collect_fingerprint,
-            matanyone2_trt_source_model_path,
+            matanyone2_trt_source_model_paths,
             original_rvm_model_path,
             save_manifest,
         )
@@ -312,31 +353,48 @@ def main(argv: list[str] | None = None) -> int:
             cache_dir = cache_dir_for_model(model_key)
             config.ONNX_TRT_ENGINE_CACHE_PATH = cache_dir
             os.environ["PT_ONNX_TRT_ENGINE_CACHE_PATH"] = str(cache_dir)
-        preserve_names = {"offline", MATANYONE2_MODEL_KEY} if model_key == TRT_MODEL_RVM and cache_dir.name != "offline" else set()
-        _clean_cache_dir(cache_dir, preserve_names=preserve_names)
-        if model_key == TRT_MODEL_MATANYONE2:
-            source_model_path = matanyone2_trt_source_model_path()
+        if model_key == TRT_MODEL_MATANYONE2 and args.matanyone2_model_key:
+            source_model_path = matanyone2_trt_source_model_paths()[args.matanyone2_model_key]
             if not source_model_path.is_file():
                 raise RuntimeError(f"MatAnyone2 TensorRT source model not found: {source_model_path}")
-
-            _print_event("STAGE:1:start:Building MatAnyone2 step-update engine")
-            stage_start = time.perf_counter()
+            _clean_cache_dir(cache_dir)
             _run_matanyone2_step_update(source_model_path)
-            _print_event(f"STAGE:1:done:{int(round(time.perf_counter() - stage_start))}")
+            _prune_unusable_engine_artifacts(cache_dir)
+            if not _engine_entries(cache_dir):
+                raise RuntimeError(f"TensorRT warmup did not produce a usable MatAnyone2 engine cache for {args.matanyone2_model_key}")
+            return 0
+        preserve_names = {"offline", MATANYONE2_CACHE_KEY} if model_key == TRT_MODEL_RVM and cache_dir.name != "offline" else set()
+        _clean_cache_dir(cache_dir, preserve_names=preserve_names)
+        if model_key == TRT_MODEL_MATANYONE2:
+            source_model_paths = matanyone2_trt_source_model_paths()
+            missing = [str(path) for path in source_model_paths.values() if not path.is_file()]
+            if missing:
+                raise RuntimeError(f"MatAnyone2 TensorRT source model not found: {', '.join(missing)}")
 
-            _print_event("STAGE:2:start:Verifying MatAnyone2 TensorRT cache")
+            for index, model_name in enumerate(MATANYONE2_MODEL_KEYS, 1):
+                source_model_path = source_model_paths[model_name]
+                model_cache_dir = cache_dir
+                model_cache_dir.mkdir(parents=True, exist_ok=True)
+                _print_event(f"STAGE:{index}:start:Building MatAnyone2 step-update engine {model_name}")
+                stage_start = time.perf_counter()
+                _run_matanyone2_step_update_isolated(model_name, source_model_path, model_cache_dir)
+                _print_event(f"STAGE:{index}:done:{int(round(time.perf_counter() - stage_start))}")
+
+            verify_stage = len(MATANYONE2_MODEL_KEYS) + 1
+            _print_event(f"STAGE:{verify_stage}:start:Verifying MatAnyone2 TensorRT cache")
             stage_start = time.perf_counter()
             _prune_unusable_engine_artifacts(cache_dir)
             engines = _engine_entries(cache_dir)
             if not engines:
                 raise RuntimeError("TensorRT warmup did not produce a usable MatAnyone2 engine cache")
-            _print_event(f"STAGE:2:done:{int(round(time.perf_counter() - stage_start))}")
+            _print_event(f"STAGE:{verify_stage}:done:{int(round(time.perf_counter() - stage_start))}")
 
-            _print_event("STAGE:3:start:Solidifying runtime cache")
+            manifest_stage = verify_stage + 1
+            _print_event(f"STAGE:{manifest_stage}:start:Solidifying runtime cache")
             stage_start = time.perf_counter()
-            manifest = build_manifest(collect_fingerprint(model_key, source_model_path), engines, time.perf_counter() - start, model_key=model_key)
+            manifest = build_manifest(collect_fingerprint(model_key), engines, time.perf_counter() - start, model_key=model_key)
             save_manifest(manifest, model_key=model_key, cache_dir=cache_dir)
-            _print_event(f"STAGE:3:done:{int(round(time.perf_counter() - stage_start))}")
+            _print_event(f"STAGE:{manifest_stage}:done:{int(round(time.perf_counter() - stage_start))}")
             _print_event(f"DONE:total_seconds={int(round(time.perf_counter() - start))}")
             return 0
 

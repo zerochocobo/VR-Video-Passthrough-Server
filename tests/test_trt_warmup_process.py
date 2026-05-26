@@ -15,7 +15,7 @@ from ui.services.trt_warmup_process import (
     _rvm_shared_1024_artifacts_available,
 )
 from utils.rvm_static_onnx import static_rvm_model_path
-from utils.trt_manifest import shape_inferred_model_path
+from utils.trt_manifest import MATANYONE2_CACHE_KEY, shape_inferred_model_path
 
 
 def _value_info(name: str, dims: list[str | int]):
@@ -24,8 +24,18 @@ def _value_info(name: str, dims: list[str | int]):
 
 class TrtWarmupProcessTests(unittest.TestCase):
     def test_parse_args_accepts_matanyone2_model(self) -> None:
-        args = _parse_args(["--model", "matanyone2", "--cache-dir", "runtime_cache/test_matanyone2_trt"])
+        args = _parse_args(
+            [
+                "--model",
+                "matanyone2",
+                "--cache-dir",
+                "runtime_cache/test_matanyone2_trt",
+                "--matanyone2-model-key",
+                "matanyone2_onnx_1024_bs1",
+            ]
+        )
         self.assertEqual(args.model, "matanyone2")
+        self.assertEqual(args.matanyone2_model_key, "matanyone2_onnx_1024_bs1")
 
     def test_rvm_state_symbolic_dims_do_not_reuse_src_height_width(self) -> None:
         graph = helper.make_graph(
@@ -62,11 +72,11 @@ class TrtWarmupProcessTests(unittest.TestCase):
             offline = cache_dir / "offline"
             offline.mkdir()
             (offline / "manifest.json").write_text("{}", encoding="utf-8")
-            matanyone = cache_dir / "matanyone2_onnx_512_bs1"
+            matanyone = cache_dir / MATANYONE2_CACHE_KEY
             matanyone.mkdir()
             (matanyone / "manifest.json").write_text("{}", encoding="utf-8")
 
-            _clean_cache_dir(cache_dir, preserve_names={"offline", "matanyone2_onnx_512_bs1"})
+            _clean_cache_dir(cache_dir, preserve_names={"offline", MATANYONE2_CACHE_KEY})
 
             self.assertFalse((cache_dir / "manifest.json").exists())
             self.assertFalse((cache_dir / "runtime.engine").exists())

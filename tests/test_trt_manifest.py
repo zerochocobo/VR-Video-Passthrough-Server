@@ -84,7 +84,7 @@ class TrtManifestTests(unittest.TestCase):
         offline_cache = self.root / "offline"
         offline_cache.mkdir()
         (offline_cache / "manifest.json").write_text("{}", encoding="utf-8")
-        matanyone_cache = self.root / trt_manifest.MATANYONE2_MODEL_KEY
+        matanyone_cache = self.root / trt_manifest.MATANYONE2_CACHE_KEY
         matanyone_cache.mkdir()
         (matanyone_cache / "manifest.json").write_text("{}", encoding="utf-8")
 
@@ -150,7 +150,8 @@ class TrtManifestTests(unittest.TestCase):
             "model_sha256": "def",
             "trt_fp16": True,
             "trt_cuda_graph": True,
-            "matanyone2_model_key": "matanyone2_onnx_512_bs1",
+            "matanyone2_model_key": "matanyone2_onnx_1024_bs1",
+            "matanyone2_model_keys": ["matanyone2_onnx_1024_bs1"],
             "matanyone2_onnx": "matanyone2_step_update.onnx",
         }
         cache_dir = trt_manifest.cache_dir_for_model(trt_manifest.TRT_MODEL_MATANYONE2)
@@ -160,14 +161,17 @@ class TrtManifestTests(unittest.TestCase):
             3,
             model_key=trt_manifest.TRT_MODEL_MATANYONE2,
         )
-        with patch.object(trt_manifest, "matanyone2_trt_source_model_path", return_value=source):
+        paths = {"matanyone2_onnx_1024_bs1": source}
+        with patch.object(trt_manifest, "matanyone2_trt_source_model_path", return_value=source), patch.object(
+            trt_manifest, "matanyone2_trt_source_model_paths", return_value=paths
+        ):
             trt_manifest.save_manifest(manifest, model_key=trt_manifest.TRT_MODEL_MATANYONE2)
             (cache_dir / "step.engine").write_bytes(b"e" * (1024 * 1024))
             self.assertEqual(
                 trt_manifest.cache_status(actual_fp=fp, model_key=trt_manifest.TRT_MODEL_MATANYONE2),
                 "ready",
             )
-        self.assertEqual(trt_manifest.manifest_path(trt_manifest.TRT_MODEL_MATANYONE2).parent.name, "matanyone2_onnx_512_bs1")
+        self.assertEqual(trt_manifest.manifest_path(trt_manifest.TRT_MODEL_MATANYONE2).parent.name, trt_manifest.MATANYONE2_CACHE_KEY)
 
     def test_nvidia_smi_fallback_collects_gpu_name_and_driver(self) -> None:
         completed = subprocess.CompletedProcess(

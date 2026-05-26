@@ -63,6 +63,7 @@
   "offline.precision_low": "低 (1024 / 0.5) - 同实时模式",
   "offline.precision_balanced": "中 (2048 / 0.25) - 推荐",
   "offline.precision_hq": "高 (2048 / 0.5) - 更多细节",
+  "offline.matanyone2_precision_high": "高 (1024) - 推荐",
   "file.select_video": "选择视频",
   "file.output_video": "选择输出文件",
   "file.select_directory": "选择目录",

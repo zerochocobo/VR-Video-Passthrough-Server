@@ -63,6 +63,7 @@
   "offline.precision_low": "Low (1024 / 0.5) - same as realtime mode",
   "offline.precision_balanced": "Balanced (2048 / 0.25) - recommended",
   "offline.precision_hq": "High (2048 / 0.5) - more detail",
+  "offline.matanyone2_precision_high": "High (1024) - Recommended",
   "file.select_video": "Select video",
   "file.output_video": "Select output file",
   "file.select_directory": "Select directory",

@@ -49,6 +49,8 @@ RVM_DEFAULT_ARGS = {
     "preset": config.PASSTHROUGH_PYNV_PRESET,
     "cq": -1,
 }
+MATANYONE2_DEFAULT_SIZE = 1024
+MATANYONE2_SIZE_CHOICES = (1024,)
 
 
 def _strip_tensorrt_provider(provider_text: str) -> str:
@@ -177,7 +179,11 @@ def _base_cmd(args: argparse.Namespace, src: Path, out: Path) -> list[str]:
     cmd.extend(["--bitrate", str(args.bitrate)])
     cmd.extend(["--alpha-stride", "1"])
     if args.engine in ("matanyone2", "matanyone2_medium"):
-        cmd.extend(["--matanyone2-size", "512"])
+        matanyone2_size = int(getattr(args, "matanyone2_size", MATANYONE2_DEFAULT_SIZE) or MATANYONE2_DEFAULT_SIZE)
+        if matanyone2_size not in MATANYONE2_SIZE_CHOICES:
+            supported = ", ".join(str(size) for size in MATANYONE2_SIZE_CHOICES)
+            raise ValueError(f"unsupported MatAnyone2 size: {matanyone2_size}; supported: {supported}")
+        cmd.extend(["--matanyone2-size", str(matanyone2_size)])
         cmd.extend(["--matanyone2-batch", "1"])
         cmd.append("--no-sbs-batch")
     if args.engine == "matanyone2":
@@ -269,6 +275,8 @@ def _run_one(args: argparse.Namespace, src: Path) -> int:
         f"buffer={env.get('PT_PASSTHROUGH_PYNV_THREADED_BUFFER_SIZE', '')} "
         f"preset={env.get('PT_PASSTHROUGH_PYNV_PRESET', '')} "
         f"model={env.get('PT_MODEL_PATH', '')} "
+        f"matanyone2_size={getattr(args, 'matanyone2_size', '') if args.engine in {'matanyone2', 'matanyone2_medium'} else ''} "
+        f"matanyone2_model={'matanyone2_onnx_' + str(getattr(args, 'matanyone2_size', MATANYONE2_DEFAULT_SIZE)) + '_bs1' if args.engine in {'matanyone2', 'matanyone2_medium'} else ''} "
         f"providers={env.get('PT_ONNX_PROVIDERS', '')} "
         f"offline_rvm_trt_enable={env.get('PT_OFFLINE_RVM_TRT_ENABLE', '1')} "
         f"offline_matanyone2_trt_enable={env.get('PT_OFFLINE_MATANYONE2_TRT_ENABLE', '1')} "
@@ -315,6 +323,7 @@ def main(argv: list[str] | None = None) -> int:
     single.add_argument("--bitrate", default=RVM_DEFAULT_ARGS["bitrate"])
     single.add_argument("--preset", default=RVM_DEFAULT_ARGS["preset"])
     single.add_argument("--cq", type=int, default=RVM_DEFAULT_ARGS["cq"])
+    single.add_argument("--matanyone2-size", type=int, choices=MATANYONE2_SIZE_CHOICES, default=MATANYONE2_DEFAULT_SIZE)
     single.add_argument("--sam3-prompt", default="person")
     single.add_argument("--skip-existing", action="store_true")
 
@@ -331,6 +340,7 @@ def main(argv: list[str] | None = None) -> int:
     batch.add_argument("--bitrate", default=RVM_DEFAULT_ARGS["bitrate"])
     batch.add_argument("--preset", default=RVM_DEFAULT_ARGS["preset"])
     batch.add_argument("--cq", type=int, default=RVM_DEFAULT_ARGS["cq"])
+    batch.add_argument("--matanyone2-size", type=int, choices=MATANYONE2_SIZE_CHOICES, default=MATANYONE2_DEFAULT_SIZE)
     batch.add_argument("--sam3-prompt", default="person")
     batch.set_defaults(out="", start=0.0, duration=0.0)
 

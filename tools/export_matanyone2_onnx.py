@@ -29,10 +29,6 @@ because MatAnyone2's memory tensors are shape-sensitive and easier to validate
 without dynamic HW axes.
 
 
-uv run python export_matanyone2_onnx.py --out-dir models/matanyone2_onnx_512_bs2 --height 512 --width 512 --batch-size 2
-uv run python export_matanyone2_onnx.py --out-dir models/matanyone2_onnx_512_bs1 --height 512 --width 512 --batch-size 1
-
-uv run python export_matanyone2_onnx.py --out-dir models/matanyone2_onnx_1024_bs2 --height 1024 --width 1024 --batch-size 2
 uv run python export_matanyone2_onnx.py --out-dir models/matanyone2_onnx_1024_bs1 --height 1024 --width 1024 --batch-size 1
 
 
@@ -358,8 +354,8 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Export MatAnyone2 subgraphs to ONNX.")
     parser.add_argument("--repo-id", default="PeiqingYang/MatAnyone2", help="Hugging Face repo id for MatAnyone2")
     parser.add_argument("--out-dir", default="models/matanyone2_onnx", help="directory for ONNX outputs")
-    parser.add_argument("--height", type=int, default=512, help="fixed export input height; must be divisible by 16")
-    parser.add_argument("--width", type=int, default=512, help="fixed export input width; must be divisible by 16")
+    parser.add_argument("--height", type=int, default=1024, help="fixed export input height; must be divisible by 16")
+    parser.add_argument("--width", type=int, default=1024, help="fixed export input width; must be divisible by 16")
     parser.add_argument("--batch-size", type=int, default=1, help="fixed export batch size; use 2 for SBS left/right batching")
     parser.add_argument("--objects", type=int, default=1, help="number of target objects; use 1 for current passthrough")
     parser.add_argument("--memory-frames", type=int, default=1, help="dummy memory frames for propagate export")

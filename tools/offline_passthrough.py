@@ -26,6 +26,7 @@ import config  # noqa: E402
 from utils.bitrate_estimator import effective_default_bitrate, parse_bitrate, source_video_bitrate  # noqa: E402
 from utils.gpu_runtime_cache import configure_gpu_runtime_cache  # noqa: E402
 from utils.subprocess_hidden import hidden_subprocess_kwargs, run_hidden_streaming  # noqa: E402
+from utils.scene_detection import SceneCutDetector  # noqa: E402
 from utils.trt_manifest import (  # noqa: E402
     MATANYONE2_TRT_ONNX_NAME,
     TRT_MODEL_MATANYONE2,
@@ -33,7 +34,7 @@ from utils.trt_manifest import (  # noqa: E402
     TRT_PROVIDER_CHAIN,
     cache_dir_for_model,
     cache_status,
-    matanyone2_model_dir,
+    is_matanyone2_trt_model_dir,
     original_rvm_model_path,
 )
 from utils.video_metadata import cfr_source_index, probe_color_metadata, probe_timing_metadata, probe_video_metadata, select_backend  # noqa: E402
@@ -46,6 +47,7 @@ from offline.sam3_matanyone2 import (  # noqa: E402
     fill_short_inactive_gaps,
 )
 from offline.decoded_frames import decoded_frame_to_bgr  # noqa: E402
+from offline.matanyone2_engine import MatAnyone2OnnxEngine as SharedMatAnyone2OnnxEngine  # noqa: E402
 
 GPU_CACHE_ENV = configure_gpu_runtime_cache()
 
@@ -85,23 +87,24 @@ def _matanyone2_session_providers(name: str, model_dir: Path):
     if name != MATANYONE2_TRT_ONNX_NAME:
         return _available_onnx_providers()
     try:
-        if model_dir.resolve() != matanyone2_model_dir().resolve():
+        if not is_matanyone2_trt_model_dir(model_dir):
             print(f"[offline] MatAnyone2 TensorRT disabled for custom model dir={model_dir}", flush=True)
             return _available_onnx_providers()
         if cache_status(model_key=TRT_MODEL_MATANYONE2) != "ready":
             print("[offline] MatAnyone2 TensorRT cache is not ready; using CUDA providers", flush=True)
             return _available_onnx_providers()
-        from pipeline.matting import _filter_available_providers, _provider_config
-
         cache_dir = cache_dir_for_model(TRT_MODEL_MATANYONE2)
         config.ONNX_TRT_ENGINE_CACHE_PATH = cache_dir
         os.environ["PT_ONNX_TRT_ENGINE_CACHE_PATH"] = str(cache_dir)
-        providers = _filter_available_providers(["TensorrtExecutionProvider", "CUDAExecutionProvider", "CPUExecutionProvider"])
+        from pipeline import matting as matting_module
+
+        matting_module.ONNX_TRT_ENGINE_CACHE_PATH = cache_dir
+        providers = matting_module._filter_available_providers(["TensorrtExecutionProvider", "CUDAExecutionProvider", "CPUExecutionProvider"])
         if "TensorrtExecutionProvider" not in providers:
             print("[offline] MatAnyone2 TensorRT provider unavailable; using CUDA providers", flush=True)
             return _available_onnx_providers()
         print(f"[offline] MatAnyone2 TensorRT enabled model={name} cache={cache_dir}", flush=True)
-        return _provider_config(providers)
+        return matting_module._provider_config(providers)
     except Exception as exc:
         print(f"[offline] MatAnyone2 TensorRT unavailable, using CUDA providers ({type(exc).__name__}: {exc})", flush=True)
         return _available_onnx_providers()
@@ -136,16 +139,27 @@ def _provider_summary(providers) -> str:
 
 
 def _resolve_matanyone2_model_dir(args, width: int = 0, height: int = 0) -> Path:
+    supported_size = 1024
     if getattr(args, "model", ""):
-        return Path(args.model).resolve()
-    size = int(getattr(args, "matanyone2_size", 512) or 512)
+        model_dir = Path(args.model).resolve()
+        manifest_path = model_dir / "manifest.json"
+        if manifest_path.exists():
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8-sig"))
+            height = int(manifest.get("height") or 0)
+            width = int(manifest.get("width") or 0)
+            if (height, width) != (supported_size, supported_size):
+                raise RuntimeError(
+                    f"unsupported MatAnyone2 model size {width}x{height}; only {supported_size}x{supported_size} is enabled"
+                )
+        return model_dir
+    size = int(getattr(args, "matanyone2_size", 1024) or 1024)
+    if size != supported_size:
+        raise RuntimeError(f"unsupported MatAnyone2 size {size}; only {supported_size}x{supported_size} is enabled")
     batch_arg = str(getattr(args, "matanyone2_batch", "1") or "1").lower()
     if batch_arg == "auto":
-        is_sbs = width > 0 and height > 0 and width >= 2 * height
-        # 1024 batch2 is memory-bandwidth/workspace heavy in ORT CUDA on this
-        # pipeline and benchmarks slower than two batch1 eye passes. Keep bs2
-        # as the default only for the 512 SBS model unless explicitly forced.
-        batch = 2 if size <= 512 and is_sbs else 1
+        # Batch2 is memory-bandwidth/workspace heavy in ORT CUDA on this
+        # pipeline and benchmarks slower than two batch1 eye passes.
+        batch = 1
     else:
         batch = int(batch_arg)
     model_dir = config.ROOT / "models" / f"matanyone2_onnx_{size}_bs{batch}"
@@ -153,7 +167,7 @@ def _resolve_matanyone2_model_dir(args, width: int = 0, height: int = 0) -> Path
         fallback = config.ROOT / "models" / "matanyone2_onnx"
         if fallback.exists():
             print(f"[offline] warning: {model_dir} not found, falling back to {fallback}")
-            return fallback.resolve()
+            return _resolve_matanyone2_model_dir(type("_Args", (), {"model": str(fallback)})())
     return model_dir.resolve()
 
 
@@ -542,536 +556,6 @@ class RvmOfflineEngine(OfflineMattingEngine):
         return lines
 
 
-class MatAnyone2OnnxEngine(OfflineMattingEngine):
-
-    class _EyeState:
-        def __init__(self):
-            self.sensory = None
-            self.memory_key = None
-            self.memory_shrinkage = None
-            self.memory_msk_value = None
-            self.obj_memory = None
-            self.last_pix_feat = None
-            self.last_mask = None
-            self.last_msk_value = None
-            self.initialized = False
-
-        def reset(self):
-            self.sensory = None
-            self.memory_key = None
-            self.memory_shrinkage = None
-            self.memory_msk_value = None
-            self.obj_memory = None
-            self.last_pix_feat = None
-            self.last_mask = None
-            self.last_msk_value = None
-            self.initialized = False
-
-    def __init__(
-        self,
-        model_dir: Path,
-        mask: Path | None,
-        sam3_dir: Path,
-        sam3_prompt: str = "person",
-        bootstrap_threshold: float = 0.55,
-        bootstrap_erode: int = 1,
-        bootstrap_dilate: int = 0,
-        bootstrap_soft: bool = False,
-        segment_frames: int = 300,
-        use_fused_update: bool = False,
-        use_step_update: bool = True,
-    ):
-        import cv2
-        import numpy as np
-        import onnxruntime as ort
-
-        from pipeline.matting import Matter
-
-        self.cv2 = cv2
-        self.np = np
-        self.ort = ort
-        self.model_dir = model_dir
-        self.mask_path = mask
-        self.sam3_dir = sam3_dir
-        self.sam3_prompt = sam3_prompt
-        self.bootstrap_threshold = min(1.0, max(0.0, float(bootstrap_threshold)))
-        self.bootstrap_erode = max(0, int(bootstrap_erode))
-        self.bootstrap_dilate = max(0, int(bootstrap_dilate))
-        self.bootstrap_soft = bool(bootstrap_soft)
-        self.segment_frames = max(0, int(segment_frames))
-        self.alpha_stride = max(1, int(config.ALPHA_STRIDE))
-        self._frame_index = 0
-        self._source_frame_index = -1
-        manifest_path = model_dir / "manifest.json"
-        if not manifest_path.exists():
-            raise RuntimeError(f"MatAnyone2 manifest not found: {manifest_path}")
-        manifest = json.loads(manifest_path.read_text(encoding="utf-8-sig"))
-        self.in_h = int(manifest.get("height") or 512)
-        self.in_w = int(manifest.get("width") or 512)
-        self.batch_size = int(manifest.get("batch_size") or 1)
-        if int(manifest.get("objects") or 1) != 1:
-            raise RuntimeError("MatAnyone2 offline engine currently supports one object only")
-        provider_report: dict[str, list[str]] = {}
-        sess_opts = ort.SessionOptions()
-        sess_opts.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
-
-        def sess(name: str):
-            path = model_dir / name
-            if not path.exists():
-                raise RuntimeError(f"MatAnyone2 ONNX file not found: {path}")
-            session = ort.InferenceSession(str(path), sess_options=sess_opts, providers=_matanyone2_session_providers(name, model_dir))
-            provider_report[name] = list(session.get_providers())
-            return session
-
-        self.image_key = sess("matanyone2_image_key.onnx")
-        self.mask_memory = sess("matanyone2_mask_memory.onnx")
-        self.first_refine = sess("matanyone2_first_frame_refine.onnx")
-        self.propagate = sess("matanyone2_propagate.onnx")
-        self.propagate_update = None
-        if use_fused_update and (model_dir / "matanyone2_propagate_update.onnx").exists():
-            self.propagate_update = sess("matanyone2_propagate_update.onnx")
-        self.step_update = None
-        if use_step_update and (model_dir / "matanyone2_step_update.onnx").exists():
-            self.step_update = sess("matanyone2_step_update.onnx")
-        self._first_refine_inputs = {i.name for i in self.first_refine.get_inputs()}
-        self._propagate_inputs = {i.name for i in self.propagate.get_inputs()}
-        self._propagate_update_inputs = {i.name for i in self.propagate_update.get_inputs()} if self.propagate_update else set()
-        self._step_update_inputs = {i.name for i in self.step_update.get_inputs()} if self.step_update else set()
-        self.tensor_dtype = self.np.float16 if self.image_key.get_inputs()[0].type == "tensor(float16)" else self.np.float32
-        image_batch = self.image_key.get_inputs()[0].shape[0]
-        self.batch2_enabled = self.batch_size >= 2 or image_batch == 2
-        sensory_meta = next(i for i in self.mask_memory.get_inputs() if i.name == "sensory")
-        sensory_shape = [int(v) for v in sensory_meta.shape]
-        self.sensory_shape = tuple(sensory_shape)
-        self.sensory_single_shape = tuple([1, *sensory_shape[1:]])
-        # SAM3 provides the bootstrap mask. Matter is used here only for its
-        # NV12 GPU upload/preprocess/composite helpers, not for RVM inference.
-        self.matter = Matter(config.ROOT / "models" / "rvm_mobilenetv3_fp32.onnx", load_model=False)
-        self.matter.reset_state()
-        self.eyes = [self._EyeState(), self._EyeState()]
-        self._mask_cache: list[np.ndarray] | None = None
-        self.segment_masks: dict[int, list[np.ndarray]] = {}
-        self._active_segment_start = -1
-        self._cached_alpha_sbs = None
-        self.profile = defaultdict(list)
-        print(
-            f"[offline] MatAnyone2 ONNX loaded dir={model_dir} input={self.in_w}x{self.in_h} "
-            f"sbs=per-eye bootstrap={'mask' if mask else 'sam3'} sam3_prompt={sam3_prompt!r} "
-            f"bootstrap_erode={self.bootstrap_erode} bootstrap_dilate={self.bootstrap_dilate} "
-            f"bootstrap_soft={self.bootstrap_soft} segment_frames={self.segment_frames} alpha_stride={self.alpha_stride} "
-            f"batch2={self.batch2_enabled} dtype={self.tensor_dtype.__name__} "
-            f"fused_update={self.propagate_update is not None} step_update={self.step_update is not None} "
-            f"providers={provider_report}"
-        )
-
-    @staticmethod
-    def _as_numpy(x):
-        try:
-            import cupy as cp
-
-            if isinstance(x, cp.ndarray):
-                return cp.asnumpy(x)
-        except Exception:
-            pass
-        return x
-
-    def _tensor(self, x):
-        return x.astype(self.tensor_dtype, copy=False)
-
-    def _image_key(self, image: "np.ndarray") -> dict[str, "np.ndarray"]:
-        names = ["f16", "f8", "f4", "f2", "f1", "pix_feat", "key", "shrinkage", "selection"]
-        t0 = time.perf_counter()
-        outs = self.image_key.run(names, {"image": image})
-        self.profile["image_key"].append((time.perf_counter() - t0) * 1000)
-        return dict(zip(names, outs))
-
-    def _mask_memory(self, image, mask, sensory, pix_feat):
-        t0 = time.perf_counter()
-        msk_value, new_sensory, obj_memory = self.mask_memory.run(
-            ["msk_value", "new_sensory", "obj_memory"],
-            {
-                "image": image,
-                "mask": mask,
-                "sensory": sensory,
-                "pix_feat": pix_feat,
-            },
-        )
-        self.profile["mask_memory"].append((time.perf_counter() - t0) * 1000)
-        return msk_value, new_sensory, obj_memory
-
-    def _first_frame_refine(self, feats, last_msk_value, obj_memory, sensory, last_mask):
-        feed = {
-            "f16": feats["f16"],
-            "f8": feats["f8"],
-            "f4": feats["f4"],
-            "f2": feats["f2"],
-            "f1": feats["f1"],
-            "pix_feat": feats["pix_feat"],
-            "last_msk_value": last_msk_value,
-            "obj_memory": obj_memory,
-            "sensory": sensory,
-            "last_mask": last_mask,
-        }
-        t0 = time.perf_counter()
-        prob, new_sensory, _logits = self.first_refine.run(
-            ["prob", "new_sensory", "logits"],
-            {k: v for k, v in feed.items() if k in self._first_refine_inputs},
-        )
-        self.profile["first_refine"].append((time.perf_counter() - t0) * 1000)
-        return prob, new_sensory
-
-    def _propagate(self, feats, state):
-        assert state.memory_key is not None
-        assert state.memory_shrinkage is not None
-        assert state.memory_msk_value is not None
-        assert state.obj_memory is not None
-        assert state.sensory is not None
-        assert state.last_mask is not None
-        assert state.last_pix_feat is not None
-        assert state.last_msk_value is not None
-        feed = {
-            "f16": feats["f16"],
-            "f8": feats["f8"],
-            "f4": feats["f4"],
-            "f2": feats["f2"],
-            "f1": feats["f1"],
-            "pix_feat": feats["pix_feat"],
-            "key": feats["key"],
-            "selection": feats["selection"],
-            "memory_key": state.memory_key,
-            "memory_shrinkage": state.memory_shrinkage,
-            "msk_value": state.memory_msk_value,
-            "obj_memory": state.obj_memory,
-            "sensory": state.sensory,
-            "last_mask": state.last_mask,
-            "last_pix_feat": state.last_pix_feat,
-            "last_pred_mask": state.last_mask,
-            "last_msk_value": state.last_msk_value,
-        }
-        t0 = time.perf_counter()
-        prob, new_sensory, _logits, _uncert_prob = self.propagate.run(
-            ["prob", "new_sensory", "logits", "uncert_prob"],
-            {k: v for k, v in feed.items() if k in self._propagate_inputs},
-        )
-        self.profile["propagate"].append((time.perf_counter() - t0) * 1000)
-        return prob, new_sensory
-
-    def _propagate_update(self, image, feats, state):
-        if self.propagate_update is None:
-            prob, sensory = self._propagate(feats, state)
-            alpha = self.np.clip(prob[:, 1:2], 0.0, 1.0).astype(self.np.float32, copy=False)
-            msk_value, sensory, obj_memory = self._mask_memory(image, alpha, sensory, feats["pix_feat"])
-            return prob, sensory, msk_value, obj_memory
-        feed = {
-            "image": image,
-            "f16": feats["f16"],
-            "f8": feats["f8"],
-            "f4": feats["f4"],
-            "f2": feats["f2"],
-            "f1": feats["f1"],
-            "pix_feat": feats["pix_feat"],
-            "key": feats["key"],
-            "selection": feats["selection"],
-            "memory_key": state.memory_key,
-            "memory_shrinkage": state.memory_shrinkage,
-            "msk_value": state.memory_msk_value,
-            "obj_memory": state.obj_memory,
-            "sensory": state.sensory,
-            "last_mask": state.last_mask,
-            "last_pix_feat": state.last_pix_feat,
-            "last_pred_mask": state.last_mask,
-            "last_msk_value": state.last_msk_value,
-        }
-        t0 = time.perf_counter()
-        prob, sensory, msk_value, obj_memory, _logits, _uncert_prob = self.propagate_update.run(
-            ["prob", "new_sensory", "new_msk_value", "new_obj_memory", "logits", "uncert_prob"],
-            {k: v for k, v in feed.items() if k in self._propagate_update_inputs},
-        )
-        self.profile["propagate_update"].append((time.perf_counter() - t0) * 1000)
-        return prob, sensory, msk_value, obj_memory
-
-    def _step_update(self, image, state):
-        if self.step_update is None:
-            feats = self._image_key(image)
-            prob, sensory, msk_value, obj_memory = self._propagate_update(image, feats, state)
-            return prob, sensory, msk_value, obj_memory, feats["pix_feat"]
-        feed = {
-            "image": image,
-            "memory_key": state.memory_key,
-            "memory_shrinkage": state.memory_shrinkage,
-            "msk_value": state.memory_msk_value,
-            "obj_memory": state.obj_memory,
-            "sensory": state.sensory,
-            "last_mask": state.last_mask,
-            "last_pix_feat": state.last_pix_feat,
-            "last_pred_mask": state.last_mask,
-            "last_msk_value": state.last_msk_value,
-        }
-        t0 = time.perf_counter()
-        prob, sensory, msk_value, obj_memory, pix_feat, _logits, _uncert_prob = self.step_update.run(
-            ["prob", "new_sensory", "new_msk_value", "new_obj_memory", "pix_feat", "logits", "uncert_prob"],
-            {k: v for k, v in feed.items() if k in self._step_update_inputs},
-        )
-        self.profile["step_update"].append((time.perf_counter() - t0) * 1000)
-        return prob, sensory, msk_value, obj_memory, pix_feat
-
-    def _load_masks(self) -> "list[np.ndarray] | None":
-        if self.mask_path is None:
-            return None
-        if self._mask_cache is not None:
-            return self._mask_cache
-        mask = self.cv2.imread(str(self.mask_path), self.cv2.IMREAD_GRAYSCALE)
-        if mask is None:
-            raise RuntimeError(f"failed to read MatAnyone2 mask: {self.mask_path}")
-        mh, mw = mask.shape[:2]
-        if mw >= 2 * mh:
-            half = mw // 2
-            masks = [mask[:, :half], mask[:, half:half * 2]]
-        else:
-            masks = [mask, mask]
-        self._mask_cache = []
-        for eye_mask in masks:
-            resized = self.cv2.resize(eye_mask, (self.in_w, self.in_h), interpolation=self.cv2.INTER_NEAREST)
-            self._mask_cache.append((resized.astype(self.np.float32) / 255.0)[None, None, :, :])
-        return self._mask_cache
-
-    def _reset_segment(self):
-        for eye in self.eyes:
-            eye.reset()
-        self._active_segment_start = -1
-        self._cached_alpha_sbs = None
-
-    def set_segment_masks(self, segment_start: int, masks: "list[np.ndarray]"):
-        self.segment_masks[int(segment_start)] = masks
-
-    def set_segment_plan(self, starts: "list[int]"):
-        self.segment_starts = sorted(set(int(x) for x in starts))
-
-    def set_source_frame_index(self, src_idx: int):
-        self._source_frame_index = int(src_idx)
-
-    def _current_segment_start(self) -> int:
-        starts = getattr(self, "segment_starts", None)
-        if starts:
-            current = starts[0]
-            for start in starts:
-                if start > self._frame_index:
-                    break
-                current = start
-            return current
-        if self.segment_frames <= 0:
-            return 0
-        return (self._frame_index // self.segment_frames) * self.segment_frames
-
-    def is_active_frame(self) -> bool:
-        return self._current_segment_start() in self.segment_masks
-
-    def composite_green_nv12(self, frame):
-        h, w = self._upload(frame)
-        import numpy as np
-
-        alpha = np.zeros((self.in_h, self.in_w * 2), dtype=np.float32)
-        self._frame_index += 1
-        return self.matter._composite_nv12_to_nv12_gpu_using_uploaded_frame(alpha, h, w), None
-
-    def _bootstrap_mask(self, h: int, w: int, eye_idx: int) -> "np.ndarray":
-        masks = self._load_masks()
-        if masks is not None:
-            return masks[eye_idx]
-        segment_start = self._current_segment_start()
-        sam3_masks = self.segment_masks.get(segment_start)
-        if sam3_masks is None:
-            raise RuntimeError(
-                f"Missing precomputed MatAnyone2 bootstrap mask for segment_start={segment_start}. "
-                "Run the configured prepass or pass --mask."
-            )
-        alpha = sam3_masks[eye_idx][0, 0]
-        # MatAnyone2 writes the first-frame mask into memory, so prefer a
-        # conservative foreground seed over a soft or slightly over-wide edge.
-        hard = (alpha >= self.bootstrap_threshold).astype(self.np.uint8)
-        kernel = self.np.ones((3, 3), self.np.uint8)
-        if self.bootstrap_erode > 0:
-            hard = self.cv2.erode(hard, kernel, iterations=self.bootstrap_erode)
-        if self.bootstrap_dilate > 0:
-            hard = self.cv2.dilate(hard, kernel, iterations=self.bootstrap_dilate)
-        if self.bootstrap_soft:
-            alpha = self.np.minimum(alpha, hard.astype(self.np.float32))
-        else:
-            alpha = hard.astype(self.np.float32)
-        return alpha[None, None, :, :].astype(self.tensor_dtype, copy=False)
-
-    def _preprocess_eye(self, x0: int, eye_w: int) -> "np.ndarray":
-        t0 = time.perf_counter()
-        image = self.matter._gpu_preprocess_nv12_one(x0, eye_w, self.in_w, self.in_h, copy_to_host=True)
-        self.profile["preprocess_eye"].append((time.perf_counter() - t0) * 1000)
-        return image.astype(self.tensor_dtype, copy=False)
-
-    def _preprocess_eyes_batch2(self, eye_w: int) -> "np.ndarray":
-        t0 = time.perf_counter()
-        left = self.matter._gpu_preprocess_nv12_one(0, eye_w, self.in_w, self.in_h, batch=2, batch_idx=0, copy_to_host=True)
-        right = self.matter._gpu_preprocess_nv12_one(eye_w, eye_w, self.in_w, self.in_h, batch=2, batch_idx=1, copy_to_host=True)
-        self.profile["preprocess_eye"].append((time.perf_counter() - t0) * 1000)
-        return self.np.ascontiguousarray(self.np.concatenate([left, right], axis=0)).astype(self.tensor_dtype, copy=False)
-
-    def _upload(self, frame) -> tuple[int, int]:
-        from pipeline.pynv_io import GpuP016Frame
-
-        h, w = int(frame.height), int(frame.width)
-        t0 = time.perf_counter()
-        if isinstance(frame, GpuP016Frame):
-            self.matter.upload_p016_planes_as_nv12_gpu(
-                frame.y.as_cupy(),
-                frame.uv.as_cupy(),
-                h,
-                w,
-                shift_bits=int(config.PASSTHROUGH_PYNV_10BIT_SHIFT),
-            )
-        else:
-            self.matter.upload_nv12_planes_gpu(frame.y.as_cupy(), frame.uv.as_cupy(), h, w)
-        self.profile["upload_nv12"].append((time.perf_counter() - t0) * 1000)
-        return h, w
-
-    def _run_eye(self, image, h: int, w: int, eye_idx: int) -> "np.ndarray":
-        state = self.eyes[eye_idx]
-        if not state.initialized:
-            feats = self._image_key(image)
-            sensory = self.np.zeros(self.sensory_single_shape, dtype=self.tensor_dtype)
-            mask = self._bootstrap_mask(h, w, eye_idx)
-            msk_value, sensory, obj_memory = self._mask_memory(image, mask, sensory, feats["pix_feat"])
-            prob, sensory = self._first_frame_refine(feats, msk_value, obj_memory[:, :, None, :, :], sensory, mask)
-            alpha = self.np.clip(prob[:, 1:2], 0.0, 1.0).astype(self.tensor_dtype, copy=False)
-            msk_value, sensory, obj_memory = self._mask_memory(image, alpha, sensory, feats["pix_feat"])
-            state.memory_key = feats["key"][:, :, None, :, :].astype(self.tensor_dtype, copy=False)
-            state.memory_shrinkage = feats["shrinkage"][:, :, None, :, :].astype(self.tensor_dtype, copy=False)
-            state.memory_msk_value = msk_value[:, :, :, None, :, :].astype(self.tensor_dtype, copy=False)
-            state.obj_memory = obj_memory[:, :, None, :, :].astype(self.tensor_dtype, copy=False)
-            state.sensory = sensory.astype(self.tensor_dtype, copy=False)
-            state.last_mask = alpha
-            state.last_pix_feat = feats["pix_feat"].astype(self.tensor_dtype, copy=False)
-            state.last_msk_value = msk_value.astype(self.tensor_dtype, copy=False)
-            state.initialized = True
-        else:
-            prob, sensory, msk_value, _obj_memory, pix_feat = self._step_update(image, state)
-            alpha = self.np.clip(prob[:, 1:2], 0.0, 1.0).astype(self.tensor_dtype, copy=False)
-            state.sensory = sensory.astype(self.tensor_dtype, copy=False)
-            state.last_mask = alpha
-            state.last_pix_feat = pix_feat.astype(self.tensor_dtype, copy=False)
-            state.last_msk_value = msk_value.astype(self.tensor_dtype, copy=False)
-        return alpha[0, 0]
-
-    def _run_eyes_batch2(self, images, h: int, w: int) -> "np.ndarray":
-        states = self.eyes
-        if images.shape[0] != 2:
-            left = self._run_eye(images[0:1], h, w, 0)
-            right = self._run_eye(images[1:2], h, w, 1)
-            return self.np.ascontiguousarray(self.np.concatenate([left, right], axis=1))
-
-        if any(not state.initialized for state in states):
-            feats = self._image_key(images)
-            sensory = self.np.zeros(self.sensory_shape, dtype=self.tensor_dtype)
-            masks = self.np.concatenate([self._bootstrap_mask(h, w, 0), self._bootstrap_mask(h, w, 1)], axis=0)
-            msk_value, sensory, obj_memory = self._mask_memory(images, masks, sensory, feats["pix_feat"])
-            prob, sensory = self._first_frame_refine(
-                feats,
-                msk_value,
-                obj_memory[:, :, None, :, :],
-                sensory,
-                masks,
-            )
-            alpha = self.np.clip(prob[:, 1:2], 0.0, 1.0).astype(self.tensor_dtype, copy=False)
-            msk_value, sensory, obj_memory = self._mask_memory(images, alpha, sensory, feats["pix_feat"])
-            for idx, state in enumerate(states):
-                state.memory_key = feats["key"][idx:idx + 1, :, None, :, :].astype(self.tensor_dtype, copy=False)
-                state.memory_shrinkage = feats["shrinkage"][idx:idx + 1, :, None, :, :].astype(self.tensor_dtype, copy=False)
-                state.memory_msk_value = msk_value[idx:idx + 1, :, :, None, :, :].astype(self.tensor_dtype, copy=False)
-                state.obj_memory = obj_memory[idx:idx + 1, :, None, :, :].astype(self.tensor_dtype, copy=False)
-                state.sensory = sensory[idx:idx + 1].astype(self.tensor_dtype, copy=False)
-                state.last_mask = alpha[idx:idx + 1]
-                state.last_pix_feat = feats["pix_feat"][idx:idx + 1].astype(self.tensor_dtype, copy=False)
-                state.last_msk_value = msk_value[idx:idx + 1].astype(self.tensor_dtype, copy=False)
-                state.initialized = True
-            return self.np.ascontiguousarray(self.np.concatenate([alpha[0, 0], alpha[1, 0]], axis=1))
-
-        for other in states[1:]:
-            assert other.memory_key is not None
-        batched_state = self._EyeState()
-        batched_state.memory_key = self.np.concatenate([s.memory_key for s in states], axis=0)
-        batched_state.memory_shrinkage = self.np.concatenate([s.memory_shrinkage for s in states], axis=0)
-        batched_state.memory_msk_value = self.np.concatenate([s.memory_msk_value for s in states], axis=0)
-        batched_state.obj_memory = self.np.concatenate([s.obj_memory for s in states], axis=0)
-        batched_state.sensory = self.np.concatenate([s.sensory for s in states], axis=0)
-        batched_state.last_mask = self.np.concatenate([s.last_mask for s in states], axis=0)
-        batched_state.last_pix_feat = self.np.concatenate([s.last_pix_feat for s in states], axis=0)
-        batched_state.last_msk_value = self.np.concatenate([s.last_msk_value for s in states], axis=0)
-        batched_state.initialized = True
-        prob, sensory, msk_value, _obj_memory, pix_feat = self._step_update(images, batched_state)
-        alpha = self.np.clip(prob[:, 1:2], 0.0, 1.0).astype(self.tensor_dtype, copy=False)
-        for idx, state in enumerate(states):
-            state.sensory = sensory[idx:idx + 1].astype(self.tensor_dtype, copy=False)
-            state.last_mask = alpha[idx:idx + 1]
-            state.last_pix_feat = pix_feat[idx:idx + 1].astype(self.tensor_dtype, copy=False)
-            state.last_msk_value = msk_value[idx:idx + 1].astype(self.tensor_dtype, copy=False)
-        return self.np.ascontiguousarray(self.np.concatenate([alpha[0, 0], alpha[1, 0]], axis=1))
-
-    def composite_nv12(self, frame):
-        segment_start = self._current_segment_start()
-        if self._active_segment_start != segment_start:
-            print(
-                f"[offline] MatAnyone2 segment reset at frame={self._frame_index} "
-                f"src_idx={self._source_frame_index} segment_start={segment_start}"
-            )
-            self._reset_segment()
-            self._active_segment_start = segment_start
-        h, w = self._upload(frame)
-        eye_w = w // 2
-        if eye_w <= 0 or w < 2 * h:
-            raise RuntimeError(f"MatAnyone2 ONNX offline engine expects SBS input, got {w}x{h}")
-        should_update = (
-            self._cached_alpha_sbs is None
-            or self.alpha_stride <= 1
-            or self._frame_index % self.alpha_stride == 0
-        )
-        if should_update and self.batch2_enabled:
-            alpha_sbs = self._run_eyes_batch2(self._preprocess_eyes_batch2(eye_w), h, w)
-            self._cached_alpha_sbs = alpha_sbs
-        elif should_update:
-            left = self._run_eye(self._preprocess_eye(0, eye_w), h, w, 0)
-            right = self._run_eye(self._preprocess_eye(eye_w, eye_w), h, w, 1)
-            t0 = time.perf_counter()
-            alpha_sbs = self.np.ascontiguousarray(self.np.concatenate([left, right], axis=1))
-            self.profile["alpha_concat"].append((time.perf_counter() - t0) * 1000)
-            self._cached_alpha_sbs = alpha_sbs
-        else:
-            alpha_sbs = self._cached_alpha_sbs
-            self.profile["alpha_reuse"].append(0.0)
-        self._frame_index += 1
-        t0 = time.perf_counter()
-        out = self.matter._composite_nv12_to_nv12_gpu_using_uploaded_frame(alpha_sbs, h, w)
-        self.profile["composite"].append((time.perf_counter() - t0) * 1000)
-        return out, None
-
-    def profile_lines(self) -> list[str]:
-        order = [
-            "upload_nv12",
-            "preprocess_eye",
-            "step_update",
-            "image_key",
-            "propagate_update",
-            "propagate",
-            "mask_memory",
-            "first_refine",
-            "alpha_concat",
-            "alpha_reuse",
-            "composite",
-        ]
-        lines = []
-        for key in order:
-            values = self.profile.get(key)
-            if values:
-                lines.append(f"matanyone2_{key}_avg = {statistics.fmean(values):.3f} ms n={len(values)}")
-        return lines
-
-
 def _make_engine(args) -> OfflineMattingEngine:
     name = args.engine
     if name == "rvm":
@@ -1079,10 +563,11 @@ def _make_engine(args) -> OfflineMattingEngine:
         return RvmOfflineEngine(model_path)
     if name == "matanyone2_onnx":
         model_dir = Path(args._matanyone2_model_dir).resolve()
-        return MatAnyone2OnnxEngine(
+        return SharedMatAnyone2OnnxEngine(
             model_dir,
             Path(args.mask).resolve() if args.mask else None,
             Path(args.sam3_model_dir).resolve(),
+            _matanyone2_session_providers,
             sam3_prompt=args.sam3_prompt,
             bootstrap_threshold=args.matanyone2_bootstrap_threshold,
             bootstrap_erode=args.matanyone2_bootstrap_erode,
@@ -1091,6 +576,8 @@ def _make_engine(args) -> OfflineMattingEngine:
             segment_frames=args.matanyone2_segment_frames,
             use_fused_update=args.matanyone2_fused_update,
             use_step_update=args.matanyone2_step_update,
+            output_mode="green",
+            log_prefix="[offline]",
         )
     raise RuntimeError(f"unknown engine: {name}")
 
@@ -1106,6 +593,7 @@ def _planned_starts_from_sam3_records(
     min_frames: int,
     cut_on_count_change: bool,
     cut_every_active_sample: bool,
+    scene_min_frames: int = 0,
 ) -> list[int]:
     if not records:
         return [0]
@@ -1121,6 +609,8 @@ def _planned_starts_from_sam3_records(
         if active and cut_on_count_change and count != last_count:
             force_cut = True
         if active and cut_every_active_sample:
+            force_cut = True
+        if active and bool(record.get("scene_cut")) and (scene_min_frames <= 0 or idx - last >= scene_min_frames):
             force_cut = True
         timed_cut = (min_frames > 0 and idx - last >= min_frames) or (max_frames > 0 and idx - last >= max_frames)
         if force_cut or timed_cut:
@@ -1148,6 +638,20 @@ def _precompute_sam3_segment_masks(args, src: Path, dec, source_fps: float, fps:
 
     max_segment_frames = max(1, int(args.matanyone2_segment_frames or target))
     min_segment_frames = max(1, int(round(max(0.0, args.matanyone2_min_segment_sec) * fps)))
+    scene_detector = (
+        SceneCutDetector(
+            threshold=config.MATANYONE2_SCENE_THRESHOLD,
+            cooldown_frames=config.MATANYONE2_SCENE_COOLDOWN,
+            ref_ema_alpha=config.MATANYONE2_SCENE_REF_EMA,
+        )
+        if config.MATANYONE2_SCENE_RESET
+        else None
+    )
+    scene_min_frames = (
+        max(1, int(round(max(0.0, config.MATANYONE2_SCENE_MIN_SEGMENT_SEC) * fps)))
+        if scene_detector is not None
+        else 0
+    )
     if args.sam3_scan in {"keyframe", "hybrid"}:
         candidates = _probe_keyframe_indices(src, source_fps, target, fps)
         if args.sam3_scan == "hybrid":
@@ -1185,6 +689,7 @@ def _precompute_sam3_segment_masks(args, src: Path, dec, source_fps: float, fps:
     print(
         f"[offline] SAM3 prepass prompt={args.sam3_prompt!r} samples={len(scan_points)} "
         f"scan={args.sam3_scan} max_segment_frames={max_segment_frames} "
+        f"scene_reset={int(scene_detector is not None)} "
         f"low_memory={args.sam3_low_memory} "
         f"encoder={_provider_summary(providers)} decoder={_provider_summary(decoder_providers)}"
     )
@@ -1197,6 +702,11 @@ def _precompute_sam3_segment_masks(args, src: Path, dec, source_fps: float, fps:
         frame = dec.frame_at(src_idx)
         bgr = decoded_frame_to_bgr(frame)
         half = frame.width // 2
+        scene_cut = False
+        scene_distance = 0.0
+        if scene_detector is not None:
+            scene_cut = scene_detector.step(bgr[:, :half] if half > 0 else bgr)
+            scene_distance = scene_detector.last_distance
         eye_images = [
             cv2.cvtColor(bgr[:, :half], cv2.COLOR_BGR2RGB),
             cv2.cvtColor(bgr[:, half:half * 2], cv2.COLOR_BGR2RGB),
@@ -1258,6 +768,7 @@ def _precompute_sam3_segment_masks(args, src: Path, dec, source_fps: float, fps:
                 "src_idx": int(src_idx),
                 "active": bool(active),
                 "object_count": int(object_count),
+                "scene_cut": bool(scene_cut),
             }
         )
         if debug_dir is not None:
@@ -1269,6 +780,7 @@ def _precompute_sam3_segment_masks(args, src: Path, dec, source_fps: float, fps:
             f"L={infos[0]['selected']} area={infos[0]['union_area_ratio']:.4f} "
             f"R={infos[1]['selected']} area={infos[1]['union_area_ratio']:.4f} "
             f"stereo={stereo_mode}"
+            + (f" scene_cut=1 dist={scene_distance:.3f}" if scene_cut else "")
             + (f" gpu={gpu_used}/{gpu_total}MiB" if gpu_total else "")
         )
         if release_interval and n % release_interval == 0:
@@ -1293,7 +805,17 @@ def _precompute_sam3_segment_masks(args, src: Path, dec, source_fps: float, fps:
         min_segment_frames,
         args.sam3_cut_on_count_change,
         args.sam3_cut_every_active_sample,
+        scene_min_frames,
     )
+    scene_cut_frames = [int(record["frame"]) for record in records if record.get("scene_cut")]
+    if scene_cut_frames:
+        scene_with_masks = [frame for frame in scene_cut_frames if frame in masks_by_start]
+        scene_included = [frame for frame in scene_with_masks if frame in starts]
+        scene_ignored = [frame for frame in scene_cut_frames if frame not in scene_included]
+        print(
+            f"[offline] MatAnyone2 scene cuts detected={scene_cut_frames} "
+            f"included={scene_included} ignored={scene_ignored}"
+        )
     masks_by_start = {start: masks_by_start[start] for start in starts if start in masks_by_start}
     print(f"[offline] MatAnyone2 segment plan starts={starts} active={sorted(masks_by_start)}")
     return masks_by_start, starts
@@ -1412,7 +934,7 @@ def main() -> int:
     parser.add_argument("--out", default="", help="output mp4 path; default is source-stem_passthrough.mp4")
     parser.add_argument("--engine", default="rvm", choices=["rvm", "matanyone2_onnx"])
     parser.add_argument("--model", default="", help="model path; RVM defaults to models/rvm_mobilenetv3_fp32.onnx")
-    parser.add_argument("--matanyone2-size", type=int, default=512, choices=[512, 1024],
+    parser.add_argument("--matanyone2-size", type=int, default=1024, choices=[1024],
                         help="MatAnyone2 ONNX size to auto-select when --model is omitted")
     parser.add_argument("--matanyone2-batch", default="1", choices=["auto", "1", "2"],
                         help="MatAnyone2 ONNX batch to auto-select when --model is omitted; auto uses bs2 only for 512 SBS")
@@ -1702,7 +1224,7 @@ def main() -> int:
     if engine is None:
         engine = _make_engine(args)
     enc_w, enc_h = info.width, info.height
-    if isinstance(engine, MatAnyone2OnnxEngine):
+    if isinstance(engine, SharedMatAnyone2OnnxEngine):
         engine.set_segment_plan(segment_starts)
         for segment_start, masks in sam3_masks.items():
             engine.set_segment_masks(segment_start, masks)
@@ -1753,9 +1275,9 @@ def main() -> int:
             td1 = time.perf_counter()
             if args.sync_profile:
                 t_sync_after_dec.append(_cuda_sync_ms(args.device_sync_profile))
-            if isinstance(engine, MatAnyone2OnnxEngine):
+            if isinstance(engine, SharedMatAnyone2OnnxEngine):
                 engine.set_source_frame_index(src_idx)
-            if isinstance(engine, MatAnyone2OnnxEngine) and not engine.is_active_frame():
+            if isinstance(engine, SharedMatAnyone2OnnxEngine) and not engine.is_active_frame():
                 out_nv12, _ = engine.composite_green_nv12(frame)
             else:
                 out_nv12, _ = engine.composite_nv12(frame)

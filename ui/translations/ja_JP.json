@@ -63,6 +63,7 @@
   "offline.precision_low": "低 (1024 / 0.5) - リアルタイムモードと同じ",
   "offline.precision_balanced": "中 (2048 / 0.25) - 推奨",
   "offline.precision_hq": "高 (2048 / 0.5) - より高いディテール",
+  "offline.matanyone2_precision_high": "高品質 (1024) - 推奨",
   "file.select_video": "動画を選択",
   "file.output_video": "出力ファイルを選択",
   "file.select_directory": "フォルダーを選択",

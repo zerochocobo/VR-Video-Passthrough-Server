@@ -2,8 +2,6 @@
 
 This file is intended for users of the exported MatAnyone2 ONNX folders:
 
-    matanyone2_onnx_512_bs1
-    matanyone2_onnx_512_bs2
     matanyone2_onnx_1024_bs1
     matanyone2_onnx_1024_bs2
 
@@ -31,13 +29,13 @@ CPU also works for small tests:
 Usage examples:
 
     python examples/matanyone2_onnx_video_infer.py ^
-      --model-dir models/matanyone2_onnx_512_bs1 ^
+      --model-dir models/matanyone2_onnx_1024_bs1 ^
       --video input.mp4 ^
       --mask first_frame_mask.png ^
       --out alpha_preview.mp4
 
     python examples/matanyone2_onnx_video_infer.py ^
-      --model-dir models/matanyone2_onnx_512_bs2 ^
+      --model-dir models/matanyone2_onnx_1024_bs1 ^
       --video sbs_vr180.mp4 ^
       --mask first_frame_mask_sbs.png ^
       --sbs ^
