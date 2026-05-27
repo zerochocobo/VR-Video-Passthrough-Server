@@ -14,7 +14,7 @@ def main() -> int:
     os.environ["PT_MATTING_MODEL_KIND"] = "rvm"
     os.environ["PT_MATTING_WARMUP_RUNS"] = "0"
     os.environ["PT_ONNX_PROVIDERS"] = "TensorrtExecutionProvider,CUDAExecutionProvider,CPUExecutionProvider"
-    os.environ["PT_ONNX_TRT_FP16_ENABLE"] = "1"
+    os.environ["PT_ONNX_TRT_FP16_ENABLE"] = "0"
     os.environ["PT_ONNX_TRT_CUDA_GRAPH_ENABLE"] = "0"
 
     import config
@@ -22,7 +22,7 @@ def main() -> int:
     config.MATTING_MODEL_KIND = "rvm"
     config.MATTING_WARMUP_RUNS = 0
     config.ONNX_PROVIDERS = ["TensorrtExecutionProvider", "CUDAExecutionProvider", "CPUExecutionProvider"]
-    config.ONNX_TRT_FP16_ENABLE = True
+    config.ONNX_TRT_FP16_ENABLE = False
     config.ONNX_TRT_CUDA_GRAPH_ENABLE = False
 
     from ui.services.process_helpers import base_environment

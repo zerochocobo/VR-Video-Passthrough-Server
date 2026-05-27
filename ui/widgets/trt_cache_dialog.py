@@ -23,8 +23,11 @@ from utils.trt_manifest import (
     cache_status,
     clear_cache,
     collect_fingerprint,
+    engine_artifact_paths,
     load_manifest_for_model,
+    matanyone2_trt_source_model_paths,
     manifest_path,
+    model_label,
     normalized_model_key,
     source_model_path,
     stale_reasons,
@@ -125,6 +128,8 @@ class TensorRTConfigDialog(QDialog):
         return 3
 
     def _model_display_name(self) -> str:
+        if self.model_key == TRT_MODEL_MATANYONE2:
+            return model_label(self.model_key)
         path = source_model_path(self.model_key)
         return path.name if path.name else str(path)
 
@@ -179,7 +184,7 @@ class TensorRTConfigDialog(QDialog):
                             pass
         details = [
             f"{self.i18n.t('trt.model')}: {self._model_display_name()}",
-            f"{self.i18n.t('trt.precision')}: FP16",
+            f"{self.i18n.t('trt.precision')}: FP32",
             f"{self.i18n.t('trt.gpu')}: {fp.get('gpu_name') or libs.gpu_name or '-'}",
             f"{self.i18n.t('trt.driver')}: {fp.get('driver_version') or '-'}",
             f"{self.i18n.t('trt.tensorrt')}: {fp.get('trt_version') or '-'}",
@@ -231,9 +236,14 @@ class TensorRTConfigDialog(QDialog):
         if libs.frozen and not libs.ready:
             self._refresh()
             return
-        model_path = source_model_path(self.model_key)
-        if not model_path.is_file():
-            self.build_error_text = "ERROR: " + self.i18n.t("trt.source_model_missing").format(path=model_path)
+        if self.model_key == TRT_MODEL_MATANYONE2:
+            missing = [path for path in matanyone2_trt_source_model_paths().values() if not path.is_file()]
+            missing_text = ", ".join(str(path) for path in missing)
+        else:
+            model_path = source_model_path(self.model_key)
+            missing_text = str(model_path) if not model_path.is_file() else ""
+        if missing_text:
+            self.build_error_text = "ERROR: " + self.i18n.t("trt.source_model_missing").format(path=missing_text)
             self.progress.setVisible(False)
             self.stage_label.setText(self.build_error_text)
             self.engines_label.setText("")
@@ -246,7 +256,7 @@ class TensorRTConfigDialog(QDialog):
         self.stage_label.setText(
             self.i18n.t("trt.building_model").format(
                 model=self._model_display_name(),
-                precision="FP16",
+                precision="FP32",
             )
         )
         self.engines_label.setText("")
@@ -274,7 +284,7 @@ class TensorRTConfigDialog(QDialog):
                 "--downsample",
                 "0.5",
                 "--fp16",
-                "1",
+                "0",
                 "--cuda-graph",
                 "0",
                 "--cache-dir",
@@ -375,11 +385,7 @@ class TensorRTConfigDialog(QDialog):
                 self.build_error_text = line
                 self.stage_label.setText(line)
         cache_dir = self._manifest_path().parent
-        count = len([
-            path
-            for path in cache_dir.iterdir()
-            if path.is_file() and path.name not in {"manifest.json", "build.log"}
-        ]) if cache_dir.exists() else 0
+        count = len(engine_artifact_paths(cache_dir, recursive=self.model_key == TRT_MODEL_MATANYONE2)) if cache_dir.exists() else 0
         self.engines_label.setText(self.i18n.t("trt.engines_built").format(count=count))
 
     def _build_finished(self, exit_code: int) -> None:

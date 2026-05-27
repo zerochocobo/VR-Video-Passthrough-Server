@@ -1,6 +1,6 @@
 MatAnyone2 ONNX models are not bundled in the release package.
 
-Download the 512 and/or 1024 ONNX model folders from:
+Download the ONNX model folders from:
 
 https://huggingface.co/zerochocobo/matanyone2_onnx/tree/main
 
@@ -8,12 +8,14 @@ Place the downloaded folders directly under this project's models/ directory.
 
 Recommended for PTMediaServer:
 
-- matanyone2_onnx_512_bs2
-  Default choice for normal VR180 side-by-side offline conversion.
 - matanyone2_onnx_512_bs1
-  Fallback for non-SBS or lower-memory processing.
-- matanyone2_onnx_1024_bs1 / matanyone2_onnx_1024_bs2
-  Higher-resolution masks, slower, higher VRAM usage.
+- matanyone2_onnx_1024_bs1
+  Enabled offline MatAnyone2 processing precisions. 1024 remains the default.
+
+Deprecated:
+
+- matanyone2_onnx_512_bs2
+- matanyone2_onnx_2048_bs1
 
 Minimum files expected in each model folder:
 
@@ -23,7 +25,7 @@ Minimum files expected in each model folder:
 - matanyone2_first_frame_refine.onnx
 - matanyone2_propagate.onnx
 
-Optional files used when available:
+Optional files used when available (matanyone2_step_update.onnx is required for TensorRT cache build):
 
 - matanyone2_propagate_update.onnx
 - matanyone2_step_update.onnx
@@ -43,9 +45,9 @@ https://huggingface.co/zerochocobo/matanyone2_onnx/tree/main
 
 下载后，将模型目录直接放到项目的 models/ 目录下。
 
-PTMediaServer 推荐普通用户至少下载：
+PTMediaServer 离线 MatAnyone2 需要下载：
 
-- matanyone2_onnx_512_bs2
 - matanyone2_onnx_512_bs1
+- matanyone2_onnx_1024_bs1
 
-1024 版本质量更高但更慢、显存压力更大，仅建议高显存用户使用。
+512 与 1024 是当前启用的 MatAnyone2 离线精度，默认仍选择 1024。2048 版本已停用。

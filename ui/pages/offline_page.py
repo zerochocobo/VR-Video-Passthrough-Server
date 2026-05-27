@@ -180,8 +180,9 @@ class OfflinePage(QWidget):
         combo.blockSignals(True)
         combo.clear()
         if engine == "matanyone2":
+            combo.addItem(self.i18n.t("offline.matanyone2_precision_fast"), ("matanyone2", 512))
             combo.addItem(self.i18n.t("offline.matanyone2_precision_high"), ("matanyone2", 1024))
-            default_index = 0
+            default_index = 1
         else:
             combo.addItem(self.i18n.t("offline.precision_low"), ("rvm", 1024, 0.5))
             combo.addItem(self.i18n.t("offline.precision_balanced"), ("rvm", 2048, 0.25))
@@ -189,12 +190,12 @@ class OfflinePage(QWidget):
             default_index = 1
         index = combo.findData(previous)
         combo.setCurrentIndex(index if index >= 0 else default_index)
-        combo.setEnabled(engine != "matanyone2")
+        combo.setEnabled(engine in {"rvm_fast", "matanyone2"})
         combo.blockSignals(False)
 
     def _recognition_combo(self) -> QComboBox:
         combo = _fit_combo(QComboBox())
-        combo.addItem("", "yoloworld_efficientsam")
+        combo.addItem("", "yolo26m_efficientsam")
         combo.addItem("", "sam3")
         return combo
 
@@ -555,7 +556,7 @@ class OfflinePage(QWidget):
         if engine != "matanyone2":
             return engine
         recognition = str(recognition_combo.currentData())
-        return "matanyone2_medium" if recognition == "yoloworld_efficientsam" else "matanyone2"
+        return "matanyone2_medium" if recognition == "yolo26m_efficientsam" else "matanyone2"
 
     def _sam3_prompt(self) -> str:
         prompt = str(self.settings.data.get("offline_sam3_prompt") or "").strip()
@@ -718,8 +719,8 @@ class OfflinePage(QWidget):
         self.stop_batch.setEnabled(running)
         self.single_trt_configure_button.setEnabled(not running)
         self.batch_trt_configure_button.setEnabled(not running)
-        self.single_precision.setEnabled(not running and str(self.single_engine.currentData()) != "matanyone2")
-        self.batch_precision.setEnabled(not running and str(self.batch_engine.currentData()) != "matanyone2")
+        self.single_precision.setEnabled(not running)
+        self.batch_precision.setEnabled(not running)
         if not running:
             self._update_trt_cache_rows()
         else:
@@ -769,7 +770,7 @@ class OfflinePage(QWidget):
             combo.setItemText(0, self.i18n.t("engine.rvm_fast"))
             combo.setItemText(1, self.i18n.t("engine.matanyone2"))
         for combo in (self.single_recognition, self.batch_recognition):
-            combo.setItemText(0, self.i18n.t("recognition.yoloworld_efficientsam"))
+            combo.setItemText(0, self.i18n.t("recognition.yolo26m_efficientsam"))
             combo.setItemText(1, self.i18n.t("recognition.sam3"))
         self._configure_precision_combo(self.single_precision, str(self.single_engine.currentData()))
         self._configure_precision_combo(self.batch_precision, str(self.batch_engine.currentData()))

@@ -2,6 +2,7 @@
   "repo_id": "PeiqingYang/MatAnyone2",
   "height": 1024,
   "width": 1024,
+  "batch_size": 1,
   "objects": 1,
   "memory_frames": 1,
   "fp16": false,
@@ -89,15 +90,19 @@
     ]
   },
   "files": {
-    "image_key": "G:\\GIT\\pt\\models\\matanyone2_onnx_1024\\matanyone2_image_key.onnx",
-    "mask_memory": "G:\\GIT\\pt\\models\\matanyone2_onnx_1024\\matanyone2_mask_memory.onnx",
-    "first_frame_refine": "G:\\GIT\\pt\\models\\matanyone2_onnx_1024\\matanyone2_first_frame_refine.onnx",
-    "propagate": "G:\\GIT\\pt\\models\\matanyone2_onnx_1024\\matanyone2_propagate.onnx"
+    "image_key": "G:\\GIT\\pt\\models\\matanyone2_onnx_1024_bs1\\matanyone2_image_key.onnx",
+    "mask_memory": "G:\\GIT\\pt\\models\\matanyone2_onnx_1024_bs1\\matanyone2_mask_memory.onnx",
+    "first_frame_refine": "G:\\GIT\\pt\\models\\matanyone2_onnx_1024_bs1\\matanyone2_first_frame_refine.onnx",
+    "propagate": "G:\\GIT\\pt\\models\\matanyone2_onnx_1024_bs1\\matanyone2_propagate.onnx",
+    "propagate_update": "G:\\GIT\\pt\\models\\matanyone2_onnx_1024_bs1\\matanyone2_propagate_update.onnx",
+    "step_update": "G:\\GIT\\pt\\models\\matanyone2_onnx_1024_bs1\\matanyone2_step_update.onnx"
   },
   "onnx_check": {
     "image_key": "ok",
     "mask_memory": "ok",
     "first_frame_refine": "ok",
-    "propagate": "ok"
+    "propagate": "ok",
+    "propagate_update": "ok",
+    "step_update": "ok"
   }
 }

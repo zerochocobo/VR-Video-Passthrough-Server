@@ -24,7 +24,7 @@ def _configure_env(cache_dir: Path) -> None:
     os.environ["PT_ONNX_PROVIDERS"] = "TensorrtExecutionProvider,CUDAExecutionProvider,CPUExecutionProvider"
     os.environ["PT_ONNX_TRT_ENGINE_CACHE_PATH"] = str(cache_dir.resolve())
     os.environ["PT_ONNX_TRT_ENGINE_CACHE_ENABLE"] = "1"
-    os.environ["PT_ONNX_TRT_FP16_ENABLE"] = "1"
+    os.environ["PT_ONNX_TRT_FP16_ENABLE"] = "0"
     os.environ["PT_ONNX_TRT_CUDA_GRAPH_ENABLE"] = "0"
 
 

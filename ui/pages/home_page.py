@@ -669,7 +669,7 @@ class HomePage(QWidget):
         self.performance_quality.setCurrentIndex(max(0, idx))
         self.performance_fps = QComboBox()
         self.performance_fps.addItem("", 0)
-        for value in (20, 30, 40, 60):
+        for value in (20, 30, 40, 50, 60):
             self.performance_fps.addItem(str(value), value)
         self.performance_fps.setFixedWidth(120)
         idx = self.performance_fps.findData(_int_setting(settings.data.get("passthrough_max_fps"), 0))

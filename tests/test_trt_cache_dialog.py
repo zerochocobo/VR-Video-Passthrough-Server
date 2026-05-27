@@ -206,6 +206,7 @@ class TensorRTCacheDialogTests(unittest.TestCase):
         args = captured["args"]
         self.assertEqual(args[args.index("--model") + 1], "rvm")
         self.assertEqual(args[args.index("--input-size") + 1], "1024")
+        self.assertEqual(args[args.index("--fp16") + 1], "0")
 
     def test_offline_rvm_build_uses_offline_warmup(self) -> None:
         from ui.widgets import trt_cache_dialog

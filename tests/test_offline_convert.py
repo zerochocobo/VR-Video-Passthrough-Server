@@ -168,6 +168,42 @@ class OfflineConvertTests(unittest.TestCase):
         self.assertIn("--alpha-stride", cmd)
         self.assertIn("1", cmd)
 
+    def test_matanyone2_medium_defaults_to_yolo26m_prepass(self) -> None:
+        args = SimpleNamespace(
+            mode="alpha",
+            engine="matanyone2_medium",
+            start=0.0,
+            duration=0.0,
+            fps=30.0,
+            input_size=1024,
+            rvm_downsample_ratio=0.5,
+            skip_frames=0,
+            bitrate="source",
+            preset="P4",
+            matanyone2_size=1024,
+        )
+        cmd = convert._base_cmd(args, Path("input.mp4"), Path("out.mp4"))
+        index = cmd.index("--matanyone2-prepass")
+        self.assertEqual(cmd[index + 1], "yolo26m_efficientsam")
+
+    def test_matanyone2_command_accepts_512_size(self) -> None:
+        args = SimpleNamespace(
+            mode="alpha",
+            engine="matanyone2",
+            start=0.0,
+            duration=0.0,
+            fps=0.0,
+            input_size=1024,
+            rvm_downsample_ratio=0.5,
+            skip_frames=0,
+            bitrate="source",
+            preset="P4",
+            matanyone2_size=512,
+        )
+        cmd = convert._base_cmd(args, Path("input.mp4"), Path("out.mp4"))
+        index = cmd.index("--matanyone2-size")
+        self.assertEqual(cmd[index + 1], "512")
+
     def test_matanyone2_command_rejects_unsupported_size(self) -> None:
         args = SimpleNamespace(
             mode="alpha",

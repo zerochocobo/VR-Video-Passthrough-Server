@@ -31,11 +31,12 @@ class TrtWarmupProcessTests(unittest.TestCase):
                 "--cache-dir",
                 "runtime_cache/test_matanyone2_trt",
                 "--matanyone2-model-key",
-                "matanyone2_onnx_1024_bs1",
+                "matanyone2_onnx_512_bs1",
             ]
         )
         self.assertEqual(args.model, "matanyone2")
-        self.assertEqual(args.matanyone2_model_key, "matanyone2_onnx_1024_bs1")
+        self.assertEqual(args.matanyone2_model_key, "matanyone2_onnx_512_bs1")
+        self.assertEqual(args.fp16, 0)
 
     def test_rvm_state_symbolic_dims_do_not_reuse_src_height_width(self) -> None:
         graph = helper.make_graph(

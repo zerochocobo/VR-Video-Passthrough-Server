@@ -182,6 +182,26 @@ class ContentDirectoryModeTests(unittest.TestCase):
         )
         self.assertEqual(cds._marked_original_title(Path("movie.mp4"), child), "movie_LR_180_SBS")
 
+    def test_offline_passthrough_output_title_is_marked(self) -> None:
+        child = SimpleNamespace(
+            video=SimpleNamespace(
+                width=3840,
+                height=1920,
+                resolution="3840x1920",
+                backend_verdict="pynv_hevc",
+                probe_error="",
+                mkv_needs_fix=False,
+            )
+        )
+        self.assertEqual(
+            cds._marked_original_title(Path("movie_LR_180_SBS_passthrough.mp4"), child),
+            "[Offline] movie_LR_180_SBS_passthrough",
+        )
+        self.assertEqual(
+            cds._marked_original_title(Path("movie_LR_180_FISHEYE_F180_alpha.mp4"), child),
+            "[Offline] movie_LR_180_FISHEYE_F180_alpha",
+        )
+
     def test_mkv_needs_fix_hides_passthrough_and_marks_title(self) -> None:
         child = SimpleNamespace(
             size=1024,

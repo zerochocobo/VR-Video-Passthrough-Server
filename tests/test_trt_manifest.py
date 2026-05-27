@@ -32,7 +32,7 @@ class TrtManifestTests(unittest.TestCase):
             "model_sha256": "abc",
             "matting_input_size": 1024,
             "rvm_downsample_ratio": 0.5,
-            "trt_fp16": True,
+            "trt_fp16": False,
             "trt_cuda_graph": True,
         }
 
@@ -137,8 +137,10 @@ class TrtManifestTests(unittest.TestCase):
         self.assertEqual(trt_manifest.cache_status(actual_fp=self._fingerprint()), "failed")
 
     def test_matanyone2_manifest_uses_separate_cache_dir(self) -> None:
-        source = self.root / "matanyone2_step_update.onnx"
-        source.write_bytes(b"onnx")
+        source_512 = self.root / "matanyone2_512_step_update.onnx"
+        source_1024 = self.root / "matanyone2_1024_step_update.onnx"
+        source_512.write_bytes(b"onnx512")
+        source_1024.write_bytes(b"onnx1024")
         fp = {
             "gpu_uuid": "GPU-test",
             "gpu_name": "Test GPU",
@@ -148,25 +150,34 @@ class TrtManifestTests(unittest.TestCase):
             "trt_version": "10",
             "ort_version": "1.20",
             "model_sha256": "def",
-            "trt_fp16": True,
+            "trt_fp16": False,
             "trt_cuda_graph": True,
             "matanyone2_model_key": "matanyone2_onnx_1024_bs1",
-            "matanyone2_model_keys": ["matanyone2_onnx_1024_bs1"],
+            "matanyone2_model_keys": list(trt_manifest.MATANYONE2_MODEL_KEYS),
             "matanyone2_onnx": "matanyone2_step_update.onnx",
         }
         cache_dir = trt_manifest.cache_dir_for_model(trt_manifest.TRT_MODEL_MATANYONE2)
         manifest = trt_manifest.build_manifest(
             fp,
-            [{"shape": "matanyone2_step_update", "size_mb": 1, "built_at": "2026-05-20T00:00:00Z"}],
+            [
+                {"shape": f"{model_key}/matanyone2_step_update", "size_mb": 1, "built_at": "2026-05-20T00:00:00Z"}
+                for model_key in trt_manifest.MATANYONE2_MODEL_KEYS
+            ],
             3,
             model_key=trt_manifest.TRT_MODEL_MATANYONE2,
         )
-        paths = {"matanyone2_onnx_1024_bs1": source}
-        with patch.object(trt_manifest, "matanyone2_trt_source_model_path", return_value=source), patch.object(
+        paths = {
+            "matanyone2_onnx_512_bs1": source_512,
+            "matanyone2_onnx_1024_bs1": source_1024,
+        }
+        with patch.object(trt_manifest, "matanyone2_trt_source_model_path", return_value=source_1024), patch.object(
             trt_manifest, "matanyone2_trt_source_model_paths", return_value=paths
         ):
             trt_manifest.save_manifest(manifest, model_key=trt_manifest.TRT_MODEL_MATANYONE2)
-            (cache_dir / "step.engine").write_bytes(b"e" * (1024 * 1024))
+            for model_key in trt_manifest.MATANYONE2_MODEL_KEYS:
+                model_cache = trt_manifest.matanyone2_trt_cache_dir_for_key(model_key, cache_dir)
+                model_cache.mkdir(parents=True, exist_ok=True)
+                (model_cache / "step.engine").write_bytes(b"e" * (1024 * 1024))
             self.assertEqual(
                 trt_manifest.cache_status(actual_fp=fp, model_key=trt_manifest.TRT_MODEL_MATANYONE2),
                 "ready",

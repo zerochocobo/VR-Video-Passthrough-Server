@@ -251,7 +251,7 @@ def _run_matanyone2_step_update_isolated(model_key: str, model_path: Path, cache
             "PT_MATTING_MODEL_KIND": "matanyone2",
             "PT_MATTING_WARMUP_RUNS": "0",
             "PT_ONNX_PROVIDERS": "TensorrtExecutionProvider,CUDAExecutionProvider,CPUExecutionProvider",
-            "PT_ONNX_TRT_FP16_ENABLE": "1",
+            "PT_ONNX_TRT_FP16_ENABLE": "0",
             "PT_ONNX_TRT_CUDA_GRAPH_ENABLE": "0",
             "PT_ONNX_TRT_ENGINE_CACHE_PATH": str(cache_dir.resolve()),
         }
@@ -267,7 +267,7 @@ def _run_matanyone2_step_update_isolated(model_key: str, model_path: Path, cache
             "--cache-dir",
             str(cache_dir.resolve()),
             "--fp16",
-            "1",
+            "0",
             "--cuda-graph",
             "0",
         ],
@@ -295,11 +295,11 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--model", default="rvm", choices=["rvm", "matanyone2"])
     parser.add_argument("--input-size", type=int, default=1024)
     parser.add_argument("--downsample", type=float, default=0.5)
-    parser.add_argument("--fp16", type=int, default=1)
+    parser.add_argument("--fp16", type=int, default=0)
     parser.add_argument("--cuda-graph", type=int, default=0)
     parser.add_argument("--cache-dir", type=Path, default=None)
     parser.add_argument("--progress-stdout", action="store_true")
-    parser.add_argument("--matanyone2-model-key", default="", choices=["", "matanyone2_onnx_1024_bs1"])
+    parser.add_argument("--matanyone2-model-key", default="", choices=["", "matanyone2_onnx_512_bs1", "matanyone2_onnx_1024_bs1"])
     return parser.parse_args(argv)
 
 
@@ -342,6 +342,7 @@ def main(argv: list[str] | None = None) -> int:
             build_manifest,
             cache_dir_for_model,
             collect_fingerprint,
+            matanyone2_trt_cache_dir_for_key,
             matanyone2_trt_source_model_paths,
             original_rvm_model_path,
             save_manifest,
@@ -373,7 +374,7 @@ def main(argv: list[str] | None = None) -> int:
 
             for index, model_name in enumerate(MATANYONE2_MODEL_KEYS, 1):
                 source_model_path = source_model_paths[model_name]
-                model_cache_dir = cache_dir
+                model_cache_dir = matanyone2_trt_cache_dir_for_key(model_name, cache_dir)
                 model_cache_dir.mkdir(parents=True, exist_ok=True)
                 _print_event(f"STAGE:{index}:start:Building MatAnyone2 step-update engine {model_name}")
                 stage_start = time.perf_counter()
@@ -383,8 +384,7 @@ def main(argv: list[str] | None = None) -> int:
             verify_stage = len(MATANYONE2_MODEL_KEYS) + 1
             _print_event(f"STAGE:{verify_stage}:start:Verifying MatAnyone2 TensorRT cache")
             stage_start = time.perf_counter()
-            _prune_unusable_engine_artifacts(cache_dir)
-            engines = _engine_entries(cache_dir)
+            engines = _engine_entries(cache_dir, recursive=True)
             if not engines:
                 raise RuntimeError("TensorRT warmup did not produce a usable MatAnyone2 engine cache")
             _print_event(f"STAGE:{verify_stage}:done:{int(round(time.perf_counter() - stage_start))}")

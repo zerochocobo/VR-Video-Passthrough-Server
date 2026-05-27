@@ -4,297 +4,341 @@ This file only keeps version releases, major bug fixes, major UI/UX updates, and
 
 ## English
 
+### 2026-05-27
+
+- **v0.1.0-beta.6 released.**
+- **MatAnyone2/recognition update:** Replaced the MatAnyone2 Medium default bootstrap chain with `YOLO26m -> EfficientSAM -> MatAnyone2`, moved the active EfficientSAM model path to `models/efficientsam/`, and removed the legacy YOLOWorld-EfficientSAM option from the offline UI.
+- **YOLO26m quality fix:** Defaulted YOLO26m to the FP32 ONNX model after confirming the FP16 export collapses on ORT CUDA, added a startup sanity warning for broken FP16 usage, improved stereo asymmetry handling, added scene-aware/boundary gap filling, and enabled unlimited multi-person pairing with `top_k=0`.
+- **MatAnyone2 quality fix:** Reduced motion drag and afterimages with anti-drag defaults, uncertainty gating, sensory-state decay, last-mask binarization, bootstrap refinement loops, and a segment default of 240 frames after validation. Also fixed the SBS left-eye buffer overwrite that made the left eye drag much more than the right.
+- **TensorRT update:** TensorRT cache builds now default to FP32 for realtime RVM, offline RVM, and offline MatAnyone2. MatAnyone2 TensorRT now builds only batch-1 caches for `512` and `1024`, with separate per-model cache directories under `runtime_cache/trt_engines/matanyone2/`.
+- **UI update:** Added a 50 FPS realtime output option between 40 and 60, exposed MatAnyone2 offline precision as `512` and `1024` with `1024` still selected by default, and kept the offline recognition choices to YOLO26m-EfficientSAM and SAM3.
+- **Offline/DLNA cleanup:** DLNA now marks generated passthrough outputs with an `[Offline]` title prefix, and offline passthrough cleans temporary `.aac` audio sidecars on success, failure, and early prepass exits.
+- **Documentation update:** Updated the EfficientSAM, YOLO26m, and MatAnyone2 model setup notes for the current YOLO26m-EfficientSAM-MatAnyone2 pipeline, FP32 YOLO26m default, and MatAnyone2 `512`/`1024` TensorRT requirements.
+
+### 2026-05-26
+
+- **MatAnyone2 offline core update:** Extracted a shared MatAnyone2 offline engine for green and alpha outputs, added the batch-1 `step_update` IOBinding hot path, and kept the fallback NumPy path for unsupported or failed IOBinding runs.
+- **MatAnyone2 stability update:** Added scene-reset planning, MatAnyone2-specific alpha smoothing controls, experimental guided alpha upsample with confidence-band gating, and an experimental ROI quality mode while keeping the guided and ROI paths off by default after validation.
+- **MatAnyone2 TensorRT fix:** Isolated MatAnyone2 TensorRT builds by model-specific cache subdirectories, split multi-precision builds into separate subprocesses to avoid process-global ORT/TensorRT reuse, and synchronized runtime provider cache paths for green and alpha offline runs.
+- **Offline process fix:** Stopping an offline conversion now terminates the whole child process tree on Windows, preventing MatAnyone2 prepass, conversion, or FFmpeg helpers from leaving GPU memory allocated after the UI reports the job as stopped.
+- **Offline RVM TensorRT update:** Completed the realtime/offline RVM TensorRT cache split, offline precision-tier readiness checks, watcher freeze fixes, offline engine output directory fix, idempotent offline runtime path handling, and 1024-engine reuse between realtime and offline caches.
+
 ### 2026-05-25
 
-- **Major UI/color fix:** Recalibrated Light Matching presets to the D65 display white point. `daylight` is now neutral 6500K, `night_cool` is now a visibly cool 8000K preset, and existing built-in preset settings are migrated so the default no longer appears yellow.
+- **UI/color fix:** Recalibrated Light Matching presets to the D65 display white point. `daylight` is now neutral 6500K, `night_cool` is now a visibly cool 8000K preset, and existing built-in preset settings are migrated so the default no longer appears yellow.
+- **Startup UX update:** Added cold-start startup heartbeat/status APIs, overlay progress details, localized reassurance text, diagnostics logging, proxy-safe local polling, and monotonic warmup progress so long CUDA/ONNX/TensorRT startup is visible instead of appearing stuck.
+- **Offline RVM update:** Added offline RVM processing precision tiers, removed the offline ResNet50 balanced path, added offline-only scene reset and alpha smoothing, and introduced offline RVM TensorRT warmup/cache completeness checks.
+- **TensorRT cache update:** Split realtime and offline RVM TensorRT cache handling so the Home page builds only realtime 1024 engines while offline mode owns the broader precision-tier cache, including safer status checks and clearer long-build messaging.
 
 ### 2026-05-24
 
 - **v0.1.0-beta.5 released.**
-- **Major bug fix:** Fixed a one-GOP live A/V sync offset caused by `+nobuffer` in the raw HEVC-to-MPEG-TS mux path. The default now disables `PT_MUX_NOBUFFER_ENABLE`, avoiding dropped first-GOP video while keeping the diagnostic override available.
-- **Major UI/packaging update:** Added a TensorRT runtime library download flow for packaged Windows builds. The TensorRT dialog can detect missing runtime DLLs, offer automatic or manual NVIDIA wheel download, verify the wheel hash, extract only required DLLs, and show progress even when `Content-Length` is unavailable.
-- **Major core/UI update:** Added offline TensorRT cache support for MatAnyone2 `step_update`, separated RVM and MatAnyone2 TensorRT manifests/cache directories, added offline-only TensorRT switches for single and batch conversion, and removed the RVM balanced option from the offline UI.
-- **Major UI/core update:** Updated light matching defaults to daylight, softened the warm preset, and refreshed Home-page TensorRT/FPS labels and help text. Realtime FPS defaults returned to 30 FPS, while the `Same as source` option remains available.
-- **Major DLNA compatibility update:** Updated VR naming for 4XVR compatibility from `_LR_180` to `_LR_180_SBS`, preserved legacy generated-output detection, and added invisible ObjectID versioning so DLNA clients such as SKYBOX refresh cached virtual names.
-- **Major logging fix:** Added a targeted uvicorn socket-send noise filter that suppresses repeated `socket.send() raised exception` messages while keeping other uvicorn warnings and errors.
-- **Major packaging/UI fix:** Hid transient Windows console windows from packaged startup, server start/stop, offline conversion, TensorRT cache build, and runtime probe processes while preserving streamed logs.
-- **Major bug fix:** Hardened offline conversion child-process output forwarding so cold CUDA/ONNX/TensorRT startup no longer appears to stop silently, and conversion logs now show both child and UI-level exit status.
-- **Major compatibility fix:** Hardened ffprobe JSON handling on Windows by decoding JSON output as UTF-8 bytes instead of locale text, improving reliability for Chinese/Japanese paths and metadata.
-- **Major TensorRT fix:** TensorRT runtime installation no longer overwrites already-loaded DLLs, and TensorRT build errors such as missing ONNX models now stay visible instead of flashing away.
-- **Major runtime fix:** Improved UI process lifecycle handling, safer forced server stop, startup polling stability, redacted passthrough owner logs, and added retry hints for busy/preempted passthrough requests.
+- **Bug fix:** Fixed a one-GOP live A/V sync offset caused by `+nobuffer` in the raw HEVC-to-MPEG-TS mux path. The default now disables `PT_MUX_NOBUFFER_ENABLE`, avoiding dropped first-GOP video while keeping the diagnostic override available.
+- **UI/packaging update:** Added a TensorRT runtime library download flow for packaged Windows builds. The TensorRT dialog can detect missing runtime DLLs, offer automatic or manual NVIDIA wheel download, verify the wheel hash, extract only required DLLs, and show progress even when `Content-Length` is unavailable.
+- **Core/UI update:** Added offline TensorRT cache support for MatAnyone2 `step_update`, separated RVM and MatAnyone2 TensorRT manifests/cache directories, added offline-only TensorRT switches for single and batch conversion, and removed the RVM balanced option from the offline UI.
+- **UI/core update:** Updated light matching defaults to daylight, softened the warm preset, and refreshed Home-page TensorRT/FPS labels and help text. Realtime FPS defaults returned to 30 FPS, while the `Same as source` option remains available.
+- **DLNA compatibility update:** Updated VR naming for 4XVR compatibility from `_LR_180` to `_LR_180_SBS`, preserved legacy generated-output detection, and added invisible ObjectID versioning so DLNA clients such as SKYBOX refresh cached virtual names.
+- **Logging fix:** Added a targeted uvicorn socket-send noise filter that suppresses repeated `socket.send() raised exception` messages while keeping other uvicorn warnings and errors.
+- **Packaging/UI fix:** Hid transient Windows console windows from packaged startup, server start/stop, offline conversion, TensorRT cache build, and runtime probe processes while preserving streamed logs.
+- **Bug fix:** Hardened offline conversion child-process output forwarding so cold CUDA/ONNX/TensorRT startup no longer appears to stop silently, and conversion logs now show both child and UI-level exit status.
+- **Compatibility fix:** Hardened ffprobe JSON handling on Windows by decoding JSON output as UTF-8 bytes instead of locale text, improving reliability for Chinese/Japanese paths and metadata.
+- **TensorRT fix:** TensorRT runtime installation no longer overwrites already-loaded DLLs, and TensorRT build errors such as missing ONNX models now stay visible instead of flashing away.
+- **Runtime fix:** Improved UI process lifecycle handling, safer forced server stop, startup polling stability, redacted passthrough owner logs, and added retry hints for busy/preempted passthrough requests.
 
 ### 2026-05-23
 
-- **Major performance/core update:** Added Track A first-chunk latency diagnostics and startup warmups, including mux timing marks, CuPy composite/alpha warmup, NVENC startup preflight, and validated low-latency mux defaults for the pipe-TS path.
-- **Major bug fix:** Resolved the nPlayer audio-only regression by removing `hevc_metadata=aud=insert` from the pipe-TS video-stage bitstream filter when `setts` timestamps are applied. Strict players now receive usable HEVC codec parameters and enter video playback mode.
-- **Major bug fix:** Fixed the FastAPI startup deprecation warning by moving runtime startup registration to a lifespan-based `create_app(startup_hook=...)` flow.
-- **Major A/V sync update:** Reduced slate startup A/V skew by limiting immediate slate burst frames, pacing subsequent slate frames, and adding slate and MPEG-TS sync validation tools.
-- **Major A/V sync investigation/update:** Added live MPEG-TS capture, audio-content alignment, and video-content alignment tools. Reworked the default live path to avoid slate/cache startup skew, use source audio directly when the AAC cache is disabled, and disable generated video slate by default for real-device A/B testing.
-- **Major UI/runtime update:** Migrated Home-page realtime output FPS handling toward source-cadence testing, added source-FPS pacing, and documented that remaining subjective A/V issues may be client playback behavior when server-side captures are objectively aligned.
+- **Performance/core update:** Added Track A first-chunk latency diagnostics and startup warmups, including mux timing marks, CuPy composite/alpha warmup, NVENC startup preflight, and validated low-latency mux defaults for the pipe-TS path.
+- **Bug fix:** Resolved the nPlayer audio-only regression by removing `hevc_metadata=aud=insert` from the pipe-TS video-stage bitstream filter when `setts` timestamps are applied. Strict players now receive usable HEVC codec parameters and enter video playback mode.
+- **Bug fix:** Fixed the FastAPI startup deprecation warning by moving runtime startup registration to a lifespan-based `create_app(startup_hook=...)` flow.
+- **A/V sync update:** Reduced slate startup A/V skew by limiting immediate slate burst frames, pacing subsequent slate frames, and adding slate and MPEG-TS sync validation tools.
+- **A/V sync investigation/update:** Added live MPEG-TS capture, audio-content alignment, and video-content alignment tools. Reworked the default live path to avoid slate/cache startup skew, use source audio directly when the AAC cache is disabled, and disable generated video slate by default for real-device A/B testing.
+- **UI/runtime update:** Migrated Home-page realtime output FPS handling toward source-cadence testing, added source-FPS pacing, and documented that remaining subjective A/V issues may be client playback behavior when server-side captures are objectively aligned.
 
 ### 2026-05-22
 
-- **Major performance/core update:** Improved TensorRT cold-start warmup by warming the process-global `Matter` singleton, preloading static TensorRT sessions for warmup shapes, resetting recurrent state after warmup, and separating startup warmup control from global matting config mutation.
-- **Major performance/core update:** Added composite/alpha CuPy warmup and NVENC startup preflight so first-playback latency no longer pays common kernel JIT or encoder initialization costs.
-- **Major core update:** Enabled offline RVM fast mode to use ready TensorRT caches, while forcing CUDA/CPU providers for unsupported offline engines and adding clearer TensorRT provider diagnostics.
-- **Major bug fix:** Fixed offline TensorRT disable behavior so UI-launched child processes no longer inherit stale TensorRT provider settings, and failed static TensorRT activation no longer retries and floods logs every frame.
-- **Major performance bug fix:** Fixed offline alpha RVM throughput by adding the missing CUDA stream synchronization before NVENC encode. Offline alpha throughput on the 8K test path rose from about 36 FPS to about 75 FPS.
-- **Major bug fix:** Fixed misleading live headers for FPS-capped sources by advertising the actual effective stream FPS instead of the configured cap when the source FPS is lower.
-- **Major bug fix:** Reduced shutdown noise in live audio-cache cleanup by avoiding premature pipe closing during interrupted `communicate()` calls and logging interrupted slate cache builds as expected cleanup.
+- **Performance/core update:** Improved TensorRT cold-start warmup by warming the process-global `Matter` singleton, preloading static TensorRT sessions for warmup shapes, resetting recurrent state after warmup, and separating startup warmup control from global matting config mutation.
+- **Performance/core update:** Added composite/alpha CuPy warmup and NVENC startup preflight so first-playback latency no longer pays common kernel JIT or encoder initialization costs.
+- **Core update:** Enabled offline RVM fast mode to use ready TensorRT caches, while forcing CUDA/CPU providers for unsupported offline engines and adding clearer TensorRT provider diagnostics.
+- **Bug fix:** Fixed offline TensorRT disable behavior so UI-launched child processes no longer inherit stale TensorRT provider settings, and failed static TensorRT activation no longer retries and floods logs every frame.
+- **Performance bug fix:** Fixed offline alpha RVM throughput by adding the missing CUDA stream synchronization before NVENC encode. Offline alpha throughput on the 8K test path rose from about 36 FPS to about 75 FPS.
+- **Bug fix:** Fixed misleading live headers for FPS-capped sources by advertising the actual effective stream FPS instead of the configured cap when the source FPS is lower.
+- **Bug fix:** Reduced shutdown noise in live audio-cache cleanup by avoiding premature pipe closing during interrupted `communicate()` calls and logging interrupted slate cache builds as expected cleanup.
 
 ### 2026-05-21
 
-- **Major DLNA/offline naming update:** Centralized VR/player filename handling in `utils.vr_naming` and reused it across DLNA titles, offline default output names, and generated-output detection.
-- **Major compatibility update:** Updated generated 2:1 half-equirectangular naming from `_SBS_180` to `_LR_180`, and alpha naming to `_LR_180_FISHEYE_F180_alpha` for broader player compatibility, including HereSphere.
-- **Major DLNA update:** Bumped the DIDL schema version and refreshed live/raw naming rules so generated green and alpha entries use player-compatible markers while preserving original playback URLs.
-- **Major offline update:** Updated RVM and alpha offline output defaults to use the new VR naming rules while keeping legacy generated-output suffixes detectable.
-- **Major bug fix:** Cleaned up audio-cache interruption handling to avoid misleading `ValueError: I/O operation on closed file` reader-thread tracebacks during stream shutdown.
+- **DLNA/offline naming update:** Centralized VR/player filename handling in `utils.vr_naming` and reused it across DLNA titles, offline default output names, and generated-output detection.
+- **Compatibility update:** Updated generated 2:1 half-equirectangular naming from `_SBS_180` to `_LR_180`, and alpha naming to `_LR_180_FISHEYE_F180_alpha` for broader player compatibility, including HereSphere.
+- **DLNA update:** Bumped the DIDL schema version and refreshed live/raw naming rules so generated green and alpha entries use player-compatible markers while preserving original playback URLs.
+- **Offline update:** Updated RVM and alpha offline output defaults to use the new VR naming rules while keeping legacy generated-output suffixes detectable.
+- **Bug fix:** Cleaned up audio-cache interruption handling to avoid misleading `ValueError: I/O operation on closed file` reader-thread tracebacks during stream shutdown.
 
 ### 2026-05-20
 
 
 - **v0.1.0-beta.4 patches and additions.**
 
-- **Major performance/UI update:** Added TensorRT acceleration cache management for realtime RVM inference, including a Performance-panel toggle, cache configure/build dialog, startup cache validation, CUDA fallback when the cache is missing or stale, and PyInstaller runtime DLL handling for TensorRT.
-- **Major bug fix:** Offline generation now targets the source video bitrate by default for all engines, including RVM fast/balanced and MatAnyone2 medium/slow. This keeps generated video size closer to the original source. If source bitrate is unavailable, offline generation falls back to 40 Mbps.
-- **Major bug fix:** Fixed lingering FFmpeg child processes after playback or server stop. PyNv streams now track and stop audio FFmpeg subprocesses, wait for slate audio/cache threads during close, clean up partially spawned pipe-TS muxers, remove stale temporary AAC files, and forced UI server stop now terminates child processes through `taskkill /T /F` on Windows.
-- **Major bug fix:** Fixed realtime 2D alpha blocks turning gray during playback by switching the default realtime RVM model back to FP32. The issue was caused by FP16 precision loss accumulating in RVM's recurrent `rec1`-`rec4` state across frames, not by alpha packing or realtime bitrate control.
+- **Performance/UI update:** Added TensorRT acceleration cache management for realtime RVM inference, including a Performance-panel toggle, cache configure/build dialog, startup cache validation, CUDA fallback when the cache is missing or stale, and PyInstaller runtime DLL handling for TensorRT.
+- **Bug fix:** Offline generation now targets the source video bitrate by default for all engines, including RVM fast/balanced and MatAnyone2 medium/slow. This keeps generated video size closer to the original source. If source bitrate is unavailable, offline generation falls back to 40 Mbps.
+- **Bug fix:** Fixed lingering FFmpeg child processes after playback or server stop. PyNv streams now track and stop audio FFmpeg subprocesses, wait for slate audio/cache threads during close, clean up partially spawned pipe-TS muxers, remove stale temporary AAC files, and forced UI server stop now terminates child processes through `taskkill /T /F` on Windows.
+- **Bug fix:** Fixed realtime 2D alpha blocks turning gray during playback by switching the default realtime RVM model back to FP32. The issue was caused by FP16 precision loss accumulating in RVM's recurrent `rec1`-`rec4` state across frames, not by alpha packing or realtime bitrate control.
 
 ### 2026-05-19
 
-- **Major bug fix:** Fixed MatAnyone2 medium offline alpha prepass crashes on HEVC Main10/P016-style decoded frames by converting 16-bit NV12/P010 planes to 8-bit BGR before YOLO-World/EfficientSAM or SAM3 prepass processing.
-- **Major bug fix:** Updated AV1 backend routing so GPUs without AV1 NVDEC support, such as RTX 20/Turing, use the FFmpeg decode fallback instead of failing later inside PyNv decode.
-- **Major UI update:** Added foreground-only Light Matching for realtime passthrough, including a dedicated Home-page panel, presets, custom settings dialog, persisted UI settings, and live runtime updates during playback.
-- **Major core update:** Added DLNA `[NoLive]` labeling and realtime-source rejection for known unsupported live sources, avoiding confusing realtime fallback attempts.
+- **Bug fix:** Fixed MatAnyone2 medium offline alpha prepass crashes on HEVC Main10/P016-style decoded frames by converting 16-bit NV12/P010 planes to 8-bit BGR before YOLO-World/EfficientSAM or SAM3 prepass processing.
+- **Bug fix:** Updated AV1 backend routing so GPUs without AV1 NVDEC support, such as RTX 20/Turing, use the FFmpeg decode fallback instead of failing later inside PyNv decode.
+- **UI update:** Added foreground-only Light Matching for realtime passthrough, including a dedicated Home-page panel, presets, custom settings dialog, persisted UI settings, and live runtime updates during playback.
+- **Core update:** Added DLNA `[NoLive]` labeling and realtime-source rejection for known unsupported live sources, avoiding confusing realtime fallback attempts.
 
 ### 2026-05-18
 
 - **v0.1.0-beta.3 patches and additions.**
-- **Major core/performance upgrade:** Added MatAnyone2 medium offline mode using YOLO-World + EfficientSAM as the bootstrap recognizer before MatAnyone2 propagation.
-- **Major core/performance upgrade:** Reduced MatAnyone2 medium peak VRAM by moving the YOLO-World/EfficientSAM prepass into a subprocess and defaulting MatAnyone2 offline processing to batch 1 without SBS batching.
-- **Major core upgrade:** Improved SAM3-backed MatAnyone2 slow mode with shared SAM3 helper code, stereo mask consistency guarding, short inactive-gap filling, and configurable SAM3 text prompts.
-- **Major UI update:** Updated the offline UI so MatAnyone2 is selected once, with a recognition-model selector for `YOLOWorld-EfficientSAM` or `SAM3 (16GB+ VRAM)`, plus a SAM3-only prompt dialog.
-- **Major UI/core update:** Added flat 2D alpha output controls, including fisheye/flat3d projection mode, distance-based disparity, square-eye flat3d sizing, and Home-page 2D alpha settings.
+- **Core/performance upgrade:** Added MatAnyone2 medium offline mode using YOLO-World + EfficientSAM as the bootstrap recognizer before MatAnyone2 propagation.
+- **Core/performance upgrade:** Reduced MatAnyone2 medium peak VRAM by moving the YOLO-World/EfficientSAM prepass into a subprocess and defaulting MatAnyone2 offline processing to batch 1 without SBS batching.
+- **Core upgrade:** Improved SAM3-backed MatAnyone2 slow mode with shared SAM3 helper code, stereo mask consistency guarding, short inactive-gap filling, and configurable SAM3 text prompts.
+- **UI update:** Updated the offline UI so MatAnyone2 is selected once, with a recognition-model selector for `YOLOWorld-EfficientSAM` or `SAM3 (16GB+ VRAM)`, plus a SAM3-only prompt dialog.
+- **UI/core update:** Added flat 2D alpha output controls, including fisheye/flat3d projection mode, distance-based disparity, square-eye flat3d sizing, and Home-page 2D alpha settings.
 
 ### 2026-05-17
 
 - **v0.1.0-beta.1 officially released for public beta testing.**
 - **v0.1.0-beta.2 patches and additions.**
-- **Major UI update:** Replaced the previous realtime/offline VRAM profile UI with Quality / Speed presets, including separate offline quality settings.
-- **Major UI update:** Added `GET /runtime_status` and a centered main status-bar indicator for current FPS and VRAM usage.
-- **Major bug fix:** Added shared NVIDIA compute capability checks and hard gates for realtime startup and offline conversion.
-- **Major core update:** Added offline source-codec preflight plus an FFmpeg NV12 decode fallback for non-PyNv sources such as MPEG-4 Visual / `mp4v-20`.
-- **Major core update:** Added a dedicated 4XVR live playback profile so AVPro/ExoPlayer reconnects can reuse managed live sessions.
-- **Major UI/core update:** Added flat 2D alpha passthrough for non-SBS 2D videos, projecting them into stereo fisheye SBS output with configurable FOV and disparity.
+- **UI update:** Replaced the previous realtime/offline VRAM profile UI with Quality / Speed presets, including separate offline quality settings.
+- **UI update:** Added `GET /runtime_status` and a centered main status-bar indicator for current FPS and VRAM usage.
+- **Bug fix:** Added shared NVIDIA compute capability checks and hard gates for realtime startup and offline conversion.
+- **Core update:** Added offline source-codec preflight plus an FFmpeg NV12 decode fallback for non-PyNv sources such as MPEG-4 Visual / `mp4v-20`.
+- **Core update:** Added a dedicated 4XVR live playback profile so AVPro/ExoPlayer reconnects can reuse managed live sessions.
+- **UI/core update:** Added flat 2D alpha passthrough for non-SBS 2D videos, projecting them into stereo fisheye SBS output with configurable FOV and disparity.
 
 ### 2026-05-16
 
-- **Major core/performance upgrade:** Added producer pacing for positive realtime FPS caps, so capped output also throttles production.
-- **Major core/performance upgrade:** Added realtime GPU resize after PyNv decode via `PT_DECODE_MAX_SIDE`.
-- **Major bug fix:** Kept offline green and alpha generation at original source resolution regardless of realtime output-size settings.
-- **Major core update:** Deduplicated alpha packing so offline alpha uses the shared `pipeline.alpha_packer.AlphaPacker` implementation.
-- **Major bug fix:** Removed the default 30 FPS cap from offline generation.
-- **Major bug fix:** Added an early startup GPU capability gate for compute capability below 7.5.
+- **Core/performance upgrade:** Added producer pacing for positive realtime FPS caps, so capped output also throttles production.
+- **Core/performance upgrade:** Added realtime GPU resize after PyNv decode via `PT_DECODE_MAX_SIDE`.
+- **Bug fix:** Kept offline green and alpha generation at original source resolution regardless of realtime output-size settings.
+- **Core update:** Deduplicated alpha packing so offline alpha uses the shared `pipeline.alpha_packer.AlphaPacker` implementation.
+- **Bug fix:** Removed the default 30 FPS cap from offline generation.
+- **Bug fix:** Added an early startup GPU capability gate for compute capability below 7.5.
 
 ### 2026-05-15
 
-- **Major core/performance upgrade:** Added staged PyNv/8K performance tooling and probes for decode, encode, mux, and end-to-end passthrough measurement.
-- **Major core/performance upgrade:** Added PyNv threaded decoder experiments, slot ownership handling, encode input lifetime safeguards, FP16 RVM benchmark support, and TensorRT/CUDA provider diagnostics.
+- **Core/performance upgrade:** Added staged PyNv/8K performance tooling and probes for decode, encode, mux, and end-to-end passthrough measurement.
+- **Core/performance upgrade:** Added PyNv threaded decoder experiments, slot ownership handling, encode input lifetime safeguards, FP16 RVM benchmark support, and TensorRT/CUDA provider diagnostics.
 
 ### 2026-05-14
 
-- **Major packaging/core fix:** Added CuPy/CUDA packaging dependency handling and improved runtime CUDA DLL loading for frozen Windows builds.
+- **Packaging/core fix:** Added CuPy/CUDA packaging dependency handling and improved runtime CUDA DLL loading for frozen Windows builds.
 
 ### 2026-05-13
 
 - **v0.1.0-alpha.1 officially released for limited public beta testing.**
-- **Major UI update:** Added the cold-start startup overlay for long first GPU warmup, local startup status polling, one-click diagnostic report copying, and structured startup failure reporting.
+- **UI update:** Added the cold-start startup overlay for long first GPU warmup, local startup status polling, one-click diagnostic report copying, and structured startup failure reporting.
 
 ### 2026-05-12
 
-- **Major packaging fix:** Added PyInstaller build fixes for Qt/ICU DLL conflicts and defensive checks to reduce duplicate or incompatible DLL collection.
+- **Packaging fix:** Added PyInstaller build fixes for Qt/ICU DLL conflicts and defensive checks to reduce duplicate or incompatible DLL collection.
 
 ### 2026-05-11
 
-- **Major UI update:** Added the first PySide6 desktop UI, including realtime server controls, quick configuration, version display, status bar, log side panel, language selector, and multi-video-directory configuration.
-- **Major UI/core update:** Added subtitle settings and preview UI work.
-- **Major core update:** Added server alpha passthrough entries, dual green/alpha passthrough listings, alpha fisheye output, alpha block layout correction, transparent zero-alpha overlay behavior, and audio post-mux support for alpha output.
+- **UI update:** Added the first PySide6 desktop UI, including realtime server controls, quick configuration, version display, status bar, log side panel, language selector, and multi-video-directory configuration.
+- **UI/core update:** Added subtitle settings and preview UI work.
+- **Core update:** Added server alpha passthrough entries, dual green/alpha passthrough listings, alpha fisheye output, alpha block layout correction, transparent zero-alpha overlay behavior, and audio post-mux support for alpha output.
 
 ### 2026-05-10
 
-- **Major core update:** Added offline RVM passthrough generation.
-- **Major core update:** Added MatAnyone2 ONNX export tooling and first offline runtime integration.
-- **Major core update:** Added SAM3/MatAnyone2 experimental segmentation workflow, including low-memory modes and active segment planning.
-- **Major core update:** Added AAC cache, audio normalization, and live-session cache improvements for live playback.
+- **Core update:** Added offline RVM passthrough generation.
+- **Core update:** Added MatAnyone2 ONNX export tooling and first offline runtime integration.
+- **Core update:** Added SAM3/MatAnyone2 experimental segmentation workflow, including low-memory modes and active segment planning.
+- **Core update:** Added AAC cache, audio normalization, and live-session cache improvements for live playback.
 
 ### 2026-05-09
 
-- **Major core update:** Added player-specific live passthrough handling for MoonVR/VLC, Skybox/libmpv, nPlayer/OPlayer-style clients, and default clients.
-- **Major core update:** Added live passthrough active-slot ownership and preemption rules.
-- **Major core update:** Added PyNv production audio mux integration and AAC/MPEG-TS timestamp handling.
-- **Major bug fix:** Added Main10/P010/P016 compatibility experiments and conversion paths for PyNv passthrough.
+- **Core update:** Added player-specific live passthrough handling for MoonVR/VLC, Skybox/libmpv, nPlayer/OPlayer-style clients, and default clients.
+- **Core update:** Added live passthrough active-slot ownership and preemption rules.
+- **Core update:** Added PyNv production audio mux integration and AAC/MPEG-TS timestamp handling.
+- **Bug fix:** Added Main10/P010/P016 compatibility experiments and conversion paths for PyNv passthrough.
 
 ### 2026-05-08
 
-- **Major core/performance upgrade:** Added PyNv production stream initial integration, including encoder, mux, decode-to-encode, and GPU matting probes.
-- **Major core update:** Added pseudo-VOD byte seek integration, passthrough live mode, and HEVC live support.
-- **Major core update:** Added DLNA physical directory browsing, thumbnails, live-only listing adjustments, live chapter containers, and short-video direct play behavior.
-- **Major core/performance upgrade:** Added GPU runtime cache support and ONNX Runtime CUDA cold-start support tooling.
+- **Core/performance upgrade:** Added PyNv production stream initial integration, including encoder, mux, decode-to-encode, and GPU matting probes.
+- **Core update:** Added pseudo-VOD byte seek integration, passthrough live mode, and HEVC live support.
+- **Core update:** Added DLNA physical directory browsing, thumbnails, live-only listing adjustments, live chapter containers, and short-video direct play behavior.
+- **Core/performance upgrade:** Added GPU runtime cache support and ONNX Runtime CUDA cold-start support tooling.
 
 ### 2026-05-07
 
-- **Major core/performance upgrade:** Added output FPS cap configuration, alpha stride reuse, RVM model selection, CUDA IOBinding experiments, GPU NV12 preprocess, and fused NV12-to-NV12 green composite kernels.
-- **Major core update:** Added PyNvVideoCodec dependency and initial PyNv decode/matting bridge code.
+- **Core/performance upgrade:** Added output FPS cap configuration, alpha stride reuse, RVM model selection, CUDA IOBinding experiments, GPU NV12 preprocess, and fused NV12-to-NV12 green composite kernels.
+- **Core update:** Added PyNvVideoCodec dependency and initial PyNv decode/matting bridge code.
 
 ### 2026-05-06
 
-- **Major core/performance upgrade:** Added CUDA decoder diagnostics, FFmpeg hardware decode candidate selection, decode output FPS/dimension propagation, and matting profiling.
-- **Major core/performance upgrade:** Added optimized green-screen composite path that avoids full-frame green background allocation.
-- **Major core update:** Added initial DLNA time-seek metadata, passthrough HEAD support, and `PT_CONTAINER` support for MP4 and MPEG-TS passthrough output.
+- **Core/performance upgrade:** Added CUDA decoder diagnostics, FFmpeg hardware decode candidate selection, decode output FPS/dimension propagation, and matting profiling.
+- **Core/performance upgrade:** Added optimized green-screen composite path that avoids full-frame green background allocation.
+- **Core update:** Added initial DLNA time-seek metadata, passthrough HEAD support, and `PT_CONTAINER` support for MP4 and MPEG-TS passthrough output.
 
 ## 中文
 
+### 2026-05-27
+
+- **v0.1.0-beta.6 发布。**
+- **MatAnyone2/识别链路更新：** MatAnyone2 中速默认前置链路改为 `YOLO26m -> EfficientSAM -> MatAnyone2`，当前 EfficientSAM 模型路径迁移到 `models/efficientsam/`，并从离线 UI 移除旧的 YOLOWorld-EfficientSAM 选项。
+- **YOLO26m 质量修复：** YOLO26m 默认改用 FP32 ONNX 模型，因为已确认 FP16 导出在 ORT CUDA 下会发生输出塌缩；新增 FP16 异常探测警告，并改进左右眼不对称处理、场景感知/边界 gap-fill，以及 `top_k=0` 的不限人数配对。
+- **MatAnyone2 质量修复：** 通过抗拖影默认参数、不确定区域门控、sensory 状态衰减、last-mask 二值化、bootstrap 多轮 refine，以及验证后的 240 帧分段默认值，降低运动拖影和残影；同时修复 SBS 左眼缓冲区被右眼预处理覆盖导致左眼拖影更重的问题。
+- **TensorRT 更新：** 实时 RVM、离线 RVM、离线 MatAnyone2 的 TensorRT cache 构建默认都改为 FP32。MatAnyone2 TensorRT 现在只构建 batch 1 的 `512` 和 `1024` cache，并在 `runtime_cache/trt_engines/matanyone2/` 下按模型目录隔离。
+- **UI 更新：** 首页实时输出 FPS 在 40 和 60 之间新增 50；离线 MatAnyone2 精度显示 `512` 与 `1024`，默认仍选 `1024`；离线识别模型只保留 YOLO26m-EfficientSAM 和 SAM3。
+- **离线/DLNA 清理：** DLNA 对已生成的离线 passthrough 输出增加 `[Offline]` 虚拟标题前缀；离线 passthrough 在成功、失败和前置识别提前退出时都会清理临时 `.aac` 音频 sidecar。
+- **文档更新：** 更新 EfficientSAM、YOLO26m、MatAnyone2 模型准备说明，匹配当前 YOLO26m-EfficientSAM-MatAnyone2 链路、YOLO26m FP32 默认模型，以及 MatAnyone2 `512`/`1024` TensorRT 要求。
+
+### 2026-05-26
+
+- **MatAnyone2 离线内核更新：** 抽出绿幕和 alpha 共用的 MatAnyone2 离线引擎，新增 batch 1 `step_update` IOBinding 热路径，并保留不支持或出错时回退到 NumPy 的路径。
+- **MatAnyone2 稳定性更新：** 新增场景重置规划、MatAnyone2 专用 alpha 平滑控制、带 confidence-band 的实验性 guided alpha upsample，以及实验性 ROI 质量模式；经过验证后 guided 与 ROI 仍默认关闭。
+- **MatAnyone2 TensorRT 修复：** MatAnyone2 TensorRT 按模型精度使用独立 cache 子目录，多精度构建拆成独立子进程以避免 ORT/TensorRT 进程全局状态串用，并同步绿幕与 alpha 离线路径的运行时 provider cache path。
+- **离线进程修复：** 停止离线转换时现在会在 Windows 上终止完整子进程树，避免 MatAnyone2 prepass、转换进程或 FFmpeg helper 在 UI 显示已停止后继续占用 GPU 显存。
+- **离线 RVM TensorRT 更新：** 完成实时/离线 RVM TensorRT cache 拆分、离线精度档完整性检查、watcher 卡顿修复、离线 engine 输出目录修复、离线路径幂等处理，以及实时与离线 cache 之间的 1024 engine 复用。
+
 ### 2026-05-25
 
-- **重大 UI/色彩修复：** 将光照匹配预设重新校准到 D65 显示白点。`daylight` 现在是中性的 6500K，`night_cool` 现在是明显偏冷的 8000K，并迁移现有内置预设设置，避免默认自然日光继续偏黄。
+- **UI/色彩修复：** 将光照匹配预设重新校准到 D65 显示白点。`daylight` 现在是中性的 6500K，`night_cool` 现在是明显偏冷的 8000K，并迁移现有内置预设设置，避免默认自然日光继续偏黄。
+- **启动体验更新：** 新增冷启动 heartbeat/status API、启动遮罩进度细节、本地化等待提示、诊断日志、绕过代理的本地轮询，以及单调递增的 warmup 进度，让较长的 CUDA/ONNX/TensorRT 启动过程可见而不是像卡住。
+- **离线 RVM 更新：** 新增离线 RVM 处理精度档，移除离线 ResNet50 balanced 路径，加入离线专用场景重置和 alpha 平滑，并引入离线 RVM TensorRT warmup/cache 完整性检查。
+- **TensorRT cache 更新：** 拆分实时与离线 RVM TensorRT cache 处理：首页只构建实时 1024 engine，离线模式维护更完整的精度档 cache，同时增加更安全的状态检查和更明确的长时间构建提示。
 
 ### 2026-05-24
 
 - **v0.1.0-beta.5 发布。**
-- **重大 BUG 修复：** 修复 raw HEVC 到 MPEG-TS mux 路径中 `+nobuffer` 导致首个 GOP 视频被丢弃、进而产生约一个 GOP A/V 偏移的问题。默认关闭 `PT_MUX_NOBUFFER_ENABLE`，同时保留诊断覆盖开关。
-- **重大 UI/打包更新：** 为 Windows 打包版新增 TensorRT 运行库下载流程。TensorRT 对话框可检测缺失运行时 DLL，提供自动/手动下载 NVIDIA wheel，校验哈希，仅解压所需 DLL，并在缺少 `Content-Length` 时仍显示进度。
-- **重大内核/UI 更新：** 新增 MatAnyone2 `step_update` 离线 TensorRT cache 支持，分离 RVM 与 MatAnyone2 的 TensorRT manifest/cache 目录，增加单文件/批量离线专用 TensorRT 开关，并从离线 UI 移除 RVM 均衡选项。
-- **重大 UI/内核更新：** 光照匹配默认改为自然日光，暖黄光预设降温并降低饱和度；同步刷新首页 TensorRT/FPS 文案与帮助说明。实时 FPS 默认回到 30 FPS，同时保留“同原视频”选项。
-- **重大 DLNA 兼容性更新：** 为 4XVR 兼容性将自动 VR 命名从 `_LR_180` 调整为 `_LR_180_SBS`，保留旧生成文件识别，并新增不可见 ObjectID 版本号以促使 SKYBOX 等 DLNA 客户端刷新虚拟名称缓存。
-- **重大日志修复：** 新增精确的 uvicorn socket-send 噪声过滤器，只抑制重复的 `socket.send() raised exception`，保留其他 uvicorn 警告和错误。
-- **重大 UI/打包修复：** 隐藏打包版启动、服务启停、离线转换、TensorRT 缓存构建和运行时探测时闪现的 Windows 黑色控制台窗口，同时保留日志输出。
-- **重大 BUG 修复：** 加固离线转换子进程日志转发，冷启动 CUDA/ONNX/TensorRT 时不再表现为静默停止，并在日志中显示子进程和 UI 外层退出状态。
-- **重大兼容性修复：** 加固 Windows 下 ffprobe JSON 读取，改为按 UTF-8 字节解码，提升含中文/日文路径和元数据时的可靠性。
-- **重大 TensorRT 修复：** TensorRT 运行库安装不再覆盖已加载 DLL；TensorRT 构建错误（如 ONNX 模型缺失）会持续显示，不再一闪而过。
-- **重大运行时修复：** 改进 UI 进程生命周期处理、服务强制停止、启动状态轮询稳定性，脱敏透视任务日志，并为繁忙或被抢占的透视请求返回重试提示。
+- **BUG 修复：** 修复 raw HEVC 到 MPEG-TS mux 路径中 `+nobuffer` 导致首个 GOP 视频被丢弃、进而产生约一个 GOP A/V 偏移的问题。默认关闭 `PT_MUX_NOBUFFER_ENABLE`，同时保留诊断覆盖开关。
+- **UI/打包更新：** 为 Windows 打包版新增 TensorRT 运行库下载流程。TensorRT 对话框可检测缺失运行时 DLL，提供自动/手动下载 NVIDIA wheel，校验哈希，仅解压所需 DLL，并在缺少 `Content-Length` 时仍显示进度。
+- **内核/UI 更新：** 新增 MatAnyone2 `step_update` 离线 TensorRT cache 支持，分离 RVM 与 MatAnyone2 的 TensorRT manifest/cache 目录，增加单文件/批量离线专用 TensorRT 开关，并从离线 UI 移除 RVM 均衡选项。
+- **UI/内核更新：** 光照匹配默认改为自然日光，暖黄光预设降温并降低饱和度；同步刷新首页 TensorRT/FPS 文案与帮助说明。实时 FPS 默认回到 30 FPS，同时保留“同原视频”选项。
+- **DLNA 兼容性更新：** 为 4XVR 兼容性将自动 VR 命名从 `_LR_180` 调整为 `_LR_180_SBS`，保留旧生成文件识别，并新增不可见 ObjectID 版本号以促使 SKYBOX 等 DLNA 客户端刷新虚拟名称缓存。
+- **日志修复：** 新增精确的 uvicorn socket-send 噪声过滤器，只抑制重复的 `socket.send() raised exception`，保留其他 uvicorn 警告和错误。
+- **UI/打包修复：** 隐藏打包版启动、服务启停、离线转换、TensorRT 缓存构建和运行时探测时闪现的 Windows 黑色控制台窗口，同时保留日志输出。
+- **BUG 修复：** 加固离线转换子进程日志转发，冷启动 CUDA/ONNX/TensorRT 时不再表现为静默停止，并在日志中显示子进程和 UI 外层退出状态。
+- **兼容性修复：** 加固 Windows 下 ffprobe JSON 读取，改为按 UTF-8 字节解码，提升含中文/日文路径和元数据时的可靠性。
+- **TensorRT 修复：** TensorRT 运行库安装不再覆盖已加载 DLL；TensorRT 构建错误（如 ONNX 模型缺失）会持续显示，不再一闪而过。
+- **运行时修复：** 改进 UI 进程生命周期处理、服务强制停止、启动状态轮询稳定性，脱敏透视任务日志，并为繁忙或被抢占的透视请求返回重试提示。
 
 ### 2026-05-23
 
-- **重大性能/内核更新：** 新增 Track A 首包延迟诊断和启动 warmup，包括 mux 时间标记、CuPy composite/alpha warmup、NVENC 启动预检，以及 pipe-TS 路径验证后的低延迟 mux 默认值。
-- **重大 BUG 修复：** 修复 nPlayer 进入 audio-only 模式的回归问题：在 pipe-TS 视频阶段应用 `setts` 时间戳时移除 `hevc_metadata=aud=insert`，使严格播放器能拿到可用 HEVC codec 参数并进入视频播放。
-- **重大 BUG 修复：** 将 FastAPI 启动注册迁移到基于 lifespan 的 `create_app(startup_hook=...)`，修复 `on_event` 弃用警告。
-- **重大 A/V 同步更新：** 通过限制 slate 初始突发帧并对后续 slate 帧按 wallclock pacing，降低启动 slate A/V 偏移；同时新增 slate 和 MPEG-TS 同步验证工具。
-- **重大 A/V 同步调查/更新：** 新增 live MPEG-TS capture、音频内容对齐和视频内容对齐工具；调整默认 live 路径以避开 slate/cache 启动偏移，在禁用 AAC cache 时直接使用源音频，并默认关闭生成的视频 slate 供真机 A/B 测试。
-- **重大 UI/运行时更新：** 调整首页实时输出 FPS 处理以支持源帧率测试，增加源帧率 pacing，并记录当服务器侧 capture 已客观对齐时，剩余主观 A/V 问题可能来自客户端播放行为。
+- **性能/内核更新：** 新增 Track A 首包延迟诊断和启动 warmup，包括 mux 时间标记、CuPy composite/alpha warmup、NVENC 启动预检，以及 pipe-TS 路径验证后的低延迟 mux 默认值。
+- **BUG 修复：** 修复 nPlayer 进入 audio-only 模式的回归问题：在 pipe-TS 视频阶段应用 `setts` 时间戳时移除 `hevc_metadata=aud=insert`，使严格播放器能拿到可用 HEVC codec 参数并进入视频播放。
+- **BUG 修复：** 将 FastAPI 启动注册迁移到基于 lifespan 的 `create_app(startup_hook=...)`，修复 `on_event` 弃用警告。
+- **A/V 同步更新：** 通过限制 slate 初始突发帧并对后续 slate 帧按 wallclock pacing，降低启动 slate A/V 偏移；同时新增 slate 和 MPEG-TS 同步验证工具。
+- **A/V 同步调查/更新：** 新增 live MPEG-TS capture、音频内容对齐和视频内容对齐工具；调整默认 live 路径以避开 slate/cache 启动偏移，在禁用 AAC cache 时直接使用源音频，并默认关闭生成的视频 slate 供真机 A/B 测试。
+- **UI/运行时更新：** 调整首页实时输出 FPS 处理以支持源帧率测试，增加源帧率 pacing，并记录当服务器侧 capture 已客观对齐时，剩余主观 A/V 问题可能来自客户端播放行为。
 
 ### 2026-05-22
 
-- **重大性能/内核更新：** 改进 TensorRT 冷启动 warmup：启动阶段预热进程全局 `Matter` singleton，预加载 warmup shape 的 static TensorRT session，warmup 后重置循环状态，并将启动 warmup 控制从全局 matting 配置变更中剥离。
-- **重大性能/内核更新：** 新增 composite/alpha CuPy warmup 和 NVENC 启动预检，降低首次播放承担 kernel JIT 或编码器初始化成本的概率。
-- **重大内核更新：** 离线 RVM fast 模式可在 cache ready 时使用 TensorRT；不支持的离线引擎强制使用 CUDA/CPU provider，并增加更清晰的 TensorRT provider 诊断输出。
-- **重大 BUG 修复：** 修复 UI 启动的子进程在关闭 TensorRT 后仍可能继承旧 provider 环境的问题；static TensorRT 激活失败后也不再逐帧重试并刷屏日志。
-- **重大性能 BUG 修复：** 修复离线 alpha RVM 在 NVENC 编码前缺少 CUDA stream 同步导致的吞吐问题。8K 测试路径离线 alpha 从约 36 FPS 提升到约 75 FPS。
-- **重大 BUG 修复：** 修复实时 FPS cap 下响应头误报帧率的问题；当源视频帧率低于配置 cap 时，live header 现在使用实际有效输出 FPS。
-- **重大 BUG 修复：** 改进 live 音频 cache 清理逻辑，避免中断 `communicate()` 时过早关闭 pipe 导致噪声 traceback，并将被中断的 slate cache 构建作为正常清理记录。
+- **性能/内核更新：** 改进 TensorRT 冷启动 warmup：启动阶段预热进程全局 `Matter` singleton，预加载 warmup shape 的 static TensorRT session，warmup 后重置循环状态，并将启动 warmup 控制从全局 matting 配置变更中剥离。
+- **性能/内核更新：** 新增 composite/alpha CuPy warmup 和 NVENC 启动预检，降低首次播放承担 kernel JIT 或编码器初始化成本的概率。
+- **内核更新：** 离线 RVM fast 模式可在 cache ready 时使用 TensorRT；不支持的离线引擎强制使用 CUDA/CPU provider，并增加更清晰的 TensorRT provider 诊断输出。
+- **BUG 修复：** 修复 UI 启动的子进程在关闭 TensorRT 后仍可能继承旧 provider 环境的问题；static TensorRT 激活失败后也不再逐帧重试并刷屏日志。
+- **性能 BUG 修复：** 修复离线 alpha RVM 在 NVENC 编码前缺少 CUDA stream 同步导致的吞吐问题。8K 测试路径离线 alpha 从约 36 FPS 提升到约 75 FPS。
+- **BUG 修复：** 修复实时 FPS cap 下响应头误报帧率的问题；当源视频帧率低于配置 cap 时，live header 现在使用实际有效输出 FPS。
+- **BUG 修复：** 改进 live 音频 cache 清理逻辑，避免中断 `communicate()` 时过早关闭 pipe 导致噪声 traceback，并将被中断的 slate cache 构建作为正常清理记录。
 
 ### 2026-05-21
 
-- **重大 DLNA/离线命名更新：** 将 VR/player 文件名处理集中到 `utils.vr_naming`，并统一用于 DLNA 标题、离线默认输出名和生成文件识别。
-- **重大兼容性更新：** 将自动生成的 2:1 half-equirectangular 命名从 `_SBS_180` 调整为 `_LR_180`，并将 alpha 命名调整为 `_LR_180_FISHEYE_F180_alpha`，提升包括 HereSphere 在内的播放器兼容性。
-- **重大 DLNA 更新：** 提升 DIDL schema 版本并刷新 live/raw 命名规则，使生成的绿幕和 alpha 入口使用更兼容播放器的标记，同时保持播放 URL 不变。
-- **重大离线更新：** RVM 与 alpha 离线默认输出名改用新的 VR 命名规则，同时继续识别旧版生成文件后缀。
-- **重大 BUG 修复：** 改进音频 cache 中断清理，避免 stream 关闭时出现误导性的 `ValueError: I/O operation on closed file` reader-thread traceback。
+- **DLNA/离线命名更新：** 将 VR/player 文件名处理集中到 `utils.vr_naming`，并统一用于 DLNA 标题、离线默认输出名和生成文件识别。
+- **兼容性更新：** 将自动生成的 2:1 half-equirectangular 命名从 `_SBS_180` 调整为 `_LR_180`，并将 alpha 命名调整为 `_LR_180_FISHEYE_F180_alpha`，提升包括 HereSphere 在内的播放器兼容性。
+- **DLNA 更新：** 提升 DIDL schema 版本并刷新 live/raw 命名规则，使生成的绿幕和 alpha 入口使用更兼容播放器的标记，同时保持播放 URL 不变。
+- **离线更新：** RVM 与 alpha 离线默认输出名改用新的 VR 命名规则，同时继续识别旧版生成文件后缀。
+- **BUG 修复：** 改进音频 cache 中断清理，避免 stream 关闭时出现误导性的 `ValueError: I/O operation on closed file` reader-thread traceback。
 
 ### 2026-05-20
 
 - **v0.1.0-beta.4 修补和新增功能。**
-- **重大 BUG 修复：** 所有离线生成引擎默认改为按源视频码率输出，包括 RVM 快速/均衡和 MatAnyone2 中速/慢速，使生成文件大小更接近原始视频。读取不到源码率时回退到 40 Mbps。
-- **重大 BUG 修复：** 修复播放或停止服务器后 FFmpeg 子进程后台常驻的问题。PyNv 流现在会跟踪并停止音频 FFmpeg 子进程，关闭时等待 slate 音频/缓存线程，清理部分启动失败的 pipe-TS muxer，删除残留临时 AAC 文件；UI 强制停止服务器时也会在 Windows 上通过 `taskkill /T /F` 终止子进程。
-- **重大 BUG 修复：** 修复实时 2D alpha 播放中 alpha 区块逐渐变灰的问题，默认实时 RVM 模型切回 FP32。根因是 RVM 的 `rec1`-`rec4` 循环状态在 FP16 下逐帧累积精度误差，不是 alpha 打包或实时码率控制。
+- **BUG 修复：** 所有离线生成引擎默认改为按源视频码率输出，包括 RVM 快速/均衡和 MatAnyone2 中速/慢速，使生成文件大小更接近原始视频。读取不到源码率时回退到 40 Mbps。
+- **BUG 修复：** 修复播放或停止服务器后 FFmpeg 子进程后台常驻的问题。PyNv 流现在会跟踪并停止音频 FFmpeg 子进程，关闭时等待 slate 音频/缓存线程，清理部分启动失败的 pipe-TS muxer，删除残留临时 AAC 文件；UI 强制停止服务器时也会在 Windows 上通过 `taskkill /T /F` 终止子进程。
+- **BUG 修复：** 修复实时 2D alpha 播放中 alpha 区块逐渐变灰的问题，默认实时 RVM 模型切回 FP32。根因是 RVM 的 `rec1`-`rec4` 循环状态在 FP16 下逐帧累积精度误差，不是 alpha 打包或实时码率控制。
 
 ### 2026-05-19
 
-- **重大 BUG 修复：** 修复 MatAnyone2 中速离线 alpha 在 HEVC Main10/P016 风格解码帧上的前置识别崩溃，YOLO-World/EfficientSAM 或 SAM3 预处理前会先把 16-bit NV12/P010 平面转换成 8-bit BGR。
-- **重大 BUG 修复：** 更新 AV1 后端路由，RTX 20/Turing 等不支持 AV1 NVDEC 的显卡会走 FFmpeg 解码 fallback，不再等到 PyNv 解码取帧阶段才失败。
-- **重大 UI 更新：** 新增实时透视前景光照匹配功能，包括首页独立面板、预设、自定义设置对话框、持久化 UI 设置，以及播放中的运行时更新。
-- **重大内核更新：** 新增 DLNA `[NoLive]` 标记，并对已知不支持实时处理的源直接拒绝实时入口，避免误走实时 fallback。
+- **BUG 修复：** 修复 MatAnyone2 中速离线 alpha 在 HEVC Main10/P016 风格解码帧上的前置识别崩溃，YOLO-World/EfficientSAM 或 SAM3 预处理前会先把 16-bit NV12/P010 平面转换成 8-bit BGR。
+- **BUG 修复：** 更新 AV1 后端路由，RTX 20/Turing 等不支持 AV1 NVDEC 的显卡会走 FFmpeg 解码 fallback，不再等到 PyNv 解码取帧阶段才失败。
+- **UI 更新：** 新增实时透视前景光照匹配功能，包括首页独立面板、预设、自定义设置对话框、持久化 UI 设置，以及播放中的运行时更新。
+- **内核更新：** 新增 DLNA `[NoLive]` 标记，并对已知不支持实时处理的源直接拒绝实时入口，避免误走实时 fallback。
 
 ### 2026-05-18
 
 - **v0.1.0-beta.3 修补和新增功能。**
-- **重大内核/性能升级：** 新增 MatAnyone2 中速离线模式，使用 YOLO-World + EfficientSAM 作为 MatAnyone2 传播前的前置识别模型。
-- **重大内核/性能升级：** 降低 MatAnyone2 中速峰值显存，YOLO-World/EfficientSAM 前置改为子进程运行，MatAnyone2 离线默认 batch 1 且关闭 SBS batch。
-- **重大内核升级：** 改进 SAM3 前置的 MatAnyone2 慢速模式，包括共享 SAM3 helper、左右眼 mask 一致性防护、短 inactive 缺口填补，以及可配置 SAM3 文本提示词。
-- **重大 UI 更新：** 调整离线 UI，MatAnyone2 作为统一引擎显示，下方增加识别模型选择，可选 `YOLOWorld-EfficientSAM` 或 `SAM3 (16GB+ VRAM)`，并增加 SAM3 专用提示词对话框。
-- **重大 UI/内核更新：** 新增 2D alpha 输出控制，包括 fisheye/flat3d 投影模式、按距离计算视差、flat3d 方形单眼画布，以及首页 2D alpha 设置入口。
+- **内核/性能升级：** 新增 MatAnyone2 中速离线模式，使用 YOLO-World + EfficientSAM 作为 MatAnyone2 传播前的前置识别模型。
+- **内核/性能升级：** 降低 MatAnyone2 中速峰值显存，YOLO-World/EfficientSAM 前置改为子进程运行，MatAnyone2 离线默认 batch 1 且关闭 SBS batch。
+- **内核升级：** 改进 SAM3 前置的 MatAnyone2 慢速模式，包括共享 SAM3 helper、左右眼 mask 一致性防护、短 inactive 缺口填补，以及可配置 SAM3 文本提示词。
+- **UI 更新：** 调整离线 UI，MatAnyone2 作为统一引擎显示，下方增加识别模型选择，可选 `YOLOWorld-EfficientSAM` 或 `SAM3 (16GB+ VRAM)`，并增加 SAM3 专用提示词对话框。
+- **UI/内核更新：** 新增 2D alpha 输出控制，包括 fisheye/flat3d 投影模式、按距离计算视差、flat3d 方形单眼画布，以及首页 2D alpha 设置入口。
 
 ### 2026-05-17
 
 - **v0.1.0-beta.1 正式发布公测。**
 - **v0.1.0-beta.2 修补和新增功能。**
-- **重大 UI 更新：** 将实时/离线界面的显存配置替换为画质/速度预设，并增加独立离线画质设置。
-- **重大 UI 更新：** 新增 `GET /runtime_status`，并在主窗口状态栏中间显示当前 FPS 和显存占用。
-- **重大 BUG 修复：** 新增共享 NVIDIA 计算能力检测，并在实时启动和离线转换中加入硬性拦截。
-- **重大内核更新：** 新增离线源编码预检，并为 MPEG-4 Visual / `mp4v-20` 等非 PyNv 源增加 FFmpeg NV12 解码 fallback。
-- **重大内核更新：** 新增 4XVR live 播放配置，使 AVPro/ExoPlayer 的重连可以复用托管 live session。
-- **重大 UI/内核更新：** 新增普通 2D 视频 alpha 直通，将非 SBS 2D 视频投影为双眼鱼眼 SBS 输出，并支持 FOV 和视差配置。
+- **UI 更新：** 将实时/离线界面的显存配置替换为画质/速度预设，并增加独立离线画质设置。
+- **UI 更新：** 新增 `GET /runtime_status`，并在主窗口状态栏中间显示当前 FPS 和显存占用。
+- **BUG 修复：** 新增共享 NVIDIA 计算能力检测，并在实时启动和离线转换中加入硬性拦截。
+- **内核更新：** 新增离线源编码预检，并为 MPEG-4 Visual / `mp4v-20` 等非 PyNv 源增加 FFmpeg NV12 解码 fallback。
+- **内核更新：** 新增 4XVR live 播放配置，使 AVPro/ExoPlayer 的重连可以复用托管 live session。
+- **UI/内核更新：** 新增普通 2D 视频 alpha 直通，将非 SBS 2D 视频投影为双眼鱼眼 SBS 输出，并支持 FOV 和视差配置。
 
 ### 2026-05-16
 
-- **重大内核/性能升级：** 为正数实时 FPS cap 增加 producer pacing，使限制 FPS 时生产端也同步节流。
-- **重大内核/性能升级：** 新增实时 PyNv 解码后的 GPU 缩放，配置项为 `PT_DECODE_MAX_SIDE`。
-- **重大 BUG 修复：** 离线绿幕和离线 alpha 生成保持源视频原尺寸输出，不跟随实时输出尺寸设置。
-- **重大内核更新：** 去重 alpha packer，离线 alpha 改用共享的 `pipeline.alpha_packer.AlphaPacker` 实现。
-- **重大 BUG 修复：** 移除离线生成默认 30 FPS 限制。
-- **重大 BUG 修复：** 新增启动阶段 GPU 算力门槛检查，compute capability 低于 7.5 时快速失败。
+- **内核/性能升级：** 为正数实时 FPS cap 增加 producer pacing，使限制 FPS 时生产端也同步节流。
+- **内核/性能升级：** 新增实时 PyNv 解码后的 GPU 缩放，配置项为 `PT_DECODE_MAX_SIDE`。
+- **BUG 修复：** 离线绿幕和离线 alpha 生成保持源视频原尺寸输出，不跟随实时输出尺寸设置。
+- **内核更新：** 去重 alpha packer，离线 alpha 改用共享的 `pipeline.alpha_packer.AlphaPacker` 实现。
+- **BUG 修复：** 移除离线生成默认 30 FPS 限制。
+- **BUG 修复：** 新增启动阶段 GPU 算力门槛检查，compute capability 低于 7.5 时快速失败。
 
 ### 2026-05-15
 
-- **重大内核/性能升级：** 新增 PyNv/8K 分阶段性能工具和 decode、encode、mux、端到端 passthrough probe。
-- **重大内核/性能升级：** 新增 PyNv threaded decoder 实验、slot ownership 处理、encode input lifetime 保护、FP16 RVM benchmark 支持，以及 TensorRT/CUDA provider 诊断。
+- **内核/性能升级：** 新增 PyNv/8K 分阶段性能工具和 decode、encode、mux、端到端 passthrough probe。
+- **内核/性能升级：** 新增 PyNv threaded decoder 实验、slot ownership 处理、encode input lifetime 保护、FP16 RVM benchmark 支持，以及 TensorRT/CUDA provider 诊断。
 
 ### 2026-05-14
 
-- **重大打包/内核修复：** 新增 frozen build 下的 CuPy/CUDA 打包依赖处理，并改进 Windows 打包版本的运行时 CUDA DLL 加载。
+- **打包/内核修复：** 新增 frozen build 下的 CuPy/CUDA 打包依赖处理，并改进 Windows 打包版本的运行时 CUDA DLL 加载。
 
 ### 2026-05-13
 
 - **v0.1.0-alpha.1 正式发布小范围公测。**
-- **重大 UI 更新：** 新增首次 GPU warmup 长等待场景的启动遮罩、本地启动状态轮询、一键复制诊断报告，以及结构化启动失败提示。
+- **UI 更新：** 新增首次 GPU warmup 长等待场景的启动遮罩、本地启动状态轮询、一键复制诊断报告，以及结构化启动失败提示。
 
 ### 2026-05-12
 
-- **重大打包修复：** 新增 PyInstaller 打包中 Qt/ICU DLL 冲突修复和防御检查，减少重复或不兼容 DLL 被收集。
+- **打包修复：** 新增 PyInstaller 打包中 Qt/ICU DLL 冲突修复和防御检查，减少重复或不兼容 DLL 被收集。
 
 ### 2026-05-11
 
-- **重大 UI 更新：** 新增第一版 PySide6 桌面 UI，包括实时服务器控制、快速配置、版本显示、状态栏、日志侧栏、语言选择和多视频目录配置。
-- **重大 UI/内核更新：** 新增字幕设置和预览 UI。
-- **重大内核更新：** 新增服务端 alpha 直通入口、绿幕/alpha 双入口列表、alpha 鱼眼输出、alpha block 布局修正、透明零 alpha overlay 行为，以及 alpha 输出音频后混流。
+- **UI 更新：** 新增第一版 PySide6 桌面 UI，包括实时服务器控制、快速配置、版本显示、状态栏、日志侧栏、语言选择和多视频目录配置。
+- **UI/内核更新：** 新增字幕设置和预览 UI。
+- **内核更新：** 新增服务端 alpha 直通入口、绿幕/alpha 双入口列表、alpha 鱼眼输出、alpha block 布局修正、透明零 alpha overlay 行为，以及 alpha 输出音频后混流。
 
 ### 2026-05-10
 
-- **重大内核更新：** 新增离线 RVM passthrough 生成。
-- **重大内核更新：** 新增 MatAnyone2 ONNX 导出工具和首个离线运行时集成。
-- **重大内核更新：** 新增 SAM3/MatAnyone2 实验性分割流程，包括低显存模式和 active segment plan。
-- **重大内核更新：** 新增 live 播放 AAC 缓存、音频归一化和 live-session 缓存改进。
+- **内核更新：** 新增离线 RVM passthrough 生成。
+- **内核更新：** 新增 MatAnyone2 ONNX 导出工具和首个离线运行时集成。
+- **内核更新：** 新增 SAM3/MatAnyone2 实验性分割流程，包括低显存模式和 active segment plan。
+- **内核更新：** 新增 live 播放 AAC 缓存、音频归一化和 live-session 缓存改进。
 
 ### 2026-05-09
 
-- **重大内核更新：** 新增 MoonVR/VLC、Skybox/libmpv、nPlayer/OPlayer 风格客户端和默认客户端的播放器专用 live passthrough 处理。
-- **重大内核更新：** 新增 live passthrough active-slot ownership 和 preemption 规则。
-- **重大内核更新：** 新增 PyNv 生产音频 mux 集成和 AAC/MPEG-TS 时间戳处理。
-- **重大 BUG 修复：** 新增 Main10/P010/P016 兼容性实验和 PyNv passthrough 转换路径。
+- **内核更新：** 新增 MoonVR/VLC、Skybox/libmpv、nPlayer/OPlayer 风格客户端和默认客户端的播放器专用 live passthrough 处理。
+- **内核更新：** 新增 live passthrough active-slot ownership 和 preemption 规则。
+- **内核更新：** 新增 PyNv 生产音频 mux 集成和 AAC/MPEG-TS 时间戳处理。
+- **BUG 修复：** 新增 Main10/P010/P016 兼容性实验和 PyNv passthrough 转换路径。
 
 ### 2026-05-08
 
-- **重大内核/性能升级：** 新增 PyNv 生产流初始集成，包括 encoder、mux、decode-to-encode 和 GPU matting probe。
-- **重大内核更新：** 新增 pseudo-VOD byte seek 集成、passthrough live 模式和 HEVC live 支持。
-- **重大内核更新：** 新增 DLNA 物理目录浏览、缩略图、live-only 列表调整、live chapter 容器和短视频 direct play 行为。
-- **重大内核/性能升级：** 新增 GPU runtime cache 和 ONNX Runtime CUDA cold-start 支持工具。
+- **内核/性能升级：** 新增 PyNv 生产流初始集成，包括 encoder、mux、decode-to-encode 和 GPU matting probe。
+- **内核更新：** 新增 pseudo-VOD byte seek 集成、passthrough live 模式和 HEVC live 支持。
+- **内核更新：** 新增 DLNA 物理目录浏览、缩略图、live-only 列表调整、live chapter 容器和短视频 direct play 行为。
+- **内核/性能升级：** 新增 GPU runtime cache 和 ONNX Runtime CUDA cold-start 支持工具。
 
 ### 2026-05-07
 
-- **重大内核/性能升级：** 新增输出 FPS cap 配置、alpha stride reuse、RVM 模型选择、CUDA IOBinding 实验、GPU NV12 preprocess 和 fused NV12-to-NV12 green composite kernel。
-- **重大内核更新：** 新增 PyNvVideoCodec 依赖和初始 PyNv decode/matting bridge。
+- **内核/性能升级：** 新增输出 FPS cap 配置、alpha stride reuse、RVM 模型选择、CUDA IOBinding 实验、GPU NV12 preprocess 和 fused NV12-to-NV12 green composite kernel。
+- **内核更新：** 新增 PyNvVideoCodec 依赖和初始 PyNv decode/matting bridge。
 
 ### 2026-05-06
 
-- **重大内核/性能升级：** 新增 CUDA decoder 诊断、FFmpeg 硬件解码候选选择、decoder 输出 FPS/尺寸传播和 matting profiling。
-- **重大内核/性能升级：** 新增优化版绿幕 composite 路径，避免整帧绿色背景分配。
-- **重大内核更新：** 新增初始 DLNA time-seek metadata、passthrough HEAD 支持，以及 `PT_CONTAINER` 对 MP4 和 MPEG-TS passthrough 输出的支持。
+- **内核/性能升级：** 新增 CUDA decoder 诊断、FFmpeg 硬件解码候选选择、decoder 输出 FPS/尺寸传播和 matting profiling。
+- **内核/性能升级：** 新增优化版绿幕 composite 路径，避免整帧绿色背景分配。
+- **内核更新：** 新增初始 DLNA time-seek metadata、passthrough HEAD 支持，以及 `PT_CONTAINER` 对 MP4 和 MPEG-TS passthrough 输出的支持。

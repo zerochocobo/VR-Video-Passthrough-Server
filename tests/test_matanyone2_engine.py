@@ -1,7 +1,7 @@
 import unittest
 from collections import defaultdict
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import numpy as np
 
@@ -39,8 +39,10 @@ class MatAnyone2EngineTests(unittest.TestCase):
         engine.tensor_dtype = np.float32
         engine.profile = defaultdict(list)
         engine.mask_path = None
-        engine._step_io_outputs = {}
-        engine._step_io_slot = 0
+        engine.cv2 = __import__("cv2")
+        engine._last_mask_gate_failed = False
+        engine._step_io_outputs = {0: {}, 1: {}}
+        engine._step_io_slots = [0, 0]
         engine.ort = type(
             "Ort",
             (),
@@ -75,6 +77,14 @@ class MatAnyone2EngineTests(unittest.TestCase):
 
         self.assertIsNot(first, second)
 
+    def test_output_ortvalue_uses_independent_eye_buckets(self):
+        engine = self._engine()
+
+        left = engine._step_output_ortvalue("prob", (1, 2, 4, 4), slot=0, eye_idx=0)
+        right = engine._step_output_ortvalue("prob", (1, 2, 4, 4), slot=0, eye_idx=1)
+
+        self.assertIsNot(left, right)
+
     def test_should_use_iobinding_requires_cuda_image_and_initialized_state(self):
         engine = self._engine()
         engine._iobinding_enabled = True
@@ -85,6 +95,91 @@ class MatAnyone2EngineTests(unittest.TestCase):
             setattr(state, attr, np.zeros((1,), dtype=np.float32))
 
         self.assertFalse(engine._should_use_iobinding(image, state))
+
+    def test_static_mask_path_is_active(self):
+        engine = self._engine()
+        engine.mask_path = Path("mask.png")
+
+        self.assertTrue(engine.is_active_frame())
+
+    def test_last_mask_uncert_gate_shape_mismatch_falls_back(self):
+        engine = self._engine()
+        state = type("State", (), {})()
+        state.last_mask = np.ones((1, 1, 4, 4), dtype=np.float32)
+        state.last_uncert = np.ones((2, 1, 4, 4), dtype=np.float32)
+
+        with patch.object(config, "MATANYONE2_LAST_MASK_UNCERT_GATE", 0.7):
+            out = engine._last_mask_input(state)
+
+        self.assertIs(out, state.last_mask)
+
+    def test_last_mask_uncert_gate_resizes_spatial_map(self):
+        engine = self._engine()
+        state = type("State", (), {})()
+        state.last_mask = np.ones((1, 1, 4, 4), dtype=np.float32)
+        state.last_uncert = np.ones((1, 1, 2, 2), dtype=np.float32)
+
+        with patch.object(config, "MATANYONE2_LAST_MASK_UNCERT_GATE", 0.5):
+            out = engine._last_mask_input(state)
+
+        self.assertEqual(out.dtype, np.float32)
+        np.testing.assert_allclose(out, np.full((1, 1, 4, 4), 0.5, dtype=np.float32))
+
+    def test_sensory_decay_preserves_dtype(self):
+        engine = self._engine()
+        sensory = np.ones((1, 2, 2), dtype=np.float16)
+
+        out = engine._decay_sensory(sensory, 0.9)
+
+        self.assertEqual(out.dtype, np.float16)
+        np.testing.assert_allclose(out, np.full((1, 2, 2), 0.9, dtype=np.float16), rtol=1e-3)
+
+    def test_last_pred_binarize_threshold(self):
+        engine = self._engine()
+        last_mask = np.array([[[[0.49, 0.50, 0.51]]]], dtype=np.float32)
+
+        with (
+            patch.object(config, "MATANYONE2_LAST_PRED_BINARIZE", True),
+            patch.object(config, "MATANYONE2_LAST_PRED_BIN_THRESHOLD", 0.5),
+        ):
+            out = engine._last_pred_mask_input(last_mask)
+
+        np.testing.assert_array_equal(out, np.array([[[[0.0, 0.0, 1.0]]]], dtype=np.float32))
+
+    def test_bootstrap_refine_iters_default_3(self):
+        engine = self._engine()
+        engine.eyes = [MatAnyone2OnnxEngine._EyeState(), MatAnyone2OnnxEngine._EyeState()]
+        engine.sensory_single_shape = (1, 1, 1, 2, 2)
+        engine.bootstrap_refine_iters = config.MATANYONE2_BOOTSTRAP_REFINE_ITERS
+        engine._image_key = Mock(
+            return_value={
+                "f16": np.zeros((1, 1, 2, 2), dtype=np.float32),
+                "f8": np.zeros((1, 1, 2, 2), dtype=np.float32),
+                "f4": np.zeros((1, 1, 2, 2), dtype=np.float32),
+                "f2": np.zeros((1, 1, 2, 2), dtype=np.float32),
+                "f1": np.zeros((1, 1, 2, 2), dtype=np.float32),
+                "pix_feat": np.zeros((1, 1, 2, 2), dtype=np.float32),
+                "key": np.zeros((1, 1, 2, 2), dtype=np.float32),
+                "shrinkage": np.zeros((1, 1, 2, 2), dtype=np.float32),
+                "selection": np.zeros((1, 1, 2, 2), dtype=np.float32),
+            }
+        )
+        sensory = np.zeros((1, 1, 1, 2, 2), dtype=np.float32)
+        msk_value = np.zeros((1, 1, 1, 2, 2), dtype=np.float32)
+        obj_memory = np.zeros((1, 1, 1, 2, 2), dtype=np.float32)
+        engine._bootstrap_mask = Mock(return_value=np.ones((1, 1, 2, 2), dtype=np.float32))
+        engine._mask_memory = Mock(return_value=(msk_value, sensory, obj_memory))
+        prob = np.zeros((1, 2, 2, 2), dtype=np.float32)
+        prob[:, 1:2] = 0.8
+        engine._first_frame_refine = Mock(return_value=(prob, sensory))
+        engine._smooth_eye_alpha = Mock(side_effect=lambda alpha, _eye_idx: alpha)
+
+        out = engine._run_eye(np.zeros((1, 3, 2, 2), dtype=np.float32), h=2, w=4, eye_idx=0)
+
+        self.assertEqual(config.MATANYONE2_BOOTSTRAP_REFINE_ITERS, 3)
+        self.assertEqual(engine._first_frame_refine.call_count, 3)
+        self.assertEqual(engine._mask_memory.call_count, 4)
+        self.assertEqual(out.shape, (2, 2))
 
     def test_maybe_refine_alpha_calls_guided_upsampler(self):
         engine = self._engine()
@@ -156,6 +251,8 @@ class MatAnyone2EngineTests(unittest.TestCase):
         class _Matter:
             def _gpu_preprocess_nv12_roi_one(self, *args, **kwargs):
                 captured["source_x0"] = kwargs.get("source_x0")
+                captured["batch"] = kwargs.get("batch")
+                captured["batch_idx"] = kwargs.get("batch_idx")
                 return np.zeros((1, 3, 8, 8), dtype=np.float32)
 
         engine.matter = _Matter()
@@ -164,6 +261,29 @@ class MatAnyone2EngineTests(unittest.TestCase):
         engine._preprocess_eye_roi(roi, eye_idx=1)
 
         self.assertEqual(captured["source_x0"], 40)
+        self.assertEqual(captured["batch"], 2)
+        self.assertEqual(captured["batch_idx"], 1)
+
+    def test_preprocess_eye_uses_eye_specific_batch_slot(self):
+        engine = self._engine()
+        engine.in_w = 8
+        engine.in_h = 8
+        engine._iobinding_enabled = False
+        engine._iobinding_failed = False
+        captured = {}
+
+        class _Matter:
+            def _gpu_preprocess_nv12_one(self, *args, **kwargs):
+                captured["batch"] = kwargs.get("batch")
+                captured["batch_idx"] = kwargs.get("batch_idx")
+                return np.zeros((1, 3, 8, 8), dtype=np.float32)
+
+        engine.matter = _Matter()
+
+        engine._preprocess_eye(40, 40, eye_idx=1)
+
+        self.assertEqual(captured["batch"], 2)
+        self.assertEqual(captured["batch_idx"], 1)
 
     def test_roi_bootstrap_mask_is_crop_letterboxed(self):
         import cv2

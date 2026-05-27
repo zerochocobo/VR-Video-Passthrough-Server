@@ -21,11 +21,12 @@ TRT_MODEL_RVM = "rvm"
 TRT_MODEL_MATANYONE2 = "matanyone2"
 MODEL_KEY = "rvm_mobilenetv3"
 MODEL_LABEL = "Robust Video Matting"
-MATANYONE2_MODEL_KEYS = ("matanyone2_onnx_1024_bs1",)
-MATANYONE2_MODEL_KEY = MATANYONE2_MODEL_KEYS[0]
-MATANYONE2_CACHE_KEY = MATANYONE2_MODEL_KEY
-MATANYONE2_MODEL_LABEL = "MatAnyone2 ONNX 1024 bs1"
+MATANYONE2_MODEL_KEYS = ("matanyone2_onnx_512_bs1", "matanyone2_onnx_1024_bs1")
+MATANYONE2_MODEL_KEY = "matanyone2_onnx_1024_bs1"
+MATANYONE2_CACHE_KEY = "matanyone2"
+MATANYONE2_MODEL_LABEL = "MatAnyone2 ONNX 512/1024 bs1"
 MATANYONE2_TRT_ONNX_NAME = "matanyone2_step_update.onnx"
+MATANYONE2_SUPPORTED_SIZES = (512, 1024)
 TRT_PROVIDER_CHAIN = "TensorrtExecutionProvider,CUDAExecutionProvider,CPUExecutionProvider"
 RVM_OFFLINE_TRT_SHAPES = (
     (1024, 1, 0.5),
@@ -78,13 +79,20 @@ def original_rvm_model_path() -> Path:
     return candidate if candidate.exists() else Path(config.MODEL_PATH).resolve()
 
 
+def matanyone2_model_key_for_size(size: int) -> str:
+    value = int(size)
+    key = f"matanyone2_onnx_{value}_bs1"
+    if key not in MATANYONE2_MODEL_KEYS:
+        supported = ", ".join(str(item) for item in MATANYONE2_SUPPORTED_SIZES)
+        raise ValueError(f"only MatAnyone2 sizes {supported} are supported")
+    return key
+
+
 def matanyone2_model_dir(size: int | None = None) -> Path:
     if size is None:
         key = MATANYONE2_MODEL_KEY
     else:
-        if int(size) != 1024:
-            raise ValueError("only MatAnyone2 1024 is supported")
-        key = f"matanyone2_onnx_{int(size)}_bs1"
+        key = matanyone2_model_key_for_size(size)
     return (config.ROOT / "models" / key).resolve()
 
 
@@ -96,12 +104,34 @@ def matanyone2_trt_source_model_paths() -> dict[str, Path]:
     return {key: (config.ROOT / "models" / key / MATANYONE2_TRT_ONNX_NAME).resolve() for key in MATANYONE2_MODEL_KEYS}
 
 
-def is_matanyone2_trt_model_dir(model_dir: Path) -> bool:
+def matanyone2_model_key_for_dir(model_dir: Path) -> str:
     try:
         resolved = model_dir.resolve()
     except OSError:
         resolved = Path(model_dir)
-    return any(resolved == (config.ROOT / "models" / key).resolve() for key in MATANYONE2_MODEL_KEYS)
+    for key in MATANYONE2_MODEL_KEYS:
+        if resolved == (config.ROOT / "models" / key).resolve():
+            return key
+    return ""
+
+
+def matanyone2_trt_cache_dir_for_key(model_key: str, cache_dir: Path | None = None) -> Path:
+    key = str(model_key or "").strip()
+    if key not in MATANYONE2_MODEL_KEYS:
+        raise ValueError(f"unsupported MatAnyone2 TensorRT model key: {model_key}")
+    root = Path(cache_dir).resolve() if cache_dir is not None else cache_dir_for_model(TRT_MODEL_MATANYONE2)
+    return root / key
+
+
+def matanyone2_trt_cache_dir_for_model_dir(model_dir: Path, cache_dir: Path | None = None) -> Path:
+    key = matanyone2_model_key_for_dir(model_dir)
+    if not key:
+        return cache_dir_for_model(TRT_MODEL_MATANYONE2, cache_dir)
+    return matanyone2_trt_cache_dir_for_key(key, cache_dir)
+
+
+def is_matanyone2_trt_model_dir(model_dir: Path) -> bool:
+    return bool(matanyone2_model_key_for_dir(model_dir))
 
 
 def source_model_path(model_key: str | None = None) -> Path:
@@ -403,6 +433,11 @@ def _manifest_engine_files_exist(
         saved_keys = fingerprint.get("matanyone2_model_keys")
         if saved_keys != list(MATANYONE2_MODEL_KEYS):
             return False
+        for model_name in MATANYONE2_MODEL_KEYS:
+            model_cache_dir = matanyone2_trt_cache_dir_for_key(model_name, cache_dir)
+            if not engine_artifact_paths(model_cache_dir, recursive=False):
+                return False
+        return True
     return bool(engine_artifact_paths(cache_dir, recursive=False))
 
 

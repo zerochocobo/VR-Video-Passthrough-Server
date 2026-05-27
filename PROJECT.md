@@ -385,8 +385,15 @@ These directories are generated or environment-specific:
 | `PT_MATANYONE2_ROI_EXPAND` | `0.30` | Expand the bootstrap-mask ROI by this bbox fraction before crop/letterbox preprocessing. |
 | `PT_MATANYONE2_ROI_MAX_EYE_FRACTION` | `0.70` | Disable ROI and fall back to full-eye processing when the expanded ROI covers too much of an eye. |
 | `PT_MATANYONE2_ROI_FEATHER` | `16` | Feather ROI alpha edges in full-eye pixels when pasting the ROI result back into the SBS alpha. |
+| `PT_MATANYONE2_SEGMENT_FRAMES` | `240` | Re-bootstrap MatAnyone2 from prepass masks after this many frames; Phase-1 state gating lets the default move beyond the earlier 60-frame workaround, `0` disables the fixed interval. |
+| `PT_MATANYONE2_LAST_MASK_UNCERT_GATE` | `0.7` | Scale down MatAnyone2 `last_mask` in high-uncertainty regions before propagation, reducing old-position drag while keeping stable areas anchored. |
+| `PT_MATANYONE2_SENSORY_DECAY_INTERVAL` | `8` | Apply a mild recurrent sensory-state decay every N output frames; `0` disables this soft reset. |
+| `PT_MATANYONE2_SENSORY_DECAY_FACTOR` | `0.9` | Multiplier used by MatAnyone2 sensory-state decay. Lower values reduce residual state more aggressively but can flicker. |
+| `PT_MATANYONE2_LAST_PRED_BINARIZE` | `1` | Feed a thresholded previous mask into MatAnyone2 `last_pred_mask` while keeping `last_mask` soft. |
+| `PT_MATANYONE2_LAST_PRED_BIN_THRESHOLD` | `0.5` | Threshold used when `PT_MATANYONE2_LAST_PRED_BINARIZE=1`. |
+| `PT_MATANYONE2_BOOTSTRAP_REFINE_ITERS` | `3` | Recurrent first-frame refinement passes used to build stronger segment memory; `1` restores the previous behavior. |
 | `PT_MATANYONE2_SCENE_RESET` | `1` | Merge detected scene cuts into MatAnyone2 offline segment planning when a bootstrap mask is available. |
-| `PT_MATANYONE2_ALPHA_SMOOTH` | `1` | Apply per-eye EMA smoothing to MatAnyone2 offline alpha and reset with segment changes. |
+| `PT_MATANYONE2_ALPHA_SMOOTH` | `0` | Optional per-eye EMA smoothing for MatAnyone2 offline alpha; default off because it can add motion afterimages. |
 | `PT_USE_PYNV` | `1` | Enable PyNv backend for eligible sources. |
 | `PT_PASSTHROUGH_MAX_FPS` | `30` | Output FPS cap. |
 | `PT_PASSTHROUGH_OUTPUT_MODE` | `green` | Generated passthrough layout: `none`, `green`, `alpha`, or `all` to expose both passthrough entries. |
@@ -458,5 +465,8 @@ DLNA client
 - Translation JSON files under `ui/translations/` are intentionally kept as
   UTF-8 with BOM. When editing or generating them programmatically, read/write
   with `utf-8-sig` and preserve the BOM.
+- MatAnyone2 medium now defaults to `yolo26m_efficientsam`; keep
+  `yoloworld_efficientsam` as a Legacy fallback until the new prepass has
+  enough user-side validation.
 - Keep handover notes in `prompt/HANDOVER_YYYYMMDD.md` when making meaningful
   project changes.

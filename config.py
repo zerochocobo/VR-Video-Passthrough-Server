@@ -315,10 +315,45 @@ MATANYONE2_SCENE_REF_EMA = float(_env("MATANYONE2_SCENE_REF_EMA", 0.95))
 #   Minimum spacing between two MatAnyone2 segment starts caused by scene cuts.
 MATANYONE2_SCENE_MIN_SEGMENT_SEC = float(_env("MATANYONE2_SCENE_MIN_SEGMENT_SEC", 3.0))
 
+# PT_MATANYONE2_SEGMENT_FRAMES:
+#   Maximum MatAnyone2 propagation length before re-bootstrapping from the
+#   prepass mask. Phase-1 state gating allows a longer default than the earlier
+#   60-frame drag workaround while keeping bootstrap overhead lower.
+MATANYONE2_SEGMENT_FRAMES = max(0, int(_env("MATANYONE2_SEGMENT_FRAMES", 240)))
+
+# PT_MATANYONE2_LAST_MASK_UNCERT_GATE:
+#   Scale the previous-frame last_mask down in high-uncertainty regions before
+#   MatAnyone2 propagation. 0 disables the gate; typical values are 0.5-0.9.
+MATANYONE2_LAST_MASK_UNCERT_GATE = max(0.0, min(1.0, float(_env("MATANYONE2_LAST_MASK_UNCERT_GATE", 0.7))))
+
+# PT_MATANYONE2_SENSORY_DECAY_INTERVAL:
+#   Soft-reset MatAnyone2 recurrent sensory state every N output frames. 0
+#   disables the decay. This reduces hidden-state drag without segment reset.
+MATANYONE2_SENSORY_DECAY_INTERVAL = max(0, int(_env("MATANYONE2_SENSORY_DECAY_INTERVAL", 8)))
+
+# PT_MATANYONE2_SENSORY_DECAY_FACTOR:
+#   Multiplier used by the sensory soft reset. Values below 0.7 can cause
+#   flicker; the default is intentionally mild.
+MATANYONE2_SENSORY_DECAY_FACTOR = max(0.0, min(1.0, float(_env("MATANYONE2_SENSORY_DECAY_FACTOR", 0.9))))
+
+# PT_MATANYONE2_LAST_PRED_BINARIZE:
+#   Use a thresholded previous mask for last_pred_mask, while keeping last_mask
+#   soft. This decouples pred_uncertainty from alpha trails.
+MATANYONE2_LAST_PRED_BINARIZE = _env("MATANYONE2_LAST_PRED_BINARIZE", "1") == "1"
+
+# PT_MATANYONE2_LAST_PRED_BIN_THRESHOLD:
+#   Threshold for the optional last_pred_mask binarization.
+MATANYONE2_LAST_PRED_BIN_THRESHOLD = max(0.0, min(1.0, float(_env("MATANYONE2_LAST_PRED_BIN_THRESHOLD", 0.5))))
+
+# PT_MATANYONE2_BOOTSTRAP_REFINE_ITERS:
+#   Number of recurrent first-frame refinement passes used to build stronger
+#   segment memory. 1 preserves the previous single-refine behavior.
+MATANYONE2_BOOTSTRAP_REFINE_ITERS = max(1, int(_env("MATANYONE2_BOOTSTRAP_REFINE_ITERS", 3)))
+
 # PT_MATANYONE2_ALPHA_SMOOTH:
 #   1 enables temporal EMA smoothing on MatAnyone2 alpha output. Smoothers reset
 #   whenever the MatAnyone2 segment plan resets.
-MATANYONE2_ALPHA_SMOOTH = _env("MATANYONE2_ALPHA_SMOOTH", "1") == "1"
+MATANYONE2_ALPHA_SMOOTH = _env("MATANYONE2_ALPHA_SMOOTH", "0") == "1"
 
 # PT_MATANYONE2_ALPHA_SMOOTH_WEIGHT:
 #   EMA weight for historical alpha. 0.6 = 60% history + 40% new alpha.
@@ -533,7 +568,9 @@ ONNX_TRT_ENGINE_CACHE_ENABLE = _env("ONNX_TRT_ENGINE_CACHE_ENABLE", "1") == "1"
 ONNX_TRT_ENGINE_CACHE_PATH: Path = Path(
     _env("ONNX_TRT_ENGINE_CACHE_PATH", ROOT / "runtime_cache" / "trt_engines")
 ).resolve()
-ONNX_TRT_FP16_ENABLE = _env("ONNX_TRT_FP16_ENABLE", "1") == "1"
+# TensorRT builds default to FP32. FP16 TRT engines have shown alpha flicker
+# on some RVM and MatAnyone2 paths.
+ONNX_TRT_FP16_ENABLE = _env("ONNX_TRT_FP16_ENABLE", "0") == "1"
 ONNX_TRT_CUDA_GRAPH_ENABLE = _env("ONNX_TRT_CUDA_GRAPH_ENABLE", "0") == "1"
 ONNX_TRT_DUMP_SUBGRAPHS = _env("ONNX_TRT_DUMP_SUBGRAPHS", "0") == "1"
 ONNX_TRT_DETAILED_BUILD_LOG = _env("ONNX_TRT_DETAILED_BUILD_LOG", "0") == "1"

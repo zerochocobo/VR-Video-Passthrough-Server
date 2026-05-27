@@ -35,6 +35,7 @@ from utils.trt_manifest import (  # noqa: E402
     cache_dir_for_model,
     cache_status,
     is_matanyone2_trt_model_dir,
+    matanyone2_trt_cache_dir_for_model_dir,
     original_rvm_model_path,
 )
 from utils.video_metadata import cfr_source_index, probe_color_metadata, probe_timing_metadata, probe_video_metadata, select_backend  # noqa: E402
@@ -90,10 +91,11 @@ def _matanyone2_session_providers(name: str, model_dir: Path):
         if not is_matanyone2_trt_model_dir(model_dir):
             print(f"[offline] MatAnyone2 TensorRT disabled for custom model dir={model_dir}", flush=True)
             return _available_onnx_providers()
-        if cache_status(model_key=TRT_MODEL_MATANYONE2) != "ready":
+        trt_root = cache_dir_for_model(TRT_MODEL_MATANYONE2)
+        if cache_status(model_key=TRT_MODEL_MATANYONE2, cache_dir=trt_root) != "ready":
             print("[offline] MatAnyone2 TensorRT cache is not ready; using CUDA providers", flush=True)
             return _available_onnx_providers()
-        cache_dir = cache_dir_for_model(TRT_MODEL_MATANYONE2)
+        cache_dir = matanyone2_trt_cache_dir_for_model_dir(model_dir, trt_root)
         config.ONNX_TRT_ENGINE_CACHE_PATH = cache_dir
         os.environ["PT_ONNX_TRT_ENGINE_CACHE_PATH"] = str(cache_dir)
         from pipeline import matting as matting_module
@@ -139,7 +141,7 @@ def _provider_summary(providers) -> str:
 
 
 def _resolve_matanyone2_model_dir(args, width: int = 0, height: int = 0) -> Path:
-    supported_size = 1024
+    supported_sizes = (512, 1024)
     if getattr(args, "model", ""):
         model_dir = Path(args.model).resolve()
         manifest_path = model_dir / "manifest.json"
@@ -147,14 +149,16 @@ def _resolve_matanyone2_model_dir(args, width: int = 0, height: int = 0) -> Path
             manifest = json.loads(manifest_path.read_text(encoding="utf-8-sig"))
             height = int(manifest.get("height") or 0)
             width = int(manifest.get("width") or 0)
-            if (height, width) != (supported_size, supported_size):
+            if (height, width) not in {(size, size) for size in supported_sizes}:
+                supported = ", ".join(f"{size}x{size}" for size in supported_sizes)
                 raise RuntimeError(
-                    f"unsupported MatAnyone2 model size {width}x{height}; only {supported_size}x{supported_size} is enabled"
+                    f"unsupported MatAnyone2 model size {width}x{height}; supported: {supported}"
                 )
         return model_dir
     size = int(getattr(args, "matanyone2_size", 1024) or 1024)
-    if size != supported_size:
-        raise RuntimeError(f"unsupported MatAnyone2 size {size}; only {supported_size}x{supported_size} is enabled")
+    if size not in supported_sizes:
+        supported = ", ".join(str(item) for item in supported_sizes)
+        raise RuntimeError(f"unsupported MatAnyone2 size {size}; supported: {supported}")
     batch_arg = str(getattr(args, "matanyone2_batch", "1") or "1").lower()
     if batch_arg == "auto":
         # Batch2 is memory-bandwidth/workspace heavy in ORT CUDA on this
@@ -280,6 +284,15 @@ def _extract_audio_sidecar(src: Path, out: Path, audio: str, start_sec: float = 
         errors="replace",
         **hidden_subprocess_kwargs(),
     ), audio_path
+
+
+def _cleanup_audio_sidecar(audio_path: Path | None) -> None:
+    if audio_path is None:
+        return
+    try:
+        audio_path.unlink(missing_ok=True)
+    except Exception:
+        pass
 
 
 def _mux_audio_sidecar_after(video_only: Path, out: Path, audio_path: Path, src: Path, duration: float = 0.0) -> tuple[list[str], subprocess.CompletedProcess]:
@@ -934,12 +947,12 @@ def main() -> int:
     parser.add_argument("--out", default="", help="output mp4 path; default is source-stem_passthrough.mp4")
     parser.add_argument("--engine", default="rvm", choices=["rvm", "matanyone2_onnx"])
     parser.add_argument("--model", default="", help="model path; RVM defaults to models/rvm_mobilenetv3_fp32.onnx")
-    parser.add_argument("--matanyone2-size", type=int, default=1024, choices=[1024],
+    parser.add_argument("--matanyone2-size", type=int, default=1024, choices=[512, 1024],
                         help="MatAnyone2 ONNX size to auto-select when --model is omitted")
     parser.add_argument("--matanyone2-batch", default="1", choices=["auto", "1", "2"],
-                        help="MatAnyone2 ONNX batch to auto-select when --model is omitted; auto uses bs2 only for 512 SBS")
+                        help="MatAnyone2 ONNX batch to auto-select when --model is omitted; auto currently uses bs1")
     parser.add_argument("--mask", default="", help="first-frame object mask for MatAnyone2")
-    parser.add_argument("--matanyone2-prepass", default="sam3", choices=["sam3", "yoloworld_efficientsam"],
+    parser.add_argument("--matanyone2-prepass", default="sam3", choices=["sam3", "yoloworld_efficientsam", "yolo26m_efficientsam"],
                         help="automatic first-mask prepass backend for MatAnyone2 when --mask is omitted")
     parser.add_argument("--ywes-model-dir", default=str(config.ROOT / "models" / "yoloworld_efficientsam"),
                         help="YOLO-World + EfficientSAM ONNX model directory")
@@ -980,6 +993,57 @@ def main() -> int:
     parser.add_argument("--ywes-subprocess", action=argparse.BooleanOptionalAction, default=True,
                         help="run YOLO-World + EfficientSAM prepass in a child process so its CUDA context is released before MatAnyone2")
     parser.add_argument("--ywes-prepass-out", default="", help=argparse.SUPPRESS)
+    parser.add_argument("--y26es-model-dir", default=str(config.ROOT / "models" / "yolo26m"),
+                        help="YOLO26m ONNX model directory")
+    parser.add_argument("--y26es-sam-model-dir", default=str(config.ROOT / "models" / "efficientsam"),
+                        help="EfficientSAM ONNX model directory for YOLO26m prepass")
+    parser.add_argument("--y26es-provider", default="cuda", choices=["cuda", "cpu"],
+                        help="execution provider for YOLO26m + EfficientSAM prepass")
+    parser.add_argument("--y26es-yolo-model", default="yolo26m_model.onnx",
+                        help="YOLO26m ONNX filename under --y26es-model-dir; default fp32 because the fp16 export silently collapses on ORT CUDAExecutionProvider (person scores ~0.01-0.03)")
+    parser.add_argument("--y26es-sam-model", default="efficientsam_s.onnx",
+                        help="EfficientSAM ONNX filename under --y26es-sam-model-dir")
+    parser.add_argument("--y26es-yolo-size", type=int, default=640,
+                        help="YOLO26m letterbox input size; exported ONNX graph is fixed at 640")
+    parser.add_argument("--y26es-score-threshold", type=float, default=0.35,
+                        help="YOLO26m person sigmoid score threshold")
+    parser.add_argument("--y26es-nms-threshold", type=float, default=0.6,
+                        help="YOLO26m fallback NMS IoU threshold")
+    parser.add_argument("--y26es-box-expand", type=float, default=0.08,
+                        help="box expansion ratio before EfficientSAM")
+    parser.add_argument("--y26es-top-k", type=int, default=0,
+                        help="max persons to segment per eye; 0 = unlimited (every plausible candidate is paired, leftovers projected to the other eye). N>0 caps at N pairs. Default 0 handles 1..many people without a hard limit. EfficientSAM cost scales linearly with the number of selected persons per scan point, so set a small positive cap (e.g., 2-3) if you want to bound prepass time on crowded content.")
+    parser.add_argument("--y26es-binarize-mask", action=argparse.BooleanOptionalAction, default=True,
+                        help="binarize EfficientSAM mask before writing MatAnyone2 prepass masks")
+    parser.add_argument("--y26es-mask-erode-px", type=int, default=1,
+                        help="morphological erosion iterations after mask binarization")
+    parser.add_argument("--y26es-max-box-area", type=float, default=0.50,
+                        help="reject YOLO26m boxes whose area exceeds this fraction of a per-eye frame; also gates the score fallback. Lower this if 'fill the frame' false-positives slip through.")
+    parser.add_argument("--y26es-cross-eye-area-ratio", type=float, default=1.5,
+                        help="when paired L/R boxes' area ratio exceeds this, project the higher-score side to the other eye to keep masks symmetric")
+    parser.add_argument("--y26es-scan", default="hybrid", choices=["keyframe", "interval", "hybrid"],
+                        help="YOLO26m + EfficientSAM prepass sample strategy")
+    parser.add_argument("--y26es-scan-interval-sec", type=float, default=1.0,
+                        help="fallback/interval YOLO26m + EfficientSAM scan step in seconds")
+    parser.add_argument("--y26es-active-min-area-ratio", type=float, default=0.001,
+                        help="sample is active if either eye union mask area is at least this ratio")
+    parser.add_argument("--y26es-gap-fill-frames", type=int, default=600,
+                        help="fill inactive YOLO26m samples between two active samples (or at clip start/end) by reusing a neighboring mask; counted in output-fps frames; 0 disables")
+    parser.add_argument("--y26es-fill-boundaries", action=argparse.BooleanOptionalAction, default=True,
+                        help="forward-fill from first active scan point to frame 0 and backward-fill from last active scan point to the tail (capped by --y26es-gap-fill-frames)")
+    parser.add_argument("--y26es-scene-aware-fill", action=argparse.BooleanOptionalAction, default=True,
+                        help="when filling middle gaps that contain a scene cut, use the post-cut neighbor for frames after the cut; also blocks boundary fill across a scene-cut anchor")
+    parser.add_argument("--y26es-debug-dir", default="",
+                        help="optional directory to save YOLO26m + EfficientSAM prepass debug files")
+    parser.add_argument("--y26es-cut-on-count-change", action=argparse.BooleanOptionalAction, default=True,
+                        help="start a new MatAnyone2 segment when selected person count changes")
+    parser.add_argument("--y26es-cut-every-active-sample", action="store_true",
+                        help="debug/quality mode: restart MatAnyone2 at every active YOLO26m sample")
+    parser.add_argument("--y26es-fail-on-empty", action=argparse.BooleanOptionalAction, default=True,
+                        help="fail instead of writing an all-background output when no person masks are found")
+    parser.add_argument("--y26es-subprocess", action=argparse.BooleanOptionalAction, default=True,
+                        help="run YOLO26m + EfficientSAM prepass in a child process so its CUDA context is released before MatAnyone2")
+    parser.add_argument("--y26es-prepass-out", default="", help=argparse.SUPPRESS)
     parser.add_argument("--sam3-model-dir", default=str(config.ROOT / "models" / "sam3_onnx"),
                         help="SAM3 ONNX model directory for MatAnyone2 first-frame text mask")
     parser.add_argument("--sam3-prompt", default="person", help="SAM3 text prompt for MatAnyone2 first-frame mask")
@@ -1034,7 +1098,7 @@ def main() -> int:
                         help="3x3 dilation iterations for MatAnyone2 bootstrap mask")
     parser.add_argument("--matanyone2-bootstrap-soft", action="store_true",
                         help="keep soft alpha inside the conservative bootstrap mask")
-    parser.add_argument("--matanyone2-segment-frames", type=int, default=300,
+    parser.add_argument("--matanyone2-segment-frames", type=int, default=config.MATANYONE2_SEGMENT_FRAMES,
                         help="reset MatAnyone2 memory and re-bootstrap with SAM3/mask every N frames; 0 disables")
     parser.add_argument("--matanyone2-min-segment-sec", type=float, default=3.0,
                         help="minimum seconds between SAM3-driven MatAnyone2 segment starts")
@@ -1070,6 +1134,7 @@ def main() -> int:
     args = parser.parse_args()
     args._sam3_child = bool(args.sam3_prepass_out)
     args._ywes_child = bool(args.ywes_prepass_out)
+    args._y26es_child = bool(args.y26es_prepass_out)
     args._tool_name = "offline_passthrough"
 
     import PyNvVideoCodec as nvc
@@ -1195,6 +1260,7 @@ def main() -> int:
             print("[audio extract stderr]")
             print(audio_extract_stderr.strip()[-2000:])
         if audio_extract_proc.returncode != 0:
+            _cleanup_audio_sidecar(audio_sidecar)
             dec.stop()
             return audio_extract_proc.returncode
 
@@ -1206,19 +1272,31 @@ def main() -> int:
         args._matanyone2_in_w = int(manifest.get("width") or 512)
         args._matanyone2_batch_size = int(manifest.get("batch_size") or 1)
     _require_sam3_vram(args)
-    if args.engine == "matanyone2_onnx" and not args.mask and args.matanyone2_prepass == "yoloworld_efficientsam":
+    if args.engine == "matanyone2_onnx" and not args.mask and args.matanyone2_prepass == "yolo26m_efficientsam":
+        from offline.yolo26m_efficientsam import precompute_segment_masks as _precompute_y26es_segment_masks
+        from offline.yolo26m_efficientsam import write_prepass_result as _write_y26es_prepass_result
+
+        sam3_masks, segment_starts = _precompute_y26es_segment_masks(args, src, dec, source_fps, fps, target, cfr_source_index)
+    elif args.engine == "matanyone2_onnx" and not args.mask and args.matanyone2_prepass == "yoloworld_efficientsam":
         from offline.yoloworld_efficientsam import precompute_segment_masks as _precompute_ywes_segment_masks
         from offline.yoloworld_efficientsam import write_prepass_result as _write_ywes_prepass_result
 
         sam3_masks, segment_starts = _precompute_ywes_segment_masks(args, src, dec, source_fps, fps, target, cfr_source_index)
     else:
         sam3_masks, segment_starts = _precompute_sam3_segment_masks(args, src, dec, source_fps, fps, target)
+    if args.y26es_prepass_out:
+        _write_y26es_prepass_result(Path(args.y26es_prepass_out).resolve(), sam3_masks, segment_starts)
+        _cleanup_audio_sidecar(audio_sidecar)
+        dec.stop()
+        return 0
     if args.ywes_prepass_out:
         _write_ywes_prepass_result(Path(args.ywes_prepass_out).resolve(), sam3_masks, segment_starts)
+        _cleanup_audio_sidecar(audio_sidecar)
         dec.stop()
         return 0
     if args.sam3_prepass_out:
         _write_sam3_prepass_result(Path(args.sam3_prepass_out).resolve(), sam3_masks, segment_starts)
+        _cleanup_audio_sidecar(audio_sidecar)
         dec.stop()
         return 0
     if engine is None:
@@ -1382,10 +1460,8 @@ def main() -> int:
                 video_only_out.unlink(missing_ok=True)
             except Exception:
                 pass
-            try:
-                audio_sidecar.unlink(missing_ok=True)
-            except Exception:
-                pass
+            _cleanup_audio_sidecar(audio_sidecar)
+    _cleanup_audio_sidecar(audio_sidecar)
     print("[ffprobe]")
     print(_ffprobe(final_out if rc == 0 else video_only_out))
     return 0 if rc == 0 else rc

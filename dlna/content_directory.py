@@ -64,6 +64,7 @@ _OBJECT_ID_VERSION_PREFIX = f"ptv{_DIDL_SCHEMA_VERSION}_"
 _dir_items_cache: dict[tuple, list[dict]] = {}
 _LIVE_MAX_SIDE = 8192
 _NO_LIVE_PREFIX = "[NoLive] "
+_OFFLINE_PREFIX = "[Offline] "
 
 
 def _parse_bitrate(s: str) -> int:
@@ -191,6 +192,8 @@ def _video_item_count(path: Path, child: IndexedChild | None = None) -> int:
 def _marked_original_title(path: Path, child: IndexedChild | None = None) -> str:
     width, height = _indexed_video_dimensions(child)
     title = source_display_stem(path.stem, width, height)
+    if is_offline_passthrough_output_name(path.name) and not title.startswith(_OFFLINE_PREFIX.strip()):
+        title = f"{_OFFLINE_PREFIX}{title}"
     if _hide_passthrough_for_path(path, child) and not title.startswith(_NO_LIVE_PREFIX.strip()):
         return f"{_NO_LIVE_PREFIX}{title}"
     return title

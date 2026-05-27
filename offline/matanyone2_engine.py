@@ -28,6 +28,7 @@ _STATE_NAMES = (
     "last_mask",
     "last_pix_feat",
     "last_pred_mask",
+    "last_uncert",
 )
 
 
@@ -48,6 +49,7 @@ class MatAnyone2OnnxEngine:
             self.last_pix_feat = None
             self.last_mask = None
             self.last_msk_value = None
+            self.last_uncert = None
             self.initialized = False
 
         def reset(self):
@@ -59,6 +61,7 @@ class MatAnyone2OnnxEngine:
             self.last_pix_feat = None
             self.last_mask = None
             self.last_msk_value = None
+            self.last_uncert = None
             self.initialized = False
 
     def __init__(
@@ -97,6 +100,7 @@ class MatAnyone2OnnxEngine:
         self.bootstrap_dilate = max(0, int(bootstrap_dilate))
         self.bootstrap_soft = bool(bootstrap_soft)
         self.segment_frames = max(0, int(segment_frames))
+        self.bootstrap_refine_iters = max(1, int(config.MATANYONE2_BOOTSTRAP_REFINE_ITERS))
         self.alpha_stride = max(1, int(config.ALPHA_STRIDE))
         self._frame_index = 0
         self._source_frame_index = -1
@@ -164,14 +168,16 @@ class MatAnyone2OnnxEngine:
         self._cached_alpha_sbs = None
         self._iobinding_enabled = False
         self._iobinding_failed = False
-        self._step_io_outputs: dict[str, object] = {}
-        self._step_io_slot = 0
+        self._step_io_outputs: dict[int, dict[str, object]] = {0: {}, 1: {}}
+        self._step_io_slots = [0, 0]
         self._eye_smoother_gpu_prev = [None, None] if self._eye_smoothers else []
         self._guided_upsample_enabled = bool(config.MATANYONE2_EDGE_AWARE_UPSAMPLE)
         self._guided_upsample_failed = False
         self._roi_enabled = bool(config.MATANYONE2_ROI_CROP)
         self._roi_failed = False
         self._segment_rois: dict[int, list[RoiMeta | None]] = {}
+        self._last_mask_gate_failed = False
+        self._last_sensory_decay_frame = -1
         if config.MATANYONE2_IOBINDING and self.step_update is not None:
             active_providers = set(self.step_update.get_providers())
             self._iobinding_enabled = bool(active_providers & {"CUDAExecutionProvider", "TensorrtExecutionProvider"})
@@ -180,10 +186,14 @@ class MatAnyone2OnnxEngine:
             f"{log_prefix} MatAnyone2 ONNX loaded dir={model_dir} input={self.in_w}x{self.in_h} "
             f"sbs=per-eye bootstrap={'mask' if mask else 'sam3'} sam3_prompt={sam3_prompt!r} "
             f"bootstrap_erode={self.bootstrap_erode} bootstrap_dilate={self.bootstrap_dilate} "
-            f"bootstrap_soft={self.bootstrap_soft} segment_frames={self.segment_frames} alpha_stride={self.alpha_stride} "
+            f"bootstrap_soft={self.bootstrap_soft} segment_frames={self.segment_frames} "
+            f"bootstrap_refine_iters={self.bootstrap_refine_iters} alpha_stride={self.alpha_stride} "
             f"batch2={self.batch2_enabled} dtype={self.tensor_dtype.__name__} "
             f"alpha_smooth={int(bool(self._eye_smoothers))} output={self.output_mode} "
             f"alpha_refine={'guided' if self._guided_upsample_enabled else 'off'} "
+            f"drag_gate={config.MATANYONE2_LAST_MASK_UNCERT_GATE:.2f} "
+            f"sensory_decay={config.MATANYONE2_SENSORY_DECAY_INTERVAL}/{config.MATANYONE2_SENSORY_DECAY_FACTOR:.2f} "
+            f"last_pred_bin={int(config.MATANYONE2_LAST_PRED_BINARIZE)} "
             f"roi={int(self._roi_enabled)} "
             f"iobinding={int(self._iobinding_enabled)} "
             f"fused_update={self.propagate_update is not None} step_update={self.step_update is not None} "
@@ -208,6 +218,132 @@ class MatAnyone2OnnxEngine:
         if hasattr(x, "data_ptr") and hasattr(x, "numpy"):
             return x.numpy()
         return self._as_numpy(x)
+
+    @staticmethod
+    def _is_cupy_array(value) -> bool:
+        return hasattr(value, "data") and hasattr(value.data, "ptr")
+
+    @staticmethod
+    def _array_shape(value) -> tuple[int, ...]:
+        if hasattr(value, "shape"):
+            shape = value.shape() if callable(value.shape) else value.shape
+            return tuple(int(v) for v in shape)
+        return tuple()
+
+    def _as_numpy4(self, value) -> np.ndarray:
+        arr = self._to_numpy(value)
+        arr = self.np.asarray(arr)
+        if arr.ndim == 2:
+            arr = arr[None, None, :, :]
+        elif arr.ndim == 3:
+            arr = arr[:, None, :, :]
+        return arr
+
+    def _as_cupy4(self, value):
+        import cupy as cp
+
+        if hasattr(value, "data_ptr"):
+            dtype = self._step_output_dtypes.get("uncert_prob", self.tensor_dtype)
+            arr = self._ortvalue_to_cupy(value, dtype)
+        elif self._is_cupy_array(value):
+            arr = value
+        else:
+            arr = cp.asarray(value)
+        if arr.ndim == 2:
+            arr = arr[None, None, :, :]
+        elif arr.ndim == 3:
+            arr = arr[:, None, :, :]
+        return arr
+
+    def _resize_numpy_batch(self, arr: np.ndarray, out_h: int, out_w: int) -> np.ndarray:
+        if int(arr.shape[-2]) == int(out_h) and int(arr.shape[-1]) == int(out_w):
+            return arr
+        b, c = int(arr.shape[0]), int(arr.shape[1])
+        out = self.np.empty((b, c, int(out_h), int(out_w)), dtype=self.np.float32)
+        for bi in range(b):
+            for ci in range(c):
+                out[bi, ci] = self.cv2.resize(
+                    arr[bi, ci].astype(self.np.float32, copy=False),
+                    (int(out_w), int(out_h)),
+                    interpolation=self.cv2.INTER_LINEAR,
+                )
+        return out
+
+    def _resize_cupy_batch(self, arr, out_h: int, out_w: int):
+        if int(arr.shape[-2]) == int(out_h) and int(arr.shape[-1]) == int(out_w):
+            return arr
+        import cupy as cp
+        from pipeline.alpha_guided_filter import _resize_float
+
+        planes = []
+        for bi in range(int(arr.shape[0])):
+            row = []
+            for ci in range(int(arr.shape[1])):
+                row.append(_resize_float(arr[bi, ci], int(out_h), int(out_w)))
+            planes.append(cp.stack(row, axis=0))
+        return cp.stack(planes, axis=0)
+
+    def _align_uncert_to_mask(self, uncert, mask):
+        if uncert is None:
+            return None
+        target_shape = self._array_shape(mask)
+        if len(target_shape) != 4:
+            return None
+        target_b, target_c, target_h, target_w = target_shape
+        use_cupy = self._is_cupy_array(mask) or hasattr(uncert, "data_ptr")
+        if use_cupy:
+            import cupy as cp
+
+            arr = self._as_cupy4(uncert)
+            if arr.ndim != 4:
+                return None
+            if int(arr.shape[0]) not in (1, target_b) or int(arr.shape[1]) not in (1, target_c):
+                return None
+            arr = self._resize_cupy_batch(arr, target_h, target_w)
+            return cp.clip(arr.astype(cp.float32, copy=False), 0.0, 1.0)
+        arr = self._as_numpy4(uncert)
+        if arr.ndim != 4:
+            return None
+        if int(arr.shape[0]) not in (1, target_b) or int(arr.shape[1]) not in (1, target_c):
+            return None
+        arr = self._resize_numpy_batch(arr, target_h, target_w)
+        return self.np.clip(arr.astype(self.np.float32, copy=False), 0.0, 1.0)
+
+    def _last_mask_input(self, state):
+        last_mask = state.last_mask
+        strength = float(config.MATANYONE2_LAST_MASK_UNCERT_GATE)
+        if strength <= 0.0 or getattr(state, "last_uncert", None) is None or last_mask is None:
+            return last_mask
+        try:
+            uncert = self._align_uncert_to_mask(state.last_uncert, last_mask)
+            if uncert is None:
+                return last_mask
+            if self._is_cupy_array(last_mask):
+                import cupy as cp
+
+                gate = cp.maximum(0.0, 1.0 - strength * uncert)
+                return (last_mask * gate).astype(last_mask.dtype, copy=False)
+            gate = self.np.maximum(0.0, 1.0 - strength * uncert)
+            return (last_mask * gate).astype(last_mask.dtype, copy=False)
+        except Exception as exc:
+            if not self._last_mask_gate_failed:
+                self._last_mask_gate_failed = True
+                print(
+                    f"[offline] MatAnyone2 last_mask uncertainty gate disabled after failure "
+                    f"({type(exc).__name__}: {exc})",
+                    flush=True,
+                )
+            return last_mask
+
+    def _last_pred_mask_input(self, last_mask):
+        if not config.MATANYONE2_LAST_PRED_BINARIZE:
+            return last_mask
+        threshold = float(config.MATANYONE2_LAST_PRED_BIN_THRESHOLD)
+        if self._is_cupy_array(last_mask):
+            import cupy as cp
+
+            return cp.where(last_mask > threshold, 1.0, 0.0).astype(last_mask.dtype, copy=False)
+        return (last_mask > threshold).astype(last_mask.dtype, copy=False)
 
     def _image_key(self, image: np.ndarray) -> dict[str, np.ndarray]:
         names = ["f16", "f8", "f4", "f2", "f1", "pix_feat", "key", "shrinkage", "selection"]
@@ -260,6 +396,8 @@ class MatAnyone2OnnxEngine:
         assert state.last_mask is not None
         assert state.last_pix_feat is not None
         assert state.last_msk_value is not None
+        last_mask = self._last_mask_input(state)
+        last_pred_mask = self._last_pred_mask_input(state.last_mask)
         feed = {
             "f16": feats["f16"],
             "f8": feats["f8"],
@@ -274,25 +412,27 @@ class MatAnyone2OnnxEngine:
             "msk_value": self._to_numpy(state.memory_msk_value),
             "obj_memory": self._to_numpy(state.obj_memory),
             "sensory": self._to_numpy(state.sensory),
-            "last_mask": self._to_numpy(state.last_mask),
+            "last_mask": self._to_numpy(last_mask),
             "last_pix_feat": self._to_numpy(state.last_pix_feat),
-            "last_pred_mask": self._to_numpy(state.last_mask),
+            "last_pred_mask": self._to_numpy(last_pred_mask),
             "last_msk_value": self._to_numpy(state.last_msk_value),
         }
         t0 = time.perf_counter()
-        prob, new_sensory, _logits, _uncert_prob = self.propagate.run(
+        prob, new_sensory, _logits, uncert_prob = self.propagate.run(
             ["prob", "new_sensory", "logits", "uncert_prob"],
             {k: v for k, v in feed.items() if k in self._propagate_inputs},
         )
         self.profile["propagate"].append((time.perf_counter() - t0) * 1000)
-        return prob, new_sensory
+        return prob, new_sensory, uncert_prob
 
     def _propagate_update(self, image, feats, state):
         if self.propagate_update is None:
-            prob, sensory = self._propagate(feats, state)
+            prob, sensory, uncert_prob = self._propagate(feats, state)
             alpha = self.np.clip(prob[:, 1:2], 0.0, 1.0).astype(self.np.float32, copy=False)
             msk_value, sensory, obj_memory = self._mask_memory(image, alpha, sensory, feats["pix_feat"])
-            return prob, sensory, msk_value, obj_memory
+            return prob, sensory, msk_value, obj_memory, uncert_prob
+        last_mask = self._last_mask_input(state)
+        last_pred_mask = self._last_pred_mask_input(state.last_mask)
         feed = {
             "image": image,
             "f16": feats["f16"],
@@ -308,30 +448,32 @@ class MatAnyone2OnnxEngine:
             "msk_value": self._to_numpy(state.memory_msk_value),
             "obj_memory": self._to_numpy(state.obj_memory),
             "sensory": self._to_numpy(state.sensory),
-            "last_mask": self._to_numpy(state.last_mask),
+            "last_mask": self._to_numpy(last_mask),
             "last_pix_feat": self._to_numpy(state.last_pix_feat),
-            "last_pred_mask": self._to_numpy(state.last_mask),
+            "last_pred_mask": self._to_numpy(last_pred_mask),
             "last_msk_value": self._to_numpy(state.last_msk_value),
         }
         t0 = time.perf_counter()
-        prob, sensory, msk_value, obj_memory, _logits, _uncert_prob = self.propagate_update.run(
+        prob, sensory, msk_value, obj_memory, _logits, uncert_prob = self.propagate_update.run(
             ["prob", "new_sensory", "new_msk_value", "new_obj_memory", "logits", "uncert_prob"],
             {k: v for k, v in feed.items() if k in self._propagate_update_inputs},
         )
         self.profile["propagate_update"].append((time.perf_counter() - t0) * 1000)
-        return prob, sensory, msk_value, obj_memory
+        return prob, sensory, msk_value, obj_memory, uncert_prob
 
-    def _step_update(self, image, state):
-        if self._should_use_iobinding(image, state):
+    def _step_update(self, image, state, eye_idx: int | None = None):
+        if eye_idx is not None and self._should_use_iobinding(image, state):
             try:
-                return self._step_update_iobinding(image, state)
+                return self._step_update_iobinding(image, state, eye_idx)
             except Exception as exc:
                 self._iobinding_failed = True
                 print(f"[offline] MatAnyone2 IOBinding failed; falling back to NumPy step_update ({type(exc).__name__}: {exc})", flush=True)
         if self.step_update is None:
             feats = self._image_key(image)
-            prob, sensory, msk_value, obj_memory = self._propagate_update(image, feats, state)
-            return prob, sensory, msk_value, obj_memory, feats["pix_feat"]
+            prob, sensory, msk_value, obj_memory, uncert_prob = self._propagate_update(image, feats, state)
+            return prob, sensory, msk_value, obj_memory, feats["pix_feat"], uncert_prob
+        last_mask = self._last_mask_input(state)
+        last_pred_mask = self._last_pred_mask_input(state.last_mask)
         feed = {
             "image": self._to_numpy(image),
             "memory_key": self._to_numpy(state.memory_key),
@@ -339,18 +481,18 @@ class MatAnyone2OnnxEngine:
             "msk_value": self._to_numpy(state.memory_msk_value),
             "obj_memory": self._to_numpy(state.obj_memory),
             "sensory": self._to_numpy(state.sensory),
-            "last_mask": self._to_numpy(state.last_mask),
+            "last_mask": self._to_numpy(last_mask),
             "last_pix_feat": self._to_numpy(state.last_pix_feat),
-            "last_pred_mask": self._to_numpy(state.last_mask),
+            "last_pred_mask": self._to_numpy(last_pred_mask),
             "last_msk_value": self._to_numpy(state.last_msk_value),
         }
         t0 = time.perf_counter()
-        prob, sensory, msk_value, obj_memory, pix_feat, _logits, _uncert_prob = self.step_update.run(
+        prob, sensory, msk_value, obj_memory, pix_feat, _logits, uncert_prob = self.step_update.run(
             ["prob", "new_sensory", "new_msk_value", "new_obj_memory", "pix_feat", "logits", "uncert_prob"],
             {k: v for k, v in feed.items() if k in self._step_update_inputs},
         )
         self.profile["step_update"].append((time.perf_counter() - t0) * 1000)
-        return prob, sensory, msk_value, obj_memory, pix_feat
+        return prob, sensory, msk_value, obj_memory, pix_feat, uncert_prob
 
     def _should_use_iobinding(self, image, state) -> bool:
         if not self._iobinding_enabled or self._iobinding_failed or self.step_update is None:
@@ -394,20 +536,30 @@ class MatAnyone2OnnxEngine:
             return
         binding.bind_ortvalue_input(name, self._state_ortvalue(value))
 
-    def _step_output_ortvalue(self, name: str, shape: tuple[int, ...], slot: int | None = None):
+    def _step_output_ortvalue(self, name: str, shape: tuple[int, ...], slot: int | None = None, eye_idx: int = 0):
         dtype = self._step_output_dtypes.get(name, self.tensor_dtype)
-        slot = self._step_io_slot if slot is None else int(slot) & 1
-        slots = self._step_io_outputs.get(name)
+        eye_idx = int(eye_idx)
+        if eye_idx < 0 or eye_idx >= len(self._step_io_slots):
+            eye_idx = 0
+        slot = self._step_io_slots[eye_idx] if slot is None else int(slot) & 1
+        bucket = self._step_io_outputs.get(eye_idx)
+        if not isinstance(bucket, dict):
+            bucket = {}
+            self._step_io_outputs[eye_idx] = bucket
+        slots = bucket.get(name)
         if not isinstance(slots, list) or len(slots) != 2:
             slots = [None, None]
-            self._step_io_outputs[name] = slots
+            bucket[name] = slots
         value = slots[slot]
         if value is None or tuple(int(v) for v in value.shape()) != tuple(shape):
             value = self.ort.OrtValue.ortvalue_from_shape_and_type(shape, dtype, "cuda", 0)
             slots[slot] = value
         return value
 
-    def _step_update_iobinding(self, image, state):
+    def _step_update_iobinding(self, image, state, eye_idx: int):
+        eye_idx = int(eye_idx)
+        if eye_idx < 0 or eye_idx >= len(self._step_io_slots):
+            eye_idx = 0
         binding = self.step_update.io_binding()
         binding.bind_input("image", "cuda", 0, self.tensor_dtype, tuple(int(v) for v in image.shape), int(image.data.ptr))
         state.memory_key = self._state_ortvalue(state.memory_key)
@@ -417,31 +569,33 @@ class MatAnyone2OnnxEngine:
         state.sensory = self._state_ortvalue(state.sensory)
         state.last_pix_feat = self._state_ortvalue(state.last_pix_feat)
         state.last_msk_value = self._state_ortvalue(state.last_msk_value)
+        last_mask = self._last_mask_input(state)
+        last_pred_mask = self._last_pred_mask_input(state.last_mask)
         bindings = {
             "memory_key": state.memory_key,
             "memory_shrinkage": state.memory_shrinkage,
             "msk_value": state.memory_msk_value,
             "obj_memory": state.obj_memory,
             "sensory": state.sensory,
-            "last_mask": state.last_mask,
+            "last_mask": last_mask,
             "last_pix_feat": state.last_pix_feat,
-            "last_pred_mask": state.last_mask,
+            "last_pred_mask": last_pred_mask,
             "last_msk_value": state.last_msk_value,
         }
         for name, value in bindings.items():
             if name in self._step_update_inputs:
                 self._bind_cuda_or_ortvalue_input(binding, name, value)
 
-        output_slot = self._step_io_slot
+        output_slot = self._step_io_slots[eye_idx]
         for meta in self.step_update.get_outputs():
             shape = tuple(int(v) for v in meta.shape)
-            binding.bind_ortvalue_output(meta.name, self._step_output_ortvalue(meta.name, shape, output_slot))
+            binding.bind_ortvalue_output(meta.name, self._step_output_ortvalue(meta.name, shape, output_slot, eye_idx))
 
         t0 = time.perf_counter()
         self.step_update.run_with_iobinding(binding)
         self.profile["step_update"].append((time.perf_counter() - t0) * 1000)
         outputs = dict(zip(self._step_output_names, binding.get_outputs()))
-        self._step_io_slot = 1 - output_slot
+        self._step_io_slots[eye_idx] = 1 - output_slot
         self.profile["iobinding_copy"].append(0.0)
         return (
             outputs["prob"],
@@ -449,7 +603,45 @@ class MatAnyone2OnnxEngine:
             outputs["new_msk_value"],
             outputs["new_obj_memory"],
             outputs["pix_feat"],
+            outputs.get("uncert_prob"),
         )
+
+    def _uncert_output_value(self, value):
+        if value is None or hasattr(value, "data_ptr"):
+            return value
+        return value.astype(self.np.float32, copy=False)
+
+    def _decay_sensory(self, value, factor: float):
+        factor = float(factor)
+        if value is None or factor >= 1.0:
+            return value
+        if hasattr(value, "data_ptr"):
+            arr = self._ortvalue_to_cupy(value, self.tensor_dtype)
+            arr *= factor
+            return value
+        if self._is_cupy_array(value):
+            value *= factor
+            return value.astype(value.dtype, copy=False)
+        return (value * factor).astype(value.dtype, copy=False)
+
+    def _maybe_decay_sensory(self):
+        interval = int(config.MATANYONE2_SENSORY_DECAY_INTERVAL)
+        if interval <= 0 or self._frame_index <= 0 or self._frame_index % interval != 0:
+            return
+        if self._last_sensory_decay_frame == self._frame_index:
+            return
+        factor = float(config.MATANYONE2_SENSORY_DECAY_FACTOR)
+        if factor >= 1.0:
+            return
+        t0 = time.perf_counter()
+        changed = False
+        for eye in self.eyes:
+            if eye.sensory is not None:
+                eye.sensory = self._decay_sensory(eye.sensory, factor)
+                changed = True
+        self._last_sensory_decay_frame = self._frame_index
+        if changed:
+            self.profile["sensory_decay"].append((time.perf_counter() - t0) * 1000)
 
     def _load_masks(self) -> list[np.ndarray] | None:
         if self.mask_path is None:
@@ -480,8 +672,8 @@ class MatAnyone2OnnxEngine:
             self._eye_smoother_gpu_prev[idx] = None
         self._active_segment_start = -1
         self._cached_alpha_sbs = None
-        self._step_io_outputs = {}
-        self._step_io_slot = 0
+        self._step_io_outputs = {0: {}, 1: {}}
+        self._step_io_slots = [0, 0]
         self._segment_rois = {}
 
     def set_segment_masks(self, segment_start: int, masks: list[np.ndarray]):
@@ -508,6 +700,8 @@ class MatAnyone2OnnxEngine:
         return (self._frame_index // self.segment_frames) * self.segment_frames
 
     def is_active_frame(self) -> bool:
+        if self.mask_path is not None:
+            return True
         return self._current_segment_start() in self.segment_masks
 
     def composite_green_nv12(self, frame):
@@ -567,13 +761,23 @@ class MatAnyone2OnnxEngine:
 
     def _preprocess_eye(self, x0: int, eye_w: int, eye_idx: int | None = None):
         t0 = time.perf_counter()
+        batch = 2 if eye_idx is not None else 1
+        batch_idx = int(eye_idx) if eye_idx is not None else 0
         use_iobinding = (
             self._iobinding_enabled
             and not self._iobinding_failed
             and eye_idx is not None
             and self.eyes[eye_idx].initialized
         )
-        image = self.matter._gpu_preprocess_nv12_one(x0, eye_w, self.in_w, self.in_h, copy_to_host=not use_iobinding)
+        image = self.matter._gpu_preprocess_nv12_one(
+            x0,
+            eye_w,
+            self.in_w,
+            self.in_h,
+            batch=batch,
+            batch_idx=batch_idx,
+            copy_to_host=not use_iobinding,
+        )
         self.profile["preprocess_eye"].append((time.perf_counter() - t0) * 1000)
         return image.astype(self.tensor_dtype, copy=False)
 
@@ -610,6 +814,8 @@ class MatAnyone2OnnxEngine:
 
     def _preprocess_eye_roi(self, roi: RoiMeta, eye_idx: int | None = None):
         t0 = time.perf_counter()
+        batch = 2 if eye_idx is not None else 1
+        batch_idx = int(eye_idx) if eye_idx is not None else 0
         use_iobinding = (
             self._iobinding_enabled
             and not self._iobinding_failed
@@ -620,6 +826,8 @@ class MatAnyone2OnnxEngine:
             roi,
             self.in_w,
             self.in_h,
+            batch=batch,
+            batch_idx=batch_idx,
             source_x0=(int(eye_idx) * roi.eye_w) if eye_idx is not None else 0,
             copy_to_host=not use_iobinding,
         )
@@ -678,9 +886,11 @@ class MatAnyone2OnnxEngine:
             sensory = self.np.zeros(self.sensory_single_shape, dtype=self.tensor_dtype)
             mask = self._bootstrap_mask(h, w, eye_idx, roi=roi)
             msk_value, sensory, obj_memory = self._mask_memory(image, mask, sensory, feats["pix_feat"])
-            prob, sensory = self._first_frame_refine(feats, msk_value, obj_memory[:, :, None, :, :], sensory, mask)
-            alpha = self.np.clip(prob[:, 1:2], 0.0, 1.0).astype(self.tensor_dtype, copy=False)
-            msk_value, sensory, obj_memory = self._mask_memory(image, alpha, sensory, feats["pix_feat"])
+            alpha = mask
+            for _ in range(self.bootstrap_refine_iters):
+                prob, sensory = self._first_frame_refine(feats, msk_value, obj_memory[:, :, None, :, :], sensory, alpha)
+                alpha = self.np.clip(prob[:, 1:2], 0.0, 1.0).astype(self.tensor_dtype, copy=False)
+                msk_value, sensory, obj_memory = self._mask_memory(image, alpha, sensory, feats["pix_feat"])
             state.memory_key = feats["key"][:, :, None, :, :].astype(self.tensor_dtype, copy=False)
             state.memory_shrinkage = feats["shrinkage"][:, :, None, :, :].astype(self.tensor_dtype, copy=False)
             state.memory_msk_value = msk_value[:, :, :, None, :, :].astype(self.tensor_dtype, copy=False)
@@ -689,14 +899,16 @@ class MatAnyone2OnnxEngine:
             state.last_mask = alpha
             state.last_pix_feat = feats["pix_feat"].astype(self.tensor_dtype, copy=False)
             state.last_msk_value = msk_value.astype(self.tensor_dtype, copy=False)
+            state.last_uncert = None
             state.initialized = True
         else:
-            prob, sensory, msk_value, _obj_memory, pix_feat = self._step_update(image, state)
+            prob, sensory, msk_value, _obj_memory, pix_feat, uncert_prob = self._step_update(image, state, eye_idx=eye_idx)
             alpha = self._prob_to_alpha(prob)
             state.sensory = self._state_output_value(sensory)
             state.last_mask = alpha
             state.last_pix_feat = self._state_output_value(pix_feat)
             state.last_msk_value = self._state_output_value(msk_value)
+            state.last_uncert = self._uncert_output_value(uncert_prob)
         alpha_2d = self._smooth_eye_alpha(alpha[0, 0], eye_idx)
         if roi is not None:
             t0 = time.perf_counter()
@@ -722,15 +934,17 @@ class MatAnyone2OnnxEngine:
             sensory = self.np.zeros(self.sensory_shape, dtype=self.tensor_dtype)
             masks = self.np.concatenate([self._bootstrap_mask(h, w, 0), self._bootstrap_mask(h, w, 1)], axis=0)
             msk_value, sensory, obj_memory = self._mask_memory(images, masks, sensory, feats["pix_feat"])
-            prob, sensory = self._first_frame_refine(
-                feats,
-                msk_value,
-                obj_memory[:, :, None, :, :],
-                sensory,
-                masks,
-            )
-            alpha = self.np.clip(prob[:, 1:2], 0.0, 1.0).astype(self.tensor_dtype, copy=False)
-            msk_value, sensory, obj_memory = self._mask_memory(images, alpha, sensory, feats["pix_feat"])
+            alpha = masks
+            for _ in range(self.bootstrap_refine_iters):
+                prob, sensory = self._first_frame_refine(
+                    feats,
+                    msk_value,
+                    obj_memory[:, :, None, :, :],
+                    sensory,
+                    alpha,
+                )
+                alpha = self.np.clip(prob[:, 1:2], 0.0, 1.0).astype(self.tensor_dtype, copy=False)
+                msk_value, sensory, obj_memory = self._mask_memory(images, alpha, sensory, feats["pix_feat"])
             for idx, state in enumerate(states):
                 state.memory_key = feats["key"][idx:idx + 1, :, None, :, :].astype(self.tensor_dtype, copy=False)
                 state.memory_shrinkage = feats["shrinkage"][idx:idx + 1, :, None, :, :].astype(self.tensor_dtype, copy=False)
@@ -740,6 +954,7 @@ class MatAnyone2OnnxEngine:
                 state.last_mask = alpha[idx:idx + 1]
                 state.last_pix_feat = feats["pix_feat"][idx:idx + 1].astype(self.tensor_dtype, copy=False)
                 state.last_msk_value = msk_value[idx:idx + 1].astype(self.tensor_dtype, copy=False)
+                state.last_uncert = None
                 state.initialized = True
             left = self._smooth_eye_alpha(alpha[0, 0], 0)
             right = self._smooth_eye_alpha(alpha[1, 0], 1)
@@ -756,14 +971,18 @@ class MatAnyone2OnnxEngine:
         batched_state.last_mask = self.np.concatenate([s.last_mask for s in states], axis=0)
         batched_state.last_pix_feat = self.np.concatenate([s.last_pix_feat for s in states], axis=0)
         batched_state.last_msk_value = self.np.concatenate([s.last_msk_value for s in states], axis=0)
+        if all(s.last_uncert is not None for s in states):
+            batched_state.last_uncert = self.np.concatenate([self._as_numpy4(s.last_uncert) for s in states], axis=0)
         batched_state.initialized = True
-        prob, sensory, msk_value, _obj_memory, pix_feat = self._step_update(images, batched_state)
+        prob, sensory, msk_value, _obj_memory, pix_feat, uncert_prob = self._step_update(images, batched_state)
         alpha = self._prob_to_alpha(prob)
+        uncert_prob = self._uncert_output_value(uncert_prob)
         for idx, state in enumerate(states):
             state.sensory = sensory[idx:idx + 1].astype(self.tensor_dtype, copy=False)
             state.last_mask = alpha[idx:idx + 1]
             state.last_pix_feat = pix_feat[idx:idx + 1].astype(self.tensor_dtype, copy=False)
             state.last_msk_value = msk_value[idx:idx + 1].astype(self.tensor_dtype, copy=False)
+            state.last_uncert = uncert_prob[idx:idx + 1] if uncert_prob is not None else None
         left = self._smooth_eye_alpha(alpha[0, 0], 0)
         right = self._smooth_eye_alpha(alpha[1, 0], 1)
         return self._concat_alpha_sbs(left, right)
@@ -807,9 +1026,11 @@ class MatAnyone2OnnxEngine:
             or self._frame_index % self.alpha_stride == 0
         )
         if should_update and self.batch2_enabled:
+            self._maybe_decay_sensory()
             alpha_sbs = self._run_eyes_batch2(self._preprocess_eyes_batch2(eye_w), h, w)
             self._cached_alpha_sbs = self._maybe_refine_alpha(alpha_sbs, h, w)
         elif should_update:
+            self._maybe_decay_sensory()
             left_roi, right_roi = self._segment_roi_pair(segment_start, eye_w, h)
             roi_active = left_roi is not None and right_roi is not None
             left_image = self._preprocess_eye_roi(left_roi, 0) if left_roi is not None else self._preprocess_eye(0, eye_w, 0)
@@ -878,6 +1099,7 @@ class MatAnyone2OnnxEngine:
             "propagate",
             "mask_memory",
             "first_refine",
+            "sensory_decay",
             "alpha_concat",
             "alpha_smooth",
             "roi_unwarp",
