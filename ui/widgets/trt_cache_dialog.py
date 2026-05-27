@@ -124,8 +124,16 @@ class TensorRTConfigDialog(QDialog):
         if self.scope == "offline":
             return 6
         if self.model_key == TRT_MODEL_MATANYONE2:
-            return len(MATANYONE2_MODEL_KEYS) + 2
+            return len(MATANYONE2_MODEL_KEYS)
         return 3
+
+    def _set_build_progress(self, completed_stages: int) -> None:
+        total = max(1, self._build_stage_count())
+        completed = max(0, min(total, int(completed_stages)))
+        percent = 99 if completed >= total else int(round(completed * 99 / total))
+        self.progress.setRange(0, 100)
+        self.progress.setValue(percent)
+        self.progress.setFormat(f"{percent}%")
 
     def _model_display_name(self) -> str:
         if self.model_key == TRT_MODEL_MATANYONE2:
@@ -210,7 +218,7 @@ class TensorRTConfigDialog(QDialog):
         else:
             self.status_label.setText(f"{self.i18n.t('trt.cache_status')}: {self.i18n.t('trt.status_' + status)}")
         if reset_progress:
-            self.progress.setRange(0, self._build_stage_count())
+            self.progress.setRange(0, 100)
             self.progress.setFormat("%p%")
             self.progress.setVisible(False)
             self.stage_label.setText(self.i18n.t("trt.download_hint") if libs.frozen and not libs.ready else self._description_text())
@@ -250,9 +258,10 @@ class TensorRTConfigDialog(QDialog):
             return
         self.build_error_text = ""
         self.stage = 0
-        self.progress.setRange(0, self._build_stage_count())
+        self.progress.setRange(0, 100)
         self.progress.setVisible(True)
         self.progress.setValue(0)
+        self.progress.setFormat("0%")
         self.stage_label.setText(
             self.i18n.t("trt.building_model").format(
                 model=self._model_display_name(),
@@ -372,15 +381,16 @@ class TensorRTConfigDialog(QDialog):
             if line.startswith("STAGE:"):
                 parts = line.split(":", 3)
                 if len(parts) >= 3:
+                    stage_number = 0
                     try:
-                        self.stage = max(self.stage, int(parts[1]))
+                        stage_number = int(parts[1])
+                        self.stage = max(self.stage, stage_number)
                     except ValueError:
                         pass
-                    self.progress.setValue(min(self.progress.maximum(), self.stage - (0 if parts[2] != "done" else 0)))
+                    completed = stage_number if parts[2] == "done" else stage_number - 1
+                    self._set_build_progress(completed)
                     if len(parts) == 4 and parts[2] == "start":
                         self.stage_label.setText(parts[3])
-                    elif parts[2] == "done":
-                        self.progress.setValue(min(self.progress.maximum(), self.stage))
             elif line.startswith("ERROR:"):
                 self.build_error_text = line
                 self.stage_label.setText(line)
@@ -392,7 +402,9 @@ class TensorRTConfigDialog(QDialog):
         self.process = None
         if exit_code == 0:
             self.build_error_text = ""
-            self.progress.setValue(self.progress.maximum())
+            self.progress.setRange(0, 100)
+            self.progress.setValue(100)
+            self.progress.setFormat("100%")
             self._refresh()
             return
         if not self.build_error_text:

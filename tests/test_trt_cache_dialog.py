@@ -155,6 +155,73 @@ class TensorRTCacheDialogTests(unittest.TestCase):
                 finally:
                     dialog.close()
 
+    def test_matanyone2_build_progress_counts_only_model_builds_and_caps_before_exit(self) -> None:
+        from ui.widgets import trt_cache_dialog
+        from utils.tensorrt_runtime_libs import TensorRTRuntimeLibStatus
+
+        self._app()
+        with tempfile.TemporaryDirectory() as raw:
+            cache_root = Path(raw)
+            runtime_status = TensorRTRuntimeLibStatus(frozen=False, lib_dir=cache_root)
+            with (
+                patch.object(trt_cache_dialog, "check_tensorrt_runtime_libs", return_value=runtime_status),
+                patch.object(trt_cache_dialog, "cache_status", return_value="missing"),
+                patch.object(trt_cache_dialog, "load_manifest_for_model", return_value={}),
+                patch.object(trt_cache_dialog, "collect_fingerprint", return_value={}),
+                patch.object(
+                    trt_cache_dialog,
+                    "manifest_path",
+                    side_effect=lambda model_key=None, scope=None: cache_root / str(scope or model_key or "rvm") / "manifest.json",
+                ),
+            ):
+                dialog = trt_cache_dialog.TensorRTConfigDialog(FakeI18n(), model_key="matanyone2")
+                try:
+                    self.assertEqual(dialog._build_stage_count(), len(trt_cache_dialog.MATANYONE2_MODEL_KEYS))
+                    dialog._read_process_output("STAGE:1:start:Building MatAnyone2 512\n")
+                    self.assertEqual(dialog.progress.value(), 0)
+                    dialog._read_process_output("STAGE:1:done:1\n")
+                    self.assertEqual(dialog.progress.value(), 50)
+                    dialog._read_process_output("STAGE:2:done:1\n")
+                    self.assertEqual(dialog.progress.value(), 99)
+                    dialog._read_process_output("STAGE:3:start:Verifying MatAnyone2 TensorRT cache\nSTAGE:4:done:0\n")
+                    self.assertEqual(dialog.progress.value(), 99)
+                finally:
+                    dialog.close()
+
+    def test_rvm_build_progress_caps_at_99_until_process_exit(self) -> None:
+        from ui.widgets import trt_cache_dialog
+        from utils.tensorrt_runtime_libs import TensorRTRuntimeLibStatus
+
+        self._app()
+        with tempfile.TemporaryDirectory() as raw:
+            cache_root = Path(raw)
+            runtime_status = TensorRTRuntimeLibStatus(frozen=False, lib_dir=cache_root)
+            with (
+                patch.object(trt_cache_dialog, "check_tensorrt_runtime_libs", return_value=runtime_status),
+                patch.object(trt_cache_dialog, "cache_status", return_value="missing"),
+                patch.object(trt_cache_dialog, "load_manifest_for_model", return_value={}),
+                patch.object(trt_cache_dialog, "collect_fingerprint", return_value={}),
+                patch.object(
+                    trt_cache_dialog,
+                    "manifest_path",
+                    side_effect=lambda model_key=None, scope=None: cache_root / str(scope or model_key or "rvm") / "manifest.json",
+                ),
+                patch.object(trt_cache_dialog, "source_model_path", side_effect=lambda model_key=None: Path(f"{model_key or 'rvm'}.onnx")),
+            ):
+                realtime = trt_cache_dialog.TensorRTConfigDialog(FakeI18n(), model_key="rvm", scope="realtime")
+                offline = trt_cache_dialog.TensorRTConfigDialog(FakeI18n(), model_key="rvm", scope="offline")
+                try:
+                    self.assertEqual(realtime._build_stage_count(), 3)
+                    realtime._read_process_output("STAGE:3:done:1\n")
+                    self.assertEqual(realtime.progress.value(), 99)
+
+                    self.assertEqual(offline._build_stage_count(), 6)
+                    offline._read_process_output("STAGE:6:done:1\n")
+                    self.assertEqual(offline.progress.value(), 99)
+                finally:
+                    realtime.close()
+                    offline.close()
+
     def test_realtime_rvm_build_uses_rvm_1024_warmup(self) -> None:
         from ui.widgets import trt_cache_dialog
         from utils.tensorrt_runtime_libs import TensorRTRuntimeLibStatus
