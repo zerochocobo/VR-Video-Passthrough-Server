@@ -2,6 +2,10 @@
 
 from pathlib import Path
 
+from ui.qt_runtime import configure_qt_runtime_paths
+
+configure_qt_runtime_paths()
+
 from PySide6.QtGui import QFont
 
 

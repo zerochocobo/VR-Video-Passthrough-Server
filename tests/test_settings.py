@@ -45,8 +45,26 @@ class SettingsTests(unittest.TestCase):
         self.assertEqual(env["PT_ALPHA_STRIDE"], "1")
         self.assertEqual(env["PT_PASSTHROUGH_MAX_FPS"], "30")
         self.assertEqual(env["PT_PASSTHROUGH_PRODUCER_REALTIME_PACING"], "1")
+        self.assertEqual(env["PT_PASSTHROUGH_SEEK_ENABLED"], "0")
+        self.assertEqual(env["PT_PASSTHROUGH_SEEK_DLNA"], "0")
+        self.assertEqual(env["PT_PASSTHROUGH_SEEK_ROUTE_POLICY"], "profile")
+        self.assertEqual(env["PT_PASSTHROUGH_SEEK_CONTAINER"], "mpegts")
         self.assertEqual(env["PT_DECODE_MAX_SIDE"], "4096")
         self.assertEqual(env["PT_LIGHT_MATCH_PRESET"], "daylight")
+
+    def test_server_env_can_enable_seekable_passthrough_for_ui_start(self) -> None:
+        s = self._settings()
+        s.data["passthrough_seek_enabled"] = True
+        s.data["passthrough_seek_dlna"] = True
+        s.data["passthrough_seek_route_policy"] = "all"
+        s.data["passthrough_seek_container"] = "mp4"
+
+        env = s.server_env()
+
+        self.assertEqual(env["PT_PASSTHROUGH_SEEK_ENABLED"], "1")
+        self.assertEqual(env["PT_PASSTHROUGH_SEEK_DLNA"], "1")
+        self.assertEqual(env["PT_PASSTHROUGH_SEEK_ROUTE_POLICY"], "all")
+        self.assertEqual(env["PT_PASSTHROUGH_SEEK_CONTAINER"], "mp4")
 
     def test_server_env_contains_video_dirs(self) -> None:
         s = self._settings()

@@ -30,7 +30,7 @@ from pipeline.subtitles import SubtitleRenderer, find_subtitle_for_video
 from utils.logger import get, warmup_event
 from utils.startup_status import get_startup_state, set_startup_phase
 from utils.cache_key import fingerprint, stat_key
-from utils.bitrate_estimator import effective_default_bitrate
+from utils.bitrate_estimator import effective_default_bitrate, parse_bitrate
 from utils.runtime_settings import get_light_match
 from utils.subprocess_hidden import hidden_subprocess_kwargs
 from utils.video_metadata import VideoProbeMetadata, cfr_source_index, probe_color_metadata, probe_timing_metadata
@@ -61,6 +61,11 @@ _audio_tmp_cleanup_lock = threading.Lock()
 _pynv_runtime_tainted = threading.Event()
 _SUBTITLE_BLEND_Y_KERNEL = None
 _SUBTITLE_BLEND_UV_KERNEL = None
+
+
+def _realtime_pynv_bitrate() -> str:
+    """Return configured realtime PyNv HEVC bitrate in bits/second."""
+    return str(parse_bitrate(config.PASSTHROUGH_HEVC_BITRATE))
 
 
 def _drain_async_queue_nowait(q: asyncio.Queue, *, keep_sentinel: bool = True) -> tuple[int, int, bool]:

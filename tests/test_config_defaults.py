@@ -41,6 +41,14 @@ class ConfigDefaultTests(unittest.TestCase):
         self.assertEqual(config.PASSTHROUGH_FMP4_FRAG_DURATION_US, 100000)
         self.assertEqual(config.PASSTHROUGH_AUDIO_MPEGTS_INTERLEAVE_DELTA, "500000000")
 
+    def test_seekable_passthrough_is_hidden_by_default(self) -> None:
+        self.assertFalse(config.PASSTHROUGH_SEEK_ENABLED)
+        self.assertFalse(config.PASSTHROUGH_SEEK_DLNA)
+        self.assertEqual(config.PASSTHROUGH_SEEK_ROUTE_POLICY, "profile")
+        self.assertIn("nplayer", config.PASSTHROUGH_SEEK_PROFILES)
+        self.assertEqual(config.PASSTHROUGH_SEEK_CONTAINER, "mpegts")
+        self.assertEqual(config.PASSTHROUGH_SEEK_HEADER_BYTES, 2 * 1024 * 1024)
+
 
 if __name__ == "__main__":
     unittest.main()

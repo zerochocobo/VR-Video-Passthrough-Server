@@ -37,6 +37,10 @@ DEFAULTS = {
     "offline_batch_trt_rvm_enabled": True,
     "offline_batch_trt_matanyone2_enabled": True,
     "passthrough_max_fps": 30,
+    "passthrough_seek_enabled": False,
+    "passthrough_seek_dlna": False,
+    "passthrough_seek_route_policy": "profile",
+    "passthrough_seek_container": "mpegts",
     "decode_max_side": 4096,
     "inference_backend": "cuda",
     "light_match_enabled": False,
@@ -182,6 +186,16 @@ class Settings:
 
     def server_env(self) -> dict[str, str]:
         passthrough_max_fps = _setting_value(self.data, "passthrough_max_fps", 0)
+        seek_route_policy = str(
+            self.data.get("passthrough_seek_route_policy") or DEFAULTS["passthrough_seek_route_policy"]
+        ).strip().lower()
+        if seek_route_policy not in {"profile", "all", "off"}:
+            seek_route_policy = DEFAULTS["passthrough_seek_route_policy"]
+        seek_container = str(
+            self.data.get("passthrough_seek_container") or DEFAULTS["passthrough_seek_container"]
+        ).strip().lower()
+        if seek_container not in {"mpegts", "mp4"}:
+            seek_container = DEFAULTS["passthrough_seek_container"]
         env = {
             "PT_VIDEO_DIR": "|".join(self.video_dirs()),
             "PT_UI_LANGUAGE": str(self.data.get("language") or system_language()),
@@ -190,6 +204,10 @@ class Settings:
             "PT_ALPHA_STRIDE": str(_setting_value(self.data, "alpha_stride", 1)),
             "PT_PASSTHROUGH_MAX_FPS": str(passthrough_max_fps),
             "PT_PASSTHROUGH_PRODUCER_REALTIME_PACING": "1",
+            "PT_PASSTHROUGH_SEEK_ENABLED": "1" if self.data.get("passthrough_seek_enabled") else "0",
+            "PT_PASSTHROUGH_SEEK_DLNA": "1" if self.data.get("passthrough_seek_dlna") else "0",
+            "PT_PASSTHROUGH_SEEK_ROUTE_POLICY": seek_route_policy,
+            "PT_PASSTHROUGH_SEEK_CONTAINER": seek_container,
             "PT_DECODE_MAX_SIDE": str(_setting_value(self.data, "decode_max_side", 4096)),
             "PT_LIGHT_MATCH_ENABLED": "1" if self.data.get("light_match_enabled") else "0",
             "PT_LIGHT_MATCH_TEMP_K": str(_setting_value(self.data, "light_match_temp_k", DEFAULTS["light_match_temp_k"])),

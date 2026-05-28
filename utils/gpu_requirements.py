@@ -83,6 +83,53 @@ def detect_nvidia_gpu_requirement() -> GpuRequirementResult:
     )
 
 
+def detect_nvidia_total_vram_gib() -> float | None:
+    """Return the largest detected NVIDIA GPU VRAM size in GiB."""
+    exe = _nvidia_smi_path()
+    if not exe:
+        return None
+    try:
+        out = subprocess.check_output(
+            [
+                exe,
+                "--query-gpu=memory.total",
+                "--format=csv,noheader,nounits",
+            ],
+            stderr=subprocess.DEVNULL,
+            text=True,
+            timeout=2,
+            **hidden_subprocess_kwargs(),
+        )
+    except Exception:
+        return None
+
+    best_mib = 0.0
+    for line in out.splitlines():
+        try:
+            best_mib = max(best_mib, float(line.strip()))
+        except ValueError:
+            continue
+    return best_mib / 1024.0 if best_mib > 0 else None
+
+
+def resolve_passthrough_max_concurrent(raw) -> int:
+    text = str(raw).strip().lower() if raw is not None else "auto"
+    if text and text not in {"auto", ""}:
+        try:
+            return max(1, int(text))
+        except ValueError:
+            pass
+
+    vram_gib = detect_nvidia_total_vram_gib()
+    if vram_gib is None:
+        return 1
+    if vram_gib >= 20.0:
+        return 3
+    if vram_gib >= 12.0:
+        return 2
+    return 1
+
+
 def unsupported_gpu_message(result: GpuRequirementResult) -> str:
     gpu = result.name or "unknown NVIDIA GPU"
     cc = result.compute_capability or "unknown"

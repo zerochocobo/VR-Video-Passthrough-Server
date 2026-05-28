@@ -25,6 +25,10 @@ from config import (
     PASSTHROUGH_LIVE_CHAPTER_MIN_INTERVAL_SEC,
     PASSTHROUGH_MKV_LIVE_POLICY,
     PASSTHROUGH_OUTPUT_MODE,
+    PASSTHROUGH_SEEK_DLNA,
+    PASSTHROUGH_SEEK_ENABLED,
+    PASSTHROUGH_SEEK_CONTAINER,
+    PASSTHROUGH_SEEK_HEADER_BYTES,
     PASSTHROUGH_SEEK_MODE,
     MEDIA_LIBRARY,
     VIDEO_DIR,
@@ -52,9 +56,20 @@ ALPHA_LIVE_PREFIX = "pla_"
 LEGACY_ALPHA_LIVE_PREFIX = "pla:"
 LIVE_ITEM_PREFIX = "lg_"
 ALPHA_LIVE_ITEM_PREFIX = "la_"
+SEEK_ITEM_PREFIX = "sg_"
+ALPHA_SEEK_ITEM_PREFIX = "sa_"
 PYNV_OUTPUT_CODEC = "hevc"
 DLNA_FLAGS_BASE = "01700000000000000000000000000000"
 DLNA_FLAGS_TIME_SEEK = "41700000000000000000000000000000"
+DLNA_FLAGS_BYTE_AND_TIME_SEEK = "01F00000000000000000000000000000"
+# Keep these legacy OP names aligned with http_app.routes_media. The old
+# passthrough/live compatibility branches intentionally keep their historic
+# OP=01/10 behavior. New seek items advertise OP=11 with file-like transfer
+# flags only; lop-npt/lop-bytes flags conflict with full random access and can
+# make clients present the item as live/limited.
+DLNA_OP_BYTE_SEEK = "01"
+DLNA_OP_TIME_SEEK = "10"
+DLNA_OP_BYTE_AND_TIME_SEEK = "11"
 DIDL_NS = "urn:schemas-upnp-org:metadata-1-0/DIDL-Lite/"
 
 _DIR_ITEMS_CACHE_MAX = 256
@@ -166,6 +181,23 @@ def _id_to_live(object_id: str) -> tuple[Path, str] | None:
     return None
 
 
+def _id_to_seek(object_id: str) -> tuple[Path, str] | None:
+    mode = "green"
+    if object_id.startswith(ALPHA_SEEK_ITEM_PREFIX):
+        mode = "alpha"
+        prefix = ALPHA_SEEK_ITEM_PREFIX
+    elif object_id.startswith(SEEK_ITEM_PREFIX):
+        prefix = SEEK_ITEM_PREFIX
+    else:
+        return None
+    rel = object_id[len(prefix):].replace("\\", "/").strip("/")
+    rel = _strip_object_id_version(rel)
+    path = MEDIA_LIBRARY.key_to_path(rel)
+    if path is not None and MEDIA_LIBRARY.contains(path) and path.is_file() and path.suffix.lower() in VIDEO_EXTS:
+        return path, mode
+    return None
+
+
 def _parent_id_for_dir(path: Path) -> str:
     path = path.resolve()
     if MEDIA_LIBRARY.multi_root:
@@ -186,7 +218,9 @@ def _video_item_count(path: Path, child: IndexedChild | None = None) -> int:
         or _hide_passthrough_for_path(path, child)
     ):
         return 1
-    return 3 if PASSTHROUGH_OUTPUT_MODE == "all" else 2
+    passthrough_modes = len(_passthrough_modes())
+    seek_items = passthrough_modes if _seek_passthrough_dlna_enabled() else 0
+    return 1 + passthrough_modes + seek_items
 
 
 def _marked_original_title(path: Path, child: IndexedChild | None = None) -> str:
@@ -260,12 +294,23 @@ def _passthrough_virtual_title(path: Path, mode: str, width: int = 0, height: in
     return live_passthrough_title(path.stem, mode, width, height)
 
 
+def _passthrough_seek_title(path: Path, mode: str, width: int = 0, height: int = 0) -> str:
+    title = _passthrough_virtual_title(path, mode, width, height)
+    if title.endswith("_live"):
+        return f"{title[:-5]}_seek"
+    return f"{title}_seek"
+
+
 def _passthrough_live_prefix(mode: str) -> str:
     return ALPHA_LIVE_PREFIX if mode == "alpha" else LIVE_PREFIX
 
 
 def _passthrough_live_item_prefix(mode: str) -> str:
     return ALPHA_LIVE_ITEM_PREFIX if mode == "alpha" else LIVE_ITEM_PREFIX
+
+
+def _passthrough_seek_item_prefix(mode: str) -> str:
+    return ALPHA_SEEK_ITEM_PREFIX if mode == "alpha" else SEEK_ITEM_PREFIX
 
 
 def _passthrough_live_query(mode: str) -> str:
@@ -275,8 +320,41 @@ def _passthrough_live_query(mode: str) -> str:
     return version
 
 
+def _passthrough_seek_query(mode: str) -> str:
+    return _passthrough_live_query(mode)
+
+
 def _live_passthrough_protocol_info() -> str:
     return "http-get:*:video/MP2T:DLNA.ORG_PN=HEVC_TS_NA_ISO;DLNA.ORG_OP=00;DLNA.ORG_CI=1"
+
+
+def _seek_passthrough_protocol_info() -> str:
+    container = _seek_passthrough_container()
+    return (
+        f"http-get:*:{_seek_passthrough_mime(container)}:DLNA.ORG_PN={_seek_passthrough_dlna_pn(container)};"
+        f"DLNA.ORG_OP={DLNA_OP_BYTE_AND_TIME_SEEK};"
+        f"DLNA.ORG_CI=0;DLNA.ORG_FLAGS={DLNA_FLAGS_BYTE_AND_TIME_SEEK}"
+    )
+
+
+def _seek_passthrough_dlna_enabled() -> bool:
+    return bool(PASSTHROUGH_SEEK_ENABLED and PASSTHROUGH_SEEK_DLNA)
+
+
+def _seek_passthrough_container() -> str:
+    return PASSTHROUGH_SEEK_CONTAINER if PASSTHROUGH_SEEK_CONTAINER in {"mpegts", "mp4"} else "mpegts"
+
+
+def _seek_passthrough_mime(container: str | None = None) -> str:
+    return "video/mp4" if (container or _seek_passthrough_container()) == "mp4" else "video/MP2T"
+
+
+def _seek_passthrough_dlna_pn(container: str | None = None) -> str:
+    return "HEVC_MP4_MAIN" if (container or _seek_passthrough_container()) == "mp4" else "HEVC_TS_NA_ISO"
+
+
+def _seek_passthrough_route_suffix(container: str | None = None) -> str:
+    return ".seek.mp4" if (container or _seek_passthrough_container()) == "mp4" else ".seek.ts"
 
 
 def _resolution_str(width: int, height: int) -> str:
@@ -411,12 +489,35 @@ def _video_items_from_index(
         pt_size, pt_bps_est, _ = estimate_for_media(path, duration, estimate_codec)
     else:
         pt_size, pt_bps_est = 0, pt_bps
-    # Keep the pseudo-VOD /passthrough endpoint implemented but hidden from
-    # DLNA listings for now. Several clients issue aggressive probe/seek
-    # requests that are a poor fit for on-demand generated media.
+    # Keep the legacy pseudo-VOD /passthrough endpoint hidden from DLNA. When
+    # seekable passthrough testing is explicitly enabled, add /passthrough_seek
+    # beside the live entry instead of replacing it, so unknown or blocked
+    # clients still have the stable /passthrough_live fallback visible.
     for mode in _passthrough_modes():
+        if _seek_passthrough_dlna_enabled():
+            query = _passthrough_seek_query(mode)
+            seek_size = max(0, int(PASSTHROUGH_SEEK_HEADER_BYTES)) + pt_size if duration > 0 else 0
+            seek_container = _seek_passthrough_container()
+            items.append(
+                {
+                    "id": f"{_passthrough_seek_item_prefix(mode)}{_versioned_rel(rel)}",
+                    "parent_id": parent_id,
+                    "title": _passthrough_seek_title(path, mode, width, height),
+                    "url": f"{base}/passthrough_seek/{quoted}{_seek_passthrough_route_suffix(seek_container)}" + (f"?{query}" if query else ""),
+                    "thumb": f"{base}/thumb/{quoted}",
+                    "size": seek_size,
+                    "duration": duration,
+                    "resolution": _passthrough_resolution(width, height, mode),
+                    "bitrate": pt_bps_est,
+                    "mime": _seek_passthrough_mime(seek_container),
+                    "dlna_pn": _seek_passthrough_dlna_pn(seek_container),
+                    "frame_rate": passthrough_frame_rate(source_fps),
+                    "passthrough": True,
+                    "passthrough_mode": mode,
+                    "protocol_info": _seek_passthrough_protocol_info(),
+                }
+            )
         query = _passthrough_live_query(mode)
-        suffix = "alpha" if mode == "alpha" else "green"
         if _uses_live_chapter_container(duration):
             live_id = f"{_passthrough_live_prefix(mode)}{_versioned_rel(rel)}"
             items.append(
@@ -612,9 +713,9 @@ def _didl_for(items: list[dict]) -> str:
             )
         else:
             if it["passthrough"] and PASSTHROUGH_SEEK_MODE == "bytes":
-                op = "01"
+                op = DLNA_OP_BYTE_SEEK
             else:
-                op = "10" if it["passthrough"] else "01"
+                op = DLNA_OP_TIME_SEEK if it["passthrough"] else DLNA_OP_BYTE_SEEK
             ci = "1" if it["passthrough"] else "0"
             if it["passthrough"] and PASSTHROUGH_SEEK_MODE == "bytes":
                 flags = DLNA_FLAGS_BASE
@@ -775,6 +876,7 @@ def handle_soap(soap_action: str, body: bytes) -> tuple[bytes, int]:
         count = int(args.get("RequestedCount", "0") or 0)
         directory = _id_to_dir(object_id)
         live = _id_to_live(object_id)
+        seek = _id_to_seek(object_id)
 
         if live is not None:
             live_path, live_mode = live
@@ -786,7 +888,14 @@ def handle_soap(soap_action: str, body: bytes) -> tuple[bytes, int]:
         else:
             all_items = _children_for_dir(directory)
         if flag == "BrowseMetadata":
-            if live is not None:
+            if seek is not None:
+                seek_path, seek_mode = seek
+                seek_items = [
+                    item for item in _video_items(seek_path, _folder_id(seek_path.parent))
+                    if item.get("passthrough") and item.get("passthrough_mode") == seek_mode and "/passthrough_seek/" in item.get("url", "")
+                ]
+                didl = _metadata_didl_for_item(seek_items[0]) if seek_items else _didl_for([])
+            elif live is not None:
                 live_path, live_mode = live
                 try:
                     info = probe_cached(live_path)

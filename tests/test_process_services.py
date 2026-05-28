@@ -2,21 +2,15 @@ from __future__ import annotations
 
 import subprocess
 import os
-import site
 import unittest
-from pathlib import Path
 from unittest.mock import patch
 
-os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
-_DLL_HANDLES = []
-if hasattr(os, "add_dll_directory"):
-    for site_dir in site.getsitepackages():
-        base = Path(site_dir)
-        for dll_dir in (base / "PySide6", base / "shiboken6"):
-            if dll_dir.exists():
-                _DLL_HANDLES.append(os.add_dll_directory(str(dll_dir)))
+from ui.qt_runtime import configure_qt_runtime_paths
 
-from PySide6.QtCore import QCoreApplication
+os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+configure_qt_runtime_paths()
+
+from PySide6.QtWidgets import QApplication
 
 from ui.services import offline_process, server_process
 from ui.services.hidden_process import HiddenProcess
@@ -24,8 +18,11 @@ from ui.services.offline_process import OfflineProcess
 from ui.services.server_process import ServerProcess
 
 
-def _app() -> QCoreApplication:
-    return QCoreApplication.instance() or QCoreApplication([])
+def _app() -> QApplication:
+    app = QApplication.instance()
+    if app is not None:
+        return app
+    return QApplication([])
 
 
 class _FakeProc:

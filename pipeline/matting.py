@@ -3423,14 +3423,87 @@ class Matter:
         return out
 
 
-_singleton: Matter | None = None
-_singleton_lock = threading.Lock()
+_pool_lock = threading.Lock()
+_pool_cond = threading.Condition(_pool_lock)
+_pool_all: list[Matter] = []
+_pool_available: list[Matter] = []
+_pool_max: int = 1
+_pool_warmup_runs: int | None = None
+
+
+def configure_matter_pool(max_concurrent: int, *, warmup_runs: int | None = None) -> None:
+    """Set the maximum number of Matter instances the pool may hand out.
+
+    Instances are lazily created on first acquire. Safe to call repeatedly;
+    shrinking the cap below the current pool size does not destroy existing
+    instances but prevents new ones from being created.
+    """
+    global _pool_max, _pool_warmup_runs
+    with _pool_lock:
+        _pool_max = max(1, int(max_concurrent))
+        if warmup_runs is not None:
+            _pool_warmup_runs = warmup_runs
+
+
+def _create_matter_locked(*, mark_available: bool) -> Matter:
+    instance = Matter(warmup_runs=_pool_warmup_runs)
+    _pool_all.append(instance)
+    if mark_available:
+        _pool_available.append(instance)
+    return instance
+
+
+def acquire_matter(*, blocking: bool = True, timeout: float | None = None) -> Matter | None:
+    """Acquire a Matter instance from the pool, creating one lazily if room.
+
+    Blocks until an instance is available unless ``blocking=False``. Returns
+    ``None`` on timeout or non-blocking failure. Each acquirer must call
+    :func:`release_matter` exactly once when done.
+    """
+    import time as _time
+
+    deadline = _time.monotonic() + timeout if timeout is not None else None
+    with _pool_cond:
+        while True:
+            if _pool_available:
+                return _pool_available.pop()
+            if len(_pool_all) < _pool_max:
+                return _create_matter_locked(mark_available=False)
+            if not blocking:
+                return None
+            if deadline is not None:
+                remaining = deadline - _time.monotonic()
+                if remaining <= 0:
+                    return None
+                _pool_cond.wait(timeout=remaining)
+            else:
+                _pool_cond.wait()
+
+
+def release_matter(instance: Matter | None) -> None:
+    """Return a Matter instance to the pool."""
+    if instance is None:
+        return
+    with _pool_cond:
+        if instance not in _pool_all or instance in _pool_available:
+            return
+        _pool_available.append(instance)
+        _pool_cond.notify()
 
 
 def get_matter(*, warmup_runs: int | None = None) -> Matter:
-    global _singleton
-    if _singleton is None:
-        with _singleton_lock:
-            if _singleton is None:
-                _singleton = Matter(warmup_runs=warmup_runs)
-    return _singleton
+    """Return the shared utility Matter instance (slot 0).
+
+    Used by startup warmup, offline tools, and benchmarks. The instance is
+    created on first call and stays available in the pool, so realtime
+    passthrough callers can later acquire it via :func:`acquire_matter`.
+    Utility callers must not run concurrently with realtime passthrough on the
+    same instance — by convention warmup completes before serving begins.
+    """
+    global _pool_warmup_runs
+    with _pool_cond:
+        if warmup_runs is not None:
+            _pool_warmup_runs = warmup_runs
+        if not _pool_all:
+            return _create_matter_locked(mark_available=True)
+        return _pool_all[0]

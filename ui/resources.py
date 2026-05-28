@@ -3,6 +3,10 @@
 from pathlib import Path
 import sys
 
+from ui.qt_runtime import configure_qt_runtime_paths
+
+configure_qt_runtime_paths()
+
 from PySide6.QtGui import QIcon
 
 

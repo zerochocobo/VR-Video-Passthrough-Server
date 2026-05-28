@@ -38,6 +38,18 @@ class ContentDirectoryModeTests(unittest.TestCase):
             self.assertEqual(cds._video_item_count(Path("movie.mkv"), needs_fix), 1)
         with patch.object(cds, "PASSTHROUGH_OUTPUT_MODE", "all"), patch.object(cds, "has_offline_passthrough_output", return_value=True):
             self.assertEqual(cds._video_item_count(source), 1)
+        with (
+            patch.object(cds, "PASSTHROUGH_OUTPUT_MODE", "green"),
+            patch.object(cds, "PASSTHROUGH_SEEK_ENABLED", True),
+            patch.object(cds, "PASSTHROUGH_SEEK_DLNA", True),
+        ):
+            self.assertEqual(cds._video_item_count(source), 3)
+        with (
+            patch.object(cds, "PASSTHROUGH_OUTPUT_MODE", "all"),
+            patch.object(cds, "PASSTHROUGH_SEEK_ENABLED", True),
+            patch.object(cds, "PASSTHROUGH_SEEK_DLNA", True),
+        ):
+            self.assertEqual(cds._video_item_count(source), 5)
 
     def test_live_ids_distinguish_alpha(self) -> None:
         with patch.object(cds, "PASSTHROUGH_OUTPUT_MODE", "all"):
@@ -99,6 +111,103 @@ class ContentDirectoryModeTests(unittest.TestCase):
 
         passthrough = [item for item in items if item.get("passthrough")]
         self.assertEqual(passthrough[0]["frame_rate"], "24")
+
+    def test_seek_dlna_switch_adds_live_fallback_virtual_entry(self) -> None:
+        child = SimpleNamespace(
+            size=1024,
+            video=SimpleNamespace(
+                duration=600.0,
+                fps=30.0,
+                width=3840,
+                height=2160,
+                resolution="3840x2160",
+                backend_verdict="pynv_hevc",
+                probe_error="",
+                mkv_needs_fix=False,
+            ),
+        )
+        with (
+            patch.object(cds, "_rel_key", return_value="movie.mp4"),
+            patch.object(cds, "PASSTHROUGH_OUTPUT_MODE", "green"),
+            patch.object(cds, "PASSTHROUGH_SEEK_ENABLED", True),
+            patch.object(cds, "PASSTHROUGH_SEEK_DLNA", True),
+            patch.object(cds, "PASSTHROUGH_SEEK_HEADER_BYTES", 2_000_000),
+            patch.object(cds, "_uses_live_chapter_container", return_value=True),
+            patch.object(cds, "estimate_for_media", return_value=(12_345_678, 20_000_000, None)),
+        ):
+            items = cds._video_items_from_index(Path("movie.mp4"), "0", child)
+
+        self.assertEqual(len(items), 3)
+        seek = next(item for item in items if "/passthrough_seek/" in item.get("url", ""))
+        live = next(item for item in items if item.get("container"))
+        self.assertFalse(seek.get("container"))
+        self.assertEqual(seek["id"], "sg_ptv7_movie.mp4")
+        self.assertIn("/passthrough_seek/movie.mp4.seek.ts", seek["url"])
+        self.assertIn("_seek", seek["title"])
+        self.assertEqual(seek["protocol_info"].split(";")[1], "DLNA.ORG_OP=11")
+        self.assertIn("DLNA.ORG_CI=0", seek["protocol_info"])
+        self.assertIn("DLNA.ORG_FLAGS=01F00000000000000000000000000000", seek["protocol_info"])
+        self.assertEqual(seek["size"], 14_345_678)
+        self.assertEqual(live["id"], "pl_ptv7_movie.mp4")
+        self.assertIn("_live", live["title"])
+
+    def test_seek_dlna_requires_route_master_switch(self) -> None:
+        child = SimpleNamespace(
+            size=1024,
+            video=SimpleNamespace(
+                duration=600.0,
+                fps=30.0,
+                width=3840,
+                height=2160,
+                resolution="3840x2160",
+                backend_verdict="pynv_hevc",
+                probe_error="",
+                mkv_needs_fix=False,
+            ),
+        )
+        with (
+            patch.object(cds, "_rel_key", return_value="movie.mp4"),
+            patch.object(cds, "PASSTHROUGH_OUTPUT_MODE", "green"),
+            patch.object(cds, "PASSTHROUGH_SEEK_ENABLED", False),
+            patch.object(cds, "PASSTHROUGH_SEEK_DLNA", True),
+            patch.object(cds, "_uses_live_chapter_container", return_value=True),
+            patch.object(cds, "estimate_for_media", return_value=(12_345_678, 20_000_000, None)),
+        ):
+            items = cds._video_items_from_index(Path("movie.mp4"), "0", child)
+
+        self.assertTrue(items[1].get("container"))
+        self.assertEqual(items[1]["id"], "pl_ptv7_movie.mp4")
+
+    def test_seek_dlna_can_advertise_true_fmp4_experiment(self) -> None:
+        child = SimpleNamespace(
+            size=1024,
+            video=SimpleNamespace(
+                duration=60.0,
+                fps=30.0,
+                width=3840,
+                height=2160,
+                resolution="3840x2160",
+                backend_verdict="pynv_hevc",
+                probe_error="",
+                mkv_needs_fix=False,
+            ),
+        )
+        with (
+            patch.object(cds, "_rel_key", return_value="movie.mp4"),
+            patch.object(cds, "PASSTHROUGH_OUTPUT_MODE", "green"),
+            patch.object(cds, "PASSTHROUGH_SEEK_ENABLED", True),
+            patch.object(cds, "PASSTHROUGH_SEEK_DLNA", True),
+            patch.object(cds, "PASSTHROUGH_SEEK_CONTAINER", "mp4"),
+            patch.object(cds, "_uses_live_chapter_container", return_value=False),
+            patch.object(cds, "estimate_for_media", return_value=(12_345_678, 20_000_000, None)),
+        ):
+            items = cds._video_items_from_index(Path("movie.mp4"), "0", child)
+
+        seek = next(item for item in items if "/passthrough_seek/" in item.get("url", ""))
+        self.assertEqual(seek["mime"], "video/mp4")
+        self.assertEqual(seek["dlna_pn"], "HEVC_MP4_MAIN")
+        self.assertIn("/passthrough_seek/movie.mp4.seek.mp4", seek["url"])
+        self.assertIn("http-get:*:video/mp4:DLNA.ORG_PN=HEVC_MP4_MAIN", seek["protocol_info"])
 
     def test_existing_offline_output_hides_virtual_modes(self) -> None:
         child = SimpleNamespace(

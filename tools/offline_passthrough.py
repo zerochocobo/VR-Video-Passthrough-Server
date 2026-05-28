@@ -9,6 +9,7 @@ independently, and the two alpha halves are stitched back for final compositing.
 from __future__ import annotations
 
 import argparse
+import importlib
 import json
 import os
 import shutil
@@ -98,7 +99,7 @@ def _matanyone2_session_providers(name: str, model_dir: Path):
         cache_dir = matanyone2_trt_cache_dir_for_model_dir(model_dir, trt_root)
         config.ONNX_TRT_ENGINE_CACHE_PATH = cache_dir
         os.environ["PT_ONNX_TRT_ENGINE_CACHE_PATH"] = str(cache_dir)
-        from pipeline import matting as matting_module
+        matting_module = importlib.import_module("pipeline.matting")
 
         matting_module.ONNX_TRT_ENGINE_CACHE_PATH = cache_dir
         providers = matting_module._filter_available_providers(["TensorrtExecutionProvider", "CUDAExecutionProvider", "CPUExecutionProvider"])

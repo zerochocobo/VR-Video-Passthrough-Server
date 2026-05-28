@@ -16,6 +16,8 @@ import sys
 from pathlib import Path
 from uuid import NAMESPACE_DNS, uuid5
 
+from utils.gpu_requirements import resolve_passthrough_max_concurrent
+
 ROOT = Path(sys.executable).resolve().parent if getattr(sys, "frozen", False) else Path(__file__).parent.resolve()
 
 
@@ -213,8 +215,43 @@ THUMB_FFMPEG_TIMEOUT_SEC = max(1.0, float(_env("THUMB_FFMPEG_TIMEOUT_SEC", 3.0))
 #   `debug_output/live_requests` for client compatibility diagnostics.
 LIVE_REQUEST_HEADER_DUMP = _env("LIVE_REQUEST_HEADER_DUMP", "0") == "1"
 
+# PT_REQUEST_HISTORY_ENABLED:
+#   1 records a bounded in-memory trace of DLNA/media requests. This is a
+#   lightweight compatibility diagnostic layer and does not change playback
+#   policy by itself.
+REQUEST_HISTORY_ENABLED = _env("REQUEST_HISTORY_ENABLED", "1") == "1"
+
+# PT_REQUEST_HISTORY_MAX_RECORDS:
+#   Maximum number of request records kept in memory for local diagnostics and
+#   the debug endpoint.
+REQUEST_HISTORY_MAX_RECORDS = max(0, int(_env("REQUEST_HISTORY_MAX_RECORDS", 500)))
+
+# PT_REQUEST_HISTORY_JSONL:
+#   1 appends request-history records to rolling JSONL files under
+#   debug_output/request_history. Writes are buffered and flushed every
+#   PT_REQUEST_HISTORY_FLUSH_EVERY records to avoid per-request fsync costs.
+REQUEST_HISTORY_JSONL = _env("REQUEST_HISTORY_JSONL", "1") == "1"
+REQUEST_HISTORY_DIR: Path = Path(_env("REQUEST_HISTORY_DIR", ROOT / "debug_output" / "request_history")).resolve()
+REQUEST_HISTORY_FLUSH_EVERY = max(1, int(_env("REQUEST_HISTORY_FLUSH_EVERY", 16)))
+
+# PT_REQUEST_HISTORY_REDACT:
+#   1 redacts client IPs and media identifiers in request-history output so
+#   JSONL traces can be shared for compatibility debugging with less local
+#   path/network leakage. This only affects request-history JSONL/in-memory
+#   output; server.log remains the raw operational log and must be filtered
+#   separately before sharing.
+REQUEST_HISTORY_REDACT = _env("REQUEST_HISTORY_REDACT", "1") == "1"
+
+# PT_REQUEST_HISTORY_DEBUG_ENDPOINT:
+#   1 enables localhost-only GET /debug/request_history for the recent in-memory
+#   history. Remote clients are rejected.
+REQUEST_HISTORY_DEBUG_ENDPOINT = _env("REQUEST_HISTORY_DEBUG_ENDPOINT", "1") == "1"
+
 # PT_PASSTHROUGH_LIVE_DEFAULT_PROFILE:
 #   Fallback live response profile for clients that are not explicitly matched.
+#   This deliberately preserves the legacy behavior as the observation baseline;
+#   switching unknown clients to strict_live remains a Phase 3 real-device data
+#   decision.
 #   Values:
 #     vlc    - direct streaming path with no shared live-session cache.
 #     libmpv - managed live-session path with first-chunk gating and reuse.
@@ -1297,10 +1334,61 @@ PASSTHROUGH_DLNA_PN = _env_any(("PASSTHROUGH_DLNA_PN", "DLNA_PN"), "")
 #   are the preferred coarse seek strategy.
 PASSTHROUGH_SEEK_MODE = _env("SEEK_MODE", "bytes").lower()
 
+# PT_PASSTHROUGH_SEEK_ENABLED:
+#   Master switch for the experimental seekable passthrough endpoint
+#   `/passthrough_seek`. Default 0 keeps the existing `/passthrough_live`
+#   behavior untouched. When this is 0, direct/manual `/passthrough_seek` URLs
+#   are rejected even if DLNA exposure is enabled.
+PASSTHROUGH_SEEK_ENABLED = _env("PASSTHROUGH_SEEK_ENABLED", "0") == "1"
+
+# PT_PASSTHROUGH_SEEK_DLNA:
+#   1 adds seekable passthrough entries to DLNA Browse while keeping the
+#   existing live/chapter fallback items visible. This is only an advertisement
+#   switch: it does not by itself enable the HTTP route. Keep it 0 for
+#   hidden/manual URL testing while PT_PASSTHROUGH_SEEK_ENABLED=1.
+PASSTHROUGH_SEEK_DLNA = _env("PASSTHROUGH_SEEK_DLNA", "0") == "1"
+
+# PT_PASSTHROUGH_SEEK_ROUTE_POLICY:
+#   Runtime guard for `/passthrough_seek` based on the request User-Agent:
+#     profile - allow only route profiles listed in PT_PASSTHROUGH_SEEK_PROFILES.
+#     all     - allow every client while the master switch is on.
+#     off     - reject even when the master switch is on.
+#   Aliases: auto/manual/list are treated as profile.
+PASSTHROUGH_SEEK_ROUTE_POLICY = _env("PASSTHROUGH_SEEK_ROUTE_POLICY", "profile").lower()
+if PASSTHROUGH_SEEK_ROUTE_POLICY in {"auto", "manual", "list"}:
+    PASSTHROUGH_SEEK_ROUTE_POLICY = "profile"
+if PASSTHROUGH_SEEK_ROUTE_POLICY not in {"profile", "all", "off"}:
+    PASSTHROUGH_SEEK_ROUTE_POLICY = "profile"
+
+# PT_PASSTHROUGH_SEEK_PROFILES:
+#   Comma-separated live-response profiles allowed when route policy is
+#   `profile`. Known values include nplayer, vlc, libmpv, 4xvr, avpro, lavf,
+#   and default. This is the manual per-player rollout list.
+PASSTHROUGH_SEEK_PROFILES = tuple(
+    part.strip().lower()
+    for part in str(_env("PASSTHROUGH_SEEK_PROFILES", "nplayer,vlc,libmpv")).replace(";", ",").split(",")
+    if part.strip()
+)
+
+# PT_PASSTHROUGH_SEEK_CONTAINER:
+#   Container emitted by the experimental `/passthrough_seek` endpoint.
+#     mpegts - current default; true MPEG-TS bytes with byte-range mapping.
+#     mp4    - true fragmented MP4 experiment for clients that refuse TS VOD.
+#   Do not fake this with only headers: the body container must match.
+PASSTHROUGH_SEEK_CONTAINER = _env("PASSTHROUGH_SEEK_CONTAINER", "mpegts").lower()
+if PASSTHROUGH_SEEK_CONTAINER not in {"mpegts", "mp4"}:
+    PASSTHROUGH_SEEK_CONTAINER = "mpegts"
+
+# PT_PASSTHROUGH_SEEK_HEADER_BYTES:
+#   Stable real prefix region for `/passthrough_seek`. Ranges intersecting this
+#   region must be served from cached muxer bytes, not synthetic headers.
+PASSTHROUGH_SEEK_HEADER_BYTES = max(0, int(_env("PASSTHROUGH_SEEK_HEADER_BYTES", 2 * 1024 * 1024)))
+
 # PT_PASSTHROUGH_MAX_CONCURRENT:
-#   Maximum concurrent passthrough streams. Keep 1 for consumer GPUs and shared
-#   Matter state unless explicit multi-session testing proves safe.
-PASSTHROUGH_MAX_CONCURRENT = max(1, int(_env("PASSTHROUGH_MAX_CONCURRENT", 1)))
+#   Maximum concurrent passthrough streams. Each concurrent stream needs its own
+#   Matter instance (independent ORT session + RVM recurrent state + GPU buffers),
+#   roughly 1.5-2GB VRAM. Use "auto" to pick a value based on detected VRAM.
+PASSTHROUGH_MAX_CONCURRENT = resolve_passthrough_max_concurrent(_env("PASSTHROUGH_MAX_CONCURRENT", "auto"))
 
 # PT_PASSTHROUGH_BUSY_WAIT_SEC:
 #   How long a new passthrough request waits for the active slot before 503.

@@ -421,7 +421,9 @@ def main(argv: list[str] | None = None) -> int:
             PyNvPassthroughStream.startup_preflight()
         except Exception as e:
             log.warning("nvenc startup preflight failed; first request will pay it lazily: %s", e, exc_info=True)
-    from pipeline.matting import matter_device
+    from pipeline.matting import configure_matter_pool, matter_device
+
+    configure_matter_pool(config.PASSTHROUGH_MAX_CONCURRENT)
     log.info(
         "PIPELINE: HWACCEL=%s DECODE_MAX_SIDE=%d DECODE_PIX_FMT=%s PASSTHROUGH_MAX_FPS=%.2f "
         "ALPHA_STRIDE=%d "

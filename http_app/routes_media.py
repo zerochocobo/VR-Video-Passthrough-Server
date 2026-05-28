@@ -41,6 +41,8 @@ from config import (
     PASSTHROUGH_OUTPUT_MODE,
     PASSTHROUGH_AUDIO_MPEGTS_VLC,
     PASSTHROUGH_FALLBACK_MAX_FPS,
+    PASSTHROUGH_GOP,
+    PASSTHROUGH_HEVC_BITRATE,
     PASSTHROUGH_MAX_FPS,
     PASSTHROUGH_MAX_CONCURRENT,
     PASSTHROUGH_MKV_LIVE_POLICY,
@@ -49,6 +51,11 @@ from config import (
     PASSTHROUGH_SEND_PACING_MULTIPLIER,
     PASSTHROUGH_SEND_REALTIME_PACING,
     PASSTHROUGH_SEEK_MODE,
+    PASSTHROUGH_SEEK_ENABLED,
+    PASSTHROUGH_SEEK_CONTAINER,
+    PASSTHROUGH_SEEK_HEADER_BYTES,
+    PASSTHROUGH_SEEK_PROFILES,
+    PASSTHROUGH_SEEK_ROUTE_POLICY,
     DEBUG_LOGS,
     LIVE_REQUEST_HEADER_DUMP,
     LIGHT_MATCH_FLUSH_QUEUES,
@@ -59,12 +66,19 @@ from config import (
 )
 from dlna.profiles import passthrough_dlna_pn, passthrough_frame_rate
 from pipeline.ffmpeg_io import probe_cached
-from pipeline.matting import get_matter
+from pipeline.matting import acquire_matter, release_matter
 from pipeline.stream import PassthroughStream
 from pipeline.pynv_stream import PYNV_BACKEND_LABEL, PYNV_OUTPUT_CODEC, PyNvPassthroughStream
 from pipeline.thumbnail import get_thumb
-from utils.bitrate_estimator import estimate_for_media, record_actual_bps
+from utils.bitrate_estimator import estimate_for_media, parse_bitrate, record_actual_bps
+from utils.byte_seek_map import map_byte_start_to_time
 from utils.logger import get
+from utils.player_compat import (
+    is_lavf_user_agent,
+    is_nplayer_user_agent,
+    live_response_profile_from_ua,
+)
+from utils.request_history import annotate_request
 from utils.runtime_settings import get_light_match
 from utils.subprocess_hidden import hidden_subprocess_kwargs
 from utils.mkv_cues import probe_mkv_cues
@@ -75,6 +89,19 @@ log = get("media")
 router = APIRouter()
 DLNA_FLAGS_BASE = "01700000000000000000000000000000"
 DLNA_FLAGS_TIME_SEEK = "41700000000000000000000000000000"
+DLNA_FLAGS_BYTE_AND_TIME_SEEK = "01F00000000000000000000000000000"
+# Historical compatibility note: the legacy passthrough/live branches in this
+# project treat OP=01 as the byte-style compatibility advertisement and OP=10
+# as the time-style advertisement, even though DLNA's BA bit wording is often
+# read the other way around. Do not "fix" these legacy values without
+# re-testing the affected players. The new seek route uses OP=11, which is
+# unambiguous because both bits are set. Its flags intentionally use file-like
+# transfer bits only; do not re-add lop-npt/lop-bytes flags such as 0x6170...
+# while advertising OP=11, because clients may downgrade that contradiction to
+# a limited/live-style resource.
+DLNA_OP_BYTE_SEEK = "01"
+DLNA_OP_TIME_SEEK = "10"
+DLNA_OP_BYTE_AND_TIME_SEEK = "11"
 _request_ids = itertools.count(1)
 
 # ---- Passthrough concurrency guard ----
@@ -83,16 +110,32 @@ _request_ids = itertools.count(1)
 _active_lock = asyncio.Lock()
 _active_streams: dict[object, tuple[str, str]] = {}
 _active_started: dict[object, float] = {}
+# Matter instance bound to each active slot key (slot_token or stream). Tracked
+# separately from _active_streams so the lifecycle survives the slot_token ->
+# stream key swap inside _replace_active_slot.
+_active_matter: dict[object, object] = {}
 _probe_cache_lock = asyncio.Lock()
 _probe_cache: dict[str, bytes] = {}
+# Benign without an async lock: the estimate inputs are deterministic, so a
+# concurrent miss only recalculates the same declared size for the same key.
+_seek_declared_size_cache: dict[tuple, int] = {}
 _thumb_lock = asyncio.Lock()
 _PROBE_CACHE_LIMIT = 16 * 1024 * 1024
 _PROBE_CACHE_TOTAL_LIMIT = 64 * 1024 * 1024
+_SEEK_DECLARED_SIZE_CACHE_LIMIT = 512
 _SMALL_PROBE_LIMIT = 64 * 1024
 _PREFIX_CACHE_WAIT_SEC = 5.0
 _PREFIX_CACHE_IDLE_SEC = 2.0
 _TAIL_PROBE_RATIO = 0.95
-_TAIL_PROBE_MAX_BYTES = 512 * 1024
+# nPlayer performs startup EOF probes with a few growing open-ended tail
+# ranges before the visible progress bar is usable. Treat these as probes so
+# they do not start a real producer at the final second and auto-advance.
+_TAIL_PROBE_MAX_BYTES = 2 * 1024 * 1024
+_SEEK_PREFIX_CACHE_FLUSH_STEP = 64 * 1024
+_SEEK_ROUTE_SUFFIXES = (
+    (".seek.ts", "mpegts"),
+    (".seek.mp4", "mp4"),
+)
 _LIVE_SEND_PACE_CHUNK_BYTES = 64 * 1024
 _LIVE_SEND_PACE_BURST_SEC = 1.5
 _LIVE_PROGRESS_INTERVAL_BYTES = 50 * 1024 * 1024
@@ -104,6 +147,27 @@ _live_session_lock = asyncio.Lock()
 _live_sessions: dict[tuple[str, str, float, str, float, str], "LiveSession"] = {}
 _live_starting: dict[tuple[str, str, float, str, float, str], float] = {}
 _LIVE_NPLAYER_START_DEBOUNCE_SEC = max(1.5, _LIVE_FIRST_CHUNK_TIMEOUT_SEC)
+
+
+def _seek_container() -> str:
+    return PASSTHROUGH_SEEK_CONTAINER if PASSTHROUGH_SEEK_CONTAINER in {"mpegts", "mp4"} else "mpegts"
+
+
+def _seek_media_type(container: str | None = None) -> str:
+    return "video/mp4" if (container or _seek_container()) == "mp4" else "video/MP2T"
+
+
+def _seek_dlna_pn(container: str | None = None) -> str:
+    return "HEVC_MP4_MAIN" if (container or _seek_container()) == "mp4" else "HEVC_TS_NA_ISO"
+
+
+def _split_seek_route_name(name: str) -> tuple[str, str | None]:
+    decoded = unquote(name)
+    lower = decoded.lower()
+    for suffix, container in _SEEK_ROUTE_SUFFIXES:
+        if lower.endswith(suffix):
+            return decoded[: -len(suffix)], container
+    return decoded, None
 
 
 _LIVE_END = object()
@@ -145,6 +209,16 @@ def _set_probe_cache_locked(key: str, data: bytes) -> None:
             break
         old_value = _probe_cache.pop(old_key)
         total -= len(old_value)
+
+
+def _release_active_slot_nowait(stream: object) -> None:
+    removed = _active_streams.pop(stream, None)
+    _active_started.pop(stream, None)
+    matter = _active_matter.pop(stream, None)
+    if removed is not None:
+        log.info("passthrough active slot released: active=%d owner=%s", len(_active_streams), _owner_log_value(removed))
+    if matter is not None:
+        release_matter(matter)
 
 
 async def _clear_live_starting(key: tuple[str, str, float, str, float, str], started_at: float | None) -> None:
@@ -471,14 +545,20 @@ def _close_stream_if_possible(stream: object) -> None:
 async def _close_preempted_stream(stream: object, who: str) -> None:
     log.info("passthrough preempt close begin: %s stream=%s", who, type(stream).__name__)
     close = getattr(stream, "close", None)
-    if callable(close):
-        try:
+    try:
+        if callable(close):
             if isinstance(stream, LiveSession):
                 await stream.close("preempted")
             else:
                 await asyncio.to_thread(close)
-        except Exception as e:
-            log.warning("passthrough preempt close failed: %s", e)
+    except Exception as e:
+        log.warning("passthrough preempt close failed: %s", e)
+    finally:
+        # _take_active_slot removes the preempted key from _active_streams
+        # before this function runs, but the old key can still own a Matter.
+        # Release it after close so a new request does not wait for the old
+        # StreamingResponse finally block before acquiring the pool slot.
+        await _release_active_slot(stream)
     log.info("passthrough preempt close done: %s stream=%s", who, type(stream).__name__)
 
 
@@ -488,6 +568,18 @@ def _owner_base(owner: tuple) -> tuple:
 
 def _owner_kind(owner: tuple) -> str:
     return str(owner[2]) if len(owner) >= 3 else ""
+
+
+def _owner_client(owner: tuple) -> str:
+    return str(owner[1]) if len(owner) >= 2 else ""
+
+
+def _can_preempt_same_client_for_seek_test(active_owner: tuple, new_owner: tuple) -> bool:
+    """During seek-route testing, one client switching files/players should not
+    be blocked by its own stale generated streams.
+    """
+    client = _owner_client(new_owner)
+    return bool(client and _owner_client(active_owner) == client)
 
 
 def _client_log_id(client: object) -> str:
@@ -518,7 +610,7 @@ def _can_preempt_owner(active_owner: tuple, new_owner: tuple) -> bool:
         kind = _owner_kind(new_owner)
         if is_live_owner:
             return kind in ("nplayer", "4xvr", "avpro")
-        return kind in ("", "libmpv", "vlc", "nplayer")
+        return kind in ("", "libmpv", "vlc", "nplayer", "seek")
     if _owner_base(active_owner) != new_base:
         return False
     active_kind = _owner_kind(active_owner)
@@ -641,6 +733,7 @@ async def _take_active_slot(
     owner: tuple,
     *,
     allow_same_owner_preempt: bool = True,
+    allow_same_client_preempt: bool = False,
 ) -> object | None | bool:
     deadline = asyncio.get_running_loop().time() + PASSTHROUGH_BUSY_WAIT_SEC
     warned = False
@@ -650,9 +743,12 @@ async def _take_active_slot(
                 _active_streams[new_stream] = owner
                 _active_started[new_stream] = asyncio.get_running_loop().time()
                 return None
-            if allow_same_owner_preempt:
+            if allow_same_owner_preempt or allow_same_client_preempt:
                 for active_stream, active_owner in list(_active_streams.items()):
-                    if _can_preempt_owner(active_owner, owner):
+                    can_preempt = allow_same_owner_preempt and _can_preempt_owner(active_owner, owner)
+                    if allow_same_client_preempt:
+                        can_preempt = can_preempt or _can_preempt_same_client_for_seek_test(active_owner, owner)
+                    if can_preempt:
                         del _active_streams[active_stream]
                         _active_started.pop(active_stream, None)
                         _active_streams[new_stream] = owner
@@ -677,25 +773,63 @@ async def _take_active_slot(
 
 async def _release_active_slot(stream: object) -> None:
     async with _active_lock:
-        removed = _active_streams.pop(stream, None)
-        _active_started.pop(stream, None)
-        if removed is not None:
-            log.info("passthrough active slot released: active=%d owner=%s", len(_active_streams), _owner_log_value(removed))
+        _release_active_slot_nowait(stream)
 
 
-async def _replace_active_slot(old_stream: object, new_stream: object) -> bool:
+async def _replace_active_slot(
+    old_stream: object,
+    new_stream: object,
+    *,
+    close_on_failure: object | None = None,
+) -> bool:
+    """Migrate slot/started/matter bookkeeping from old key to new key.
+
+    On failure (old key already preempted) the popped Matter is returned to
+    the pool inline. Without this, callers that hit the failure branch and
+    return 409 would leak the Matter, because the failure path leaves the
+    handler before any ``_release_active_slot`` call can recover it.
+
+    Critically, failure cleanup closes any running stream before releasing the
+    Matter. For slot-token callers the running stream is ``close_on_failure``;
+    for session-key callers it is usually ``old_stream``.
+    """
+    leaked_matter = None
     async with _active_lock:
         owner = _active_streams.pop(old_stream, None)
         started_at = _active_started.pop(old_stream, None)
+        matter = _active_matter.pop(old_stream, None)
         if owner is None:
-            return False
-        _active_streams[new_stream] = owner
-        _active_started[new_stream] = started_at or asyncio.get_running_loop().time()
-        return True
+            leaked_matter = matter
+        else:
+            _active_streams[new_stream] = owner
+            _active_started[new_stream] = started_at or asyncio.get_running_loop().time()
+            if matter is not None:
+                _active_matter[new_stream] = matter
+    if owner is None:
+        close_targets: list[object] = []
+        if close_on_failure is not None:
+            close_targets.append(close_on_failure)
+        if all(target is not old_stream for target in close_targets):
+            close_targets.append(old_stream)
+        for target in close_targets:
+            close = getattr(target, "close", None)
+            if not callable(close):
+                continue
+            try:
+                await asyncio.to_thread(close)
+            except Exception as e:
+                log.warning(
+                    "replace_active_slot close failed: %s err=%s",
+                    type(target).__name__, e,
+                )
+    if leaked_matter is not None:
+        # Release only after failure streams have been stopped so another
+        # request cannot acquire a Matter still used by an old worker.
+        release_matter(leaked_matter)
+    return owner is not None
 
 
-def _safe_video_path(name: str) -> Path:
-    name = unquote(name)
+def _safe_video_path_from_key(name: str) -> Path:
     p = MEDIA_LIBRARY.key_to_path(name)
     if p is None:
         raise HTTPException(403, "forbidden")
@@ -706,6 +840,15 @@ def _safe_video_path(name: str) -> Path:
     if not p.is_file() or p.suffix.lower() not in VIDEO_EXTS:
         raise HTTPException(404, "not found")
     return p
+
+
+def _safe_video_path(name: str) -> Path:
+    return _safe_video_path_from_key(unquote(name))
+
+
+def _safe_seek_video_path(name: str) -> tuple[Path, str | None]:
+    key, route_container = _split_seek_route_name(name)
+    return _safe_video_path_from_key(key), route_container
 
 
 def _safe_subtitle_path(name: str) -> Path:
@@ -826,8 +969,9 @@ def _file_range_response(path: Path, media_type: str, range_header: str | None, 
 
 
 @router.get("/subs/{name:path}")
-async def subtitle_get(name: str, range: str | None = Header(default=None)):
+async def subtitle_get(request: Request, name: str, range: str | None = Header(default=None)):
     path = _safe_subtitle_path(name)
+    annotate_request(request, media_name=path.name, media_path=str(path))
     headers = {
         "Content-Disposition": "inline",
         "Access-Control-Allow-Origin": "*",
@@ -836,8 +980,9 @@ async def subtitle_get(name: str, range: str | None = Header(default=None)):
 
 
 @router.head("/subs/{name:path}")
-async def subtitle_head(name: str, range: str | None = Header(default=None)):
+async def subtitle_head(request: Request, name: str, range: str | None = Header(default=None)):
     path = _safe_subtitle_path(name)
+    annotate_request(request, media_name=path.name, media_path=str(path))
     size = path.stat().st_size
     headers = {
         "Accept-Ranges": "bytes",
@@ -855,8 +1000,9 @@ async def subtitle_head(name: str, range: str | None = Header(default=None)):
 
 
 @router.head("/media/{name:path}")
-async def media_head(name: str, range: str | None = Header(default=None)):
+async def media_head(request: Request, name: str, range: str | None = Header(default=None)):
     path = _safe_video_path(name)
+    annotate_request(request, media_name=path.name, media_path=str(path))
     size = path.stat().st_size
     headers = {
         "Accept-Ranges": "bytes",
@@ -884,6 +1030,7 @@ async def media_get(
 ):
     rid = next(_request_ids)
     path = _safe_video_path(name)
+    annotate_request(request, media_name=path.name, media_path=str(path))
     size = path.stat().st_size
     subtitle_headers = _subtitle_headers_for_video(path)
     if DEBUG_LOGS:
@@ -1000,6 +1147,17 @@ def _estimated_passthrough_bps(path: Path, codec: str = "") -> int:
     return max(1, PASSTHROUGH_SEND_MIN_BPS, paced_bps)
 
 
+def _estimated_live_pynv_size(duration: float) -> int:
+    if duration <= 0:
+        return 0
+    return int(parse_bitrate(PASSTHROUGH_HEVC_BITRATE) * float(duration) / 8.0)
+
+
+def _estimated_live_pynv_send_bps() -> int:
+    paced_bps = int(float(parse_bitrate(PASSTHROUGH_HEVC_BITRATE)) * PASSTHROUGH_SEND_PACING_MULTIPLIER)
+    return max(1, PASSTHROUGH_SEND_MIN_BPS, paced_bps)
+
+
 async def _pace_live_send(start_wall: float, sent_bytes: int, bps: int) -> None:
     if not PASSTHROUGH_SEND_REALTIME_PACING or sent_bytes <= 0 or bps <= 0:
         return
@@ -1048,6 +1206,149 @@ def _passthrough_backend_verdict(path: Path) -> str:
 def _probe_cache_key(path: Path, codec: str, duration: float) -> str:
     total = _estimated_passthrough_size(path, duration, codec)
     return f"{path.resolve()}|{codec}|{total}"
+
+
+def _seek_declared_size_key(path: Path, codec: str, duration: float, client_host: str, container: str | None = None) -> tuple:
+    try:
+        st = path.stat()
+        stat_part = (st.st_size, st.st_mtime_ns)
+    except OSError:
+        stat_part = (0, 0)
+    return (
+        str(path.resolve()),
+        stat_part[0],
+        stat_part[1],
+        codec,
+        container or _seek_container(),
+        round(float(duration or 0.0), 3),
+        int(PASSTHROUGH_SEEK_HEADER_BYTES),
+        client_host or "",
+    )
+
+
+def _estimated_seek_passthrough_size(path: Path, duration: float, codec: str, client_host: str = "", container: str | None = None) -> int:
+    key = _seek_declared_size_key(path, codec, duration, client_host, container)
+    cached = _seek_declared_size_cache.get(key)
+    if cached is not None:
+        return cached
+    base = _estimated_passthrough_size(path, duration, codec)
+    total = max(0, int(PASSTHROUGH_SEEK_HEADER_BYTES)) + base
+    if len(_seek_declared_size_cache) >= _SEEK_DECLARED_SIZE_CACHE_LIMIT:
+        _seek_declared_size_cache.pop(next(iter(_seek_declared_size_cache)), None)
+    _seek_declared_size_cache[key] = total
+    return total
+
+
+def _seek_probe_cache_key(path: Path, codec: str, duration: float, total: int, container: str | None = None) -> str:
+    return f"seek|{container or _seek_container()}|{path.resolve()}|{codec}|{round(float(duration or 0.0), 3)}|{total}"
+
+
+def _seek_route_allowed(user_agent: str) -> tuple[bool, str, str]:
+    profile = _live_response_profile(user_agent)
+    if not PASSTHROUGH_SEEK_ENABLED:
+        return False, "disabled", profile
+    policy = PASSTHROUGH_SEEK_ROUTE_POLICY
+    if policy == "off":
+        return False, "route_policy_off", profile
+    if policy == "all":
+        return True, "route_policy_all", profile
+    if profile in set(PASSTHROUGH_SEEK_PROFILES):
+        return True, "profile_allowed", profile
+    return False, f"profile_{profile}_blocked", profile
+
+
+def _seek_blocked_response(reason: str) -> Response:
+    if reason == "disabled":
+        return Response("seekable passthrough disabled", status_code=404)
+    return Response(
+        "seekable passthrough disabled for this client; use /passthrough_live",
+        status_code=403,
+    )
+
+
+def _seek_output_fps(info) -> float:
+    source_fps = float(getattr(info, "fps", 0.0) or 0.0)
+    cap = float(PASSTHROUGH_MAX_FPS or 0.0)
+    if cap > 0 and source_fps > 0:
+        return min(source_fps, cap)
+    return source_fps if source_fps > 0 else cap
+
+
+def _seek_prefix_cache_limit() -> int:
+    return min(_PROBE_CACHE_LIMIT, max(0, int(PASSTHROUGH_SEEK_HEADER_BYTES or 0)))
+
+
+def _cache_prefix_limit() -> int:
+    return _PROBE_CACHE_LIMIT
+
+
+def _apply_seek_diag_headers(
+    headers: dict[str, str],
+    *,
+    start_sec: float,
+    output_mode: str,
+    container: str | None = None,
+    mapped=None,
+) -> None:
+    headers["X-Passthrough-Seek-Time"] = f"{start_sec:.3f}"
+    headers["X-Passthrough-Mode"] = f"seek-{container or _seek_container()}-{output_mode}"
+    if mapped is not None:
+        headers["X-Passthrough-Seek-Ratio"] = f"{mapped.ratio:.6f}"
+        headers["X-Passthrough-Seek-Raw-Time"] = f"{mapped.time_sec:.3f}"
+        headers["X-Passthrough-Seek-Gop"] = f"{mapped.gop_seconds:.3f}"
+
+
+def _seek_headers(
+    *,
+    path: Path,
+    duration: float,
+    codec: str,
+    total: int,
+    start_sec: float,
+    range_header: str | None,
+    include_length: bool,
+    container: str | None = None,
+    backend_verdict: str | None = None,
+    info=None,
+) -> dict[str, str]:
+    resolved_container = container or _seek_container()
+    headers = {
+        "Content-Type": _seek_media_type(resolved_container),
+        "Cache-Control": "no-cache",
+        "transferMode.dlna.org": "Interactive",
+        "contentFeatures.dlna.org": (
+            f"DLNA.ORG_PN={_seek_dlna_pn(resolved_container)};"
+            f"DLNA.ORG_OP={DLNA_OP_BYTE_AND_TIME_SEEK};"
+            "DLNA.ORG_CI=0;"
+            f"DLNA.ORG_FLAGS={DLNA_FLAGS_BYTE_AND_TIME_SEEK}"
+        ),
+        "Accept-Ranges": "bytes",
+        "X-Passthrough-Seekable": "1",
+        "X-Passthrough-Estimated-Size": str(total),
+    }
+    if info is None:
+        info = probe_cached(path)
+    frame_rate = passthrough_frame_rate(_seek_output_fps(info))
+    if frame_rate:
+        headers["X-Passthrough-FrameRate"] = frame_rate
+    _, estimated_bps, estimate = estimate_for_media(path, duration, codec)
+    headers["X-Passthrough-Estimated-Bps"] = str(estimated_bps)
+    headers["X-Passthrough-Estimate-Source"] = estimate.source
+    if backend_verdict:
+        headers["X-Passthrough-Backend-Verdict"] = backend_verdict
+    byte_range = _parse_byte_range(range_header, total)
+    response_range = byte_range or ByteRange(start=0, end=max(0, total - 1), total=total)
+    if include_length:
+        headers["Content-Length"] = str(response_range.length)
+    if byte_range is not None:
+        headers["Content-Range"] = f"bytes {byte_range.start}-{byte_range.end}/{total}"
+    if duration > 0:
+        start_npt = _format_npt(start_sec)
+        end_npt = _format_npt(duration)
+        headers["TimeSeekRange.dlna.org"] = f"npt={start_npt}-{end_npt}/{end_npt}"
+        headers["availableSeekRange.dlna.org"] = f"1 npt=0.000-{end_npt}"
+        headers["X-AvailableSeekRange.dlna.org"] = f"1 npt=0.000-{end_npt}"
+    return headers
 
 
 def _range_start(value: str | None) -> int | None:
@@ -1123,6 +1424,22 @@ def _is_tail_probe_range(byte_range: ByteRange | None) -> bool:
     )
 
 
+def _is_header_only_range(byte_range: ByteRange | None) -> bool:
+    if byte_range is None:
+        return False
+    return (
+        byte_range.start < PASSTHROUGH_SEEK_HEADER_BYTES
+        and byte_range.end < PASSTHROUGH_SEEK_HEADER_BYTES
+    )
+
+
+def _is_header_crossing_range(byte_range: ByteRange | None) -> bool:
+    if byte_range is None:
+        return False
+    header_limit = _seek_prefix_cache_limit()
+    return header_limit > 0 and byte_range.start < header_limit <= byte_range.end
+
+
 def _seek_from_byte_range(value: str | None, path: Path, duration: float, codec: str = "") -> float | None:
     total = _estimated_passthrough_size(path, duration, codec)
     byte_range = _parse_byte_range(value, total)
@@ -1147,6 +1464,16 @@ def _range_416(path: Path, duration: float, codec: str = "") -> Response:
         status_code=416,
         headers={
             "Content-Range": f"bytes */{total}",
+            "Accept-Ranges": "bytes",
+        },
+    )
+
+
+def _seek_range_416(total: int) -> Response:
+    return Response(
+        status_code=416,
+        headers={
+            "Content-Range": f"bytes */{max(0, int(total))}",
             "Accept-Ranges": "bytes",
         },
     )
@@ -1186,10 +1513,10 @@ def _passthrough_media_type() -> str:
 def _passthrough_content_features(backend_verdict: str | None = None) -> str:
     dlna_pn = passthrough_dlna_pn(backend_verdict)
     if PASSTHROUGH_SEEK_MODE == "bytes":
-        op = "01"
+        op = DLNA_OP_BYTE_SEEK
         flags = "01700000000000000000000000000000"
     else:
-        op = "10"
+        op = DLNA_OP_TIME_SEEK
         flags = DLNA_FLAGS_TIME_SEEK
     return (
         f"DLNA.ORG_PN={dlna_pn};DLNA.ORG_OP={op};DLNA.ORG_CI=1;"
@@ -1226,28 +1553,15 @@ def _live_adaptive_max_fps(path: Path, meta) -> float | None:
 
 
 def _live_response_profile(user_agent: str) -> str:
-    ua = user_agent.lower()
-    if "nplayer" in ua:
-        return "nplayer"
-    if "avpromobilevideo" in ua or "exoplayerlib" in ua:
-        return "avpro"
-    if "libmpv" in ua or "skybox" in ua:
-        return "libmpv"
-    if "dalvik/" in ua:
-        return "4xvr"
-    if "vlc" in ua or "libvlc" in ua or "moonvr" in ua:
-        return "vlc"
-    if "lavf/" in ua:
-        return "lavf"
-    return PASSTHROUGH_LIVE_DEFAULT_PROFILE
+    return live_response_profile_from_ua(user_agent, PASSTHROUGH_LIVE_DEFAULT_PROFILE)
 
 
 def _is_nplayer_client(user_agent: str) -> bool:
-    return "nplayer" in user_agent.lower()
+    return is_nplayer_user_agent(user_agent)
 
 
 def _is_lavf_client(user_agent: str) -> bool:
-    return "lavf/" in user_agent.lower()
+    return is_lavf_user_agent(user_agent)
 
 
 def _format_fps_header(fps: float | None) -> str | None:
@@ -1401,8 +1715,9 @@ def _passthrough_headers(
 
 # ---- Thumbnails ----
 @router.get("/thumb/{name:path}")
-async def thumb_get(name: str, pt: int = Query(default=0)):
+async def thumb_get(request: Request, name: str, pt: int = Query(default=0)):
     path = _safe_video_path(name)
+    annotate_request(request, media_name=path.name, media_path=str(path), thumb_passthrough=bool(pt))
     async with _thumb_lock:
         out = await asyncio.to_thread(get_thumb, path, bool(pt))
     if out is None:
@@ -1425,6 +1740,7 @@ async def passthrough_live_get(
 ):
     rid = next(_request_ids)
     path = _safe_video_path(name)
+    annotate_request(request, media_name=path.name, media_path=str(path), passthrough_route="live")
     try:
         info, live_meta, live_block_reason = await asyncio.to_thread(_probe_live_request_metadata, path)
     except Exception as e:
@@ -1479,8 +1795,15 @@ async def passthrough_live_get(
     live_max_fps = _live_adaptive_max_fps(path, live_meta)
     live_profile = _live_response_profile(user_agent)
     is_nplayer = _is_nplayer_client(user_agent)
+    annotate_request(
+        request,
+        route_profile=live_profile,
+        passthrough_mode=live_output_mode,
+        requested_t=round(float(t), 3),
+    )
     use_managed_live_session = live_profile in {"4xvr", "avpro", "libmpv"} or is_nplayer
     live_total = _estimated_passthrough_size(path, max(0.0, info.duration - t), PYNV_OUTPUT_CODEC)
+    annotate_request(request, total_estimated_size=live_total)
     live_send_bps = _estimated_passthrough_bps(path, PYNV_OUTPUT_CODEC)
     live_send_pacing = PASSTHROUGH_SEND_REALTIME_PACING and live_profile != "libmpv"
     use_vlc_pseudo_vod = (
@@ -1571,6 +1894,11 @@ async def passthrough_live_get(
         async with _live_session_lock:
             started_at = _live_starting.get(live_key)
         if started_at is not None and now - started_at < _LIVE_NPLAYER_START_DEBOUNCE_SEC:
+            annotate_request(
+                request,
+                duplicate_startup=True,
+                duplicate_startup_age_ms=int(max(0.0, now - started_at) * 1000),
+            )
             deadline = now + _LIVE_NPLAYER_START_DEBOUNCE_SEC
             while asyncio.get_running_loop().time() < deadline:
                 cached_session = await _get_live_session(live_key)
@@ -1612,6 +1940,7 @@ async def passthrough_live_get(
         who=f"live:{path.name}@{t:.2f}s",
         owner=owner,
         allow_same_owner_preempt=is_nplayer or live_profile in {"4xvr", "avpro"},
+        allow_same_client_preempt=PASSTHROUGH_SEEK_ENABLED,
     )
     if preempted is False:
         await _clear_live_starting(live_key, live_starting_at)
@@ -1627,22 +1956,48 @@ async def passthrough_live_get(
             else None
         )
 
-        def build_stream():
-            matter = get_matter()
-            return _select_passthrough_stream(
-                path,
-                t,
-                matter,
-                container="mpegts",
-                max_fps=live_max_fps,
-                audio_mode_override=live_audio_override,
-                output_mode=live_output_mode,
-                preflight=False,
-            )
+        live_acquire_timeout = max(PASSTHROUGH_BUSY_WAIT_SEC, 1.0)
 
-        stream, stream_backend, stream_verdict = await asyncio.to_thread(build_stream)
-        if not await _replace_active_slot(slot_token, stream):
-            stream.close()
+        def build_stream():
+            matter = acquire_matter(blocking=True, timeout=live_acquire_timeout)
+            if matter is None:
+                return None
+            try:
+                stream_tuple = _select_passthrough_stream(
+                    path,
+                    t,
+                    matter,
+                    container="mpegts",
+                    max_fps=live_max_fps,
+                    audio_mode_override=live_audio_override,
+                    output_mode=live_output_mode,
+                    preflight=False,
+                )
+            except BaseException:
+                release_matter(matter)
+                raise
+            return stream_tuple, matter
+
+        built = await asyncio.to_thread(build_stream)
+        if built is None:
+            await _release_active_slot(slot_token)
+            await _clear_live_starting(live_key, live_starting_at)
+            log.warning(
+                "passthrough_live[%d] return 503 matter pool exhausted after %.1fs",
+                rid, live_acquire_timeout,
+            )
+            return Response(
+                "passthrough live busy", status_code=503, headers={"Retry-After": "2"}
+            )
+        (stream, stream_backend, stream_verdict), live_matter = built
+        async with _active_lock:
+            if slot_token in _active_streams:
+                _active_matter[slot_token] = live_matter
+                live_matter = None
+        if live_matter is not None:
+            # The slot was preempted while we were building; do not leak the matter.
+            release_matter(live_matter)
+        if not await _replace_active_slot(slot_token, stream, close_on_failure=stream):
             await _clear_live_starting(live_key, live_starting_at)
             log.info("passthrough_live[%d] return 409 preempted before stream", rid)
             return Response("passthrough live preempted", status_code=409, headers={"Retry-After": "1"})
@@ -1687,7 +2042,7 @@ async def passthrough_live_get(
             headers.pop("Content-Length", None)
             headers["contentFeatures.dlna.org"] = (
                 "DLNA.ORG_PN=HEVC_TS_NA_ISO;"
-                "DLNA.ORG_OP=01;"
+                f"DLNA.ORG_OP={DLNA_OP_BYTE_SEEK};"
                 "DLNA.ORG_CI=1;"
                 f"DLNA.ORG_FLAGS={DLNA_FLAGS_BASE}"
             )
@@ -1697,14 +2052,14 @@ async def passthrough_live_get(
             headers.pop("Content-Length", None)
             headers["contentFeatures.dlna.org"] = (
                 "DLNA.ORG_PN=HEVC_TS_NA_ISO;"
-                "DLNA.ORG_OP=10;"
+                f"DLNA.ORG_OP={DLNA_OP_TIME_SEEK};"
                 "DLNA.ORG_CI=1;"
                 f"DLNA.ORG_FLAGS={DLNA_FLAGS_TIME_SEEK}"
             )
     else:
         headers["contentFeatures.dlna.org"] = (
             "DLNA.ORG_PN=HEVC_TS_NA_ISO;"
-            "DLNA.ORG_OP=10;"
+            f"DLNA.ORG_OP={DLNA_OP_TIME_SEEK};"
             "DLNA.ORG_CI=1;"
             f"DLNA.ORG_FLAGS={DLNA_FLAGS_TIME_SEEK}"
         )
@@ -1977,7 +2332,9 @@ async def passthrough_live_get(
 
     session = LiveSession(live_key, stream, headers, first_live_chunk, owner, rid, live_send_bps, live_send_pacing)
     if not await _replace_active_slot(stream, session):
-        await asyncio.to_thread(stream.close)
+        # _replace_active_slot has already closed `stream` (it owned old_stream
+        # lifecycle on the failure path, closing it before releasing the Matter
+        # to prevent another acquirer from grabbing a Matter still in use).
         await _clear_live_starting(live_key, live_starting_at)
         log.info("passthrough_live[%d] return 409 preempted before live session", rid)
         return Response("passthrough live preempted", status_code=409, headers={"Retry-After": "1"})
@@ -2063,6 +2420,472 @@ async def passthrough_live_get(
     )
 
 
+def _seek_output_mode(requested_mode: str | None) -> str:
+    requested = (requested_mode or "").lower()
+    if PASSTHROUGH_OUTPUT_MODE == "all":
+        return requested if requested in {"green", "alpha"} else "green"
+    if PASSTHROUGH_OUTPUT_MODE == "alpha":
+        return "alpha"
+    return "green"
+
+
+async def _serve_seek_prefix_or_retry(
+    *,
+    rid: int,
+    path: Path,
+    media_type: str,
+    headers: dict[str, str],
+    byte_range: ByteRange,
+    probe_key: str,
+    range_header: str | None,
+) -> Response:
+    async with _probe_cache_lock:
+        cached = _probe_cache.get(probe_key, b"")
+    if byte_range.end < len(cached):
+        body = cached[byte_range.start:byte_range.end + 1]
+        headers["Content-Range"] = f"bytes {byte_range.start}-{byte_range.end}/{byte_range.total}"
+        headers["Content-Length"] = str(len(body))
+        headers["X-Passthrough-Probe-Source"] = "seek-prefix-cache"
+        log.info(
+            "passthrough_seek[%d] prefix cache hit: %s range=%s served=%d-%d cached=%d len=%d",
+            rid, path.name, range_header, byte_range.start, byte_range.end, len(cached), len(body),
+        )
+        return Response(body, status_code=206, headers=headers, media_type=media_type)
+    log.info(
+        "passthrough_seek[%d] prefix cache miss: %s range=%s start=%d cached=%d header=%d limit=%d",
+        rid, path.name, range_header, byte_range.start, len(cached),
+        PASSTHROUGH_SEEK_HEADER_BYTES, _seek_prefix_cache_limit(),
+    )
+    return Response(
+        "seek prefix cache not ready",
+        status_code=503,
+        headers={
+            "Retry-After": "1",
+            "Accept-Ranges": "bytes",
+            "Content-Type": media_type,
+            "X-Passthrough-Probe-Source": "seek-prefix-cache-not-ready",
+        },
+        media_type=media_type,
+    )
+
+
+async def _seek_prefix_splice_or_retry(
+    *,
+    rid: int,
+    path: Path,
+    media_type: str,
+    headers: dict[str, str],
+    byte_range: ByteRange,
+    probe_key: str,
+    range_header: str | None,
+) -> tuple[bytes, int] | Response:
+    header_limit = _seek_prefix_cache_limit()
+    deadline = asyncio.get_running_loop().time() + _PREFIX_CACHE_WAIT_SEC
+    cached = b""
+    while header_limit > 0:
+        async with _probe_cache_lock:
+            cached = _probe_cache.get(probe_key, b"")
+        if len(cached) >= header_limit:
+            prefix = cached[byte_range.start:header_limit]
+            headers["X-Passthrough-Probe-Source"] = "seek-prefix-cache-crossing"
+            log.info(
+                "passthrough_seek[%d] prefix crossing cache hit: %s range=%s served=%d-%d cached=%d skip=%d len=%d",
+                rid, path.name, range_header, byte_range.start, header_limit - 1, len(cached), header_limit, len(prefix),
+            )
+            return prefix, header_limit
+        if asyncio.get_running_loop().time() >= deadline:
+            break
+        await asyncio.sleep(0.05)
+    log.info(
+        "passthrough_seek[%d] prefix crossing cache miss: %s range=%s start=%d cached=%d header=%d limit=%d",
+        rid, path.name, range_header, byte_range.start, len(cached),
+        PASSTHROUGH_SEEK_HEADER_BYTES, header_limit,
+    )
+    return Response(
+        "seek prefix cache not ready",
+        status_code=503,
+        headers={
+            "Retry-After": "1",
+            "Accept-Ranges": "bytes",
+            "Content-Type": media_type,
+            "X-Passthrough-Probe-Source": "seek-prefix-cache-not-ready",
+        },
+        media_type=media_type,
+    )
+
+
+@router.head("/passthrough_seek/{name:path}")
+async def passthrough_seek_head(
+    request: Request,
+    name: str,
+    mode: str | None = Query(default=None),
+    range_header: str | None = Header(default=None, alias="Range"),
+    time_seek_range: str | None = Header(default=None, alias="TimeSeekRange.dlna.org"),
+    get_content_features: str | None = Header(default=None, alias="getcontentFeatures.dlna.org"),
+    transfer_mode: str | None = Header(default=None, alias="transferMode.dlna.org"),
+):
+    rid = next(_request_ids)
+    path, route_container = _safe_seek_video_path(name)
+    user_agent = request.headers.get("user-agent", "")
+    allowed, reason, route_profile = _seek_route_allowed(user_agent)
+    output_mode = _seek_output_mode(mode)
+    annotate_request(
+        request,
+        media_name=path.name,
+        media_path=str(path),
+        passthrough_route="seekable",
+        route_profile=route_profile,
+        passthrough_mode=output_mode,
+    )
+    if not allowed:
+        log.info("passthrough_seek[%d] HEAD blocked: reason=%s profile=%s", rid, reason, route_profile)
+        return _seek_blocked_response(reason)
+    info = probe_cached(path)
+    codec = PYNV_OUTPUT_CODEC
+    client_host = request.client.host if request.client else ""
+    container = route_container or _seek_container()
+    media_type = _seek_media_type(container)
+    total = _estimated_seek_passthrough_size(path, info.duration, codec, client_host, container)
+    byte_range = _parse_byte_range(range_header, total)
+    if range_header and byte_range is None:
+        return _seek_range_416(total)
+    t = 0.0
+    mapped = None
+    npt_t = _parse_npt_seconds(time_seek_range)
+    if npt_t is not None:
+        t = npt_t
+    elif byte_range is not None:
+        mapped = map_byte_start_to_time(
+            start=byte_range.start,
+            total=total,
+            duration_sec=info.duration,
+            header_bytes=PASSTHROUGH_SEEK_HEADER_BYTES,
+            output_fps=_seek_output_fps(info),
+            gop_frames=PASSTHROUGH_GOP,
+        )
+        t = mapped.snapped_time_sec
+    if info.duration > 0:
+        t = min(t, max(0.0, info.duration - 0.01))
+    headers = _seek_headers(
+        path=path,
+        duration=info.duration,
+        codec=codec,
+        total=total,
+        start_sec=t,
+        range_header=range_header,
+        include_length=True,
+        container=container,
+        info=info,
+    )
+    # Intentional compatibility deviation from RFC 7233: `bytes=0-` is treated
+    # as a full-start probe and answered like the non-Range startup path. Some
+    # DLNA/VR clients behave better when the first open-ended request is not a
+    # partial-content response; non-zero ranges still return 206.
+    status_code = 206 if range_header and byte_range is not None and not _is_zero_open_range(range_header, byte_range) else 200
+    if status_code == 200:
+        headers.pop("Content-Range", None)
+    _apply_seek_diag_headers(headers, start_sec=t, output_mode=output_mode, container=container, mapped=mapped)
+    log.info(
+        "passthrough_seek[%d] HEAD: %s @ %.2fs profile=%s reason=%s range=%r time_seek=%r getfeatures=%r transfer=%r",
+        rid, path.name, t, route_profile, reason, range_header, time_seek_range, get_content_features, transfer_mode,
+    )
+    return Response(status_code=status_code, headers=headers, media_type=media_type)
+
+
+@router.get("/passthrough_seek/{name:path}")
+async def passthrough_seek_get(
+    request: Request,
+    name: str,
+    mode: str | None = Query(default=None),
+    range_header: str | None = Header(default=None, alias="Range"),
+    time_seek_range: str | None = Header(default=None, alias="TimeSeekRange.dlna.org"),
+    get_content_features: str | None = Header(default=None, alias="getcontentFeatures.dlna.org"),
+    transfer_mode: str | None = Header(default=None, alias="transferMode.dlna.org"),
+):
+    rid = next(_request_ids)
+    path, route_container = _safe_seek_video_path(name)
+    user_agent = request.headers.get("user-agent", "")
+    accept = request.headers.get("accept", "")
+    allowed, reason, route_profile = _seek_route_allowed(user_agent)
+    output_mode = _seek_output_mode(mode)
+    annotate_request(
+        request,
+        media_name=path.name,
+        media_path=str(path),
+        passthrough_route="seekable",
+        route_profile=route_profile,
+        passthrough_mode=output_mode,
+    )
+    if not allowed:
+        log.info("passthrough_seek[%d] blocked: reason=%s profile=%s ua=%r", rid, reason, route_profile, user_agent[:160])
+        return _seek_blocked_response(reason)
+
+    info = probe_cached(path)
+    codec = PYNV_OUTPUT_CODEC
+    client_host = request.client.host if request.client else ""
+    container = route_container or _seek_container()
+    media_type = _seek_media_type(container)
+    total = _estimated_seek_passthrough_size(path, info.duration, codec, client_host, container)
+    annotate_request(request, total_estimated_size=total)
+    byte_range = _parse_byte_range(range_header, total)
+    if range_header and byte_range is None:
+        return _seek_range_416(total)
+
+    t = 0.0
+    mapped = None
+    npt_t = _parse_npt_seconds(time_seek_range)
+    if npt_t is not None:
+        t = npt_t
+    elif byte_range is not None and not _is_zero_open_range(range_header, byte_range):
+        mapped = map_byte_start_to_time(
+            start=byte_range.start,
+            total=total,
+            duration_sec=info.duration,
+            header_bytes=PASSTHROUGH_SEEK_HEADER_BYTES,
+            output_fps=_seek_output_fps(info),
+            gop_frames=PASSTHROUGH_GOP,
+        )
+        t = mapped.snapped_time_sec
+    if info.duration > 0:
+        t = min(t, max(0.0, info.duration - 0.01))
+
+    probe_key = _seek_probe_cache_key(path, codec, info.duration, total, container)
+    headers = _seek_headers(
+        path=path,
+        duration=info.duration,
+        codec=codec,
+        total=total,
+        start_sec=t,
+        range_header=range_header,
+        include_length=True,
+        container=container,
+        info=info,
+    )
+    _apply_seek_diag_headers(headers, start_sec=t, output_mode=output_mode, container=container, mapped=mapped)
+
+    if byte_range is not None and _is_tail_probe_range(byte_range):
+        body = b"\x00" * byte_range.length
+        headers["Content-Range"] = f"bytes {byte_range.start}-{byte_range.end}/{total}"
+        headers["Content-Length"] = str(len(body))
+        headers["X-Passthrough-Probe-Source"] = "seek-tail-empty"
+        log.info(
+            "passthrough_seek[%d] tail probe ignored: %s range=%s total=%d",
+            rid, path.name, range_header, total,
+        )
+        return Response(body, status_code=206, headers=headers, media_type=media_type)
+
+    if (
+        byte_range is not None
+        and not _is_zero_open_range(range_header, byte_range)
+        and _is_header_only_range(byte_range)
+    ):
+        return await _serve_seek_prefix_or_retry(
+            rid=rid,
+            path=path,
+            media_type=media_type,
+            headers=headers,
+            byte_range=byte_range,
+            probe_key=probe_key,
+            range_header=range_header,
+        )
+
+    prefix_splice = b""
+    skip_initial_bytes = 0
+    if (
+        byte_range is not None
+        and not _is_zero_open_range(range_header, byte_range)
+        and _is_header_crossing_range(byte_range)
+    ):
+        splice = await _seek_prefix_splice_or_retry(
+            rid=rid,
+            path=path,
+            media_type=media_type,
+            headers=headers,
+            byte_range=byte_range,
+            probe_key=probe_key,
+            range_header=range_header,
+        )
+        if isinstance(splice, Response):
+            return splice
+        prefix_splice, skip_initial_bytes = splice
+    if skip_initial_bytes:
+        log.info(
+            "passthrough_seek[%d] stream header-crossing range after cached prefix with skip=%d range=%r prefix=%d",
+            rid, skip_initial_bytes, range_header, len(prefix_splice),
+        )
+
+    log.info(
+        "passthrough_seek[%d] start: %s @ %.2fs profile=%s mode=%s range=%r ua=%r accept=%r time_seek=%r transfer=%r",
+        rid, path.name, t, route_profile, output_mode, range_header, user_agent[:160], accept[:160], time_seek_range, transfer_mode,
+    )
+    slot_token = object()
+    owner = (str(path.resolve()), client_host, "seek")
+    preempted = await _take_active_slot(
+        slot_token,
+        who=f"seek:{path.name}@{t:.2f}s",
+        owner=owner,
+        allow_same_client_preempt=PASSTHROUGH_SEEK_ENABLED,
+    )
+    if preempted is False:
+        log.info("passthrough_seek[%d] return 503 busy", rid)
+        return Response("seekable passthrough busy", status_code=503, headers={"Retry-After": "2"})
+    if preempted is not None:
+        await _close_preempted_stream(preempted, f"seek:{path.name}@{t:.2f}s")
+
+    try:
+        acquire_timeout = max(PASSTHROUGH_BUSY_WAIT_SEC, 1.0)
+        matter = await asyncio.to_thread(acquire_matter, blocking=True, timeout=acquire_timeout)
+        if matter is None:
+            await _release_active_slot(slot_token)
+            log.warning("passthrough_seek[%d] return 503 matter pool exhausted after %.1fs", rid, acquire_timeout)
+            return Response("seekable passthrough busy", status_code=503, headers={"Retry-After": "2"})
+        async with _active_lock:
+            if slot_token in _active_streams:
+                _active_matter[slot_token] = matter
+                matter_tracked = True
+            else:
+                matter_tracked = False
+        if not matter_tracked:
+            release_matter(matter)
+            log.info("passthrough_seek[%d] return 409 preempted before stream", rid)
+            return Response("seekable passthrough preempted", status_code=409, headers={"Retry-After": "1"})
+        stream, stream_backend, stream_verdict = _select_passthrough_stream(
+            path,
+            t,
+            matter,
+            container=container,
+            output_mode=output_mode,
+        )
+        if not await _replace_active_slot(slot_token, stream, close_on_failure=stream):
+            log.info("passthrough_seek[%d] return 409 preempted before stream", rid)
+            return Response("seekable passthrough preempted", status_code=409, headers={"Retry-After": "1"})
+    except Exception:
+        await _release_active_slot(slot_token)
+        raise
+
+    headers["X-Passthrough-Backend"] = stream_backend
+    headers["X-Passthrough-Backend-Verdict"] = stream_verdict
+    # Keep the same `bytes=0-` startup compatibility behavior as HEAD above.
+    status_code = 206 if range_header and byte_range is not None and not _is_zero_open_range(range_header, byte_range) else 200
+    if status_code == 200:
+        headers.pop("Content-Range", None)
+    content_length = int(headers.get("Content-Length") or "0")
+    cache_prefix = byte_range is None or byte_range.start == 0
+    log.info(
+        "passthrough_seek[%d] response: status=%d backend=%s verdict=%s total=%d content_length=%d byte_range=%s headers_range=%r",
+        rid, status_code, stream_backend, stream_verdict, total, content_length, byte_range, headers.get("Content-Range"),
+    )
+
+    async def gen():
+        sent = 0
+        probe_prefix = bytearray()
+        probe_prefix_limit = _seek_prefix_cache_limit() if cache_prefix else 0
+        probe_prefix_flushed_len = 0
+        probe_prefix_next_flush_len = (
+            min(_SEEK_PREFIX_CACHE_FLUSH_STEP, probe_prefix_limit)
+            if probe_prefix_limit > 0
+            else 0
+        )
+        first_chunk = True
+        skip_remaining = skip_initial_bytes
+        disconnect_task: asyncio.Task | None = None
+
+        async def disconnect_watchdog():
+            while True:
+                await asyncio.sleep(0.25)
+                try:
+                    disconnected = await request.is_disconnected()
+                except Exception as e:
+                    log.info("passthrough_seek[%d] disconnect watchdog stopped: %s", rid, e)
+                    return
+                if disconnected:
+                    log.info("passthrough_seek[%d] disconnect watchdog closing stream", rid)
+                    await asyncio.to_thread(stream.close)
+                    return
+
+        try:
+            disconnect_task = asyncio.create_task(disconnect_watchdog())
+            if prefix_splice:
+                chunk = prefix_splice
+                if content_length > 0 and len(chunk) > content_length:
+                    chunk = chunk[:content_length]
+                sent += len(chunk)
+                first_chunk = False
+                log.info(
+                    "passthrough_seek[%d] first chunk: len=%d sent=%d source=prefix-splice",
+                    rid, len(chunk), sent,
+                )
+                yield chunk
+            async for chunk in stream.iter_bytes():
+                if skip_remaining > 0:
+                    if len(chunk) <= skip_remaining:
+                        skip_remaining -= len(chunk)
+                        continue
+                    chunk = chunk[skip_remaining:]
+                    skip_remaining = 0
+                if content_length > 0:
+                    remaining = content_length - sent
+                    if remaining <= 0:
+                        break
+                    if len(chunk) > remaining:
+                        chunk = chunk[:remaining]
+                if probe_prefix_limit > 0 and len(probe_prefix) < probe_prefix_limit:
+                    need = probe_prefix_limit - len(probe_prefix)
+                    probe_prefix.extend(chunk[:need])
+                    if len(probe_prefix) >= probe_prefix_next_flush_len:
+                        async with _probe_cache_lock:
+                            _set_probe_cache_locked(probe_key, bytes(probe_prefix))
+                        probe_prefix_flushed_len = len(probe_prefix)
+                        if probe_prefix_flushed_len >= probe_prefix_limit:
+                            probe_prefix_next_flush_len = probe_prefix_limit + 1
+                        else:
+                            probe_prefix_next_flush_len = min(
+                                probe_prefix_limit,
+                                probe_prefix_flushed_len + _SEEK_PREFIX_CACHE_FLUSH_STEP,
+                            )
+                sent += len(chunk)
+                if first_chunk:
+                    first_chunk = False
+                    log.info("passthrough_seek[%d] first chunk: len=%d sent=%d stream_bytes=%d", rid, len(chunk), sent, getattr(stream, "bytes_emitted", -1))
+                yield chunk
+            if PASSTHROUGH_PAD_TO_LENGTH and content_length > 0 and sent < content_length:
+                log.info("passthrough_seek[%d] padding begin: sent=%d content_length=%d", rid, sent, content_length)
+                pad = b"\x00" * min(64 * 1024, content_length - sent)
+                while sent < content_length:
+                    chunk = pad[: min(len(pad), content_length - sent)]
+                    sent += len(chunk)
+                    yield chunk
+                log.info("passthrough_seek[%d] padding end: sent=%d", rid, sent)
+        finally:
+            if disconnect_task is not None:
+                disconnect_task.cancel()
+            # Put the scarce Matter/slot back before any awaited diagnostics or
+            # cache writes. Starlette may cancel the streaming task as soon as a
+            # client disconnects; if cleanup is interrupted after PyNv closes
+            # but before _release_active_slot(), later players see false 503
+            # busy even though the worker has stopped.
+            _close_stream_if_possible(stream)
+            _release_active_slot_nowait(stream)
+            if probe_prefix and len(probe_prefix) != probe_prefix_flushed_len:
+                async with _probe_cache_lock:
+                    _set_probe_cache_locked(probe_key, bytes(probe_prefix))
+            if stream.bytes_emitted > 0 and (content_length <= 0 or sent >= content_length):
+                if stream.frames_produced > 0 and stream.output_fps > 0:
+                    elapsed_media = stream.frames_produced / stream.output_fps
+                else:
+                    elapsed_media = max(0.001, info.duration - t)
+                record_actual_bps(
+                    path,
+                    codec,
+                    None,
+                    stream.bytes_emitted * 8 / elapsed_media,
+                    elapsed_media,
+                )
+            log.info("passthrough_seek[%d] finally done: sent=%d", rid, sent)
+
+    return StreamingResponse(gen(), status_code=status_code, headers=headers, media_type=media_type)
+
+
 @router.head("/passthrough/{name:path}")
 async def passthrough_head(
     request: Request,
@@ -2075,6 +2898,7 @@ async def passthrough_head(
 ):
     rid = next(_request_ids)
     path = _safe_video_path(name)
+    annotate_request(request, media_name=path.name, media_path=str(path), passthrough_route="pseudo_vod")
     info = probe_cached(path)
     estimate_codec = _passthrough_estimate_codec(path) or info.codec_name
     backend_verdict = _passthrough_backend_verdict(path)
@@ -2097,6 +2921,7 @@ async def passthrough_head(
         requested_t, time_seek_range, range_header, get_content_features, transfer_mode,
     )
     total = _estimated_passthrough_size(path, info.duration, estimate_codec)
+    annotate_request(request, total_estimated_size=total)
     byte_range = _parse_byte_range(range_header, total)
     status_code = 206 if PASSTHROUGH_SEEK_MODE == "bytes" and range_header and not _is_zero_open_range(range_header, byte_range) else 200
     headers = _passthrough_headers(media_type, t, info.duration, path, estimate_codec, range_header, include_length=True, backend_verdict=backend_verdict)
@@ -2122,6 +2947,7 @@ async def passthrough_get(
 ):
     rid = next(_request_ids)
     path = _safe_video_path(name)
+    annotate_request(request, media_name=path.name, media_path=str(path), passthrough_route="pseudo_vod")
     info = probe_cached(path)
     estimate_codec = _passthrough_estimate_codec(path) or info.codec_name
     backend_verdict = _passthrough_backend_verdict(path)
@@ -2150,6 +2976,7 @@ async def passthrough_get(
         requested_t, time_seek_range, range_header, get_content_features, transfer_mode,
     )
     total = _estimated_passthrough_size(path, info.duration, estimate_codec)
+    annotate_request(request, total_estimated_size=total)
     byte_range = _parse_byte_range(range_header, total)
     if PASSTHROUGH_SEEK_MODE == "bytes" and _is_tail_probe_range(byte_range):
         assert byte_range is not None
@@ -2266,17 +3093,46 @@ async def passthrough_get(
         log.info("passthrough[%d] return 503 busy", rid)
         return Response("passthrough busy", status_code=503, headers={"Retry-After": "2"})
     if preempted is not None:
-        log.info(
-            "passthrough preempt deferred close: %s stream=%s",
-            f"{path.name}@{t:.2f}s",
-            type(preempted).__name__,
-        )
+        # Close the preempted stream synchronously so its Matter is returned to
+        # the pool before we try to acquire one. Without this, when
+        # MAX_CONCURRENT=1 the new request would block the event loop in
+        # acquire_matter() waiting for a Matter that only the old stream's
+        # generator can release, deadlocking the loop.
+        await _close_preempted_stream(preempted, f"{path.name}@{t:.2f}s")
 
     try:
-        matter = get_matter()
-        stream, stream_backend, stream_verdict = _select_passthrough_stream(path, t, matter)
-        if not await _replace_active_slot(slot_token, stream):
-            stream.close()
+        # Run acquire_matter on a worker thread so the blocking
+        # threading.Condition.wait() never freezes the event loop. Bound the
+        # wait so a stuck producer cannot pin this request forever; on timeout
+        # rollback the slot and return 503.
+        acquire_timeout = max(PASSTHROUGH_BUSY_WAIT_SEC, 1.0)
+        matter = await asyncio.to_thread(
+            acquire_matter, blocking=True, timeout=acquire_timeout
+        )
+        if matter is None:
+            await _release_active_slot(slot_token)
+            log.warning(
+                "passthrough[%d] return 503 matter pool exhausted after %.1fs",
+                rid, acquire_timeout,
+            )
+            return Response(
+                "passthrough busy", status_code=503, headers={"Retry-After": "2"}
+            )
+        async with _active_lock:
+            if slot_token in _active_streams:
+                _active_matter[slot_token] = matter
+                matter_tracked = True
+            else:
+                matter_tracked = False
+        if not matter_tracked:
+            release_matter(matter)
+            log.info("passthrough[%d] return 409 preempted before stream", rid)
+            return Response("passthrough preempted", status_code=409, headers={"Retry-After": "1"})
+        try:
+            stream, stream_backend, stream_verdict = _select_passthrough_stream(path, t, matter)
+        except BaseException:
+            raise
+        if not await _replace_active_slot(slot_token, stream, close_on_failure=stream):
             log.info("passthrough[%d] return 409 preempted before stream", rid)
             return Response("passthrough preempted", status_code=409, headers={"Retry-After": "1"})
     except Exception:
@@ -2314,6 +3170,12 @@ async def passthrough_get(
         nonlocal cache_probe_prefix, pad_to_declared_length
         sent = 0
         probe_prefix = bytearray()
+        probe_prefix_limit = (
+            _cache_prefix_limit()
+            if PASSTHROUGH_SEEK_MODE == "bytes" and (byte_range is None or byte_range.start == 0)
+            else 0
+        )
+        probe_prefix_flushed_len = 0
         first_chunk = True
         next_progress = 1024 * 1024
         disconnect_task: asyncio.Task | None = None
@@ -2341,14 +3203,15 @@ async def passthrough_get(
                     if len(chunk) > remaining:
                         chunk = chunk[:remaining]
                 if (
-                    PASSTHROUGH_SEEK_MODE == "bytes"
-                    and (byte_range is None or byte_range.start == 0)
-                    and len(probe_prefix) < _PROBE_CACHE_LIMIT
+                    probe_prefix_limit > 0
+                    and len(probe_prefix) < probe_prefix_limit
                 ):
-                    need = _PROBE_CACHE_LIMIT - len(probe_prefix)
+                    need = probe_prefix_limit - len(probe_prefix)
                     probe_prefix.extend(chunk[:need])
-                    async with _probe_cache_lock:
-                        _set_probe_cache_locked(probe_key, bytes(probe_prefix))
+                    if len(probe_prefix) >= probe_prefix_limit:
+                        async with _probe_cache_lock:
+                            _set_probe_cache_locked(probe_key, bytes(probe_prefix))
+                        probe_prefix_flushed_len = len(probe_prefix)
                 sent += len(chunk)
                 if first_chunk:
                     first_chunk = False
@@ -2416,7 +3279,9 @@ async def passthrough_get(
             if disconnect_task is not None:
                 disconnect_task.cancel()
             log.info("passthrough[%d] finally begin: sent=%d cache_probe=%s pad=%s stream_bytes=%d frames=%d", rid, sent, cache_probe_prefix, pad_to_declared_length, getattr(stream, "bytes_emitted", -1), getattr(stream, "frames_produced", -1))
-            if cache_probe_prefix and probe_prefix:
+            _close_stream_if_possible(stream)
+            _release_active_slot_nowait(stream)
+            if cache_probe_prefix and probe_prefix and len(probe_prefix) != probe_prefix_flushed_len:
                 async with _probe_cache_lock:
                     _set_probe_cache_locked(probe_key, bytes(probe_prefix))
             if stream.bytes_emitted > 0 and (content_length <= 0 or sent >= content_length):
@@ -2431,8 +3296,6 @@ async def passthrough_get(
                     stream.bytes_emitted * 8 / elapsed_media,
                     elapsed_media,
                 )
-            await asyncio.to_thread(stream.close)
-            await _release_active_slot(stream)
             log.info("passthrough[%d] finally done: sent=%d", rid, sent)
 
     return StreamingResponse(gen(), status_code=status_code, headers=headers, media_type=media_type)
