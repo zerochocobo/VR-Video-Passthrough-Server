@@ -1,11 +1,21 @@
 """UPnP ConnectionManager SOAP handling."""
 from __future__ import annotations
 
-SOURCE_PROTOCOL_INFO = (
-    "http-get:*:video/mp4:*,"
-    "http-get:*:video/MP2T:*,"
-    "http-get:*:video/x-matroska:*"
-)
+from config import DLNA_IMAGE_ENABLED, IMAGE_MIME_BY_EXT
+
+
+def _source_protocol_info() -> str:
+    protocols = [
+        "http-get:*:video/mp4:*",
+        "http-get:*:video/MP2T:*",
+        "http-get:*:video/x-matroska:*",
+    ]
+    if DLNA_IMAGE_ENABLED:
+        protocols.extend(f"http-get:*:{mime}:*" for mime in dict.fromkeys(IMAGE_MIME_BY_EXT.values()))
+    return ",".join(protocols)
+
+
+SOURCE_PROTOCOL_INFO = _source_protocol_info()
 
 SERVICE_TYPE = "urn:schemas-upnp-org:service:ConnectionManager:1"
 

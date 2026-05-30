@@ -29,6 +29,7 @@ from ui.resources import SWITCH_OFF_IMAGE_PATH, SWITCH_ON_IMAGE_PATH
 from ui.settings import quality_speed_preset, quality_speed_value
 from ui.widgets.trt_cache_dialog import TensorRTConfigDialog
 from utils.trt_manifest import TRT_MODEL_MATANYONE2, TRT_MODEL_RVM, cache_status, manifest_path
+from utils.video_metadata import probe_video_metadata
 
 
 OFFLINE_LABEL_WIDTH = 132
@@ -36,6 +37,84 @@ ACTION_ICON_SIZE = 20
 HELP_ICON_SIZE = 20
 SWITCH_OFF_IMAGE = SWITCH_OFF_IMAGE_PATH.as_posix()
 SWITCH_ON_IMAGE = SWITCH_ON_IMAGE_PATH.as_posix()
+_TIME_EPSILON = 1e-3
+
+
+def _format_time_seconds(seconds: float) -> str:
+    total = max(0, int(round(float(seconds or 0.0))))
+    h, rem = divmod(total, 3600)
+    m, s = divmod(rem, 60)
+    return f"{h:02d}:{m:02d}:{s:02d}"
+
+
+def _parse_time_text(text: str) -> float | None:
+    value = str(text or "").strip()
+    if not value:
+        return None
+    if ":" not in value:
+        try:
+            seconds = float(value)
+        except ValueError:
+            return None
+        return seconds if seconds >= 0 else None
+    parts = [part.strip() for part in value.split(":")]
+    if len(parts) not in (2, 3) or any(not part.isdigit() for part in parts):
+        return None
+    numbers = [int(part) for part in parts]
+    if len(numbers) == 2:
+        h, m, s = 0, numbers[0], numbers[1]
+    else:
+        h, m, s = numbers
+    if h < 0 or m >= 60 or s >= 60:
+        return None
+    return float(h * 3600 + m * 60 + s)
+
+
+def _resolve_time_range(
+    start_text: str,
+    duration_value: object,
+    custom_minutes_text: str,
+    end_text: str,
+    video_duration: float,
+) -> tuple[float, float, str]:
+    start = _parse_time_text(start_text)
+    if start is None:
+        return 0.0, 0.0, "offline.time_error_start_format"
+    try:
+        total = float(video_duration or 0.0)
+    except (TypeError, ValueError):
+        total = 0.0
+    if total <= 0:
+        return 0.0, 0.0, "offline.time_error_video_duration"
+    if start > total + _TIME_EPSILON:
+        return 0.0, 0.0, "offline.time_error_start_after_video"
+
+    if duration_value == "custom":
+        try:
+            minutes = float(str(custom_minutes_text or "").strip())
+        except ValueError:
+            return 0.0, 0.0, "offline.time_error_custom_minutes"
+        if minutes <= 0:
+            return 0.0, 0.0, "offline.time_error_custom_minutes"
+        duration = minutes * 60.0
+    elif duration_value == "custom_end":
+        end = _parse_time_text(end_text)
+        if end is None:
+            return 0.0, 0.0, "offline.time_error_end_format"
+        if end <= start + _TIME_EPSILON:
+            return 0.0, 0.0, "offline.time_error_end_before_start"
+        if end > total + _TIME_EPSILON:
+            return 0.0, 0.0, "offline.time_error_end_after_video"
+        return start, end - start, ""
+    else:
+        try:
+            duration = float(duration_value or 0.0)
+        except (TypeError, ValueError):
+            duration = 0.0
+
+    if duration > 0 and start + duration > total + _TIME_EPSILON:
+        return 0.0, 0.0, "offline.time_error_clip_after_video"
+    return start, max(0.0, duration), ""
 
 
 def _action_icon(kind: str) -> QIcon:
@@ -211,6 +290,7 @@ class OfflinePage(QWidget):
         combo.addItem("", 30.0)
         combo.addItem("", 60.0)
         combo.addItem("", "custom")
+        combo.addItem("", "custom_end")
         combo.addItem("", 0.0)
         return combo
 
@@ -260,12 +340,17 @@ class OfflinePage(QWidget):
         self.single_custom_minutes_label = QLabel()
         self.single_custom_minutes = QLineEdit("5")
         self.single_custom_minutes.setFixedWidth(48)
+        self.single_custom_end_label = QLabel()
+        self.single_custom_end = QLineEdit("00:05:00")
+        self.single_custom_end.setFixedWidth(90)
         self.single_duration.currentIndexChanged.connect(self._update_custom_duration_visibility)
         row.addWidget(self.single_start)
         row.addSpacing(12)
         row.addWidget(self.single_duration)
         row.addWidget(self.single_custom_minutes_label)
         row.addWidget(self.single_custom_minutes)
+        row.addWidget(self.single_custom_end_label)
+        row.addWidget(self.single_custom_end)
         row.addStretch(1)
         return row
 
@@ -422,17 +507,7 @@ class OfflinePage(QWidget):
             target.setText(path)
 
     def _start_seconds(self) -> float:
-        text = self.single_start.text().strip()
-        try:
-            if ":" not in text:
-                return max(0.0, float(text or 0))
-            parts = [float(part or 0) for part in text.split(":")]
-            while len(parts) < 3:
-                parts.insert(0, 0.0)
-            h, m, s = parts[-3:]
-            return max(0.0, h * 3600 + m * 60 + s)
-        except ValueError:
-            return 0.0
+        return _parse_time_text(self.single_start.text()) or 0.0
 
     def _duration_seconds(self) -> float:
         value = self.single_duration.currentData()
@@ -441,12 +516,22 @@ class OfflinePage(QWidget):
                 return max(1.0, float(self.single_custom_minutes.text() or 1) * 60.0)
             except ValueError:
                 return 60.0
+        if value == "custom_end":
+            start = _parse_time_text(self.single_start.text())
+            end = _parse_time_text(self.single_custom_end.text())
+            if start is None or end is None or end <= start:
+                return 0.0
+            return end - start
         return float(value or 0.0)
 
     def _update_custom_duration_visibility(self) -> None:
-        visible = self.single_duration.currentData() == "custom"
-        self.single_custom_minutes_label.setVisible(visible)
-        self.single_custom_minutes.setVisible(visible)
+        value = self.single_duration.currentData()
+        minutes_visible = value == "custom"
+        end_visible = value == "custom_end"
+        self.single_custom_minutes_label.setVisible(minutes_visible)
+        self.single_custom_minutes.setVisible(minutes_visible)
+        self.single_custom_end_label.setVisible(end_visible)
+        self.single_custom_end.setVisible(end_visible)
 
     def _update_matanyone_help_visibility(self) -> None:
         self.single_matanyone_help.setVisible(str(self.single_engine.currentData()) == "matanyone2")
@@ -645,8 +730,41 @@ class OfflinePage(QWidget):
                     combo.setCurrentIndex(idx)
                     combo.blockSignals(False)
 
+    def _show_time_error(self, key: str, video_duration: float = 0.0) -> None:
+        message = self.i18n.t(key).format(duration=_format_time_seconds(video_duration))
+        QMessageBox.warning(self, self.i18n.t("offline.time_error_title"), message)
+
+    def _validated_single_time_range(self) -> tuple[float, float] | None:
+        video_text = self.single_video.text().strip()
+        if not video_text:
+            self._show_time_error("offline.time_error_video_missing")
+            return None
+        video_path = Path(video_text)
+        if not video_path.is_file():
+            self._show_time_error("offline.time_error_video_missing")
+            return None
+        try:
+            video_duration = float(probe_video_metadata(video_path).timing.duration or 0.0)
+        except Exception:
+            video_duration = 0.0
+        start, duration, error_key = _resolve_time_range(
+            self.single_start.text(),
+            self.single_duration.currentData(),
+            self.single_custom_minutes.text(),
+            self.single_custom_end.text(),
+            video_duration,
+        )
+        if error_key:
+            self._show_time_error(error_key, video_duration)
+            return None
+        return start, duration
+
     def run_single(self) -> None:
         engine = self._effective_engine(self.single_engine, self.single_recognition)
+        time_range = self._validated_single_time_range()
+        if time_range is None:
+            return
+        start_seconds, duration_seconds = time_range
         args = [
             "single",
             self.single_video.text(),
@@ -655,9 +773,9 @@ class OfflinePage(QWidget):
             "--engine",
             engine,
             "--start",
-            str(self._start_seconds()),
+            str(start_seconds),
             "--duration",
-            str(self._duration_seconds()),
+            str(duration_seconds),
             "--skip-frames",
             "0",
         ]
@@ -779,9 +897,17 @@ class OfflinePage(QWidget):
         self.single_matanyone_help.setToolTip(self.i18n.t("offline.matanyone_help_title"))
         self.batch_matanyone_help.setToolTip(self.i18n.t("offline.matanyone_help_title"))
         self._update_recognition_visibility()
-        for index, key in enumerate(("offline.duration_15s", "offline.duration_30s", "offline.duration_1m", "offline.duration_custom", "offline.duration_full")):
+        for index, key in enumerate((
+            "offline.duration_15s",
+            "offline.duration_30s",
+            "offline.duration_1m",
+            "offline.duration_custom",
+            "offline.duration_custom_end",
+            "offline.duration_full",
+        )):
             self.single_duration.setItemText(index, self.i18n.t(key))
         self.single_custom_minutes_label.setText(self.i18n.t("offline.minutes"))
+        self.single_custom_end_label.setText(self.i18n.t("offline.end_time"))
         for combo in (self.single_quality_speed, self.batch_quality_speed):
             for index, key in enumerate(("quality_speed.ultrafast", "quality_speed.medium", "quality_speed.veryslow")):
                 combo.setItemText(index, self.i18n.t(key))

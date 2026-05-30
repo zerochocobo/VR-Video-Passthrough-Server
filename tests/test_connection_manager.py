@@ -3,6 +3,7 @@ from __future__ import annotations
 import unittest
 from xml.etree import ElementTree as ET
 
+import dlna.connection_manager as cm
 from dlna.connection_manager import handle_soap
 from dlna.descriptions import cm_scpd
 
@@ -46,7 +47,19 @@ class ConnectionManagerTests(unittest.TestCase):
         text = payload.decode("utf-8")
         self.assertIn("<u:GetProtocolInfoResponse", text)
         self.assertIn("<Source>http-get:*:video/mp4:*", text)
+        self.assertNotIn("http-get:*:image/jpeg:*", text)
         self.assertIn("<Sink></Sink>", text)
+
+    def test_source_protocol_info_can_include_images_when_enabled(self) -> None:
+        original = cm.DLNA_IMAGE_ENABLED
+        try:
+            cm.DLNA_IMAGE_ENABLED = True
+            text = cm._source_protocol_info()
+        finally:
+            cm.DLNA_IMAGE_ENABLED = original
+
+        self.assertIn("http-get:*:image/jpeg:*", text)
+        self.assertIn("http-get:*:image/png:*", text)
 
     def test_get_current_connection_ids(self) -> None:
         payload, status = handle_soap(

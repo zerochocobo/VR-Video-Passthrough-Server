@@ -23,7 +23,7 @@ OFFLINE_PASSTHROUGH_SUFFIXES = (
 )
 
 _ENGINE_SEGMENT_RE = re.compile(
-    r"_(?:rvm1|rvm|matanyone2m|matanyone2)_s\d{6}_(?:all|\d+s|\d+m)$",
+    r"_(?:rvm1|rvm|matanyone2m|matanyone2)_s\d{6}(?:_e\d{6})?_(?:all|\d+s|\d+m)$",
     re.IGNORECASE,
 )
 

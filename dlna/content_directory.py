@@ -2,11 +2,12 @@
 
 The root ObjectID maps to VIDEO_DIR. Physical subdirectories are exposed as
 DIDL containers with ids of the form ``d_<relative/path>``. Each normal video
-file is exposed as the raw media item plus a passthrough-live item. The older
-pseudo-VOD passthrough endpoint still exists in HTTP code but is hidden from
-DLNA while client seek behavior is being evaluated. The passthrough-live item
-is a chapter container, allowing clients to choose a start time without relying
-on HTTP Range seeking.
+file is exposed as the raw media item plus a passthrough-live item. When enabled
+by config, still images are also exposed as photo items using the same /media
+route. The older pseudo-VOD passthrough endpoint still exists in HTTP code but
+is hidden from DLNA while client seek behavior is being evaluated. The
+passthrough-live item is a chapter container, allowing clients to choose a start
+time without relying on HTTP Range seeking.
 """
 from __future__ import annotations
 
@@ -19,6 +20,10 @@ from xml.etree import ElementTree as ET
 
 from config import (
     HTTP_PORT,
+    DLNA_IMAGE_ENABLED,
+    IMAGE_DLNA_PN_BY_EXT,
+    IMAGE_EXTS,
+    IMAGE_MIME_BY_EXT,
     LAN_IP,
     PASSTHROUGH_BITRATE,
     PASSTHROUGH_LIVE_CHAPTER_MAX_ITEMS,
@@ -58,6 +63,7 @@ LIVE_ITEM_PREFIX = "lg_"
 ALPHA_LIVE_ITEM_PREFIX = "la_"
 SEEK_ITEM_PREFIX = "sg_"
 ALPHA_SEEK_ITEM_PREFIX = "sa_"
+IMAGE_ITEM_PREFIX = "img_"
 PYNV_OUTPUT_CODEC = "hevc"
 DLNA_FLAGS_BASE = "01700000000000000000000000000000"
 DLNA_FLAGS_TIME_SEEK = "41700000000000000000000000000000"
@@ -73,7 +79,7 @@ DLNA_OP_BYTE_AND_TIME_SEEK = "11"
 DIDL_NS = "urn:schemas-upnp-org:metadata-1-0/DIDL-Lite/"
 
 _DIR_ITEMS_CACHE_MAX = 256
-_DIDL_SCHEMA_VERSION = 7
+_DIDL_SCHEMA_VERSION = 9
 _SYSTEM_UPDATE_ID = _DIDL_SCHEMA_VERSION
 _OBJECT_ID_VERSION_PREFIX = f"ptv{_DIDL_SCHEMA_VERSION}_"
 _dir_items_cache: dict[tuple, list[dict]] = {}
@@ -198,6 +204,17 @@ def _id_to_seek(object_id: str) -> tuple[Path, str] | None:
     return None
 
 
+def _id_to_image(object_id: str) -> Path | None:
+    if not DLNA_IMAGE_ENABLED or not object_id.startswith(IMAGE_ITEM_PREFIX):
+        return None
+    rel = object_id[len(IMAGE_ITEM_PREFIX):].replace("\\", "/").strip("/")
+    rel = _strip_object_id_version(rel)
+    path = MEDIA_LIBRARY.key_to_path(rel)
+    if path is not None and MEDIA_LIBRARY.contains(path) and path.is_file() and path.suffix.lower() in IMAGE_EXTS:
+        return path
+    return None
+
+
 def _parent_id_for_dir(path: Path) -> str:
     path = path.resolve()
     if MEDIA_LIBRARY.multi_root:
@@ -287,6 +304,54 @@ def _subtitle_item(track: SubtitleTrack) -> dict:
         "lang": track.lang,
         "type": track.kind,
         "mime": track.mime,
+    }
+
+
+def _image_mime(path: Path) -> str:
+    return IMAGE_MIME_BY_EXT.get(path.suffix.lower(), "application/octet-stream")
+
+
+def _image_protocol_info(path: Path) -> str:
+    mime = _image_mime(path)
+    dlna_pn = IMAGE_DLNA_PN_BY_EXT.get(path.suffix.lower())
+    if not dlna_pn:
+        return f"http-get:*:{mime}:*"
+    return (
+        f"http-get:*:{mime}:DLNA.ORG_PN={dlna_pn};"
+        "DLNA.ORG_OP=00;"
+        f"DLNA.ORG_CI=0;DLNA.ORG_FLAGS={DLNA_FLAGS_BASE}"
+    )
+
+
+def _image_resolution(path: Path) -> str:
+    try:
+        from PIL import Image
+
+        with Image.open(path) as image:
+            width, height = image.size
+        return _resolution_str(int(width), int(height))
+    except Exception:
+        return ""
+
+
+def _image_item_from_index(path: Path, parent_id: str, child: IndexedChild | None = None) -> dict:
+    base = f"http://{LAN_IP}:{HTTP_PORT}"
+    rel = _rel_key(path)
+    quoted = quote(rel)
+    url = f"{base}/media/{quoted}"
+    size = child.size if child is not None else path.stat().st_size
+    return {
+        "id": f"{IMAGE_ITEM_PREFIX}{_versioned_rel(rel)}",
+        "parent_id": parent_id,
+        "title": path.stem,
+        "url": url,
+        "thumb": url,
+        "thumb_profile": IMAGE_DLNA_PN_BY_EXT.get(path.suffix.lower(), ""),
+        "size": size,
+        "resolution": _image_resolution(path),
+        "mime": _image_mime(path),
+        "protocol_info": _image_protocol_info(path),
+        "upnp_class": "object.item.imageItem.photo",
     }
 
 
@@ -625,6 +690,7 @@ def _children_for_dir(directory: Path) -> list[dict]:
         int(subtitle_output_enabled()),
         int(PASSTHROUGH_LIVE_CHAPTER_MAX_ITEMS),
         int(PASSTHROUGH_LIVE_CHAPTER_MIN_INTERVAL_SEC),
+        int(DLNA_IMAGE_ENABLED),
         _DIDL_SCHEMA_VERSION,
     )
     cached = _dir_items_cache.get(cache_key)
@@ -644,6 +710,8 @@ def _children_for_dir(directory: Path) -> list[dict]:
             )
         elif child.path.suffix.lower() in VIDEO_EXTS:
             items.extend(_video_items_from_index(child.path, parent_id, child, sibling_paths))
+        elif DLNA_IMAGE_ENABLED and child.path.suffix.lower() in IMAGE_EXTS:
+            items.append(_image_item_from_index(child.path, parent_id, child))
     if len(_dir_items_cache) >= _DIR_ITEMS_CACHE_MAX:
         _dir_items_cache.pop(next(iter(_dir_items_cache)))
     _dir_items_cache[cache_key] = list(items)
@@ -692,12 +760,14 @@ def _didl_for(items: list[dict]) -> str:
             continue
 
         url = html.escape(it["url"])
-        thumb = html.escape(it["thumb"])
-        size = it["size"]
-        duration = _fmt_duration(it["duration"])
-        resolution = it["resolution"]
-        bitrate = it["bitrate"]
+        thumb = html.escape(str(it.get("thumb") or ""))
+        size = int(it.get("size", 0) or 0)
+        duration_value = it.get("duration")
+        duration = _fmt_duration(float(duration_value or 0.0))
+        resolution = str(it.get("resolution") or "")
+        bitrate = int(it.get("bitrate", 0) or 0)
         mime = it["mime"]
+        upnp_class = str(it.get("upnp_class") or "object.item.videoItem")
 
         if "protocol_info" in it:
             proto = it["protocol_info"]
@@ -712,15 +782,15 @@ def _didl_for(items: list[dict]) -> str:
                 f"DLNA.ORG_FLAGS={flags}"
             )
         else:
-            if it["passthrough"] and PASSTHROUGH_SEEK_MODE == "bytes":
+            if it.get("passthrough") and PASSTHROUGH_SEEK_MODE == "bytes":
                 op = DLNA_OP_BYTE_SEEK
             else:
-                op = DLNA_OP_TIME_SEEK if it["passthrough"] else DLNA_OP_BYTE_SEEK
-            ci = "1" if it["passthrough"] else "0"
-            if it["passthrough"] and PASSTHROUGH_SEEK_MODE == "bytes":
+                op = DLNA_OP_TIME_SEEK if it.get("passthrough") else DLNA_OP_BYTE_SEEK
+            ci = "1" if it.get("passthrough") else "0"
+            if it.get("passthrough") and PASSTHROUGH_SEEK_MODE == "bytes":
                 flags = DLNA_FLAGS_BASE
             else:
-                flags = DLNA_FLAGS_TIME_SEEK if it["passthrough"] else DLNA_FLAGS_BASE
+                flags = DLNA_FLAGS_TIME_SEEK if it.get("passthrough") else DLNA_FLAGS_BASE
             proto = (
                 f"http-get:*:{mime}:DLNA.ORG_PN={it['dlna_pn']};"
                 f"DLNA.ORG_OP={op};"
@@ -731,7 +801,7 @@ def _didl_for(items: list[dict]) -> str:
         attrs: list[str] = []
         if size > 0:
             attrs.append(f'size="{size}"')
-        if not it.get("omit_duration"):
+        if duration_value is not None and not it.get("omit_duration"):
             attrs.append(f'duration="{duration}"')
         if bitrate > 0 and not it.get("omit_bitrate"):
             attrs.append(f'bitrate="{bitrate}"')
@@ -753,11 +823,17 @@ def _didl_for(items: list[dict]) -> str:
             subtitle_xml.append(f'<sec:CaptionInfoEx sec:type="{sub_type}">{sub_url}</sec:CaptionInfoEx>')
             subtitle_xml.append(f'<sec:CaptionInfo sec:type="{sub_type}">{sub_url}</sec:CaptionInfo>')
 
+        thumb_profile = html.escape(str(it.get("thumb_profile") or "JPEG_TN"))
+        album_art_xml = (
+            f'<upnp:albumArtURI dlna:profileID="{thumb_profile}">{thumb}</upnp:albumArtURI>'
+            if thumb and thumb_profile
+            else (f"<upnp:albumArtURI>{thumb}</upnp:albumArtURI>" if thumb else "")
+        )
         out.append(
             f'<item id="{html.escape(it["id"])}" parentID="{parent_id}" restricted="1">'
             f"<dc:title>{title}</dc:title>"
-            f"<upnp:class>object.item.videoItem</upnp:class>"
-            f'<upnp:albumArtURI dlna:profileID="JPEG_TN">{thumb}</upnp:albumArtURI>'
+            f"<upnp:class>{html.escape(upnp_class)}</upnp:class>"
+            f"{album_art_xml}"
             f"<res {res_attrs}>{url}</res>"
             f"{''.join(subtitle_xml)}"
             f"</item>"
@@ -877,6 +953,7 @@ def handle_soap(soap_action: str, body: bytes) -> tuple[bytes, int]:
         directory = _id_to_dir(object_id)
         live = _id_to_live(object_id)
         seek = _id_to_seek(object_id)
+        image = _id_to_image(object_id)
 
         if live is not None:
             live_path, live_mode = live
@@ -910,6 +987,8 @@ def handle_soap(soap_action: str, body: bytes) -> tuple[bytes, int]:
                         if item.get("passthrough") and item.get("passthrough_mode") == live_mode
                     ]
                     didl = _metadata_didl_for_item(live_items[0]) if live_items else _didl_for([])
+            elif image is not None:
+                didl = _metadata_didl_for_item(_image_item_from_index(image, _folder_id(image.parent)))
             else:
                 didl = _metadata_didl_for_dir(directory or _root())
             return _wrap_soap(

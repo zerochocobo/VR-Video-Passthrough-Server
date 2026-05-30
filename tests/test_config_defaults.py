@@ -49,6 +49,11 @@ class ConfigDefaultTests(unittest.TestCase):
         self.assertEqual(config.PASSTHROUGH_SEEK_CONTAINER, "mpegts")
         self.assertEqual(config.PASSTHROUGH_SEEK_HEADER_BYTES, 2 * 1024 * 1024)
 
+    def test_dlna_images_are_disabled_by_default(self) -> None:
+        self.assertFalse(config.DLNA_IMAGE_ENABLED)
+        self.assertIn(".jpg", config.IMAGE_EXTS)
+        self.assertEqual(config.IMAGE_MIME_BY_EXT[".png"], "image/png")
+
 
 if __name__ == "__main__":
     unittest.main()

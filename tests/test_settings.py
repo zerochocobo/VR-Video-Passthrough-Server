@@ -49,6 +49,7 @@ class SettingsTests(unittest.TestCase):
         self.assertEqual(env["PT_PASSTHROUGH_SEEK_DLNA"], "0")
         self.assertEqual(env["PT_PASSTHROUGH_SEEK_ROUTE_POLICY"], "profile")
         self.assertEqual(env["PT_PASSTHROUGH_SEEK_CONTAINER"], "mpegts")
+        self.assertEqual(env["PT_DLNA_IMAGE_ENABLED"], "0")
         self.assertEqual(env["PT_DECODE_MAX_SIDE"], "4096")
         self.assertEqual(env["PT_LIGHT_MATCH_PRESET"], "daylight")
 

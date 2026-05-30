@@ -22,6 +22,9 @@ from fastapi.responses import FileResponse, Response, StreamingResponse
 
 from config import (
     HTTP_PORT,
+    DLNA_IMAGE_ENABLED,
+    IMAGE_EXTS,
+    IMAGE_MIME_BY_EXT,
     LAN_IP,
     PASSTHROUGH_CONTAINER,
     PASSTHROUGH_BUSY_WAIT_SEC,
@@ -846,6 +849,35 @@ def _safe_video_path(name: str) -> Path:
     return _safe_video_path_from_key(unquote(name))
 
 
+def _is_image_path(path: Path) -> bool:
+    return path.suffix.lower() in IMAGE_EXTS
+
+
+def _media_type_for_path(path: Path) -> str:
+    if _is_image_path(path):
+        return IMAGE_MIME_BY_EXT.get(path.suffix.lower(), "application/octet-stream")
+    return "video/mp4"
+
+
+def _safe_media_path_from_key(name: str) -> Path:
+    p = MEDIA_LIBRARY.key_to_path(name)
+    if p is None:
+        raise HTTPException(403, "forbidden")
+    p = p.resolve()
+    if not MEDIA_LIBRARY.contains(p):
+        raise HTTPException(403, "forbidden")
+    suffix = p.suffix.lower()
+    if p.is_file() and suffix in VIDEO_EXTS:
+        return p
+    if p.is_file() and DLNA_IMAGE_ENABLED and suffix in IMAGE_EXTS:
+        return p
+    raise HTTPException(404, "not found")
+
+
+def _safe_media_path(name: str) -> Path:
+    return _safe_media_path_from_key(unquote(name))
+
+
 def _safe_seek_video_path(name: str) -> tuple[Path, str | None]:
     key, route_container = _split_seek_route_name(name)
     return _safe_video_path_from_key(key), route_container
@@ -1001,13 +1033,15 @@ async def subtitle_head(request: Request, name: str, range: str | None = Header(
 
 @router.head("/media/{name:path}")
 async def media_head(request: Request, name: str, range: str | None = Header(default=None)):
-    path = _safe_video_path(name)
+    path = _safe_media_path(name)
     annotate_request(request, media_name=path.name, media_path=str(path))
     size = path.stat().st_size
+    media_type = _media_type_for_path(path)
+    subtitle_headers = _subtitle_headers_for_video(path) if path.suffix.lower() in VIDEO_EXTS else {}
     headers = {
         "Accept-Ranges": "bytes",
-        "Content-Type": "video/mp4",
-        **_subtitle_headers_for_video(path),
+        "Content-Type": media_type,
+        **subtitle_headers,
     }
     byte_range = _parse_byte_range(range, size)
     if byte_range is not None:
@@ -1029,10 +1063,11 @@ async def media_get(
     get_content_features: str | None = Header(default=None, alias="getcontentFeatures.dlna.org"),
 ):
     rid = next(_request_ids)
-    path = _safe_video_path(name)
+    path = _safe_media_path(name)
     annotate_request(request, media_name=path.name, media_path=str(path))
     size = path.stat().st_size
-    subtitle_headers = _subtitle_headers_for_video(path)
+    media_type = _media_type_for_path(path)
+    subtitle_headers = _subtitle_headers_for_video(path) if path.suffix.lower() in VIDEO_EXTS else {}
     if DEBUG_LOGS:
         log.info(
             "media[%d] request: path=%s size=%d range=%r time_seek=%r transfer=%r getfeatures=%r ua=%r client=%s",
@@ -1085,7 +1120,7 @@ async def media_get(
             "Content-Range": f"bytes {start}-{end}/{size}",
             "Accept-Ranges": "bytes",
             "Content-Length": str(length),
-            "Content-Type": "video/mp4",
+            "Content-Type": media_type,
             **subtitle_headers,
         }
         if DEBUG_LOGS:
@@ -1100,11 +1135,11 @@ async def media_get(
                 not bool(m.group(2)),
                 not bool(m.group(1)),
             )
-        return StreamingResponse(gen(), status_code=206, headers=headers, media_type="video/mp4")
+        return StreamingResponse(gen(), status_code=206, headers=headers, media_type=media_type)
 
     if DEBUG_LOGS:
         log.info("media[%d] response: status=200 path=%s size=%d full-file", rid, path.name, size)
-    return FileResponse(path, media_type="video/mp4", headers={"Accept-Ranges": "bytes", **subtitle_headers})
+    return FileResponse(path, media_type=media_type, headers={"Accept-Ranges": "bytes", **subtitle_headers})
 
 
 def _parse_npt_seconds(value: str | None) -> float | None:

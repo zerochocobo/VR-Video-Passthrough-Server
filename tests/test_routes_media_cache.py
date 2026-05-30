@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import unittest
 import asyncio
+import tempfile
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -29,6 +30,27 @@ class ProbeCacheTests(unittest.TestCase):
         finally:
             routes_media._probe_cache.clear()
             routes_media._probe_cache.update(original_cache)
+
+
+class SourceMediaRouteTests(unittest.TestCase):
+    def test_media_type_for_images_uses_real_image_mime(self) -> None:
+        self.assertEqual(routes_media._media_type_for_path(Path("photo.jpg")), "image/jpeg")
+        self.assertEqual(routes_media._media_type_for_path(Path("photo.png")), "image/png")
+        self.assertEqual(routes_media._media_type_for_path(Path("movie.mp4")), "video/mp4")
+
+    def test_media_head_serves_image_content_type(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            path = Path(raw) / "photo.png"
+            path.write_bytes(b"abcdef")
+            with (
+                patch.object(routes_media, "_safe_media_path", return_value=path),
+                patch.object(routes_media, "annotate_request", return_value=None),
+            ):
+                response = asyncio.run(routes_media.media_head(SimpleNamespace(), "photo.png", range=None))
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.headers["content-type"], "image/png")
+        self.assertEqual(response.headers["content-length"], "6")
 
 
 class ExistingPassthroughStrategyCharacterizationTests(unittest.TestCase):

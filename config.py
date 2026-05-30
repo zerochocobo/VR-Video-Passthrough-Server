@@ -116,6 +116,28 @@ VIDEO_DIR: Path = VIDEO_DIRS[0]
 # File extensions considered video media during directory scans.
 VIDEO_EXTS = {".mp4", ".mkv", ".mov", ".m4v"}
 
+# PT_DLNA_IMAGE_ENABLED:
+#   1 exposes still images in DLNA Browse and allows /media/{name} to serve
+#   those image files with their real image Content-Type. Default is off because
+#   most tested VR players do not support image playback through this DLNA path.
+DLNA_IMAGE_ENABLED = _env("DLNA_IMAGE_ENABLED", "0") == "1"
+
+# File extensions considered image media when PT_DLNA_IMAGE_ENABLED=1.
+IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".gif"}
+IMAGE_MIME_BY_EXT = {
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".png": "image/png",
+    ".webp": "image/webp",
+    ".bmp": "image/bmp",
+    ".gif": "image/gif",
+}
+IMAGE_DLNA_PN_BY_EXT = {
+    ".jpg": "JPEG_LRG",
+    ".jpeg": "JPEG_LRG",
+    ".png": "PNG_LRG",
+}
+
 # ---- Burned-in subtitle overlay ----
 # PT_SUBTITLE_ENABLE:
 #   1 enables automatic burned-in subtitles for passthrough streams. The server

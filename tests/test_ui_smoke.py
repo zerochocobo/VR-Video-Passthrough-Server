@@ -203,6 +203,8 @@ class UiSmokeTests(unittest.TestCase):
             self.assertEqual(window.offline.single_labels["trt"].text(), window.i18n.t("trt.row_label"))
             self.assertEqual(window.offline.single_quality_speed.count(), 3)
             self.assertIn(window.offline.single_quality_speed.currentData(), {"ultrafast", "medium", "veryslow"})
+            self.assertEqual(window.offline.single_duration.findData("custom_end"), 4)
+            self.assertTrue(hasattr(window.offline, "single_custom_end"))
             self.assertEqual(window.offline.batch_quality_speed.count(), 3)
             self.assertEqual(window.offline.single_engine.count(), 2)
             self.assertEqual(window.offline.single_engine.itemData(0), "rvm_fast")

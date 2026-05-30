@@ -19,7 +19,7 @@ class OfflineConvertTests(unittest.TestCase):
         self.assertEqual(convert._default_out(src, "green", 3840, 1920), Path("sample_LR_180_SBS_passthrough.mp4"))
         self.assertEqual(convert._default_out(src, "alpha"), Path("sample_LR_180_FISHEYE_F180_alpha.mp4"))
 
-    def test_single_output_name_includes_mode_engine_start_and_duration(self) -> None:
+    def test_single_output_name_includes_mode_engine_start_end_and_duration(self) -> None:
         src = Path("sample.mp4")
         green_args = SimpleNamespace(command="single", mode="green", engine="rvm_fast", start=300.0, duration=15.0)
         alpha_args = SimpleNamespace(command="single", mode="alpha", engine="matanyone2", start=5.0, duration=300.0)
@@ -27,9 +27,9 @@ class OfflineConvertTests(unittest.TestCase):
 
         self.assertEqual(
             convert._single_out(src, green_args, 3840, 1920),
-            Path("sample_rvm1_S000500_15S_LR_180_SBS_passthrough.mp4"),
+            Path("sample_rvm1_S000500_E000515_15S_LR_180_SBS_passthrough.mp4"),
         )
-        self.assertEqual(convert._single_out(src, alpha_args), Path("sample_matanyone2_S000005_5M_LR_180_FISHEYE_F180_alpha.mp4"))
+        self.assertEqual(convert._single_out(src, alpha_args), Path("sample_matanyone2_S000005_E000505_5M_LR_180_FISHEYE_F180_alpha.mp4"))
         self.assertEqual(convert._single_out(src, all_args, 1920, 1080), Path("sample_rvm1_S000000_ALL_passthrough.mp4"))
 
     def test_batch_video_files_skip_passthrough(self) -> None:
@@ -283,7 +283,7 @@ class OfflineConvertTests(unittest.TestCase):
         finally:
             convert._base_cmd = original_base_cmd
 
-        self.assertEqual(seen["out"], (root / "out" / "demo_rvm1_S000500_15S_LR_180_FISHEYE_F180_alpha.mp4").resolve())
+        self.assertEqual(seen["out"], (root / "out" / "demo_rvm1_S000500_E000515_15S_LR_180_FISHEYE_F180_alpha.mp4").resolve())
 
 
 if __name__ == "__main__":

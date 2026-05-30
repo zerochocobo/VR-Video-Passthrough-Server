@@ -139,7 +139,11 @@ def _single_out(src: Path, args: argparse.Namespace, width: int = 0, height: int
     engine_tag = ENGINE_TAGS[args.engine]
     start_tag = f"S{_time_tag(args.start)}"
     duration_tag = _duration_tag(args.duration)
-    base = f"{src.stem}_{engine_tag}_{start_tag}_{duration_tag}"
+    if float(args.duration or 0.0) > 0:
+        end_tag = f"E{_time_tag(float(args.start or 0.0) + float(args.duration or 0.0))}"
+        base = f"{src.stem}_{engine_tag}_{start_tag}_{end_tag}_{duration_tag}"
+    else:
+        base = f"{src.stem}_{engine_tag}_{start_tag}_{duration_tag}"
     return src.with_name(f"{offline_passthrough_stem(base, args.mode, width, height)}.mp4")
 
 

@@ -1,7 +1,10 @@
 ﻿from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from pathlib import Path
+
+log = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -10,32 +13,54 @@ class MediaRoot:
     path: Path
 
 
+def _safe_resolve(path: Path, *, warn: bool = True) -> Path | None:
+    try:
+        return path.expanduser().resolve()
+    except (OSError, RuntimeError) as e:
+        if warn:
+            log.warning("skip unusable media directory %s: %s", path, e)
+        return None
+
+
+def _absolute_fallback(path: Path) -> Path:
+    try:
+        return path.expanduser().absolute()
+    except (OSError, RuntimeError):
+        return path.absolute()
+
+
 def parse_video_dirs(raw: object, default: Path) -> list[Path]:
     text = str(raw or "").strip()
     parts = [part.strip() for part in text.split("|") if part.strip()]
     if not parts:
         parts = [str(default)]
+    fallback = _safe_resolve(Path(default), warn=False) or _absolute_fallback(Path(default))
     roots: list[Path] = []
     seen: set[str] = set()
     for part in parts:
-        path = Path(part).expanduser().resolve()
+        path = _safe_resolve(Path(part))
+        if path is None:
+            continue
         key = str(path).casefold()
         if key in seen:
             continue
         seen.add(key)
         roots.append(path)
-    return roots or [default.resolve()]
+    return roots or [fallback]
 
 
 def build_media_roots(paths: list[Path]) -> list[MediaRoot]:
     used: dict[str, int] = {}
     roots: list[MediaRoot] = []
     for path in paths:
+        resolved = _safe_resolve(path)
+        if resolved is None:
+            continue
         base = path.name or path.drive.rstrip(":\\") or "Videos"
         index = used.get(base.casefold(), 0) + 1
         used[base.casefold()] = index
         label = base if index == 1 else f"{base}{index}"
-        roots.append(MediaRoot(label=label, path=path.resolve()))
+        roots.append(MediaRoot(label=label, path=resolved))
     return roots
 
 

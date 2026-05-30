@@ -313,8 +313,10 @@ class MediaIndex:
         for child in children:
             try:
                 is_dir = child.is_dir()
-                is_video = child.is_file() and child.suffix.lower() in config.VIDEO_EXTS
-                if not is_dir and not is_video:
+                suffix = child.suffix.lower()
+                is_video = child.is_file() and suffix in config.VIDEO_EXTS
+                is_image = child.is_file() and config.DLNA_IMAGE_ENABLED and suffix in config.IMAGE_EXTS
+                if not is_dir and not is_video and not is_image:
                     continue
                 st = child.stat()
                 child_key = _dir_key(child)
@@ -350,7 +352,7 @@ class MediaIndex:
                     """,
                     (child_key, key, child.name, 1 if is_dir else 0, suffix, size, mtime_ns, now),
                 )
-                video = None if is_dir else self._video_for(conn, child, child_key, size, mtime_ns)
+                video = self._video_for(conn, child, child_key, size, mtime_ns) if (not is_dir and suffix in config.VIDEO_EXTS) else None
                 children_out.append(
                     IndexedChild(
                         path=child,
@@ -402,7 +404,7 @@ class MediaIndex:
         parent_key: str,
     ) -> list[IndexedChild] | None:
         out: list[IndexedChild] = []
-        for child, child_key, _suffix, is_dir, size, mtime_ns in rows:
+        for child, child_key, suffix, is_dir, size, mtime_ns in rows:
             entry = conn.execute(
                 """
                 SELECT size, mtime_ns FROM entries
@@ -413,7 +415,7 @@ class MediaIndex:
             if entry is None or int(entry["size"]) != size or int(entry["mtime_ns"]) != mtime_ns:
                 return None
             video = None
-            if not is_dir:
+            if not is_dir and suffix in config.VIDEO_EXTS:
                 video = self._video_from_db(conn, child_key, size, mtime_ns)
                 if video is None:
                     return None
@@ -595,6 +597,8 @@ class MediaIndex:
                         count += 1
                     else:
                         count += 3 if config.PASSTHROUGH_OUTPUT_MODE == "all" else 2
+                elif child.is_file() and config.DLNA_IMAGE_ENABLED and child.suffix.lower() in config.IMAGE_EXTS:
+                    count += 1
             except OSError:
                 continue
         return count

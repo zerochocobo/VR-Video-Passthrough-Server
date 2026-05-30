@@ -81,7 +81,7 @@ class ContentDirectoryModeTests(unittest.TestCase):
             items = cds._video_items_from_index(Path("movie.mp4"), "0", child)
 
         passthrough = [item for item in items if item.get("passthrough")]
-        self.assertEqual([item["id"] for item in passthrough], ["lg_ptv7_movie.mp4", "la_ptv7_movie.mp4"])
+        self.assertEqual([item["id"] for item in passthrough], ["lg_ptv9_movie.mp4", "la_ptv9_movie.mp4"])
         self.assertIn("mode=green", passthrough[0]["url"])
         self.assertIn("mode=alpha", passthrough[1]["url"])
         self.assertEqual([item["passthrough_mode"] for item in passthrough], ["green", "alpha"])
@@ -141,14 +141,14 @@ class ContentDirectoryModeTests(unittest.TestCase):
         seek = next(item for item in items if "/passthrough_seek/" in item.get("url", ""))
         live = next(item for item in items if item.get("container"))
         self.assertFalse(seek.get("container"))
-        self.assertEqual(seek["id"], "sg_ptv7_movie.mp4")
+        self.assertEqual(seek["id"], "sg_ptv9_movie.mp4")
         self.assertIn("/passthrough_seek/movie.mp4.seek.ts", seek["url"])
         self.assertIn("_seek", seek["title"])
         self.assertEqual(seek["protocol_info"].split(";")[1], "DLNA.ORG_OP=11")
         self.assertIn("DLNA.ORG_CI=0", seek["protocol_info"])
         self.assertIn("DLNA.ORG_FLAGS=01F00000000000000000000000000000", seek["protocol_info"])
         self.assertEqual(seek["size"], 14_345_678)
-        self.assertEqual(live["id"], "pl_ptv7_movie.mp4")
+        self.assertEqual(live["id"], "pl_ptv9_movie.mp4")
         self.assertIn("_live", live["title"])
 
     def test_seek_dlna_requires_route_master_switch(self) -> None:
@@ -176,7 +176,7 @@ class ContentDirectoryModeTests(unittest.TestCase):
             items = cds._video_items_from_index(Path("movie.mp4"), "0", child)
 
         self.assertTrue(items[1].get("container"))
-        self.assertEqual(items[1]["id"], "pl_ptv7_movie.mp4")
+        self.assertEqual(items[1]["id"], "pl_ptv9_movie.mp4")
 
     def test_seek_dlna_can_advertise_true_fmp4_experiment(self) -> None:
         child = SimpleNamespace(
@@ -260,7 +260,7 @@ class ContentDirectoryModeTests(unittest.TestCase):
                 ][0]
             )
 
-        self.assertIn("la_ptv7_movie.mp4", didl)
+        self.assertIn("la_ptv9_movie.mp4", didl)
         self.assertIn("mode=alpha", didl)
         self.assertNotIn("mode=green", didl)
         self.assertIn("DLNA.ORG_OP=00", didl)
@@ -490,7 +490,7 @@ class ContentDirectoryModeTests(unittest.TestCase):
             items = cds._root_items()
 
         self.assertEqual([item["title"] for item in items], ["VR", "VR2"])
-        self.assertEqual([item["id"] for item in items], ["d_ptv7_VR", "d_ptv7_VR2"])
+        self.assertEqual([item["id"] for item in items], ["d_ptv9_VR", "d_ptv9_VR2"])
 
     def test_didl_namespace_has_trailing_slash(self) -> None:
         didl = cds._didl_for([])
@@ -564,6 +564,55 @@ class ContentDirectoryModeTests(unittest.TestCase):
 
         self.assertEqual(off_items[0]["title"], "off")
         self.assertEqual(on_items[0]["title"], "on")
+        cds._dir_items_cache.clear()
+
+    def test_children_for_dir_includes_image_items_when_enabled(self) -> None:
+        child = SimpleNamespace(
+            is_dir=False,
+            path=Path("photo.jpg"),
+            name="photo.jpg",
+            size=1234,
+        )
+        snapshot = SimpleNamespace(key="root", signature="sig", children=[child])
+        with (
+            patch.object(cds, "DLNA_IMAGE_ENABLED", True),
+            patch.object(cds, "get_media_index") as get_index,
+            patch.object(cds, "_folder_id", return_value="0"),
+            patch.object(cds, "_rel_key", return_value="photo.jpg"),
+            patch.object(cds, "_image_resolution", return_value="640x480"),
+        ):
+            get_index.return_value.list_directory.return_value = snapshot
+            cds._dir_items_cache.clear()
+            items = cds._children_for_dir(Path("."))
+
+        self.assertEqual(len(items), 1)
+        self.assertEqual(items[0]["id"], "img_ptv9_photo.jpg")
+        self.assertEqual(items[0]["mime"], "image/jpeg")
+        self.assertEqual(items[0]["protocol_info"], "http-get:*:image/jpeg:DLNA.ORG_PN=JPEG_LRG;DLNA.ORG_OP=00;DLNA.ORG_CI=0;DLNA.ORG_FLAGS=01700000000000000000000000000000")
+        didl = cds._didl_for(items)
+        self.assertIn("<upnp:class>object.item.imageItem.photo</upnp:class>", didl)
+        self.assertIn('protocolInfo="http-get:*:image/jpeg:', didl)
+        self.assertIn("/media/photo.jpg", didl)
+        cds._dir_items_cache.clear()
+
+    def test_children_for_dir_skips_image_items_when_disabled(self) -> None:
+        child = SimpleNamespace(
+            is_dir=False,
+            path=Path("photo.jpg"),
+            name="photo.jpg",
+            size=1234,
+        )
+        snapshot = SimpleNamespace(key="root", signature="sig", children=[child])
+        with (
+            patch.object(cds, "DLNA_IMAGE_ENABLED", False),
+            patch.object(cds, "get_media_index") as get_index,
+            patch.object(cds, "_folder_id", return_value="0"),
+        ):
+            get_index.return_value.list_directory.return_value = snapshot
+            cds._dir_items_cache.clear()
+            items = cds._children_for_dir(Path("."))
+
+        self.assertEqual(items, [])
         cds._dir_items_cache.clear()
 
     def test_legacy_colon_folder_id_still_resolves(self) -> None:
