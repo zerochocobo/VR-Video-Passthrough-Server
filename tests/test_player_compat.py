@@ -8,6 +8,7 @@ from fastapi.responses import StreamingResponse
 from fastapi.testclient import TestClient
 from starlette.requests import Request
 
+from http_app import routes_dlna
 from http_app.server import create_app
 from utils import player_compat
 from utils.request_history import RequestHistory, annotate_request, build_record, get_request_history
@@ -32,6 +33,66 @@ class PlayerCompatProfileTests(unittest.TestCase):
         for ua, expected in cases:
             with self.subTest(ua=ua):
                 self.assertEqual(player_compat.live_response_profile_from_ua(ua, "vlc"), expected)
+
+    def test_deovr_cds_profile_detects_blank_ua_browse_fingerprint(self) -> None:
+        fields = {
+            "BrowseFlag": "BrowseDirectChildren",
+            "Filter": "res,res@size,res@duration,dc:date,upnp:albumArtURI",
+            "RequestedCount": "0",
+        }
+
+        self.assertEqual(routes_dlna._cds_client_profile({}, fields), "deovr")  # noqa: SLF001
+        self.assertEqual(
+            routes_dlna._cds_client_profile(  # noqa: SLF001
+                {"user-agent": "Mozilla/5.0 [DEO15.6.3755]/meta-store"},
+                {},
+            ),
+            "deovr",
+        )
+        self.assertIsNone(
+            routes_dlna._cds_client_profile(  # noqa: SLF001
+                {"user-agent": "Android/14 UPnP/1.0 Cling/2.0"},
+                fields,
+            )
+        )
+        self.assertIsNone(routes_dlna._cds_client_profile({}, {**fields, "RequestedCount": "999"}))  # noqa: SLF001
+
+    def test_soap_history_fields_keep_deovr_filter(self) -> None:
+        body = (
+            b"<s:Envelope><s:Body><u:Browse>"
+            b"<BrowseFlag>BrowseDirectChildren</BrowseFlag>"
+            b"<Filter>res,res@size,res@duration,dc:date,upnp:albumArtURI</Filter>"
+            b"<RequestedCount>0</RequestedCount>"
+            b"</u:Browse></s:Body></s:Envelope>"
+        )
+
+        fields = routes_dlna._soap_history_fields(body)  # noqa: SLF001
+
+        self.assertEqual(fields["Filter"], "res,res@size,res@duration,dc:date,upnp:albumArtURI")
+        self.assertEqual(routes_dlna._cds_client_profile({}, fields), "deovr")  # noqa: SLF001
+
+    def test_skybox_player_ua_matches_versioned_skybox(self) -> None:
+        # Real Skybox playback path.
+        self.assertTrue(player_compat.is_skybox_player_ua("SKYBOX/2.0.2"))
+        self.assertTrue(player_compat.is_skybox_player_ua("skybox/3.0"))
+        self.assertTrue(player_compat.is_skybox_player_ua("Mozilla/5.0 SkyboxVR libmpv"))
+        # Bare libmpv (Skybox's screenshot prober) is NOT the player UA.
+        self.assertFalse(player_compat.is_skybox_player_ua("libmpv"))
+        self.assertFalse(player_compat.is_skybox_player_ua(""))
+        self.assertFalse(player_compat.is_skybox_player_ua(None))  # type: ignore[arg-type]
+
+    def test_libmpv_screenshot_probe_ua_matches_bare_libmpv_only(self) -> None:
+        # Skybox's bare "libmpv" UA = chapter-thumbnail probe.
+        self.assertTrue(player_compat.is_libmpv_screenshot_probe_ua("libmpv"))
+        self.assertTrue(player_compat.is_libmpv_screenshot_probe_ua("LibMpv"))
+        self.assertTrue(player_compat.is_libmpv_screenshot_probe_ua("  libmpv  "))
+        # Skybox's actual playback UA must not match — it needs the full pipeline.
+        self.assertFalse(player_compat.is_libmpv_screenshot_probe_ua("SKYBOX/2.0.2"))
+        self.assertFalse(player_compat.is_libmpv_screenshot_probe_ua("Mozilla/5.0 SkyboxVR libmpv"))
+        # Real libmpv builds advertise a version or other tokens.
+        self.assertFalse(player_compat.is_libmpv_screenshot_probe_ua("libmpv/0.40.0"))
+        self.assertFalse(player_compat.is_libmpv_screenshot_probe_ua(""))
+        self.assertFalse(player_compat.is_libmpv_screenshot_probe_ua(None))  # type: ignore[arg-type]
 
     def test_lavf_is_side_probe_intent_not_player_class(self) -> None:
         profile = player_compat.match_profile("Lavf/58.45.100")

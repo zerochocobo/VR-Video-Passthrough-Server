@@ -86,6 +86,7 @@ _dir_items_cache: dict[tuple, list[dict]] = {}
 _LIVE_MAX_SIDE = 8192
 _NO_LIVE_PREFIX = "[NoLive] "
 _OFFLINE_PREFIX = "[Offline] "
+_CDS_CLIENT_DEOVR = "deovr"
 
 
 def _parse_bitrate(s: str) -> int:
@@ -389,7 +390,21 @@ def _passthrough_seek_query(mode: str) -> str:
     return _passthrough_live_query(mode)
 
 
-def _live_passthrough_protocol_info() -> str:
+def _is_deovr_cds_client(client_profile: str | None) -> bool:
+    return str(client_profile or "").strip().lower() == _CDS_CLIENT_DEOVR
+
+
+def _live_route_hint_suffix(client_profile: str | None = None) -> str:
+    return "" if _is_deovr_cds_client(client_profile) else ".ts"
+
+
+def _live_passthrough_protocol_info(client_profile: str | None = None) -> str:
+    if _is_deovr_cds_client(client_profile):
+        return (
+            "http-get:*:video/MP2T:DLNA.ORG_PN=HEVC_TS_NA_ISO;"
+            f"DLNA.ORG_OP={DLNA_OP_TIME_SEEK};"
+            f"DLNA.ORG_CI=1;DLNA.ORG_FLAGS={DLNA_FLAGS_TIME_SEEK}"
+        )
     return "http-get:*:video/MP2T:DLNA.ORG_PN=HEVC_TS_NA_ISO;DLNA.ORG_OP=00;DLNA.ORG_CI=1"
 
 
@@ -476,8 +491,8 @@ def _child_count(path: Path) -> int:
         return 0
 
 
-def _video_items(path: Path, parent_id: str) -> list[dict]:
-    return _video_items_from_index(path, parent_id, None)
+def _video_items(path: Path, parent_id: str, client_profile: str | None = None) -> list[dict]:
+    return _video_items_from_index(path, parent_id, None, client_profile=client_profile)
 
 
 def _video_items_from_index(
@@ -485,6 +500,7 @@ def _video_items_from_index(
     parent_id: str,
     child: IndexedChild | None,
     siblings: list[Path] | None = None,
+    client_profile: str | None = None,
 ) -> list[dict]:
     base = f"http://{LAN_IP}:{HTTP_PORT}"
     pt_bps = _parse_bitrate(PASSTHROUGH_BITRATE)
@@ -558,6 +574,8 @@ def _video_items_from_index(
     # seekable passthrough testing is explicitly enabled, add /passthrough_seek
     # beside the live entry instead of replacing it, so unknown or blocked
     # clients still have the stable /passthrough_live fallback visible.
+    live_route_suffix = _live_route_hint_suffix(client_profile)
+    live_omit_filelike_attrs = not _is_deovr_cds_client(client_profile)
     for mode in _passthrough_modes():
         if _seek_passthrough_dlna_enabled():
             query = _passthrough_seek_query(mode)
@@ -600,7 +618,10 @@ def _video_items_from_index(
                     "id": f"{_passthrough_live_item_prefix(mode)}{_versioned_rel(rel)}",
                     "parent_id": parent_id,
                     "title": _passthrough_virtual_title(path, mode, width, height),
-                    "url": f"{base}/passthrough_live/{quoted}" + (f"?{query}" if query else ""),
+                    # The default ``.ts`` suffix is a client-pipeline hint for
+                    # Skybox. DeoVR gets the legacy unsuffixed URL because it
+                    # filters these virtual entries during CDS Browse.
+                    "url": f"{base}/passthrough_live/{quoted}{live_route_suffix}" + (f"?{query}" if query else ""),
                     "thumb": f"{base}/thumb/{quoted}",
                     "size": 0,
                     "duration": duration,
@@ -611,15 +632,15 @@ def _video_items_from_index(
                     "frame_rate": passthrough_frame_rate(source_fps),
                     "passthrough": True,
                     "passthrough_mode": mode,
-                    "protocol_info": _live_passthrough_protocol_info(),
-                    "omit_duration": True,
-                    "omit_bitrate": True,
+                    "protocol_info": _live_passthrough_protocol_info(client_profile),
+                    "omit_duration": live_omit_filelike_attrs,
+                    "omit_bitrate": live_omit_filelike_attrs,
                 }
             )
     return items
 
 
-def _live_chapter_items(path: Path, mode: str) -> list[dict]:
+def _live_chapter_items(path: Path, mode: str, client_profile: str | None = None) -> list[dict]:
     if has_offline_passthrough_output(path):
         return []
     base = f"http://{LAN_IP}:{HTTP_PORT}"
@@ -647,6 +668,8 @@ def _live_chapter_items(path: Path, mode: str) -> list[dict]:
     items: list[dict] = []
     virtual_title = _passthrough_virtual_title(path, mode, width, height)
     suffix = "alpha" if mode == "alpha" else "green"
+    live_route_suffix = _live_route_hint_suffix(client_profile)
+    live_omit_filelike_attrs = not _is_deovr_cds_client(client_profile)
     for offset in _live_chapter_offsets(duration):
         title = f"{_fmt_title_time(offset)}_{virtual_title}"
         remain = max(0.0, duration - float(offset)) if duration > 0 else 0.0
@@ -655,7 +678,8 @@ def _live_chapter_items(path: Path, mode: str) -> list[dict]:
                 "id": f"lt{suffix[0]}_{_versioned_rel(rel)}@{offset}",
                 "parent_id": parent_id,
                 "title": title,
-                "url": f"{base}/passthrough_live/{quoted}?t={offset}" + (f"&{query}" if query else ""),
+                # See note above re: the optional ``.ts`` Skybox pipeline hint.
+                "url": f"{base}/passthrough_live/{quoted}{live_route_suffix}?t={offset}" + (f"&{query}" if query else ""),
                 "thumb": f"{base}/thumb/{quoted}",
                 "size": 0,
                 "duration": remain,
@@ -666,15 +690,15 @@ def _live_chapter_items(path: Path, mode: str) -> list[dict]:
                 "frame_rate": passthrough_frame_rate(source_fps),
                 "passthrough": True,
                 "passthrough_mode": mode,
-                "protocol_info": _live_passthrough_protocol_info(),
-                "omit_duration": True,
-                "omit_bitrate": True,
+                "protocol_info": _live_passthrough_protocol_info(client_profile),
+                "omit_duration": live_omit_filelike_attrs,
+                "omit_bitrate": live_omit_filelike_attrs,
             }
         )
     return items
 
 
-def _children_for_dir(directory: Path) -> list[dict]:
+def _children_for_dir(directory: Path, client_profile: str | None = None) -> list[dict]:
     directory = directory.resolve()
     parent_id = _folder_id(directory)
     items: list[dict] = []
@@ -692,6 +716,7 @@ def _children_for_dir(directory: Path) -> list[dict]:
         int(PASSTHROUGH_LIVE_CHAPTER_MIN_INTERVAL_SEC),
         int(DLNA_IMAGE_ENABLED),
         _DIDL_SCHEMA_VERSION,
+        str(client_profile or ""),
     )
     cached = _dir_items_cache.get(cache_key)
     if cached is not None:
@@ -709,7 +734,7 @@ def _children_for_dir(directory: Path) -> list[dict]:
                 }
             )
         elif child.path.suffix.lower() in VIDEO_EXTS:
-            items.extend(_video_items_from_index(child.path, parent_id, child, sibling_paths))
+            items.extend(_video_items_from_index(child.path, parent_id, child, sibling_paths, client_profile))
         elif DLNA_IMAGE_ENABLED and child.path.suffix.lower() in IMAGE_EXTS:
             items.append(_image_item_from_index(child.path, parent_id, child))
     if len(_dir_items_cache) >= _DIR_ITEMS_CACHE_MAX:
@@ -718,9 +743,9 @@ def _children_for_dir(directory: Path) -> list[dict]:
     return items
 
 
-def _root_items() -> list[dict]:
+def _root_items(client_profile: str | None = None) -> list[dict]:
     if not MEDIA_LIBRARY.multi_root:
-        return _children_for_dir(_root())
+        return _children_for_dir(_root(), client_profile)
     return [
         {
             "container": True,
@@ -941,7 +966,7 @@ def _metadata_didl_for_live(path: Path, mode: str) -> str:
     )
 
 
-def handle_soap(soap_action: str, body: bytes) -> tuple[bytes, int]:
+def handle_soap(soap_action: str, body: bytes, client_profile: str | None = None) -> tuple[bytes, int]:
     action = soap_action.strip('"').split("#")[-1]
     args = _parse_soap_args(body)
 
@@ -957,13 +982,13 @@ def handle_soap(soap_action: str, body: bytes) -> tuple[bytes, int]:
 
         if live is not None:
             live_path, live_mode = live
-            all_items = _live_chapter_items(live_path, live_mode)
+            all_items = _live_chapter_items(live_path, live_mode, client_profile)
         elif object_id == ROOT_ID and MEDIA_LIBRARY.multi_root:
-            all_items = _root_items()
+            all_items = _root_items(client_profile)
         elif directory is None or not directory.is_dir():
             all_items: list[dict] = []
         else:
-            all_items = _children_for_dir(directory)
+            all_items = _children_for_dir(directory, client_profile)
         if flag == "BrowseMetadata":
             if seek is not None:
                 seek_path, seek_mode = seek
@@ -983,7 +1008,7 @@ def handle_soap(soap_action: str, body: bytes) -> tuple[bytes, int]:
                     didl = _metadata_didl_for_live(live_path, live_mode)
                 else:
                     live_items = [
-                        item for item in _video_items(live_path, _folder_id(live_path.parent))
+                        item for item in _video_items(live_path, _folder_id(live_path.parent), client_profile)
                         if item.get("passthrough") and item.get("passthrough_mode") == live_mode
                     ]
                     didl = _metadata_didl_for_item(live_items[0]) if live_items else _didl_for([])

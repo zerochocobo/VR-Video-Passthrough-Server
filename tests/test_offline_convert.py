@@ -4,6 +4,7 @@ import io
 import os
 import shutil
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -32,9 +33,21 @@ class OfflineConvertTests(unittest.TestCase):
         self.assertEqual(convert._single_out(src, alpha_args), Path("sample_matanyone2_S000005_E000505_5M_LR_180_FISHEYE_F180_alpha.mp4"))
         self.assertEqual(convert._single_out(src, all_args, 1920, 1080), Path("sample_rvm1_S000000_ALL_passthrough.mp4"))
 
+    def test_single_segments_output_name_includes_segment_count_and_range(self) -> None:
+        src = Path("sample.mp4")
+        args = SimpleNamespace(command="single", mode="green", engine="rvm_fast")
+        self.assertEqual(
+            convert._single_segments_out(src, args, [(0.0, 15.0), (60.0, 90.0)], 3840, 1920),
+            Path("sample_rvm1_SEG2_S000000_E000130_LR_180_SBS_passthrough.mp4"),
+        )
+
+    def test_segment_arg_parses_hhmmss_range(self) -> None:
+        self.assertEqual(convert._segment_arg("00:01:00-00:01:30"), (60.0, 90.0))
+        with self.assertRaises(Exception):
+            convert._segment_arg("00:01:00-00:00:30")
+
     def test_batch_video_files_skip_passthrough(self) -> None:
-        root = Path("runtime_cache/test_offline_convert")
-        shutil.rmtree(root, ignore_errors=True)
+        root = Path(tempfile.mkdtemp(prefix="pt_offline_convert_"))
         root.mkdir(parents=True, exist_ok=True)
         self.addCleanup(lambda: shutil.rmtree(root, ignore_errors=True))
         (root / "a.mp4").write_text("a", encoding="utf-8")
@@ -236,8 +249,7 @@ class OfflineConvertTests(unittest.TestCase):
         self.assertIn("child-err", err.getvalue())
 
     def test_single_out_dir_uses_default_passthrough_name(self) -> None:
-        root = Path("runtime_cache/test_offline_out_dir")
-        shutil.rmtree(root, ignore_errors=True)
+        root = Path(tempfile.mkdtemp(prefix="pt_offline_out_dir_"))
         (root / "src").mkdir(parents=True, exist_ok=True)
         (root / "out").mkdir(parents=True, exist_ok=True)
         src = root / "src" / "demo.mp4"
@@ -284,6 +296,50 @@ class OfflineConvertTests(unittest.TestCase):
             convert._base_cmd = original_base_cmd
 
         self.assertEqual(seen["out"], (root / "out" / "demo_rvm1_S000500_E000515_15S_LR_180_FISHEYE_F180_alpha.mp4").resolve())
+
+    def test_run_segments_generates_each_part_and_concats(self) -> None:
+        root = Path(tempfile.mkdtemp(prefix="pt_offline_segments_"))
+        (root / "src").mkdir(parents=True, exist_ok=True)
+        (root / "out").mkdir(parents=True, exist_ok=True)
+        src = root / "src" / "demo.mp4"
+        src.write_text("video", encoding="utf-8")
+        self.addCleanup(lambda: shutil.rmtree(root, ignore_errors=True))
+
+        fake_meta = SimpleNamespace(
+            timing=SimpleNamespace(duration=600.0),
+            codec=SimpleNamespace(width=3840, height=1920),
+        )
+        args = SimpleNamespace(
+            command="single",
+            out_dir=str(root / "out"),
+            out="",
+            mode="green",
+            engine="rvm_fast",
+            segments=[(0.0, 15.0), (60.0, 90.0)],
+            skip_existing=False,
+        )
+        seen: dict[str, object] = {"parts": []}
+
+        def fake_run_one(segment_args, src_path):
+            seen["parts"].append((segment_args.start, segment_args.duration, Path(segment_args.out).name))
+            Path(segment_args.out).write_text("part", encoding="utf-8")
+            return 0
+
+        def fake_concat(paths, out, work_dir):
+            seen["concat_paths"] = [Path(path).name for path in paths]
+            seen["out"] = out
+            out.write_text("final", encoding="utf-8")
+            return 0
+
+        gpu_requirement = SimpleNamespace(detected=False, supported=True)
+        with patch.object(convert, "detect_nvidia_gpu_requirement", return_value=gpu_requirement), patch.object(
+            convert, "probe_video_metadata", return_value=fake_meta
+        ), patch.object(convert, "_run_one", side_effect=fake_run_one), patch.object(convert, "_concat_segments", side_effect=fake_concat):
+            self.assertEqual(convert._run_segments(args, src), 0)
+
+        self.assertEqual(seen["parts"], [(0.0, 15.0, "part_001.mp4"), (60.0, 30.0, "part_002.mp4")])
+        self.assertEqual(seen["concat_paths"], ["part_001.mp4", "part_002.mp4"])
+        self.assertEqual(seen["out"], (root / "out" / "demo_rvm1_SEG2_S000000_E000130_LR_180_SBS_passthrough.mp4").resolve())
 
 
 if __name__ == "__main__":

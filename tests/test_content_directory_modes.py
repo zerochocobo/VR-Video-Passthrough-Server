@@ -457,6 +457,58 @@ class ContentDirectoryModeTests(unittest.TestCase):
         self.assertNotIn("bitrate=", didl)
         self.assertIn('resolution="3840x2160"', didl)
 
+    def test_deovr_live_item_uses_legacy_cds_shape(self) -> None:
+        child = SimpleNamespace(
+            size=1024,
+            video=SimpleNamespace(
+                duration=60.0,
+                fps=24.0,
+                width=3840,
+                height=2160,
+                resolution="3840x2160",
+                backend_verdict="pynv_hevc",
+                probe_error="",
+                mkv_needs_fix=False,
+            ),
+        )
+        with (
+            patch.object(cds, "_rel_key", return_value="movie.mp4"),
+            patch.object(cds, "PASSTHROUGH_OUTPUT_MODE", "all"),
+            patch.object(cds, "_uses_live_chapter_container", return_value=False),
+            patch.object(cds, "estimate_for_media", return_value=(0, 20_000_000, None)),
+            patch.object(cds, "find_external_subtitles", return_value=[]),
+        ):
+            live = [
+                item for item in cds._video_items_from_index(Path("movie.mp4"), "0", child, client_profile="deovr")
+                if item.get("passthrough") and item.get("passthrough_mode") == "green"
+            ][0]
+            didl = cds._metadata_didl_for_item(live)
+
+        self.assertIn("/passthrough_live/movie.mp4?mode=green", didl)
+        self.assertNotIn("/passthrough_live/movie.mp4.ts", didl)
+        self.assertIn("DLNA.ORG_OP=10", didl)
+        self.assertIn("DLNA.ORG_FLAGS=41700000000000000000000000000000", didl)
+        self.assertIn('duration="0:01:00.000"', didl)
+        self.assertIn('bitrate="20000000"', didl)
+
+    def test_deovr_live_chapter_items_use_legacy_cds_shape(self) -> None:
+        source = Path("movie.mp4")
+        info = SimpleNamespace(duration=720.0, width=3840, height=2160)
+        with (
+            patch.object(cds, "_rel_key", return_value="movie.mp4"),
+            patch.object(cds, "probe_cached", return_value=info),
+            patch.object(cds, "estimate_for_media", return_value=(0, 20_000_000, None)),
+            patch.object(cds, "_live_chapter_offsets", return_value=[0, 300]),
+        ):
+            didl = cds._didl_for(cds._live_chapter_items(source, "green", client_profile="deovr"))
+
+        self.assertIn("/passthrough_live/movie.mp4?t=0&amp;mode=green", didl)
+        self.assertNotIn("/passthrough_live/movie.mp4.ts", didl)
+        self.assertIn("DLNA.ORG_OP=10", didl)
+        self.assertIn("DLNA.ORG_FLAGS=41700000000000000000000000000000", didl)
+        self.assertIn('duration="0:12:00.000"', didl)
+        self.assertIn('bitrate="20000000"', didl)
+
     def test_didl_res_url_escapes_query_ampersands(self) -> None:
         didl = cds._didl_for(
             [

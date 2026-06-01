@@ -214,6 +214,30 @@ def is_lavf_user_agent(user_agent: str) -> bool:
     return "lavf/" in (user_agent or "").lower()
 
 
+def is_libmpv_screenshot_probe_ua(user_agent: str) -> bool:
+    """Skybox sends a bare ``libmpv`` User-Agent (no version, no other
+    tokens) when it is generating chapter thumbnails: it fires one
+    ``/passthrough_live?t=<chapter>`` request per chapter time-offset in a
+    tight burst, reads only the prefix, then disconnects. The actual Skybox
+    playback path uses ``SKYBOX/x.y.z``. Real mpv builds advertise
+    ``libmpv/<version>`` or include other tokens. Match exactly ``libmpv``
+    (case-insensitive) so only Skybox's probe pattern is diverted.
+    """
+    return (user_agent or "").strip().lower() == "libmpv"
+
+
+def is_skybox_player_ua(user_agent: str) -> bool:
+    """The real Skybox playback path uses ``SKYBOX/x.y.z`` UA. Skybox is
+    strict about DLNA live vs VOD signalling: the same response that other
+    VR players accept (TimeSeekRange + finite duration + chunked transfer
+    without Content-Length) makes Skybox treat the resource as VOD, then
+    fail because the byte-Range/Content-Length VOD contract is not honored.
+    Detect SKYBOX here so the live response can be stripped down to pure-
+    live signalling for it without touching other player paths.
+    """
+    return "skybox" in (user_agent or "").lower()
+
+
 def profile_class_for_route_profile(route_profile: str) -> str:
     if route_profile in {"nplayer"}:
         return PROFILE_NPLAYER_LIKE

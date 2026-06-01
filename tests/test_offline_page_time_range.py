@@ -27,7 +27,7 @@ from PySide6.QtCore import QObject, Signal
 from PySide6.QtWidgets import QApplication
 
 from ui.i18n import I18n
-from ui.pages.offline_page import OfflinePage, _parse_time_text, _resolve_time_range
+from ui.pages.offline_page import OfflinePage, _parse_hhmmss_text, _parse_time_text, _resolve_time_range, _resolve_time_segments
 
 
 class _FakeSettings:
@@ -69,6 +69,11 @@ class OfflinePageTimeRangeTests(unittest.TestCase):
             with self.subTest(value=value):
                 self.assertIsNone(_parse_time_text(value))
 
+    def test_parse_hhmmss_text_requires_three_fields(self) -> None:
+        self.assertEqual(_parse_hhmmss_text("01:02:03"), 3723.0)
+        self.assertIsNone(_parse_hhmmss_text("02:03"))
+        self.assertIsNone(_parse_hhmmss_text("1:60:00"))
+
     def test_custom_end_time_resolves_to_duration(self) -> None:
         start, duration, error = _resolve_time_range(
             "00:01:00",
@@ -102,6 +107,15 @@ class OfflinePageTimeRangeTests(unittest.TestCase):
             "offline.time_error_clip_after_video",
         )
 
+    def test_time_segments_require_order_and_video_bounds(self) -> None:
+        segments, error, row = _resolve_time_segments([(0.0, 60.0), (60.0, 90.0)], 120.0)
+        self.assertEqual(error, "")
+        self.assertEqual(row, 0)
+        self.assertEqual(segments, [(0.0, 60.0), (60.0, 90.0)])
+        self.assertEqual(_resolve_time_segments([(30.0, 30.0)], 120.0)[1], "offline.time_error_segment_order")
+        self.assertEqual(_resolve_time_segments([(0.0, 90.0), (80.0, 100.0)], 120.0)[1], "offline.time_error_segment_overlap")
+        self.assertEqual(_resolve_time_segments([(0.0, 130.0)], 120.0)[1], "offline.time_error_segment_end_after_video")
+
     def test_run_single_converts_custom_end_time_to_duration(self) -> None:
         app = QApplication.instance() or QApplication([])
         with tempfile.TemporaryDirectory() as tmp:
@@ -125,6 +139,36 @@ class OfflinePageTimeRangeTests(unittest.TestCase):
                     args = process.started_args or []
                     self.assertEqual(args[args.index("--start") + 1], "60.0")
                     self.assertEqual(args[args.index("--duration") + 1], "90.0")
+                finally:
+                    page.close()
+                    app.processEvents()
+
+    def test_run_single_uses_configured_time_segments(self) -> None:
+        app = QApplication.instance() or QApplication([])
+        with tempfile.TemporaryDirectory() as tmp:
+            src = Path(tmp) / "input.mp4"
+            src.write_bytes(b"video")
+            process = _FakeProcess()
+            with patch("ui.pages.offline_page.cache_status", return_value="missing"), patch(
+                "ui.pages.offline_page.probe_video_metadata",
+                return_value=SimpleNamespace(timing=SimpleNamespace(duration=600.0)),
+            ):
+                page = OfflinePage(I18n("en_US"), _FakeSettings(), process)
+                try:
+                    page.single_video.setText(str(src))
+                    page.single_time_mode.setCurrentIndex(page.single_time_mode.findData("segments"))
+                    page.single_time_segments = [(0.0, 15.0), (60.0, 90.0)]
+
+                    page.run_single()
+
+                    self.assertIsNotNone(process.started_args)
+                    args = process.started_args or []
+                    self.assertNotIn("--start", args)
+                    self.assertNotIn("--duration", args)
+                    first = args.index("--segment")
+                    self.assertEqual(args[first + 1], "00:00:00-00:00:15")
+                    second = args.index("--segment", first + 2)
+                    self.assertEqual(args[second + 1], "00:01:00-00:01:30")
                 finally:
                     page.close()
                     app.processEvents()

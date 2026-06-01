@@ -10,6 +10,7 @@ import os
 import shutil
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 if __package__ in (None, ""):
@@ -135,6 +136,43 @@ def _duration_tag(seconds: float) -> str:
     return f"{total}S"
 
 
+def _parse_time_text(text: str) -> float | None:
+    value = str(text or "").strip()
+    if not value:
+        return None
+    if ":" not in value:
+        try:
+            seconds = float(value)
+        except ValueError:
+            return None
+        return seconds if seconds >= 0 else None
+    parts = [part.strip() for part in value.split(":")]
+    if len(parts) not in (2, 3) or any(not part.isdigit() for part in parts):
+        return None
+    numbers = [int(part) for part in parts]
+    if len(numbers) == 2:
+        h, m, s = 0, numbers[0], numbers[1]
+    else:
+        h, m, s = numbers
+    if m >= 60 or s >= 60:
+        return None
+    return float(h * 3600 + m * 60 + s)
+
+
+def _segment_arg(text: str) -> tuple[float, float]:
+    value = str(text or "").strip()
+    if "-" not in value:
+        raise argparse.ArgumentTypeError("segment must be START-END")
+    start_text, end_text = value.split("-", 1)
+    start = _parse_time_text(start_text)
+    end = _parse_time_text(end_text)
+    if start is None or end is None:
+        raise argparse.ArgumentTypeError("segment times must use HH:MM:SS, MM:SS, or seconds")
+    if end <= start:
+        raise argparse.ArgumentTypeError("segment end must be later than segment start")
+    return start, end
+
+
 def _single_out(src: Path, args: argparse.Namespace, width: int = 0, height: int = 0) -> Path:
     engine_tag = ENGINE_TAGS[args.engine]
     start_tag = f"S{_time_tag(args.start)}"
@@ -144,6 +182,20 @@ def _single_out(src: Path, args: argparse.Namespace, width: int = 0, height: int
         base = f"{src.stem}_{engine_tag}_{start_tag}_{end_tag}_{duration_tag}"
     else:
         base = f"{src.stem}_{engine_tag}_{start_tag}_{duration_tag}"
+    return src.with_name(f"{offline_passthrough_stem(base, args.mode, width, height)}.mp4")
+
+
+def _single_segments_out(
+    src: Path,
+    args: argparse.Namespace,
+    segments: list[tuple[float, float]],
+    width: int = 0,
+    height: int = 0,
+) -> Path:
+    engine_tag = ENGINE_TAGS[args.engine]
+    start_tag = f"S{_time_tag(segments[0][0])}"
+    end_tag = f"E{_time_tag(segments[-1][1])}"
+    base = f"{src.stem}_{engine_tag}_SEG{len(segments)}_{start_tag}_{end_tag}"
     return src.with_name(f"{offline_passthrough_stem(base, args.mode, width, height)}.mp4")
 
 
@@ -291,6 +343,121 @@ def _run_one(args: argparse.Namespace, src: Path) -> int:
     return run_hidden_streaming(cmd, cwd=ROOT, env=env, exit_label="offline")
 
 
+def _validate_segments(segments: list[tuple[float, float]], total_duration: float = 0.0) -> str:
+    if not segments:
+        return "at least one segment is required"
+    previous_end = -1.0
+    for index, (start, end) in enumerate(segments, 1):
+        if start < 0:
+            return f"segment {index} start must be greater than or equal to 0"
+        if end <= start:
+            return f"segment {index} end must be later than start"
+        if total_duration > 0 and start > total_duration + 1e-3:
+            return f"segment {index} start is later than source duration {_time_tag(total_duration)}"
+        if total_duration > 0 and end > total_duration + 1e-3:
+            return f"segment {index} end is later than source duration {_time_tag(total_duration)}"
+        if index > 1 and start < previous_end - 1e-3:
+            return f"segment {index} overlaps the previous segment"
+        previous_end = end
+    return ""
+
+
+def _concat_file_line(path: Path) -> str:
+    text = str(path.resolve()).replace("\\", "/").replace("'", "\\'")
+    return f"file '{text}'"
+
+
+def _concat_segments(segment_paths: list[Path], out: Path, work_dir: Path) -> int:
+    ffmpeg = shutil.which("ffmpeg") or "ffmpeg"
+    list_path = work_dir / "concat.txt"
+    list_path.write_text("\n".join(_concat_file_line(path) for path in segment_paths) + "\n", encoding="utf-8")
+    cmd = [
+        ffmpeg,
+        "-hide_banner",
+        "-y",
+        "-f",
+        "concat",
+        "-safe",
+        "0",
+        "-i",
+        str(list_path),
+        "-c",
+        "copy",
+        "-movflags",
+        "+faststart",
+        str(out),
+    ]
+    print("[offline] concat=" + subprocess.list2cmdline(cmd), flush=True)
+    proc = subprocess.run(
+        cmd,
+        cwd=ROOT,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+        **hidden_subprocess_kwargs(),
+    )
+    if proc.stdout.strip():
+        print(proc.stdout.strip()[-2000:], flush=True)
+    if proc.stderr.strip():
+        print("[concat stderr]", flush=True)
+        print(proc.stderr.strip()[-2000:], flush=True)
+    print(f"[offline] concat_rc={proc.returncode}", flush=True)
+    return int(proc.returncode)
+
+
+def _run_segments(args: argparse.Namespace, src: Path) -> int:
+    segments = list(getattr(args, "segments", []) or [])
+    gpu_requirement = detect_nvidia_gpu_requirement()
+    if gpu_requirement.detected and not gpu_requirement.supported:
+        print(f"[offline] ERROR: {unsupported_gpu_message(gpu_requirement)}", flush=True)
+        return 3
+    meta = probe_video_metadata(src)
+    total_duration = float(meta.timing.duration or 0.0)
+    error = _validate_segments(segments, total_duration)
+    if error:
+        print(f"[offline] ERROR: invalid time segments: {error}", flush=True)
+        return 2
+    width = int(getattr(meta.codec, "width", 0) or 0)
+    height = int(getattr(meta.codec, "height", 0) or 0)
+    default_out = _single_segments_out(src, args, segments, width, height)
+    if getattr(args, "out_dir", ""):
+        out = Path(args.out_dir).resolve() / default_out.name
+    else:
+        out = Path(args.out).resolve() if args.out else default_out
+    if out.exists() and args.skip_existing:
+        print(f"[offline] skip existing: {out}")
+        return 0
+    out.parent.mkdir(parents=True, exist_ok=True)
+    print(
+        f"[offline] segment merge: parts={len(segments)} out={out}",
+        flush=True,
+    )
+    with tempfile.TemporaryDirectory(prefix=f".{out.stem}_segments_", dir=out.parent) as tmp:
+        tmp_dir = Path(tmp)
+        segment_paths: list[Path] = []
+        for index, (start, end) in enumerate(segments, 1):
+            part_out = tmp_dir / f"part_{index:03d}.mp4"
+            segment_paths.append(part_out)
+            segment_args = argparse.Namespace(**vars(args))
+            segment_args.start = float(start)
+            segment_args.duration = float(end - start)
+            segment_args.out = str(part_out)
+            segment_args.out_dir = ""
+            segment_args.segments = []
+            segment_args.skip_existing = False
+            print(
+                f"[offline] segment {index}/{len(segments)}: "
+                f"{_time_tag(start)}-{_time_tag(end)} duration={end - start:.3f}s",
+                flush=True,
+            )
+            rc = _run_one(segment_args, src)
+            if rc != 0:
+                print(f"[offline] segment {index}/{len(segments)} failed rc={rc}", flush=True)
+                return rc
+        return _concat_segments(segment_paths, out, tmp_dir)
+
+
 def _gpu_vram_gb() -> float:
     exe = shutil.which("nvidia-smi")
     if not exe:
@@ -320,6 +487,7 @@ def main(argv: list[str] | None = None) -> int:
     single.add_argument("--engine", choices=sorted(ENGINES), default="rvm_fast")
     single.add_argument("--start", type=float, default=0.0)
     single.add_argument("--duration", type=float, default=0.0)
+    single.add_argument("--segment", dest="segments", type=_segment_arg, action="append", default=[], metavar="START-END")
     single.add_argument("--fps", type=float, default=RVM_DEFAULT_ARGS["fps"])
     single.add_argument("--input-size", type=int, default=RVM_DEFAULT_ARGS["input_size"])
     single.add_argument("--rvm-downsample-ratio", type=float, default=RVM_DEFAULT_ARGS["downsample_ratio"])
@@ -356,6 +524,8 @@ def main(argv: list[str] | None = None) -> int:
             print(f"[offline] insufficient GPU VRAM: detected={vram:.1f}GB required=16GB", flush=True)
             return 2
     if args.command == "single":
+        if getattr(args, "segments", None):
+            return _run_segments(args, Path(args.video).resolve())
         return _run_one(args, Path(args.video).resolve())
 
     root = Path(args.directory).resolve()

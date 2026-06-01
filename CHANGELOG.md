@@ -4,6 +4,33 @@ This file only keeps version releases, major bug fixes, major UI/UX updates, and
 
 ## English
 
+### 2026-06-01
+
+- **v0.1.0 released.**
+- **Skybox live playback fix:** DLNA passthrough-live URLs now append a `.ts` route-hint suffix so Skybox selects its MPEG-TS pipeline instead of rejecting TS bytes behind an `.mp4` URL. The live route strips `.ts`, `.m2ts`, and `.mpegts` before source lookup, keeping older cached URLs and other clients compatible.
+- **Skybox/libmpv probe guard:** Bare `libmpv` screenshot probes now return `503` before acquiring a slot, starting GPU work, or draining an active session. Same-key libmpv startup requests are debounced, and same-owner preemption no longer closes already-built realtime streams or `LiveSession` objects.
+
+### 2026-05-31
+
+- **Offline single-video UI update:** Renamed the single-video tab away from test wording, added a mode selector for start/duration versus time-slice merge, and added persisted `HH:MM:SS` slice configuration with validation.
+- **Offline segment merge:** `offline.convert single --segment START-END` can now process multiple configured time slices through the existing offline pipeline and concatenate the generated MP4 parts into one final output with FFmpeg concat copy.
+
+### 2026-05-30
+
+- **Startup crash fix:** Media directory parsing now skips unresolvable Windows cloud/rclone roots such as PikPak mounts instead of crashing UI startup or backend config import. Other valid local media folders continue to load.
+
+### 2026-05-29
+
+- **Offline single-video time controls:** Added a custom end-time option with video-duration probing and validation, then converted it to the existing `--start` and `--duration` offline command contract. English, Chinese, and Japanese translations were added.
+- **Offline output naming:** Positive-duration single-video outputs now include an end-time tag such as `S000500_E000615_75S`, while generated-output detection still accepts legacy start-duration names.
+- **DLNA image browse test switch:** Added a disabled-by-default `PT_DLNA_IMAGE_ENABLED` / UI setting for optional DLNA image browsing tests, including image MIME/protocol advertisement, DIDL image items, and `/media` serving for supported image formats.
+
+### 2026-05-28
+
+- **Realtime concurrency update:** Replaced the process-wide Matter singleton with a lazy Matter pool, added adaptive `PT_PASSTHROUGH_MAX_CONCURRENT=auto` based on NVIDIA VRAM, and wired live and non-live passthrough routes to acquire and release per-stream Matter instances without recurrent-state crosstalk or deadlock.
+- **Seekable passthrough Stage 1:** Added the opt-in `/passthrough_seek/{name}` route, byte-range-to-time mapping, virtual MPEG-TS declared-size handling, UA/profile guards, and additive DLNA seek items behind explicit enable/DLNA switches while leaving existing live routes untouched.
+- **DLNA/player compatibility diagnostics:** Added request-history middleware, redacted JSONL dumps, trace IDs, localhost debug endpoints, and shadow profile/intent/decision classification for DLNA, media, and passthrough requests without changing playback behavior.
+
 ### 2026-05-27
 
 - **v0.1.0-beta.6 released.**
@@ -14,6 +41,7 @@ This file only keeps version releases, major bug fixes, major UI/UX updates, and
 - **UI update:** Added a 50 FPS realtime output option between 40 and 60, exposed MatAnyone2 offline precision as `512` and `1024` with `1024` still selected by default, and kept the offline recognition choices to YOLO26m-EfficientSAM and SAM3.
 - **Offline/DLNA cleanup:** DLNA now marks generated passthrough outputs with an `[Offline]` title prefix, and offline passthrough cleans temporary `.aac` audio sidecars on success, failure, and early prepass exits.
 - **Documentation update:** Updated the EfficientSAM, YOLO26m, and MatAnyone2 model setup notes for the current YOLO26m-EfficientSAM-MatAnyone2 pipeline, FP32 YOLO26m default, and MatAnyone2 `512`/`1024` TensorRT requirements.
+- **TensorRT UI fix:** TensorRT cache build progress now counts MatAnyone2 `512` and `1024` as two model-build units and caps realtime RVM, offline RVM, and MatAnyone2 progress at 99% until the child process exits successfully, avoiding premature 100% completion during finalization.
 
 ### 2026-05-26
 
@@ -176,6 +204,33 @@ This file only keeps version releases, major bug fixes, major UI/UX updates, and
 
 ## 中文
 
+### 2026-06-01
+
+- **v0.1.0 发布。**
+- **Skybox 实时播放修复：** DLNA 广播的 passthrough-live URL 末尾追加 `.ts` 路由提示后缀，避免 Skybox 因 `.mp4` URL 选择 MP4 pipeline 后拒绝实际 MPEG-TS 字节；路由端会在查找源文件前剥离 `.ts`、`.m2ts` 和 `.mpegts`，旧缓存 URL 与其它客户端保持兼容。
+- **Skybox/libmpv 探测保护：** 纯 `libmpv` UA 的截图探测现在会在占用 slot、启动 GPU 工作或读取现有 live session 前快速返回 `503`；libmpv 同 live key 启动请求会 debounce，same-owner preempt 也不再关闭已经构建完成的实时流或 `LiveSession`。
+
+### 2026-05-31
+
+- **离线单视频 UI 更新：** 单视频页签移除“测试”措辞，时间行新增“开始时间和时长”与“时间片段合并”模式选择，并加入可持久化的 `HH:MM:SS` 片段配置和校验。
+- **离线片段合并：** `offline.convert single --segment START-END` 现在支持多个时间片段复用现有离线链路生成分段 MP4，再通过 FFmpeg concat copy 合并为一个最终输出。
+
+### 2026-05-30
+
+- **启动崩溃修复：** 媒体目录解析现在会跳过无法 `resolve()` 的 Windows 云盘/rclone 根目录（如 PikPak 挂载），不再让 UI 启动或后端 `config.py` 导入崩溃；其它有效本地媒体目录继续可用。
+
+### 2026-05-29
+
+- **离线单视频时间控制：** 新增自定义结束时间选项，启动前会探测视频时长并校验开始、结束和时长范围，再转换为现有 `--start` 与 `--duration` 离线命令参数；同步新增英文、中文和日文翻译。
+- **离线输出命名：** 带正时长的单视频输出文件名现在包含结束时间标记，例如 `S000500_E000615_75S`；旧的开始时间加时长命名仍可被识别为生成的离线输出。
+- **DLNA 图片浏览测试开关：** 新增默认关闭的 `PT_DLNA_IMAGE_ENABLED` / UI 设置，用于可选 DLNA 图片浏览测试；启用时支持图片 MIME/protocol 广播、DIDL 图片项，以及 `/media` 对支持图片格式的服务。
+
+### 2026-05-28
+
+- **实时并发更新：** 将进程级 Matter singleton 替换为惰性 Matter 池，新增按 NVIDIA 显存解析的 `PT_PASSTHROUGH_MAX_CONCURRENT=auto`，并让 live 与 non-live passthrough 按流 acquire/release Matter，避免并发串用循环状态或死锁。
+- **可 seek passthrough 阶段 1：** 新增 opt-in 的 `/passthrough_seek/{name}` 路由、byte range 到时间的映射、虚拟 MPEG-TS 大小处理、UA/profile 保护，以及由显式 enable/DLNA 开关控制的附加 DLNA seek 条目；原 live 路由保持不变。
+- **DLNA/播放器兼容诊断：** 新增请求历史 middleware、脱敏 JSONL、trace id、本机 debug endpoint，以及对 DLNA、media、passthrough 请求的影子 profile/intent/decision 分类；当前仅观察审计，不改变播放行为。
+
 ### 2026-05-27
 
 - **v0.1.0-beta.6 发布。**
@@ -186,6 +241,7 @@ This file only keeps version releases, major bug fixes, major UI/UX updates, and
 - **UI 更新：** 首页实时输出 FPS 在 40 和 60 之间新增 50；离线 MatAnyone2 精度显示 `512` 与 `1024`，默认仍选 `1024`；离线识别模型只保留 YOLO26m-EfficientSAM 和 SAM3。
 - **离线/DLNA 清理：** DLNA 对已生成的离线 passthrough 输出增加 `[Offline]` 虚拟标题前缀；离线 passthrough 在成功、失败和前置识别提前退出时都会清理临时 `.aac` 音频 sidecar。
 - **文档更新：** 更新 EfficientSAM、YOLO26m、MatAnyone2 模型准备说明，匹配当前 YOLO26m-EfficientSAM-MatAnyone2 链路、YOLO26m FP32 默认模型，以及 MatAnyone2 `512`/`1024` TensorRT 要求。
+- **TensorRT UI 修复：** TensorRT cache 构建进度现在把 MatAnyone2 `512` 和 `1024` 只计为两个模型构建单元，并让实时 RVM、离线 RVM 和 MatAnyone2 在子进程成功退出前最高显示 99%，避免 finalization 期间过早显示 100%。
 
 ### 2026-05-26
 

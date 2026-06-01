@@ -78,6 +78,7 @@ from utils.byte_seek_map import map_byte_start_to_time
 from utils.logger import get
 from utils.player_compat import (
     is_lavf_user_agent,
+    is_libmpv_screenshot_probe_ua,
     is_nplayer_user_agent,
     live_response_profile_from_ua,
 )
@@ -410,7 +411,29 @@ class LiveSession:
                 if _live_sessions.get(self.key) is self:
                     _live_sessions.pop(self.key, None)
 
-    async def subscribe(self, rid: int, *, primary: bool | None = None):
+    async def subscribe(
+        self,
+        rid: int,
+        *,
+        primary: bool | None = None,
+        snapshot_only: bool = True,
+    ):
+        """Subscribe to this LiveSession.
+
+        ``primary=True`` participants back-pressure the producer via a
+        blocking ``queue.put`` in ``_publish``; non-primary participants are
+        added with ``put_nowait`` and silently dropped if their queue fills,
+        so they can never stall the producer.
+
+        ``snapshot_only=True`` (the default for non-primary subscribers)
+        means the subscriber receives the current cache prefix and then
+        ends. This is the 2026-05-10 behaviour: it stops Skybox/libmpv's
+        duplicate-startup GETs from competing for the same Wi-Fi link as
+        the primary decoder connection, which on an 8K SBS HEVC alpha link
+        is already bandwidth-limited. A 3-way bandwidth split made the
+        primary drop below realtime (22fps instead of 30fps) and produced
+        a permanent loading spinner on Skybox — see HANDOVER 2026-05-31.
+        """
         self.last_used = asyncio.get_running_loop().time()
         if self.expire_task is not None:
             self.expire_task.cancel()
@@ -424,11 +447,12 @@ class LiveSession:
                 self.subscribers.add(subscriber)
             snapshot = bytes(self.cache)
         log.info(
-            "passthrough_live[%d] live cache subscribe: key=%s snapshot=%d primary=%s closed=%s subscribers=%d",
+            "passthrough_live[%d] live cache subscribe: key=%s snapshot=%d primary=%s snapshot_only=%s closed=%s subscribers=%d",
             rid,
             _live_session_log_key(self.key),
             len(snapshot),
             subscriber.primary,
+            snapshot_only,
             self.closed,
             len(self.subscribers),
         )
@@ -442,9 +466,9 @@ class LiveSession:
                     if self.send_pacing:
                         await _pace_live_send(pace_start, sent, self.send_bps)
                     yield chunk
-            if not subscriber.primary:
+            if snapshot_only and not subscriber.primary:
                 log.info(
-                    "passthrough_live[%d] live cache duplicate snapshot complete: key=%s sent=%d",
+                    "passthrough_live[%d] live cache snapshot-only complete: key=%s sent=%d",
                     rid,
                     _live_session_log_key(self.key),
                     sent,
@@ -612,13 +636,19 @@ def _can_preempt_owner(active_owner: tuple, new_owner: tuple) -> bool:
     if active_owner == new_owner:
         kind = _owner_kind(new_owner)
         if is_live_owner:
-            return kind in ("nplayer", "4xvr", "avpro")
+            # libmpv same-owner preempt is safe because same-live_key duplicates
+            # are caught earlier by the libmpv startup debounce in
+            # passthrough_live_get and join via subscribe(primary=False).
+            # Reaching this point means different-live_key (typically a
+            # different t= chapter probe from the same Skybox client) and the
+            # old slot should yield to the newer probe.
+            return kind in ("nplayer", "4xvr", "avpro", "libmpv")
         return kind in ("", "libmpv", "vlc", "nplayer", "seek")
     if _owner_base(active_owner) != new_base:
         return False
     active_kind = _owner_kind(active_owner)
     new_kind = _owner_kind(new_owner)
-    if is_live_owner and new_kind in ("nplayer", "4xvr", "avpro"):
+    if is_live_owner and new_kind in ("nplayer", "4xvr", "avpro", "libmpv"):
         return True
     if active_kind == "lavf" and new_kind in ("vlc", "libmpv"):
         return True
@@ -730,6 +760,15 @@ async def runtime_status():
     return status
 
 
+def _is_real_active_stream(active_stream: object) -> bool:
+    """True when active_stream is a real producer (PyNvPassthroughStream or
+    LiveSession), False when it is the raw slot_token placeholder returned by
+    object() during slot acquisition. Slot_tokens have no close(); real
+    producers always expose a callable close().
+    """
+    return callable(getattr(active_stream, "close", None))
+
+
 async def _take_active_slot(
     new_stream: object,
     who: str,
@@ -751,6 +790,15 @@ async def _take_active_slot(
                     can_preempt = allow_same_owner_preempt and _can_preempt_owner(active_owner, owner)
                     if allow_same_client_preempt:
                         can_preempt = can_preempt or _can_preempt_same_client_for_seek_test(active_owner, owner)
+                    if can_preempt and active_owner == owner and _is_real_active_stream(active_stream):
+                        # Same-owner preempt of a real in-flight producer would
+                        # kill its build / iter_bytes mid-stream and turn into
+                        # 409/503 for that request — the failure mode seen when
+                        # a Skybox chapter-probe burst cascades through N libmpv
+                        # requests. Only raw slot_tokens may be preempted by
+                        # same-owner; established producers wait/503 instead so
+                        # the working stream stays intact.
+                        can_preempt = False
                     if can_preempt:
                         del _active_streams[active_stream]
                         _active_started.pop(active_stream, None)
@@ -847,6 +895,33 @@ def _safe_video_path_from_key(name: str) -> Path:
 
 def _safe_video_path(name: str) -> Path:
     return _safe_video_path_from_key(unquote(name))
+
+
+# Suffixes that the live route silently strips from the URL path before
+# resolving the underlying source file. Skybox/2.0.x (and reportedly older
+# Skybox builds) pick their HTTP playback pipeline from the URL file
+# extension: a request to ``/passthrough_live/<...>.mp4`` is routed to the
+# MP4 byte-range pipeline (pipeline=basic in Skybox debug), the MP4 parser
+# then finds no ftyp/moov atoms in our MPEG-TS bytes and the entire
+# response is dropped — Skybox's debug overlay shows zero network traffic
+# even though the server clearly delivered megabytes. Appending ``.ts`` to
+# the DLNA URL pushes Skybox onto its TS pipeline. Compliant clients (4XVR,
+# HereSphere, nPlayer, VLC) ignore the URL extension and key off
+# Content-Type, so the extra suffix is harmless there.
+_LIVE_ROUTE_HINT_SUFFIXES = (".ts", ".m2ts", ".mpegts")
+
+
+def _strip_live_route_hint_suffix(name: str) -> str:
+    """Drop an optional MPEG-TS pipeline hint suffix from the URL path. See
+    ``_LIVE_ROUTE_HINT_SUFFIXES``. The suffix is treated as a client hint
+    only; the file lookup uses the original source filename.
+    """
+    decoded = unquote(name)
+    lower = decoded.lower()
+    for suffix in _LIVE_ROUTE_HINT_SUFFIXES:
+        if lower.endswith(suffix):
+            return decoded[: -len(suffix)]
+    return decoded
 
 
 def _is_image_path(path: Path) -> bool:
@@ -1774,6 +1849,11 @@ async def passthrough_live_get(
     get_content_features: str | None = Header(default=None, alias="getcontentFeatures.dlna.org"),
 ):
     rid = next(_request_ids)
+    # Skybox keys its HTTP pipeline on the URL extension; we advertise the
+    # live URL with a ``.ts`` suffix so its TS pipeline activates. Strip
+    # the suffix here so the source-file lookup still resolves the real
+    # ``.mp4`` (or other source) on disk.
+    name = _strip_live_route_hint_suffix(name)
     path = _safe_video_path(name)
     annotate_request(request, media_name=path.name, media_path=str(path), passthrough_route="live")
     try:
@@ -1904,6 +1984,34 @@ async def passthrough_live_get(
             rid, range_header, path.name,
         )
         return Response("passthrough live active", status_code=409, headers={"Retry-After": "1"})
+    # Skybox fires bare "libmpv" UA chapter-thumbnail probes for every
+    # time-sliced DLNA item the moment the file is opened. Real chapter
+    # thumbnails come from /thumb (returns JPEG); the libmpv probes here
+    # are just connectivity checks Skybox does as a side-effect.
+    #
+    # We must NOT serve them from the existing playback session's cache
+    # snapshot: 8K SBS HEVC alpha has a 30MB-class prefix, and a burst of
+    # ~10 probes will dump 300MB into Wi-Fi at once, starving the real
+    # SKYBOX UA playback connection. Pcap evidence: bandwidth-split made
+    # the primary fall from 30fps target to 17fps actual, locking the
+    # player on a permanent loading spinner.
+    #
+    # The probes are user-confirmed discardable. Always fast-fail 503 so
+    # they never reserve a slot, start GPU work, or consume bandwidth.
+    # SKYBOX/x.y.z UA — the real playback path — is unaffected.
+    if is_libmpv_screenshot_probe_ua(user_agent):
+        annotate_request(request, screenshot_probe=True)
+        log.info(
+            "passthrough_live[%d] libmpv screenshot probe rejected (preserves bandwidth for real playback): key=%s",
+            rid,
+            _live_session_log_key(live_key),
+        )
+        return Response(
+            "passthrough live screenshot probe rejected",
+            status_code=503,
+            headers={"Retry-After": "1"},
+        )
+
     cached_session = await _get_live_session(live_key)
     if cached_session is not None:
         async with cached_session.lock:
@@ -1924,7 +2032,16 @@ async def passthrough_live_get(
         )
     await _close_idle_live_sessions_for_request(live_key, rid)
     live_starting_at: float | None = None
-    if is_nplayer:
+    # libmpv/Skybox enables same-owner preempt below for different-t chapter
+    # probes. Same-live_key duplicates must NOT take that path; they need to
+    # wait briefly for the in-flight starter to register a LiveSession and
+    # then join via subscribe(primary=False). Without this debounce, a near-
+    # simultaneous duplicate GET would race past _get_live_session, fall into
+    # _take_active_slot, and preempt the original starter before it produces
+    # any bytes — the failure mode HANDOVER 2026-05-10 warned about.
+    needs_startup_debounce = is_nplayer or live_profile == "libmpv"
+    if needs_startup_debounce:
+        debounce_label = "nPlayer" if is_nplayer else "libmpv"
         now = asyncio.get_running_loop().time()
         async with _live_session_lock:
             started_at = _live_starting.get(live_key)
@@ -1939,8 +2056,9 @@ async def passthrough_live_get(
                 cached_session = await _get_live_session(live_key)
                 if cached_session is not None:
                     log.info(
-                        "passthrough_live[%d] nPlayer duplicate startup joined cache: key=%s age=%.3fs",
+                        "passthrough_live[%d] %s duplicate startup joined cache: key=%s age=%.3fs",
                         rid,
+                        debounce_label,
                         _live_session_log_key(live_key),
                         asyncio.get_running_loop().time() - started_at,
                     )
@@ -1955,8 +2073,9 @@ async def passthrough_live_get(
                 still_starting = _live_starting.get(live_key) == started_at
             if still_starting:
                 log.info(
-                    "passthrough_live[%d] return 409 nPlayer duplicate startup still pending: key=%s age=%.3fs",
+                    "passthrough_live[%d] return 409 %s duplicate startup still pending: key=%s age=%.3fs",
                     rid,
+                    debounce_label,
                     _live_session_log_key(live_key),
                     asyncio.get_running_loop().time() - started_at,
                 )
@@ -1966,15 +2085,19 @@ async def passthrough_live_get(
         live_starting_at = now
 
     slot_token = object()
-    # nPlayer does not reliably notify the server when the user leaves a live
-    # item, so only nPlayer may replace an old live stream from the same device.
-    # Other players keep their narrower duplicate-request/session behavior.
+    # nPlayer, 4xvr/avpro, and libmpv may replace an old live stream from the
+    # same device. nPlayer does not reliably notify the server when the user
+    # leaves a live item; libmpv/Skybox sends bursts of different-t chapter
+    # probes that would otherwise queue 10s and 503. Same-live_key duplicates
+    # for these profiles are caught earlier by the startup debounce above and
+    # join via subscribe(primary=False), so reaching this point with a same-
+    # owner active slot means a genuinely different request that should win.
     owner = ("live", client_host, live_profile)
     preempted = await _take_active_slot(
         slot_token,
         who=f"live:{path.name}@{t:.2f}s",
         owner=owner,
-        allow_same_owner_preempt=is_nplayer or live_profile in {"4xvr", "avpro"},
+        allow_same_owner_preempt=is_nplayer or live_profile in {"4xvr", "avpro", "libmpv"},
         allow_same_client_preempt=PASSTHROUGH_SEEK_ENABLED,
     )
     if preempted is False:
@@ -2098,6 +2221,7 @@ async def passthrough_live_get(
             "DLNA.ORG_CI=1;"
             f"DLNA.ORG_FLAGS={DLNA_FLAGS_TIME_SEEK}"
         )
+
     log.info(
         "passthrough_live[%d] response: profile=%s status=%s backend=%s verdict=%s ignored_range=%r live_total_est=%d send_bps=%d send_pacing=%s headers=%s",
         rid,

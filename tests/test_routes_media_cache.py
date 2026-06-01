@@ -60,7 +60,11 @@ class ExistingPassthroughStrategyCharacterizationTests(unittest.TestCase):
 
         self.assertTrue(routes_media._can_preempt_owner(("live", "client", "nplayer"), ("live", "client", "nplayer")))
         self.assertTrue(routes_media._can_preempt_owner(("live", "client", "4xvr"), ("live", "client", "4xvr")))
-        self.assertFalse(routes_media._can_preempt_owner(("live", "client", "libmpv"), ("live", "client", "libmpv")))
+        # libmpv same-owner preempt is enabled; same-live_key duplicates are
+        # caught earlier by the libmpv startup debounce in
+        # passthrough_live_get, so reaching the slot path means a different
+        # request that should win (typically a different t= chapter probe).
+        self.assertTrue(routes_media._can_preempt_owner(("live", "client", "libmpv"), ("live", "client", "libmpv")))
         self.assertTrue(routes_media._can_preempt_owner(("live", "client", "vlc"), ("live", "client", "nplayer")))
         self.assertFalse(routes_media._can_preempt_owner(("live", "client-a", "nplayer"), ("live", "client-b", "nplayer")))
         self.assertTrue(routes_media._can_preempt_owner(("live", "client", "lavf"), ("live", "client", "vlc")))
@@ -1021,6 +1025,14 @@ class LiveProfileTests(unittest.TestCase):
         owner = ("live", "192.168.31.112", "4xvr")
         self.assertTrue(routes_media._can_preempt_owner(owner, owner))
 
+    def test_libmpv_live_owner_can_preempt_same_device(self) -> None:
+        # Skybox/libmpv chapter probes hit different live_keys (different t=),
+        # so same-owner preempt is required to avoid 10s busy-wait pile-up.
+        # Same-live_key duplicates are kept safe by the libmpv startup debounce
+        # in passthrough_live_get.
+        owner = ("live", "192.168.31.112", "libmpv")
+        self.assertTrue(routes_media._can_preempt_owner(owner, owner))
+
     def test_owner_log_value_hides_local_path_and_client_ip(self) -> None:
         owner = (r"G:\VR\private_movie.mp4", "192.168.31.112")
         text = str(routes_media._owner_log_value(owner))
@@ -1038,6 +1050,353 @@ class LiveProfileTests(unittest.TestCase):
         self.assertIn("vlc", text)
         self.assertIn("client-", text)
         self.assertNotIn("192.168.31.112", text)
+
+
+class LibmpvLivePreemptTests(unittest.TestCase):
+    """Regression: Skybox/libmpv chapter probe bursts must not pile up behind
+    a stale active slot, while same-live_key duplicates must still join the
+    existing LiveSession instead of preempting the original starter.
+    """
+
+    def _run(self, coro):
+        return asyncio.run(coro)
+
+    def test_take_active_slot_lets_libmpv_preempt_prior_same_owner_slot(self) -> None:
+        old_stream = object()
+        new_stream = object()
+        owner = ("live", "192.168.31.112", "libmpv")
+        original_streams = dict(routes_media._active_streams)
+        original_started = dict(routes_media._active_started)
+        original_matter = dict(routes_media._active_matter)
+        routes_media._active_streams.clear()
+        routes_media._active_started.clear()
+        routes_media._active_matter.clear()
+        routes_media._active_streams[old_stream] = owner
+
+        try:
+            with patch.object(routes_media, "PASSTHROUGH_MAX_CONCURRENT", 1):
+                result = self._run(
+                    routes_media._take_active_slot(
+                        new_stream,
+                        "live:sample.mp4@720.00s",
+                        owner,
+                        allow_same_owner_preempt=True,
+                        allow_same_client_preempt=False,
+                    )
+                )
+            self.assertIs(result, old_stream)
+            self.assertIn(new_stream, routes_media._active_streams)
+            self.assertNotIn(old_stream, routes_media._active_streams)
+        finally:
+            routes_media._active_streams.clear()
+            routes_media._active_started.clear()
+            routes_media._active_matter.clear()
+            routes_media._active_streams.update(original_streams)
+            routes_media._active_started.update(original_started)
+            routes_media._active_matter.update(original_matter)
+
+    def test_take_active_slot_refuses_to_preempt_real_same_owner_producer(self) -> None:
+        """Regression: a Skybox chapter-probe burst must not kill a libmpv
+        producer that has already started building or serving bytes. Only raw
+        slot_tokens (object()) may be preempted by same-owner; a real producer
+        (PyNvPassthroughStream or LiveSession surrogate with .close()) is
+        protected and the new request must fall through to the wait/503 path.
+        """
+
+        class _FakeRealStream:
+            def close(self) -> None:
+                pass
+
+        old_real_stream = _FakeRealStream()
+        new_stream = object()
+        owner = ("live", "192.168.31.112", "libmpv")
+        original_streams = dict(routes_media._active_streams)
+        original_started = dict(routes_media._active_started)
+        original_matter = dict(routes_media._active_matter)
+        routes_media._active_streams.clear()
+        routes_media._active_started.clear()
+        routes_media._active_matter.clear()
+        routes_media._active_streams[old_real_stream] = owner
+
+        try:
+            with (
+                patch.object(routes_media, "PASSTHROUGH_MAX_CONCURRENT", 1),
+                patch.object(routes_media, "PASSTHROUGH_BUSY_WAIT_SEC", 0),
+            ):
+                result = self._run(
+                    routes_media._take_active_slot(
+                        new_stream,
+                        "live:sample.mp4@720.00s",
+                        owner,
+                        allow_same_owner_preempt=True,
+                        allow_same_client_preempt=False,
+                    )
+                )
+            self.assertIs(result, False)
+            self.assertIn(old_real_stream, routes_media._active_streams)
+            self.assertNotIn(new_stream, routes_media._active_streams)
+        finally:
+            routes_media._active_streams.clear()
+            routes_media._active_started.clear()
+            routes_media._active_matter.clear()
+            routes_media._active_streams.update(original_streams)
+            routes_media._active_started.update(original_started)
+            routes_media._active_matter.update(original_matter)
+
+    def test_take_active_slot_returns_busy_for_libmpv_without_preempt_flag(self) -> None:
+        old_stream = object()
+        new_stream = object()
+        owner = ("live", "192.168.31.112", "libmpv")
+        original_streams = dict(routes_media._active_streams)
+        original_started = dict(routes_media._active_started)
+        original_matter = dict(routes_media._active_matter)
+        routes_media._active_streams.clear()
+        routes_media._active_started.clear()
+        routes_media._active_matter.clear()
+        routes_media._active_streams[old_stream] = owner
+
+        try:
+            with (
+                patch.object(routes_media, "PASSTHROUGH_MAX_CONCURRENT", 1),
+                patch.object(routes_media, "PASSTHROUGH_BUSY_WAIT_SEC", 0),
+            ):
+                result = self._run(
+                    routes_media._take_active_slot(
+                        new_stream,
+                        "live:sample.mp4@720.00s",
+                        owner,
+                        allow_same_owner_preempt=False,
+                        allow_same_client_preempt=False,
+                    )
+                )
+            self.assertIs(result, False)
+            self.assertIn(old_stream, routes_media._active_streams)
+            self.assertNotIn(new_stream, routes_media._active_streams)
+        finally:
+            routes_media._active_streams.clear()
+            routes_media._active_started.clear()
+            routes_media._active_matter.clear()
+            routes_media._active_streams.update(original_streams)
+            routes_media._active_started.update(original_started)
+            routes_media._active_matter.update(original_matter)
+
+    def _make_fake_session(self, events: list[str]):
+        """Build a minimal LiveSession-shaped stub that records subscribe calls
+        and yields no real bytes. Used by debounce/probe path tests below.
+        """
+
+        class _FakeLiveSession:
+            def __init__(self) -> None:
+                self.headers = {"Content-Type": "video/MP2T"}
+                self.closed = False
+                self.subscribers: list = []
+                self.lock = asyncio.Lock()
+                self.bytes_emitted = 0
+                self.frames_produced = 0
+
+            def subscribe(self, rid: int, *, primary: bool = False, snapshot_only: bool = True):
+                events.append(f"subscribe primary={primary} snapshot_only={snapshot_only}")
+
+                async def _gen():
+                    yield b""
+
+                return _gen()
+
+        return _FakeLiveSession()
+
+    def test_strip_live_route_hint_suffix_drops_ts_for_skybox_pipeline(self) -> None:
+        """Skybox keys its HTTP pipeline on the URL extension, so DLNA URLs
+        end in ``.ts``. The route strips that suffix back off before the
+        source-file lookup so the underlying ``.mp4`` is still found.
+        """
+        self.assertEqual(
+            routes_media._strip_live_route_hint_suffix("Downloads/x/movie.mp4.ts"),
+            "Downloads/x/movie.mp4",
+        )
+        self.assertEqual(
+            routes_media._strip_live_route_hint_suffix("Downloads/x/movie.mp4.TS"),
+            "Downloads/x/movie.mp4",
+        )
+        self.assertEqual(
+            routes_media._strip_live_route_hint_suffix("Downloads/x/movie.mp4.m2ts"),
+            "Downloads/x/movie.mp4",
+        )
+        # Backward compat: existing/cached URLs without the hint suffix
+        # must still resolve to the same file path.
+        self.assertEqual(
+            routes_media._strip_live_route_hint_suffix("Downloads/x/movie.mp4"),
+            "Downloads/x/movie.mp4",
+        )
+        # URL-encoded names round-trip through unquote.
+        self.assertEqual(
+            routes_media._strip_live_route_hint_suffix("Downloads/x/movie%20file.mp4.ts"),
+            "Downloads/x/movie file.mp4",
+        )
+
+    def test_libmpv_screenshot_probe_does_not_drain_existing_session_cache(self) -> None:
+        """Bare libmpv UA probes must NOT be served from an existing playback
+        session's cache snapshot — even when one is available. Pcap evidence
+        showed ~9 simultaneous probes dumping ~30MB each (~270MB total) into
+        the Wi-Fi link, starving the real SKYBOX UA playback connection and
+        causing a permanent loading spinner. They must 503 immediately so the
+        playback's bandwidth stays uncontested.
+        """
+        events: list[str] = []
+        fake_session = self._make_fake_session(events)
+        path = Path("sivr00170_B.mp4")
+        live_meta = SimpleNamespace(
+            codec=SimpleNamespace(width=3840, height=2160),
+            timing=SimpleNamespace(effective_fps=lambda *_: 30.0),
+            color=SimpleNamespace(),
+        )
+        info = SimpleNamespace(duration=1500.0, fps=30.0)
+        client_host = "192.168.31.112"
+
+        class _FakeRequest:
+            headers = {"user-agent": "libmpv", "accept": "*/*"}
+            client = SimpleNamespace(host=client_host)
+
+        request = _FakeRequest()
+
+        async def run() -> object:
+            existing_key = (
+                str(path.resolve()),
+                client_host,
+                round(240.0, 3),  # real Skybox playback at t=240
+                routes_media.PYNV_OUTPUT_CODEC,
+                round(30.0, 3),
+                "libmpv:green",
+            )
+            fake_session.key = existing_key
+            async with routes_media._live_session_lock:
+                routes_media._live_sessions[existing_key] = fake_session
+            try:
+                return await routes_media.passthrough_live_get(
+                    request,
+                    "sivr00170_B.mp4",
+                    t=1440.0,
+                    mode=None,
+                    range_header="bytes=0-",
+                    time_seek_range=None,
+                    transfer_mode=None,
+                    get_content_features=None,
+                )
+            finally:
+                async with routes_media._live_session_lock:
+                    routes_media._live_sessions.pop(existing_key, None)
+
+        original_sessions = dict(routes_media._live_sessions)
+        original_starting = dict(routes_media._live_starting)
+        original_streams = dict(routes_media._active_streams)
+        try:
+            routes_media._live_sessions.clear()
+            routes_media._live_starting.clear()
+            routes_media._active_streams.clear()
+            with (
+                patch.object(routes_media, "_safe_video_path", return_value=path),
+                patch.object(routes_media, "annotate_request", return_value=None),
+                patch.object(routes_media, "_probe_live_request_metadata", return_value=(info, live_meta, "")),
+                patch.object(routes_media, "_live_adaptive_max_fps", return_value=30.0),
+                patch.object(routes_media, "_dump_live_request_headers", return_value=None),
+                patch.object(routes_media, "_estimated_passthrough_size", return_value=4_000_000_000),
+                patch.object(routes_media, "_estimated_passthrough_bps", return_value=100_000_000),
+                patch.object(routes_media, "PASSTHROUGH_OUTPUT_MODE", "green"),
+                patch.object(
+                    routes_media,
+                    "_take_active_slot",
+                    side_effect=AssertionError(
+                        "libmpv screenshot probe must not reserve a slot"
+                    ),
+                ),
+            ):
+                response = self._run(run())
+        finally:
+            routes_media._live_sessions.clear()
+            routes_media._live_starting.clear()
+            routes_media._active_streams.clear()
+            routes_media._live_sessions.update(original_sessions)
+            routes_media._live_starting.update(original_starting)
+            routes_media._active_streams.update(original_streams)
+
+        self.assertEqual(response.status_code, 503)
+        self.assertEqual(response.headers.get("retry-after"), "1")
+        # Must NOT subscribe to the existing session and pull bytes from it.
+        self.assertEqual(events, [], f"probe must not call subscribe(); got {events}")
+
+    def test_libmpv_screenshot_probe_returns_503_when_no_producer(self) -> None:
+        """Bare libmpv UA probe with no matching active session must fast-fail
+        with 503 Retry-After, NOT start a GPU pipeline. This is the user-
+        approved behaviour: thumbnail probes are discardable.
+        """
+        path = Path("sivr00170_B.mp4")
+        live_meta = SimpleNamespace(
+            codec=SimpleNamespace(width=3840, height=2160),
+            timing=SimpleNamespace(effective_fps=lambda *_: 30.0),
+            color=SimpleNamespace(),
+        )
+        info = SimpleNamespace(duration=1500.0, fps=30.0)
+        client_host = "192.168.31.112"
+
+        class _FakeRequest:
+            headers = {"user-agent": "libmpv", "accept": "*/*"}
+            client = SimpleNamespace(host=client_host)
+
+        request = _FakeRequest()
+
+        async def run() -> object:
+            return await routes_media.passthrough_live_get(
+                request,
+                "sivr00170_B.mp4",
+                t=1440.0,
+                mode=None,
+                range_header="bytes=0-",
+                time_seek_range=None,
+                transfer_mode=None,
+                get_content_features=None,
+            )
+
+        original_sessions = dict(routes_media._live_sessions)
+        original_starting = dict(routes_media._live_starting)
+        original_streams = dict(routes_media._active_streams)
+        try:
+            routes_media._live_sessions.clear()
+            routes_media._live_starting.clear()
+            routes_media._active_streams.clear()
+            with (
+                patch.object(routes_media, "_safe_video_path", return_value=path),
+                patch.object(routes_media, "annotate_request", return_value=None),
+                patch.object(routes_media, "_probe_live_request_metadata", return_value=(info, live_meta, "")),
+                patch.object(routes_media, "_live_adaptive_max_fps", return_value=30.0),
+                patch.object(routes_media, "_dump_live_request_headers", return_value=None),
+                patch.object(routes_media, "_estimated_passthrough_size", return_value=4_000_000_000),
+                patch.object(routes_media, "_estimated_passthrough_bps", return_value=100_000_000),
+                patch.object(routes_media, "PASSTHROUGH_OUTPUT_MODE", "green"),
+                patch.object(
+                    routes_media,
+                    "_take_active_slot",
+                    side_effect=AssertionError(
+                        "libmpv screenshot probe must not reserve a slot"
+                    ),
+                ),
+                patch.object(
+                    routes_media,
+                    "_select_passthrough_stream",
+                    side_effect=AssertionError(
+                        "libmpv screenshot probe must not start GPU pipeline"
+                    ),
+                ),
+            ):
+                response = self._run(run())
+        finally:
+            routes_media._live_sessions.clear()
+            routes_media._live_starting.clear()
+            routes_media._active_streams.clear()
+            routes_media._live_sessions.update(original_sessions)
+            routes_media._live_starting.update(original_starting)
+            routes_media._active_streams.update(original_streams)
+
+        self.assertEqual(response.status_code, 503)
+        self.assertEqual(response.headers.get("retry-after"), "1")
 
 
 class LiveSupportTests(unittest.TestCase):

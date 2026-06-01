@@ -32,6 +32,7 @@ DEFAULTS = {
     "quality_speed": "ultrafast",
     "offline_quality_speed": "medium",
     "offline_sam3_prompt": "person",
+    "offline_single_time_segments": [],
     "offline_single_trt_rvm_enabled": True,
     "offline_single_trt_matanyone2_enabled": True,
     "offline_batch_trt_rvm_enabled": True,

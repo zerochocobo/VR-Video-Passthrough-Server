@@ -10,6 +10,7 @@ from PySide6.QtWidgets import (
     QDialog,
     QFileDialog,
     QGridLayout,
+    QHeaderView,
     QHBoxLayout,
     QLabel,
     QLineEdit,
@@ -17,6 +18,8 @@ from PySide6.QtWidgets import (
     QPushButton,
     QSizePolicy,
     QTabWidget,
+    QTableWidget,
+    QTableWidgetItem,
     QTextEdit,
     QVBoxLayout,
     QWidget,
@@ -38,6 +41,7 @@ HELP_ICON_SIZE = 20
 SWITCH_OFF_IMAGE = SWITCH_OFF_IMAGE_PATH.as_posix()
 SWITCH_ON_IMAGE = SWITCH_ON_IMAGE_PATH.as_posix()
 _TIME_EPSILON = 1e-3
+_SETTINGS_TIME_SEGMENTS_KEY = "offline_single_time_segments"
 
 
 def _format_time_seconds(seconds: float) -> str:
@@ -68,6 +72,78 @@ def _parse_time_text(text: str) -> float | None:
     if h < 0 or m >= 60 or s >= 60:
         return None
     return float(h * 3600 + m * 60 + s)
+
+
+def _parse_hhmmss_text(text: str) -> float | None:
+    value = str(text or "").strip()
+    parts = [part.strip() for part in value.split(":")]
+    if len(parts) != 3 or any(not part.isdigit() for part in parts):
+        return None
+    h, m, s = [int(part) for part in parts]
+    if m >= 60 or s >= 60:
+        return None
+    return float(h * 3600 + m * 60 + s)
+
+
+def _coerce_time_segments(value: object) -> list[tuple[float, float]]:
+    if not isinstance(value, list):
+        return []
+    segments: list[tuple[float, float]] = []
+    for item in value:
+        start: object
+        end: object
+        if isinstance(item, dict):
+            start = item.get("start")
+            end = item.get("end")
+        elif isinstance(item, (list, tuple)) and len(item) >= 2:
+            start, end = item[0], item[1]
+        else:
+            continue
+        try:
+            start_sec = float(start)
+            end_sec = float(end)
+        except (TypeError, ValueError):
+            continue
+        if start_sec >= 0 and end_sec > start_sec + _TIME_EPSILON:
+            segments.append((start_sec, end_sec))
+    return segments
+
+
+def _serialize_time_segments(segments: list[tuple[float, float]]) -> list[dict[str, float]]:
+    return [{"start": float(start), "end": float(end)} for start, end in segments]
+
+
+def _resolve_time_segments(
+    segments: list[tuple[float | None, float | None]],
+    video_duration: float,
+) -> tuple[list[tuple[float, float]], str, int]:
+    try:
+        total = float(video_duration or 0.0)
+    except (TypeError, ValueError):
+        total = 0.0
+    if total <= 0:
+        return [], "offline.time_error_video_duration", 0
+    if not segments:
+        return [], "offline.time_error_segments_empty", 0
+
+    normalized: list[tuple[float, float]] = []
+    previous_end = -1.0
+    for index, (start, end) in enumerate(segments, 1):
+        if start is None or start < 0:
+            return [], "offline.time_error_segment_start_format", index
+        if end is None or end < 0:
+            return [], "offline.time_error_segment_end_format", index
+        if end <= start + _TIME_EPSILON:
+            return [], "offline.time_error_segment_order", index
+        if start > total + _TIME_EPSILON:
+            return [], "offline.time_error_segment_start_after_video", index
+        if end > total + _TIME_EPSILON:
+            return [], "offline.time_error_segment_end_after_video", index
+        if normalized and start < previous_end - _TIME_EPSILON:
+            return [], "offline.time_error_segment_overlap", index
+        normalized.append((float(start), float(end)))
+        previous_end = float(end)
+    return normalized, "", 0
 
 
 def _resolve_time_range(
@@ -201,6 +277,7 @@ class OfflinePage(QWidget):
         self.i18n = i18n
         self.settings = settings
         self.process = process
+        self.single_time_segments = _coerce_time_segments(self.settings.data.get(_SETTINGS_TIME_SEGMENTS_KEY))
         self.title_label = QLabel()
         self.title_label.setObjectName("OfflinePageTitle")
         self.back_button = QPushButton()
@@ -294,6 +371,13 @@ class OfflinePage(QWidget):
         combo.addItem("", 0.0)
         return combo
 
+    def _time_mode_combo(self) -> QComboBox:
+        combo = _fit_combo(QComboBox())
+        combo.addItem("", "range")
+        combo.addItem("", "segments")
+        combo.currentIndexChanged.connect(self._update_time_mode_visibility)
+        return combo
+
     def _quality_speed_combo(self) -> QComboBox:
         combo = _fit_combo(QComboBox())
         for value in ("ultrafast", "medium", "veryslow"):
@@ -343,7 +427,12 @@ class OfflinePage(QWidget):
         self.single_custom_end_label = QLabel()
         self.single_custom_end = QLineEdit("00:05:00")
         self.single_custom_end.setFixedWidth(90)
+        self.single_segments_config_button = QPushButton()
+        self.single_segments_label = QLabel()
+        self.single_segments_label.setStyleSheet("color: #5f6368;")
+        self.single_segments_label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         self.single_duration.currentIndexChanged.connect(self._update_custom_duration_visibility)
+        self.single_segments_config_button.clicked.connect(self.show_time_segments_dialog)
         row.addWidget(self.single_start)
         row.addSpacing(12)
         row.addWidget(self.single_duration)
@@ -351,6 +440,8 @@ class OfflinePage(QWidget):
         row.addWidget(self.single_custom_minutes)
         row.addWidget(self.single_custom_end_label)
         row.addWidget(self.single_custom_end)
+        row.addWidget(self.single_segments_config_button)
+        row.addWidget(self.single_segments_label, 1)
         row.addStretch(1)
         return row
 
@@ -370,6 +461,7 @@ class OfflinePage(QWidget):
         self.single_sam3_prompt_button = QPushButton()
         self.single_sam3_prompt_label = QLabel()
         self.single_quality_speed = self._quality_speed_combo()
+        self.single_time_mode = self._time_mode_combo()
         self.single_skip = QCheckBox()
         self.single_skip.setChecked(True)
         self.start_single.clicked.connect(self.run_single)
@@ -393,7 +485,7 @@ class OfflinePage(QWidget):
         grid = QGridLayout(page)
         grid.setColumnMinimumWidth(0, OFFLINE_LABEL_WIDTH)
         grid.setColumnStretch(1, 1)
-        self.single_labels = {key: _label() for key in ("video", "output", "mode", "engine", "precision", "recognition", "trt", "performance", "time")}
+        self.single_labels = {key: _label() for key in ("video", "output", "mode", "engine", "precision", "recognition", "trt", "performance")}
         grid.addWidget(self.single_labels["video"], 0, 0)
         grid.addLayout(row_video, 0, 1)
         grid.addWidget(self.single_labels["output"], 1, 0)
@@ -419,12 +511,14 @@ class OfflinePage(QWidget):
         grid.addLayout(self._trt_cache_row("single"), 6, 1)
         grid.addWidget(self.single_labels["performance"], 7, 0)
         grid.addLayout(self._performance_row(self.single_quality_speed), 7, 1)
-        grid.addWidget(self.single_labels["time"], 8, 0)
+        grid.addWidget(self.single_time_mode, 8, 0, alignment=Qt.AlignRight)
         grid.addLayout(self._time_row(), 8, 1)
         grid.addWidget(self.single_skip, 9, 1)
         grid.addLayout(actions, 10, 1)
         self.tabs.addTab(page, "")
         self._update_custom_duration_visibility()
+        self._update_time_mode_visibility()
+        self._update_time_segments_label()
 
     def _batch_tab(self) -> None:
         page = QWidget()
@@ -525,6 +619,8 @@ class OfflinePage(QWidget):
         return float(value or 0.0)
 
     def _update_custom_duration_visibility(self) -> None:
+        if hasattr(self, "single_time_mode") and str(self.single_time_mode.currentData()) == "segments":
+            return
         value = self.single_duration.currentData()
         minutes_visible = value == "custom"
         end_visible = value == "custom_end"
@@ -532,6 +628,46 @@ class OfflinePage(QWidget):
         self.single_custom_minutes.setVisible(minutes_visible)
         self.single_custom_end_label.setVisible(end_visible)
         self.single_custom_end.setVisible(end_visible)
+
+    def _update_time_mode_visibility(self) -> None:
+        if not hasattr(self, "single_time_mode"):
+            return
+        segments_mode = str(self.single_time_mode.currentData()) == "segments"
+        for widget in (
+            self.single_start,
+            self.single_duration,
+            self.single_custom_minutes_label,
+            self.single_custom_minutes,
+            self.single_custom_end_label,
+            self.single_custom_end,
+        ):
+            widget.setVisible(not segments_mode)
+        self.single_segments_config_button.setVisible(segments_mode)
+        self.single_segments_label.setVisible(segments_mode)
+        if not segments_mode:
+            self._update_custom_duration_visibility()
+
+    def _time_segments_label_text(self) -> str:
+        if not self.single_time_segments:
+            return self.i18n.t("offline.time_segments_none")
+        ranges = ", ".join(
+            f"{_format_time_seconds(start)}-{_format_time_seconds(end)}"
+            for start, end in self.single_time_segments[:2]
+        )
+        if len(self.single_time_segments) > 2:
+            ranges = f"{ranges}, +{len(self.single_time_segments) - 2}"
+        return self.i18n.t("offline.time_segments_summary").format(count=len(self.single_time_segments), ranges=ranges)
+
+    def _update_time_segments_label(self) -> None:
+        if not hasattr(self, "single_segments_label"):
+            return
+        text = self._time_segments_label_text()
+        tooltip = "\n".join(
+            f"{_format_time_seconds(start)} - {_format_time_seconds(end)}"
+            for start, end in self.single_time_segments
+        )
+        self.single_segments_label.setText(text)
+        self.single_segments_label.setToolTip(tooltip)
 
     def _update_matanyone_help_visibility(self) -> None:
         self.single_matanyone_help.setVisible(str(self.single_engine.currentData()) == "matanyone2")
@@ -730,11 +866,11 @@ class OfflinePage(QWidget):
                     combo.setCurrentIndex(idx)
                     combo.blockSignals(False)
 
-    def _show_time_error(self, key: str, video_duration: float = 0.0) -> None:
-        message = self.i18n.t(key).format(duration=_format_time_seconds(video_duration))
+    def _show_time_error(self, key: str, video_duration: float = 0.0, row: int = 0) -> None:
+        message = self.i18n.t(key).format(duration=_format_time_seconds(video_duration), row=row)
         QMessageBox.warning(self, self.i18n.t("offline.time_error_title"), message)
 
-    def _validated_single_time_range(self) -> tuple[float, float] | None:
+    def _validated_single_video_duration(self) -> float | None:
         video_text = self.single_video.text().strip()
         if not video_text:
             self._show_time_error("offline.time_error_video_missing")
@@ -747,6 +883,15 @@ class OfflinePage(QWidget):
             video_duration = float(probe_video_metadata(video_path).timing.duration or 0.0)
         except Exception:
             video_duration = 0.0
+        if video_duration <= 0:
+            self._show_time_error("offline.time_error_video_duration")
+            return None
+        return video_duration
+
+    def _validated_single_time_range(self) -> tuple[float, float] | None:
+        video_duration = self._validated_single_video_duration()
+        if video_duration is None:
+            return None
         start, duration, error_key = _resolve_time_range(
             self.single_start.text(),
             self.single_duration.currentData(),
@@ -759,12 +904,105 @@ class OfflinePage(QWidget):
             return None
         return start, duration
 
+    def _validated_single_time_segments(self) -> list[tuple[float, float]] | None:
+        video_duration = self._validated_single_video_duration()
+        if video_duration is None:
+            return None
+        segments, error_key, row = _resolve_time_segments(self.single_time_segments, video_duration)
+        if error_key:
+            self._show_time_error(error_key, video_duration, row)
+            return None
+        return segments
+
+    def show_time_segments_dialog(self) -> None:
+        video_duration = self._validated_single_video_duration()
+        if video_duration is None:
+            return
+
+        dialog = QDialog(self)
+        dialog.setWindowTitle(self.i18n.t("offline.time_segments_dialog_title"))
+        layout = QVBoxLayout(dialog)
+        table = QTableWidget(dialog)
+        table.setColumnCount(2)
+        table.setHorizontalHeaderLabels(
+            [
+                self.i18n.t("offline.time_segments_start"),
+                self.i18n.t("offline.time_segments_end"),
+            ]
+        )
+        table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        table.verticalHeader().setVisible(False)
+        table.setMinimumWidth(320)
+
+        def append_row(start: float = 0.0, end: float = 0.0) -> None:
+            row = table.rowCount()
+            table.insertRow(row)
+            table.setItem(row, 0, QTableWidgetItem(_format_time_seconds(start)))
+            table.setItem(row, 1, QTableWidgetItem(_format_time_seconds(end)))
+
+        initial_segments = self.single_time_segments or [(0.0, min(300.0, video_duration))]
+        for start, end in initial_segments:
+            append_row(start, end)
+
+        buttons = QHBoxLayout()
+        add_button = QPushButton(self.i18n.t("button.add"))
+        remove_button = QPushButton(self.i18n.t("button.remove"))
+        save_button = QPushButton(self.i18n.t("button.save"))
+        close_button = QPushButton(self.i18n.t("button.close"))
+        buttons.addWidget(add_button)
+        buttons.addWidget(remove_button)
+        buttons.addStretch(1)
+        buttons.addWidget(save_button)
+        buttons.addWidget(close_button)
+
+        def add_segment() -> None:
+            if table.rowCount() > 0:
+                previous_end_item = table.item(table.rowCount() - 1, 1)
+                previous_end = _parse_hhmmss_text(previous_end_item.text() if previous_end_item else "") or 0.0
+            else:
+                previous_end = 0.0
+            start = min(previous_end, video_duration)
+            end = min(start + 300.0, video_duration)
+            append_row(start, end)
+
+        def remove_segment() -> None:
+            row = table.currentRow()
+            if row < 0:
+                row = table.rowCount() - 1
+            if row >= 0:
+                table.removeRow(row)
+
+        def save_segments() -> None:
+            raw_segments: list[tuple[float | None, float | None]] = []
+            for row in range(table.rowCount()):
+                start_item = table.item(row, 0)
+                end_item = table.item(row, 1)
+                raw_segments.append(
+                    (
+                        _parse_hhmmss_text(start_item.text() if start_item else ""),
+                        _parse_hhmmss_text(end_item.text() if end_item else ""),
+                    )
+                )
+            segments, error_key, row = _resolve_time_segments(raw_segments, video_duration)
+            if error_key:
+                self._show_time_error(error_key, video_duration, row)
+                return
+            self.single_time_segments = segments
+            self.settings.data[_SETTINGS_TIME_SEGMENTS_KEY] = _serialize_time_segments(segments)
+            self.settings.save()
+            self._update_time_segments_label()
+            dialog.accept()
+
+        add_button.clicked.connect(add_segment)
+        remove_button.clicked.connect(remove_segment)
+        save_button.clicked.connect(save_segments)
+        close_button.clicked.connect(dialog.reject)
+        layout.addWidget(table)
+        layout.addLayout(buttons)
+        dialog.exec()
+
     def run_single(self) -> None:
         engine = self._effective_engine(self.single_engine, self.single_recognition)
-        time_range = self._validated_single_time_range()
-        if time_range is None:
-            return
-        start_seconds, duration_seconds = time_range
         args = [
             "single",
             self.single_video.text(),
@@ -772,13 +1010,21 @@ class OfflinePage(QWidget):
             self.single_mode.currentData(),
             "--engine",
             engine,
-            "--start",
-            str(start_seconds),
-            "--duration",
-            str(duration_seconds),
             "--skip-frames",
             "0",
         ]
+        if str(self.single_time_mode.currentData()) == "segments":
+            segments = self._validated_single_time_segments()
+            if segments is None:
+                return
+            for start_seconds, end_seconds in segments:
+                args.extend(["--segment", f"{_format_time_seconds(start_seconds)}-{_format_time_seconds(end_seconds)}"])
+        else:
+            time_range = self._validated_single_time_range()
+            if time_range is None:
+                return
+            start_seconds, duration_seconds = time_range
+            args.extend(["--start", str(start_seconds), "--duration", str(duration_seconds)])
         if self.single_out_dir.text().strip():
             args.extend(["--out-dir", self.single_out_dir.text().strip()])
         if self.single_skip.isChecked():
@@ -839,6 +1085,8 @@ class OfflinePage(QWidget):
         self.batch_trt_configure_button.setEnabled(not running)
         self.single_precision.setEnabled(not running)
         self.batch_precision.setEnabled(not running)
+        self.single_time_mode.setEnabled(not running)
+        self.single_segments_config_button.setEnabled(not running)
         if not running:
             self._update_trt_cache_rows()
         else:
@@ -873,7 +1121,6 @@ class OfflinePage(QWidget):
         self.single_labels["recognition"].setText(self.i18n.t("offline.recognition_model"))
         self.single_labels["trt"].setText(self.i18n.t("trt.row_label"))
         self.single_labels["performance"].setText(self.i18n.t("performance.quality_speed"))
-        self.single_labels["time"].setText(self.i18n.t("offline.time_range"))
         self.batch_labels["directory"].setText(self.i18n.t("offline.directory"))
         self.batch_labels["mode"].setText(self.i18n.t("offline.mode"))
         self.batch_labels["engine"].setText(self.i18n.t("offline.engine"))
@@ -908,6 +1155,11 @@ class OfflinePage(QWidget):
             self.single_duration.setItemText(index, self.i18n.t(key))
         self.single_custom_minutes_label.setText(self.i18n.t("offline.minutes"))
         self.single_custom_end_label.setText(self.i18n.t("offline.end_time"))
+        self.single_time_mode.setItemText(0, self.i18n.t("offline.time_mode_range"))
+        self.single_time_mode.setItemText(1, self.i18n.t("offline.time_mode_segments"))
+        self.single_segments_config_button.setText(self.i18n.t("offline.time_segments_configure"))
+        self._update_time_segments_label()
+        self._update_time_mode_visibility()
         for combo in (self.single_quality_speed, self.batch_quality_speed):
             for index, key in enumerate(("quality_speed.ultrafast", "quality_speed.medium", "quality_speed.veryslow")):
                 combo.setItemText(index, self.i18n.t(key))
