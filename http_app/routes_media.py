@@ -86,8 +86,10 @@ from utils.request_history import annotate_request
 from utils.runtime_settings import get_light_match
 from utils.subprocess_hidden import hidden_subprocess_kwargs
 from utils.mkv_cues import probe_mkv_cues
+from utils.offline_outputs import has_offline_two_dvr_output
 from utils.subtitles import find_external_subtitles, is_subtitle_path, subtitle_mime
 from utils.video_metadata import probe_video_metadata, select_backend
+from utils.vr_naming import has_vr_filename_marker, is_half_equirectangular_source
 
 log = get("media")
 router = APIRouter()
@@ -587,6 +589,25 @@ async def _close_preempted_stream(stream: object, who: str) -> None:
         # StreamingResponse finally block before acquiring the pool slot.
         await _release_active_slot(stream)
     log.info("passthrough preempt close done: %s stream=%s", who, type(stream).__name__)
+
+
+async def _close_active_two_dvr_for_client(client_host: str, rid: int, keep_key: tuple | None = None) -> None:
+    stale: list[object] = []
+    async with _active_lock:
+        for active_stream, active_owner in list(_active_streams.items()):
+            if _owner_base(active_owner) != ("live", client_host):
+                continue
+            stream_obj = active_stream.stream if isinstance(active_stream, LiveSession) else active_stream
+            if getattr(stream_obj, "output_mode", "") != "two_dvr":
+                continue
+            if keep_key is not None and isinstance(active_stream, LiveSession) and active_stream.key == keep_key:
+                continue
+            stale.append(active_stream)
+            del _active_streams[active_stream]
+            _active_started.pop(active_stream, None)
+    for stream in stale:
+        log.info("passthrough_live[%d] close previous 2D->3D live stream before new request: stream=%s", rid, type(stream).__name__)
+        await _close_preempted_stream(stream, "two_dvr superseded")
 
 
 def _owner_base(owner: tuple) -> tuple:
@@ -1683,6 +1704,44 @@ def _format_fps_header(fps: float | None) -> str | None:
 _LIVE_MAX_SIDE = 8192
 
 
+def _configured_passthrough_modes() -> tuple[str, ...]:
+    raw = str(PASSTHROUGH_OUTPUT_MODE or "none").strip().lower()
+    if raw == "none":
+        return ()
+    if raw == "all":
+        return ("green", "alpha")
+    out: list[str] = []
+    for token in re.split(r"[,;\s]+", raw):
+        if token == "all":
+            tokens = ("green", "alpha")
+        else:
+            tokens = (token,)
+        for mode in tokens:
+            if mode in {"green", "alpha", "two_dvr"} and mode not in out:
+                out.append(mode)
+    return tuple(out)
+
+
+def _select_live_output_mode(requested_mode: str) -> str:
+    modes = _configured_passthrough_modes()
+    if requested_mode in modes:
+        return requested_mode
+    if "green" in modes:
+        return "green"
+    if "alpha" in modes:
+        return "alpha"
+    if "two_dvr" in modes:
+        return "two_dvr"
+    return "green"
+
+
+def _is_two_d_source(path: Path, width: int = 0, height: int = 0) -> bool:
+    return (
+        not has_vr_filename_marker(path.stem)
+        and not is_half_equirectangular_source(width, height)
+    )
+
+
 def _live_block_reason(path: Path, meta) -> str:
     if path.suffix.lower() == ".mkv":
         policy = PASSTHROUGH_MKV_LIVE_POLICY
@@ -1705,6 +1764,29 @@ def _live_block_reason(path: Path, meta) -> str:
     return ""
 
 
+def _two_dvr_live_block_reason(path: Path, meta) -> str:
+    codec = meta.codec
+    if not _is_two_d_source(path, codec.width, codec.height):
+        return "2D->3D live is only available for 2D source videos"
+    if has_offline_two_dvr_output(path):
+        return "offline 2D->3D output already exists"
+    if int(codec.width or 0) > 4096:
+        return "2D->3D live source width exceeds 4096px; SBS output would exceed 8K"
+    bit_depth = int(codec.bit_depth if codec and codec.bit_depth > 0 else 8)
+    if bit_depth > 8:
+        return "2D->3D live currently supports 8-bit NV12 sources only"
+    # 2D->3D live only runs on the GPU NV12 (PyNv) path; sources the backend would
+    # route to the ffmpeg fallback (VFR, unsupported codec/pixel format, HDR/10-bit)
+    # cannot be served and must be rejected cleanly instead of failing at startup.
+    try:
+        decision = select_backend(meta.timing, meta.codec, meta.color)
+    except Exception as e:
+        return f"2D->3D live source probe failed: {e}"
+    if decision.verdict != "pynv_hevc":
+        return f"2D->3D live requires the GPU NV12 path (source ineligible: {decision.reason})"
+    return ""
+
+
 def _probe_live_request_metadata(path: Path):
     info = probe_cached(path)
     live_meta = probe_video_metadata(path)
@@ -1724,6 +1806,8 @@ def _select_passthrough_stream(
     output_mode = (output_mode or PASSTHROUGH_OUTPUT_MODE).lower()
     if output_mode == "all":
         output_mode = "green"
+    elif output_mode not in {"green", "alpha", "two_dvr"}:
+        output_mode = _select_live_output_mode("")
     fallback_container = "mpegts" if container == "mpegts" else None
     fallback_max_fps = max_fps
     if fallback_container == "mpegts" and PASSTHROUGH_FALLBACK_MAX_FPS > 0:
@@ -1737,6 +1821,8 @@ def _select_passthrough_stream(
     def fallback_stream() -> PassthroughStream:
         if output_mode == "alpha":
             raise RuntimeError("alpha passthrough requires the PyNv NV12 live path")
+        if output_mode == "two_dvr":
+            raise RuntimeError("2D->3D live requires the PyNv NV12 live path")
         return PassthroughStream(
             path,
             start_sec,
@@ -1830,7 +1916,8 @@ async def thumb_get(request: Request, name: str, pt: int = Query(default=0)):
     annotate_request(request, media_name=path.name, media_path=str(path), thumb_passthrough=bool(pt))
     async with _thumb_lock:
         out = await asyncio.to_thread(get_thumb, path, bool(pt))
-    if out is None:
+    if out is None or not out.exists():
+        log.warning("thumb unavailable after generation: path=%s passthrough=%s out=%s", path.name, bool(pt), out)
         raise HTTPException(404, "thumb not available")
     return FileResponse(out, media_type="image/jpeg",
                         headers={"Cache-Control": "public, max-age=86400"})
@@ -1868,12 +1955,7 @@ async def passthrough_live_get(
     if info.duration > 0:
         t = min(t, max(0.0, info.duration - 0.01))
     requested_mode = (mode or "").lower()
-    if PASSTHROUGH_OUTPUT_MODE == "all":
-        live_output_mode = requested_mode if requested_mode in {"green", "alpha"} else "green"
-    elif PASSTHROUGH_OUTPUT_MODE == "alpha":
-        live_output_mode = "alpha"
-    else:
-        live_output_mode = "green"
+    live_output_mode = _select_live_output_mode(requested_mode)
 
     user_agent = request.headers.get("user-agent", "")
     accept = request.headers.get("accept", "")
@@ -1907,6 +1989,16 @@ async def passthrough_live_get(
     if live_block_reason:
         log.info("passthrough_live[%d] reject unsupported live source: %s reason=%s", rid, path.name, live_block_reason)
         return Response(f"live passthrough unsupported: {live_block_reason}", status_code=409)
+    if live_output_mode == "two_dvr":
+        two_dvr_block_reason = _two_dvr_live_block_reason(path, live_meta)
+        if two_dvr_block_reason:
+            log.info(
+                "passthrough_live[%d] reject unsupported 2D->3D live source: %s reason=%s",
+                rid,
+                path.name,
+                two_dvr_block_reason,
+            )
+            return Response(f"2D->3D live unsupported: {two_dvr_block_reason}", status_code=409)
     live_max_fps = _live_adaptive_max_fps(path, live_meta)
     live_profile = _live_response_profile(user_agent)
     is_nplayer = _is_nplayer_client(user_agent)
@@ -2084,6 +2176,9 @@ async def passthrough_live_get(
             _live_starting[live_key] = now
         live_starting_at = now
 
+    if live_output_mode == "two_dvr":
+        await _close_active_two_dvr_for_client(client_host, rid, keep_key=live_key)
+
     slot_token = object()
     # nPlayer, 4xvr/avpro, and libmpv may replace an old live stream from the
     # same device. nPlayer does not reliably notify the server when the user
@@ -2117,9 +2212,10 @@ async def passthrough_live_get(
         live_acquire_timeout = max(PASSTHROUGH_BUSY_WAIT_SEC, 1.0)
 
         def build_stream():
-            matter = acquire_matter(blocking=True, timeout=live_acquire_timeout)
+            matter = None if live_output_mode == "two_dvr" else acquire_matter(blocking=True, timeout=live_acquire_timeout)
             if matter is None:
-                return None
+                if live_output_mode != "two_dvr":
+                    return None
             try:
                 stream_tuple = _select_passthrough_stream(
                     path,
@@ -2148,9 +2244,15 @@ async def passthrough_live_get(
                 "passthrough live busy", status_code=503, headers={"Retry-After": "2"}
             )
         (stream, stream_backend, stream_verdict), live_matter = built
+        if live_output_mode == "two_dvr" and float(getattr(stream, "output_fps", 0.0) or 0.0) <= 0.0:
+            try:
+                stream.output_fps = float(live_meta.timing.effective_fps(live_max_fps))
+            except Exception:
+                pass
         async with _active_lock:
             if slot_token in _active_streams:
-                _active_matter[slot_token] = live_matter
+                if live_matter is not None:
+                    _active_matter[slot_token] = live_matter
                 live_matter = None
         if live_matter is not None:
             # The slot was preempted while we were building; do not leak the matter.
@@ -2581,9 +2683,10 @@ async def passthrough_live_get(
 
 def _seek_output_mode(requested_mode: str | None) -> str:
     requested = (requested_mode or "").lower()
-    if PASSTHROUGH_OUTPUT_MODE == "all":
+    modes = tuple(mode for mode in _configured_passthrough_modes() if mode in {"green", "alpha"})
+    if "green" in modes and "alpha" in modes:
         return requested if requested in {"green", "alpha"} else "green"
-    if PASSTHROUGH_OUTPUT_MODE == "alpha":
+    if "alpha" in modes:
         return "alpha"
     return "green"
 

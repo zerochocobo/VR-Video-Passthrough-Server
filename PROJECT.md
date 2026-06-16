@@ -465,8 +465,8 @@ DLNA client
 - Translation JSON files under `ui/translations/` are intentionally kept as
   UTF-8 with BOM. When editing or generating them programmatically, read/write
   with `utf-8-sig` and preserve the BOM.
-- MatAnyone2 medium now defaults to `yolo26m_efficientsam`; keep
-  `yoloworld_efficientsam` as a Legacy fallback until the new prepass has
-  enough user-side validation.
+- MatAnyone2 medium now defaults to `yolo26m_efficientsam`; `yolo26m_birefnet`
+  remains available from the offline recognition selector for higher-VRAM
+  systems, and `yoloworld_efficientsam` remains a command-line legacy fallback.
 - Keep handover notes in `prompt/HANDOVER_YYYYMMDD.md` when making meaningful
   project changes.

@@ -7,7 +7,7 @@ from PySide6.QtCore import QObject, Signal
 
 from ui.log_sanitizer import clean_log_text
 from ui.services.hidden_process import HiddenProcess
-from ui.services.process_helpers import ROOT, base_environment, offline_command
+from ui.services.process_helpers import ROOT, base_environment, offline_command, two_dvr_command
 from utils.subprocess_hidden import hidden_subprocess_kwargs
 
 _TERMINATE_WAIT_MS = 3000
@@ -28,6 +28,9 @@ class OfflineProcess(QObject):
         self.process.error.connect(self._error_occurred)
         self.process.finished.connect(self._finished)
 
+    def _command(self) -> tuple[str, list[str]]:
+        return offline_command()
+
     def is_running(self) -> bool:
         return self.process.is_running()
 
@@ -43,7 +46,7 @@ class OfflineProcess(QObject):
                 **(extra_env or {}),
             }
         )
-        program, base_args = offline_command()
+        program, base_args = self._command()
         self.output.emit(
             "[offline] GPU runtime initialization may take a while on first use. "
             "If this is the first offline run after installation or a driver/model update, "
@@ -106,3 +109,10 @@ class OfflineProcess(QObject):
             self.output.emit("[offline] process completed rc=0\n")
         self._stop_requested = False
         self.state_changed.emit(False)
+
+
+class TwoDvrProcess(OfflineProcess):
+    """Offline 2D->VR/3D converter process (offline/two_dvr.py)."""
+
+    def _command(self) -> tuple[str, list[str]]:
+        return two_dvr_command()

@@ -539,6 +539,28 @@ ALPHA_2D_FLAT3D_SAFE_H = max(0.01, min(1.0, float(_env("ALPHA_2D_FLAT3D_SAFE_H",
 #   formula as subtitles and the current output eye width.
 ALPHA_2D_DISTANCE_M = max(0.1, float(_env("ALPHA_2D_DISTANCE_M", 4.0)))
 
+# PT_TWO_DVR_MODEL:
+#   DA3 depth model preset for 2D->3D: base/small (518) or base_hd/small_hd (1036).
+TWO_DVR_MODEL = _env("TWO_DVR_MODEL", "base").strip().lower()
+if TWO_DVR_MODEL not in {"small", "base", "small_hd", "base_hd"}:
+    TWO_DVR_MODEL = "base"
+
+# PT_TWO_DVR_HOLE_FILL:
+#   Stereo hole-fill mode used by realtime 2D->3D flat SBS output.
+TWO_DVR_HOLE_FILL = _env("TWO_DVR_HOLE_FILL", "soft_shift").strip().lower()
+if TWO_DVR_HOLE_FILL not in {"inverse_warp", "soft_shift"}:
+    TWO_DVR_HOLE_FILL = "soft_shift"
+
+# PT_TWO_DVR_EYE_DISTANCE_MM:
+#   Backward-compatible base eye distance for realtime 2D->3D live output.
+#   User-facing UI keeps this at 65mm and exposes PT_TWO_DVR_STRENGTH instead.
+TWO_DVR_EYE_DISTANCE_MM = max(1.0, float(_env("TWO_DVR_EYE_DISTANCE_MM", 65.0)))
+
+# PT_TWO_DVR_STRENGTH:
+#   User-facing 3D strength multiplier. 1.0 matches the default 65mm baseline;
+#   render code still clamps final pixel disparity per output width.
+TWO_DVR_STRENGTH = max(0.1, min(3.0, float(_env("TWO_DVR_STRENGTH", 1.0))))
+
 # PT_RVM_IOBINDING:
 #   1 enables ORT IOBinding for the RVM path. This usually reduces copies and
 #   improves GPU throughput.

@@ -199,6 +199,25 @@ class OfflineConvertTests(unittest.TestCase):
         index = cmd.index("--matanyone2-prepass")
         self.assertEqual(cmd[index + 1], "yolo26m_efficientsam")
 
+    def test_matanyone2_medium_accepts_birefnet_prepass(self) -> None:
+        args = SimpleNamespace(
+            mode="alpha",
+            engine="matanyone2_medium",
+            matanyone2_prepass="yolo26m_birefnet",
+            start=0.0,
+            duration=0.0,
+            fps=30.0,
+            input_size=1024,
+            rvm_downsample_ratio=0.5,
+            skip_frames=0,
+            bitrate="source",
+            preset="P4",
+            matanyone2_size=1024,
+        )
+        cmd = convert._base_cmd(args, Path("input.mp4"), Path("out.mp4"))
+        index = cmd.index("--matanyone2-prepass")
+        self.assertEqual(cmd[index + 1], "yolo26m_birefnet")
+
     def test_matanyone2_command_accepts_512_size(self) -> None:
         args = SimpleNamespace(
             mode="alpha",

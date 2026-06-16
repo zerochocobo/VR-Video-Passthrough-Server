@@ -9,6 +9,7 @@ size, or mtime changes.
 from __future__ import annotations
 
 import subprocess
+import time
 from pathlib import Path
 
 import cv2
@@ -45,12 +46,15 @@ def _out_path(src: Path, passthrough: bool, fp: str) -> Path:
 
 def _cleanup_stale(src: Path, passthrough: bool, keep: Path) -> None:
     """Delete stale thumbnails for the same source stem and passthrough mode."""
+    cutoff = time.time() - 3600.0
     for p in THUMB_DIR.glob(f"{src.stem}_*.jpg"):
         if p == keep:
             continue
         if p.stem.endswith("-pt") != passthrough:
             continue
         try:
+            if p.stat().st_mtime >= cutoff:
+                continue
             p.unlink()
         except OSError as e:
             log.debug("cleanup skip %s: %s", p.name, e)
@@ -113,7 +117,24 @@ def get_thumb(src: Path, passthrough: bool) -> Path | None:
         except Exception as e:
             log.warning("passthrough thumb matting failed, fallback raw: %s", e)
 
-    cv2.imwrite(str(out), img, [cv2.IMWRITE_JPEG_QUALITY, 85])
+    ok, encoded = cv2.imencode(".jpg", img, [cv2.IMWRITE_JPEG_QUALITY, 85])
+    if not ok or encoded is None:
+        log.warning("jpeg thumb encode failed: %s", src)
+        return None
+    tmp = out.with_name(f".{out.name}.tmp")
+    try:
+        tmp.write_bytes(encoded.tobytes())
+        tmp.replace(out)
+    except OSError as e:
+        log.warning("jpeg thumb write failed: %s error=%s", out, e)
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+        return None
+    if not out.exists():
+        log.warning("jpeg thumb missing after write: %s", out)
+        return None
     _cleanup_stale(src, passthrough=passthrough, keep=out)
     log.info("thumb generated: src=%s passthrough=%s out=%s", src.name, passthrough, out.name)
     return out

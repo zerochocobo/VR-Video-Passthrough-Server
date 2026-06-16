@@ -16,6 +16,14 @@ def _setting_value(data: dict, key: str, default):
     value = data.get(key)
     return default if value is None or value == "" else value
 
+
+def _two_dvr_strength_value(value, default: float = 1.0) -> float:
+    try:
+        strength = float(value)
+    except (TypeError, ValueError):
+        strength = default
+    return max(0.1, min(3.0, strength))
+
 LIGHT_MATCH_PRESETS = {
     "home_warm": {"temp_k": 4000, "tint": 0, "exposure_ev": 0.0, "contrast": 1.0, "gamma": 1.0, "saturation": 1.0},
     "daylight": {"temp_k": 6500, "tint": 0, "exposure_ev": 0.0, "contrast": 1.0, "gamma": 1.0, "saturation": 1.0},
@@ -27,6 +35,11 @@ DEFAULTS = {
     "video_dirs": [str(ROOT / "videos")],
     "mode_green": True,
     "mode_alpha": True,
+    "mode_two_dvr": True,
+    "two_dvr_live_model": "base",
+    "two_dvr_live_hole_fill": "soft_shift",
+    "two_dvr_live_eye_distance": 65.0,
+    "two_dvr_live_strength": 1.0,
     "background_color": "00FF00",
     "alpha_stride": 1,
     "quality_speed": "ultrafast",
@@ -161,6 +174,19 @@ class Settings:
                             for key, value in values.items():
                                 self.data[f"light_match_{key}"] = value
                         self._mark_migration_done("20260525_light_match_temps_recalibrated")
+                    if not self._migration_done("20260616_two_dvr_strength", loaded):
+                        if "two_dvr_live_strength" not in loaded:
+                            try:
+                                old_eye = float(loaded.get("two_dvr_live_eye_distance", DEFAULTS["two_dvr_live_eye_distance"]))
+                            except (TypeError, ValueError):
+                                old_eye = DEFAULTS["two_dvr_live_eye_distance"]
+                            self.data["two_dvr_live_strength"] = _two_dvr_strength_value(
+                                old_eye / DEFAULTS["two_dvr_live_eye_distance"]
+                            )
+                        self.data["two_dvr_live_model"] = DEFAULTS["two_dvr_live_model"]
+                        self.data["two_dvr_live_hole_fill"] = DEFAULTS["two_dvr_live_hole_fill"]
+                        self.data["two_dvr_live_eye_distance"] = DEFAULTS["two_dvr_live_eye_distance"]
+                        self._mark_migration_done("20260616_two_dvr_strength")
             except Exception:
                 pass
 
@@ -176,15 +202,16 @@ class Settings:
         )
 
     def passthrough_mode(self) -> str:
-        green = bool(self.data.get("mode_green"))
-        alpha = bool(self.data.get("mode_alpha"))
-        if green and alpha:
+        modes: list[str] = []
+        if bool(self.data.get("mode_green")):
+            modes.append("green")
+        if bool(self.data.get("mode_alpha")):
+            modes.append("alpha")
+        if bool(self.data.get("mode_two_dvr")):
+            modes.append("two_dvr")
+        if modes == ["green", "alpha"]:
             return "all"
-        if green:
-            return "green"
-        if alpha:
-            return "alpha"
-        return "none"
+        return ",".join(modes) if modes else "none"
 
     def server_env(self) -> dict[str, str]:
         passthrough_max_fps = _setting_value(self.data, "passthrough_max_fps", 0)
@@ -222,6 +249,12 @@ class Settings:
             "PT_LIGHT_MATCH_PRESET": str(self.data.get("light_match_preset") or DEFAULTS["light_match_preset"]),
             "PT_ALPHA_2D_PROJECTION": str(self.data.get("alpha_2d_projection") or "fisheye"),
             "PT_ALPHA_2D_DISTANCE_M": str(_setting_value(self.data, "alpha_2d_distance_m", 4.0)),
+            "PT_TWO_DVR_MODEL": str(DEFAULTS["two_dvr_live_model"]),
+            "PT_TWO_DVR_HOLE_FILL": str(DEFAULTS["two_dvr_live_hole_fill"]),
+            "PT_TWO_DVR_EYE_DISTANCE_MM": str(DEFAULTS["two_dvr_live_eye_distance"]),
+            "PT_TWO_DVR_STRENGTH": str(_two_dvr_strength_value(
+                _setting_value(self.data, "two_dvr_live_strength", DEFAULTS["two_dvr_live_strength"])
+            )),
             "PT_SUBTITLE_ENABLE": "1" if self.data.get("subtitle_enable") else "0",
             "PT_SUBTITLE_MODE": str(self.data.get("subtitle_mode") or "auto"),
             "PT_SUBTITLE_DIRECTION": str(self.data.get("subtitle_direction") or "horizontal_bottom"),

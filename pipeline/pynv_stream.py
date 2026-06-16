@@ -1757,7 +1757,7 @@ class PyNvPassthroughStream:
                     audio_input = cache_path
                     log.info("[PYNV][%d] audio cache hit: %s bytes=%d total_elapsed=0.000s", self.sid, cache_path.name, cache_path.stat().st_size)
                 else:
-                    direct_only = self.output_mode == "alpha"
+                    direct_only = self.output_mode in {"alpha", "two_dvr"}
                     slate_audio_addr = self._start_slate_audio_server(cache_key, cache_path, direct_only=direct_only)
             else:
                 audio_input = self._cached_aac_input(audio_mode)
@@ -1988,6 +1988,9 @@ class PyNvPassthroughStream:
     def _worker_loop(self) -> None:
         log.info("[PYNV][%d] worker start src=%s path=%s start=%.3f", self.sid, self.src.name, self.src, self.start_sec)
         self._log_vram("worker_start")
+        if self.output_mode == "two_dvr":
+            self._worker_loop_two_dvr()
+            return
         pending_nv12_slots: list[object] = []
         slate_stop = threading.Event()
         slate_thread: threading.Thread | None = None
@@ -2629,6 +2632,345 @@ class PyNvPassthroughStream:
                 pass
             self._log_vram("worker_done")
             log.info("[PYNV][%d] worker done frames=%d bytes_emitted=%d reader_started=%s", self.sid, self.frames_produced, self.bytes_emitted, reader_started)
+
+    def _worker_loop_two_dvr(self) -> None:
+        reader_started = False
+        try:
+            import numpy as np
+            import cupy as cp
+            import PyNvVideoCodec as nvc
+            from offline.da3_depth import ensure_model_available, warmup_depth_engine
+            from offline.two_dvr import _ensure_trt_cache
+            from offline.two_dvr_gpu import GpuStereoRenderer
+            from offline.two_dvr_pynv import DA3_SIZE, _NV12_RGB_KERNELS, _letterbox_box
+            from offline.two_dvr_render import (
+                DEFAULT_FLAT_FOV_DEG,
+                PROJECTION_FLAT_3D,
+                effective_eye_distance_mm,
+                near_from_depth,
+                strength_multiplier,
+            )
+
+            codec_meta = self.metadata.codec if self.metadata is not None else None
+            bit_depth = int(codec_meta.bit_depth if codec_meta and codec_meta.bit_depth > 0 else 8)
+            if bit_depth > 8:
+                raise RuntimeError("2D->3D live currently supports 8-bit NV12 sources only")
+            meta_dec = PyNvSimpleDecoder(self.src, bit_depth=bit_depth)
+            self._log_vram("two_dvr_decoder_metadata_created")
+            info = meta_dec.info
+            if int(info.width) > 4096:
+                meta_dec.stop()
+                raise RuntimeError("2D->3D live source width exceeds 4096px; SBS output would exceed 8K")
+            dec_len = len(meta_dec)
+            timing = self.metadata.timing if self.metadata is not None else probe_timing_metadata(self.src)
+            if not timing.is_cfr:
+                meta_dec.stop()
+                raise RuntimeError("2D->3D live requires strong CFR source")
+            source_fps = float(timing.source_fps or info.fps or 30.0)
+            fps_cap = config.PASSTHROUGH_MAX_FPS if self.max_fps is None else float(self.max_fps)
+            fps = float(timing.effective_fps(fps_cap))
+            self.output_fps = fps
+            producer_pacing = bool(config.PASSTHROUGH_PRODUCER_REALTIME_PACING or fps_cap > 0)
+            start_out = int(round(self.start_sec * fps))
+            target = max(0, int((timing.duration or info.duration or 0.0) * fps) - start_out)
+            max_target = int((dec_len - 1) * fps / source_fps) + 1 if source_fps > 0 else dec_len
+            target = min(target, max(1, max_target))
+            initial_src_idx = min(dec_len - 1, cfr_source_index(start_out, source_fps, fps))
+            meta_dec.stop()
+            self._dec = PyNvThreadedSerialDecoder(
+                self.src,
+                bit_depth=bit_depth,
+                start_frame=initial_src_idx,
+                batch_size=config.PASSTHROUGH_PYNV_THREADED_BATCH_SIZE,
+                buffer_size=config.PASSTHROUGH_PYNV_THREADED_BUFFER_SIZE,
+                info=info,
+                num_frames=dec_len,
+            )
+            self._log_vram("two_dvr_decoder_created")
+
+            model_variant = config.TWO_DVR_MODEL if config.TWO_DVR_MODEL in {"small", "base", "small_hd", "base_hd"} else "base"
+            hole_fill = config.TWO_DVR_HOLE_FILL if config.TWO_DVR_HOLE_FILL in {"inverse_warp", "soft_shift"} else "soft_shift"
+            strength = strength_multiplier(config.TWO_DVR_STRENGTH)
+            eye_distance = effective_eye_distance_mm(config.TWO_DVR_EYE_DISTANCE_MM, strength)
+            log.info("[PYNV][%d] 2D->3D live model=%s ensure available", self.sid, model_variant)
+            if not ensure_model_available(model_variant, log=lambda m: log.info("[PYNV][%d] %s", self.sid, m)):
+                raise RuntimeError(f"DA3 model {model_variant} unavailable and download failed")
+            log.info("[PYNV][%d] 2D->3D live TensorRT cache ensure begin model=%s", self.sid, model_variant)
+            _ensure_trt_cache(model_variant, "trt")
+            engine = warmup_depth_engine(
+                variant=model_variant,
+                provider="trt",
+                log=lambda msg: log.info("[PYNV][%d] %s", self.sid, msg),
+            )
+            if not engine.folded:
+                raise RuntimeError("2D->3D live requires folded-preprocess DA3 model")
+            self._log_vram("two_dvr_da3_created")
+
+            width, height = int(info.width), int(info.height)
+            renderer = GpuStereoRenderer(
+                width,
+                height,
+                PROJECTION_FLAT_3D,
+                eye_distance,
+                hole_fill,
+                DEFAULT_FLAT_FOV_DEG,
+            )
+            out_w, out_h = int(renderer.out_w), int(renderer.out_h)
+            if out_w > 8192:
+                raise RuntimeError(f"2D->3D live output width exceeds 8K: {out_w}")
+            da3_size = int(engine.size)   # 518 (base/small) or 1036 (hd presets)
+            x0, y0, nw, nh = _letterbox_box(width, height, da3_size)
+            subtitle_renderer: SubtitleRenderer | None = None
+            subtitle_path = find_subtitle_for_video(self.src)
+            if subtitle_path is not None:
+                try:
+                    subtitle_renderer = SubtitleRenderer(subtitle_path, out_w, out_h)
+                    if not subtitle_renderer.enabled:
+                        subtitle_renderer = None
+                except Exception as e:
+                    subtitle_renderer = None
+                    log.warning("[PYNV][%d] subtitle load failed: %s error=%s", self.sid, subtitle_path.name, e)
+
+            bitrate_estimate = effective_default_bitrate(self.src, PYNV_BACKEND_LABEL)
+            bitrate = str(bitrate_estimate.bps)
+            enc_kwargs = _pynv_encoder_kwargs(bitrate=bitrate, fps=f"{fps:.6f}")
+            self._enc = nvc.CreateEncoder(out_w, out_h, "NV12", False, **enc_kwargs)
+            self._log_vram("two_dvr_encoder_created")
+            log.info(
+                "[PYNV][%d] 2D->3D live start: source=%dx%d output=%dx%d source_fps=%.3f output_fps=%.3f "
+                "target=%d model=%s provider=%s hole_fill=%s strength=%.2f eye_distance=%.1fmm container=%s",
+                self.sid,
+                width,
+                height,
+                out_w,
+                out_h,
+                source_fps,
+                fps,
+                target,
+                model_variant,
+                engine.providers[0] if engine.providers else "unknown",
+                hole_fill,
+                strength,
+                eye_distance,
+                self.container,
+            )
+
+            mux_duration = max(0.0, float(timing.duration or info.duration or 0.0) - self.start_sec)
+            self._mux = self._open_muxer(fps, mux_duration)
+            mux_input = self._video_mux.stdin if self._video_mux is not None else self._mux.stdin
+            assert mux_input is not None
+            self._reader = threading.Thread(target=self._reader_loop, name="pynv-reader", daemon=True)
+            self._stderr_reader = threading.Thread(target=self._stderr_loop, name="pynv-stderr", daemon=True)
+            self._reader.start()
+            self._stderr_reader.start()
+            if self._video_mux is not None:
+                threading.Thread(target=self._video_stderr_loop, name="pynv-video-stderr", daemon=True).start()
+            reader_started = True
+
+            mod = cp.RawModule(code=_NV12_RGB_KERNELS)
+            k_to_rgb = mod.get_function("nv12_to_rgb")
+            k_lb = mod.get_function("nv12_to_rgb_letterbox")
+            k_to_nv12 = mod.get_function("rgb_to_nv12")
+            rgb_g = cp.empty((height, width, 3), cp.uint8)
+            canvas_g = cp.empty((da3_size, da3_size, 3), cp.uint8)
+            out_nv12 = cp.empty((out_h * 3 // 2, out_w), cp.uint8)
+            bx = (16, 16, 1)
+            grid = ((width + 15) // 16, (height + 15) // 16, 1)
+            grid_lb = ((da3_size + 15) // 16, (da3_size + 15) // 16, 1)
+            grid_out = ((out_w + 15) // 16, (out_h + 15) // 16, 1)
+
+            t_start = time.perf_counter()
+            interval_start = t_start
+            interval_bytes = 0
+            last_src_idx = -1
+            sum_decode = sum_depth = sum_render = sum_encode = sum_mux = 0.0
+            max_decode = max_depth = max_render = max_encode = max_mux = 0.0
+            for i in range(target):
+                if self._stop.is_set():
+                    break
+                if producer_pacing and self.container == "mpegts" and fps > 0:
+                    due = t_start + (i / fps)
+                    now = time.perf_counter()
+                    if due > now:
+                        self._stop.wait(due - now)
+                        if self._stop.is_set():
+                            break
+                out_idx = start_out + i
+                src_idx = min(len(self._dec) - 1, cfr_source_index(out_idx, source_fps, fps))
+                if src_idx <= last_src_idx:
+                    src_idx = min(len(self._dec) - 1, last_src_idx + 1)
+                last_src_idx = src_idx
+                t0 = time.perf_counter()
+                if i == 0:
+                    log.info("[PYNV][%d] 2D->3D first frame decode begin src_idx=%d", self.sid, src_idx)
+                frame = self._dec.frame_at(src_idx).owned_copy()
+                if isinstance(frame, GpuP016Frame):
+                    raise RuntimeError("2D->3D live received P016 frame despite 8-bit preflight")
+                y_g = frame.y.as_cupy(cp.uint8).reshape(height, width)
+                uv_g = frame.uv.as_cupy(cp.uint8).reshape(height // 2, width)
+                t1 = time.perf_counter()
+                if i == 0:
+                    log.info("[PYNV][%d] 2D->3D first frame depth begin decode_ms=%.1f", self.sid, (t1 - t0) * 1000.0)
+                k_lb(
+                    grid_lb,
+                    bx,
+                    (
+                        y_g,
+                        uv_g,
+                        canvas_g,
+                        np.int32(width),
+                        np.int32(height),
+                        np.int32(da3_size),
+                        np.int32(x0),
+                        np.int32(y0),
+                        np.int32(nw),
+                        np.int32(nh),
+                    ),
+                )
+                canvas = canvas_g.get()[None]
+                depth = engine.session.run([engine.output_name], {engine.input_name: canvas})[0][0]
+                near = near_from_depth(depth[y0:y0 + nh, x0:x0 + nw], hole_fill)
+                near_g = cp.asarray(near)
+                t2 = time.perf_counter()
+                if i == 0:
+                    log.info("[PYNV][%d] 2D->3D first frame render begin depth_ms=%.1f", self.sid, (t2 - t1) * 1000.0)
+                k_to_rgb(grid, bx, (y_g, uv_g, rgb_g, np.int32(width), np.int32(height)))
+                sbs_rgb = renderer.render_into_gpu(rgb_g, near_g)
+                k_to_nv12(grid_out, bx, (sbs_rgb, out_nv12, np.int32(out_w), np.int32(out_h)))
+                self._apply_subtitle_overlay(out_nv12, subtitle_renderer, out_idx / fps if fps > 0 else 0.0)
+                cp.cuda.get_current_stream().synchronize()
+                t3 = time.perf_counter()
+                if i == 0:
+                    log.info("[PYNV][%d] 2D->3D first frame encode begin render_ms=%.1f", self.sid, (t3 - t2) * 1000.0)
+                flags = 0
+                if i == 0:
+                    flags = int(nvc.NV_ENC_PIC_FLAGS.FORCEIDR) | int(nvc.NV_ENC_PIC_FLAGS.OUTPUT_SPSPPS)
+                    log.info(
+                        "[PYNV][%d] 2D->3D seek start: requested_sec=%.3f out_idx=%d src_idx=%d fps=%.3f source_fps=%.3f",
+                        self.sid,
+                        self.start_sec,
+                        out_idx,
+                        src_idx,
+                        fps,
+                        source_fps,
+                    )
+                with self._encoder_lock:
+                    bitstream = self._enc.Encode(GpuNv12AppFrame(out_nv12, out_w, out_h), flags)
+                t4 = time.perf_counter()
+                if i == 0:
+                    log.info(
+                        "[PYNV][%d] 2D->3D first frame encode done encode_ms=%.1f bitstream=%d",
+                        self.sid,
+                        (t4 - t3) * 1000.0,
+                        len(bitstream) if bitstream else 0,
+                    )
+                if bitstream:
+                    if self.frames_produced == 0:
+                        log.info(
+                            "[PYNV][%d] first 2D->3D bitstream len=%d hevc_nals=%s",
+                            self.sid,
+                            len(bitstream),
+                            _hevc_nal_summary(bitstream) if PYNV_OUTPUT_CODEC == "hevc" else "n/a",
+                        )
+                    mux_stdin = self._video_mux.stdin if self._video_mux is not None else self._mux.stdin
+                    if self._stop.is_set() or not mux_stdin or mux_stdin.closed:
+                        break
+                    try:
+                        write_started = time.perf_counter()
+                        self._mark_first_write()
+                        mux_stdin.write(bitstream)
+                        if not self._real_video_started.is_set():
+                            self._real_video_started.set()
+                            self._log_vram("first_2dvr_video_bitstream")
+                        interval_bytes += len(bitstream)
+                        write_elapsed = time.perf_counter() - write_started
+                        if write_elapsed >= 1.0:
+                            log.warning("[PYNV][%d] 2D->3D mux stdin write slow: frame=%d elapsed=%.3fs", self.sid, i + 1, write_elapsed)
+                    except (BrokenPipeError, OSError, ValueError) as e:
+                        log.info("[PYNV][%d] 2D->3D mux stdin write stopped at frame=%d: %s", self.sid, i + 1, e)
+                        break
+                t5 = time.perf_counter()
+                self.frames_produced = i + 1
+                sum_decode += t1 - t0
+                sum_depth += t2 - t1
+                sum_render += t3 - t2
+                sum_encode += t4 - t3
+                sum_mux += t5 - t4
+                max_decode = max(max_decode, t1 - t0)
+                max_depth = max(max_depth, t2 - t1)
+                max_render = max(max_render, t3 - t2)
+                max_encode = max(max_encode, t4 - t3)
+                max_mux = max(max_mux, t5 - t4)
+                if config.DEBUG_LOGS and self.frames_produced % _DIAG_INTERVAL == 0:
+                    elapsed = max(0.001, time.perf_counter() - t_start)
+                    interval_elapsed = max(0.001, time.perf_counter() - interval_start)
+                    interval_frames = _DIAG_INTERVAL
+                    log.info(
+                        "[PYNV][%d] 2D->3D frame %d/%d fps=%.2f interval_fps=%.2f src_idx=%d bytes=%d out_bps=%.1fM "
+                        "stage_avg_ms decode=%.2f depth=%.2f render=%.2f encode=%.2f mux=%.2f "
+                        "stage_max_ms decode=%.2f depth=%.2f render=%.2f encode=%.2f mux=%.2f",
+                        self.sid,
+                        self.frames_produced,
+                        target,
+                        self.frames_produced / elapsed,
+                        interval_frames / interval_elapsed,
+                        src_idx,
+                        self.bytes_emitted,
+                        (interval_bytes * 8.0 / interval_elapsed) / 1_000_000.0,
+                        (sum_decode / interval_frames) * 1000.0,
+                        (sum_depth / interval_frames) * 1000.0,
+                        (sum_render / interval_frames) * 1000.0,
+                        (sum_encode / interval_frames) * 1000.0,
+                        (sum_mux / interval_frames) * 1000.0,
+                        max_decode * 1000.0,
+                        max_depth * 1000.0,
+                        max_render * 1000.0,
+                        max_encode * 1000.0,
+                        max_mux * 1000.0,
+                    )
+                    interval_start = time.perf_counter()
+                    interval_bytes = 0
+                    sum_decode = sum_depth = sum_render = sum_encode = sum_mux = 0.0
+                    max_decode = max_depth = max_render = max_encode = max_mux = 0.0
+            if not self._stop.is_set():
+                log.info("[PYNV][%d] 2D->3D EndEncode begin frames=%d", self.sid, self.frames_produced)
+                with self._encoder_lock:
+                    tail = self._enc.EndEncode()
+                if tail:
+                    mux_stdin = self._video_mux.stdin if self._video_mux is not None else self._mux.stdin
+                    if mux_stdin:
+                        self._mark_first_write()
+                        mux_stdin.write(tail)
+                log.info("[PYNV][%d] 2D->3D EndEncode done", self.sid)
+        except Exception as e:
+            if self._stop.is_set():
+                log.info("[PYNV][%d] 2D->3D worker stopped during close: %s", self.sid, e)
+                return
+            if self.frames_produced == 0 and self.bytes_emitted == 0:
+                self.startup_error = str(e)
+            log.error("[PYNV][%d] 2D->3D worker exception: %s\n%s", self.sid, e, traceback.format_exc(limit=8))
+        finally:
+            self._enc = None
+            try:
+                if self._dec is not None:
+                    self._dec.stop()
+            except Exception:
+                pass
+            try:
+                stdin = self._video_mux.stdin if self._video_mux is not None else (self._mux.stdin if self._mux else None)
+                if stdin:
+                    log.info("[PYNV][%d] 2D->3D worker closing mux stdin frames=%d stop=%s", self.sid, self.frames_produced, self._stop.is_set())
+                    stdin.close()
+            except Exception:
+                pass
+            if not reader_started:
+                self._post_sentinel()
+            try:
+                gc.collect()
+            except Exception:
+                pass
+            self._log_vram("two_dvr_worker_done")
+            log.info("[PYNV][%d] 2D->3D worker done frames=%d bytes_emitted=%d reader_started=%s", self.sid, self.frames_produced, self.bytes_emitted, reader_started)
 
     def _worker_loop_two_stage_green(
         self,

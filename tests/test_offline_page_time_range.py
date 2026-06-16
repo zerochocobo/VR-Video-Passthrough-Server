@@ -173,6 +173,32 @@ class OfflinePageTimeRangeTests(unittest.TestCase):
                     page.close()
                     app.processEvents()
 
+    def test_run_single_passes_selected_birefnet_prepass(self) -> None:
+        app = QApplication.instance() or QApplication([])
+        with tempfile.TemporaryDirectory() as tmp:
+            src = Path(tmp) / "input.mp4"
+            src.write_bytes(b"video")
+            process = _FakeProcess()
+            with patch("ui.pages.offline_page.cache_status", return_value="missing"), patch(
+                "ui.pages.offline_page.probe_video_metadata",
+                return_value=SimpleNamespace(timing=SimpleNamespace(duration=600.0)),
+            ):
+                page = OfflinePage(I18n("en_US"), _FakeSettings(), process)
+                try:
+                    page.single_video.setText(str(src))
+                    page.single_engine.setCurrentIndex(page.single_engine.findData("matanyone2"))
+                    page.single_recognition.setCurrentIndex(page.single_recognition.findData("yolo26m_birefnet"))
+
+                    page.run_single()
+
+                    self.assertIsNotNone(process.started_args)
+                    args = process.started_args or []
+                    self.assertEqual(args[args.index("--engine") + 1], "matanyone2_medium")
+                    self.assertEqual(args[args.index("--matanyone2-prepass") + 1], "yolo26m_birefnet")
+                finally:
+                    page.close()
+                    app.processEvents()
+
 
 if __name__ == "__main__":
     unittest.main()

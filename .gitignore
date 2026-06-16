@@ -23,7 +23,6 @@ NVENC
 *.ass
 *.srt
 *.psd
-*.spec
 uv.lock
 *.onnx
 *.onnx.data

@@ -34,7 +34,13 @@ def onnx_providers(provider: str = "cuda") -> list:
 
 
 def _sigmoid(x: np.ndarray) -> np.ndarray:
-    return 1.0 / (1.0 + np.exp(-x))
+    arr = np.asarray(x, dtype=np.float32)
+    out = np.empty_like(arr, dtype=np.float32)
+    positive = arr >= 0
+    out[positive] = 1.0 / (1.0 + np.exp(-arr[positive]))
+    exp_x = np.exp(arr[~positive])
+    out[~positive] = exp_x / (1.0 + exp_x)
+    return out
 
 
 def _letterbox_rgb(image_rgb: np.ndarray, size: int) -> tuple[np.ndarray, float, float, float]:

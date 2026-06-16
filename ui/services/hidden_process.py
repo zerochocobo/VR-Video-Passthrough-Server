@@ -9,6 +9,17 @@ from PySide6.QtCore import QObject, Signal
 
 from utils.subprocess_hidden import hidden_subprocess_kwargs
 
+_INT32_MAX = 2**31 - 1
+_UINT32_MOD = 2**32
+
+
+def _qt_exit_code(code: int) -> int:
+    """Normalize Windows DWORD process exit codes for Qt's signed int signal."""
+    value = int(code)
+    if value > _INT32_MAX:
+        value -= _UINT32_MOD
+    return value
+
 
 class HiddenProcess(QObject):
     """Small QObject wrapper around subprocess.Popen with no console window."""
@@ -117,7 +128,7 @@ class HiddenProcess(QObject):
 
     def _wait_loop(self, proc: subprocess.Popen, generation: int) -> None:
         try:
-            rc = int(proc.wait())
+            rc = _qt_exit_code(int(proc.wait()))
         except Exception:
             rc = -1
         should_emit = False

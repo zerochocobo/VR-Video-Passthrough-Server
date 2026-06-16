@@ -352,6 +352,7 @@ class OfflinePage(QWidget):
     def _recognition_combo(self) -> QComboBox:
         combo = _fit_combo(QComboBox())
         combo.addItem("", "yolo26m_efficientsam")
+        combo.addItem("", "yolo26m_birefnet")
         combo.addItem("", "sam3")
         return combo
 
@@ -777,7 +778,14 @@ class OfflinePage(QWidget):
         if engine != "matanyone2":
             return engine
         recognition = str(recognition_combo.currentData())
-        return "matanyone2_medium" if recognition == "yolo26m_efficientsam" else "matanyone2"
+        return "matanyone2_medium" if recognition in {"yolo26m_efficientsam", "yolo26m_birefnet"} else "matanyone2"
+
+    @staticmethod
+    def _medium_prepass_args(recognition_combo: QComboBox) -> list[str]:
+        recognition = str(recognition_combo.currentData())
+        if recognition in {"yolo26m_efficientsam", "yolo26m_birefnet"}:
+            return ["--matanyone2-prepass", recognition]
+        return []
 
     def _sam3_prompt(self) -> str:
         prompt = str(self.settings.data.get("offline_sam3_prompt") or "").strip()
@@ -1033,6 +1041,8 @@ class OfflinePage(QWidget):
             args.extend(self._rvm_precision_args(self.single_precision))
         if engine in {"matanyone2", "matanyone2_medium"}:
             args.extend(self._matanyone2_precision_args(self.single_precision))
+        if engine == "matanyone2_medium":
+            args.extend(self._medium_prepass_args(self.single_recognition))
         if engine == "matanyone2":
             args.extend(["--sam3-prompt", self._sam3_prompt()])
         self.settings.save()
@@ -1061,6 +1071,8 @@ class OfflinePage(QWidget):
             args.extend(self._rvm_precision_args(self.batch_precision))
         if engine in {"matanyone2", "matanyone2_medium"}:
             args.extend(self._matanyone2_precision_args(self.batch_precision))
+        if engine == "matanyone2_medium":
+            args.extend(self._medium_prepass_args(self.batch_recognition))
         if engine == "matanyone2":
             args.extend(["--sam3-prompt", self._sam3_prompt()])
         self.settings.save()
@@ -1136,7 +1148,8 @@ class OfflinePage(QWidget):
             combo.setItemText(1, self.i18n.t("engine.matanyone2"))
         for combo in (self.single_recognition, self.batch_recognition):
             combo.setItemText(0, self.i18n.t("recognition.yolo26m_efficientsam"))
-            combo.setItemText(1, self.i18n.t("recognition.sam3"))
+            combo.setItemText(1, self.i18n.t("recognition.yolo26m_birefnet"))
+            combo.setItemText(2, self.i18n.t("recognition.sam3"))
         self._configure_precision_combo(self.single_precision, str(self.single_engine.currentData()))
         self._configure_precision_combo(self.batch_precision, str(self.batch_engine.currentData()))
         self.single_sam3_prompt_button.setText(self.i18n.t("offline.sam3_prompt_button"))

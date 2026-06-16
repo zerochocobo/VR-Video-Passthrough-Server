@@ -7,6 +7,7 @@ from utils.offline_outputs import (
     has_offline_passthrough_output,
     is_offline_passthrough_output_name,
     matches_offline_output_for_source,
+    matches_offline_two_dvr_output_for_source,
 )
 
 
@@ -43,6 +44,25 @@ class OfflineOutputDetectionTests(unittest.TestCase):
         self.assertTrue(is_offline_passthrough_output_name("movie_LR_180_FISHEYE_F180_alpha.mp4"))
         self.assertTrue(is_offline_passthrough_output_name("movie_SBS_F180_alpha.mp4"))
         self.assertFalse(is_offline_passthrough_output_name("movie_alpha_notes.mp4"))
+
+    def test_detects_two_dvr_outputs_for_source(self) -> None:
+        source = Path("movie.mp4")
+
+        self.assertTrue(matches_offline_two_dvr_output_for_source(source, Path("movie_3D_LR_Screen.mp4")))
+        self.assertTrue(matches_offline_two_dvr_output_for_source(source, Path("movie_S000130_3D_LR_Screen.mp4")))
+        self.assertTrue(matches_offline_two_dvr_output_for_source(source, Path("movie_S000130_E000200_3D_LR_Screen.mp4")))
+        self.assertTrue(matches_offline_two_dvr_output_for_source(source, Path("movie_SEG2_S000130_E000505_3D_LR_Screen.mp4")))
+        # Legacy flat3d SBS output naming is still recognized.
+        self.assertTrue(matches_offline_two_dvr_output_for_source(source, Path("movie_2dvr_base_flat3d_LR_SBS.mp4")))
+
+    def test_two_dvr_rejects_prefix_collisions(self) -> None:
+        source = Path("movie.mp4")
+
+        # A different source whose stem starts with "movie_" must not be treated
+        # as movie's own 2D->3D output.
+        self.assertFalse(matches_offline_two_dvr_output_for_source(source, Path("movie_part2_3D_LR_Screen.mp4")))
+        self.assertFalse(matches_offline_two_dvr_output_for_source(source, Path("movie_part2_2dvr_base_flat3d_LR_SBS.mp4")))
+        self.assertFalse(matches_offline_two_dvr_output_for_source(source, source))
 
     def test_has_offline_output_accepts_snapshot_siblings(self) -> None:
         source = Path("movie.mp4")

@@ -51,10 +51,14 @@ def _prepend_path(paths: list[Path]) -> None:
 
 
 if sys.platform.startswith("win") and hasattr(os, "add_dll_directory"):
-    # CUDA 12.6 NVRTC cannot emit sm_120 cubin for Blackwell GPUs. CuPy's
-    # default direct-cubin path can then fail with CUDA_ERROR_NO_BINARY_FOR_GPU.
-    # PTX lets the installed NVIDIA driver JIT for the actual device.
-    os.environ.setdefault("CUPY_COMPILE_WITH_PTX", "1")
+    # The package now bundles the pip CUDA 12.x NVRTC (>=12.8), which CAN emit
+    # native cubins for Blackwell sm_120. So we keep CuPy on its default direct-
+    # cubin path (PTX disabled) -- this avoids the PTX->driver JIT cold-start
+    # ("cuda compute cache" recompile) that CUPY_COMPILE_WITH_PTX=1 incurred with
+    # the old system CUDA 12.6 NVRTC. nvrtc 12.x supports sm_50..sm_120, covering
+    # every GPU this product targets. Override to "1" if a future GPU needs the
+    # driver-JIT fallback.
+    os.environ.setdefault("CUPY_COMPILE_WITH_PTX", "0")
 
     exe_dir = Path(sys.executable).resolve().parent
     internal_dir = Path(getattr(sys, "_MEIPASS", exe_dir / "_internal")).resolve()

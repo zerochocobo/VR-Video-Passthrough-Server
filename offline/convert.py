@@ -52,6 +52,7 @@ RVM_DEFAULT_ARGS = {
 }
 MATANYONE2_DEFAULT_SIZE = 1024
 MATANYONE2_SIZE_CHOICES = (512, 1024)
+MATANYONE2_MEDIUM_PREPASS_CHOICES = ("yolo26m_efficientsam", "yolo26m_birefnet")
 
 
 def _strip_tensorrt_provider(provider_text: str) -> str:
@@ -245,7 +246,11 @@ def _base_cmd(args: argparse.Namespace, src: Path, out: Path) -> list[str]:
     if args.engine == "matanyone2":
         cmd.extend(["--sam3-prompt", str(getattr(args, "sam3_prompt", "person") or "person")])
     if args.engine == "matanyone2_medium":
-        cmd.extend(["--matanyone2-prepass", "yolo26m_efficientsam"])
+        prepass = str(getattr(args, "matanyone2_prepass", "yolo26m_efficientsam") or "yolo26m_efficientsam")
+        if prepass not in MATANYONE2_MEDIUM_PREPASS_CHOICES:
+            supported = ", ".join(MATANYONE2_MEDIUM_PREPASS_CHOICES)
+            raise ValueError(f"unsupported MatAnyone2 medium prepass: {prepass}; supported: {supported}")
+        cmd.extend(["--matanyone2-prepass", prepass])
     cmd.extend(["--preset", str(args.preset)])
     cmd.extend(["--cq", str(getattr(args, "cq", RVM_DEFAULT_ARGS["cq"]))])
     if engine == "rvm":
@@ -496,6 +501,7 @@ def main(argv: list[str] | None = None) -> int:
     single.add_argument("--preset", default=RVM_DEFAULT_ARGS["preset"])
     single.add_argument("--cq", type=int, default=RVM_DEFAULT_ARGS["cq"])
     single.add_argument("--matanyone2-size", type=int, choices=MATANYONE2_SIZE_CHOICES, default=MATANYONE2_DEFAULT_SIZE)
+    single.add_argument("--matanyone2-prepass", choices=MATANYONE2_MEDIUM_PREPASS_CHOICES, default="yolo26m_efficientsam")
     single.add_argument("--sam3-prompt", default="person")
     single.add_argument("--skip-existing", action="store_true")
 
@@ -513,6 +519,7 @@ def main(argv: list[str] | None = None) -> int:
     batch.add_argument("--preset", default=RVM_DEFAULT_ARGS["preset"])
     batch.add_argument("--cq", type=int, default=RVM_DEFAULT_ARGS["cq"])
     batch.add_argument("--matanyone2-size", type=int, choices=MATANYONE2_SIZE_CHOICES, default=MATANYONE2_DEFAULT_SIZE)
+    batch.add_argument("--matanyone2-prepass", choices=MATANYONE2_MEDIUM_PREPASS_CHOICES, default="yolo26m_efficientsam")
     batch.add_argument("--sam3-prompt", default="person")
     batch.set_defaults(out="", start=0.0, duration=0.0)
 

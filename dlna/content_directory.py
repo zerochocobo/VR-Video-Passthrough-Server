@@ -45,10 +45,19 @@ from pipeline.ffmpeg_io import probe_cached
 from utils.bitrate_estimator import estimate_for_media
 from utils.logger import get
 from utils.media_index import IndexedChild, get_media_index
-from utils.offline_outputs import has_offline_passthrough_output, is_offline_passthrough_output_name
+from utils.offline_outputs import (
+    has_offline_passthrough_output,
+    has_offline_two_dvr_output,
+    is_offline_passthrough_output_name,
+)
 from utils.subtitles import SubtitleTrack, find_external_subtitles, subtitle_output_enabled
 from utils.video_metadata import probe_video_metadata, select_backend
-from utils.vr_naming import live_passthrough_title, source_display_stem
+from utils.vr_naming import (
+    has_vr_filename_marker,
+    is_half_equirectangular_source,
+    live_passthrough_title,
+    source_display_stem,
+)
 
 log = get("cds")
 
@@ -59,8 +68,10 @@ LIVE_PREFIX = "pl_"
 LEGACY_LIVE_PREFIX = "pl:"
 ALPHA_LIVE_PREFIX = "pla_"
 LEGACY_ALPHA_LIVE_PREFIX = "pla:"
+TWO_DVR_LIVE_PREFIX = "pl3_"
 LIVE_ITEM_PREFIX = "lg_"
 ALPHA_LIVE_ITEM_PREFIX = "la_"
+TWO_DVR_LIVE_ITEM_PREFIX = "l3_"
 SEEK_ITEM_PREFIX = "sg_"
 ALPHA_SEEK_ITEM_PREFIX = "sa_"
 IMAGE_ITEM_PREFIX = "img_"
@@ -164,11 +175,17 @@ def _id_to_dir(object_id: str) -> Path | None:
 def _id_to_live(object_id: str) -> tuple[Path, str] | None:
     mode = "green"
     prefix = LIVE_PREFIX
-    if object_id.startswith(ALPHA_LIVE_ITEM_PREFIX):
+    if object_id.startswith(TWO_DVR_LIVE_ITEM_PREFIX):
+        mode = "two_dvr"
+        prefix = TWO_DVR_LIVE_ITEM_PREFIX
+    elif object_id.startswith(ALPHA_LIVE_ITEM_PREFIX):
         mode = "alpha"
         prefix = ALPHA_LIVE_ITEM_PREFIX
     elif object_id.startswith(LIVE_ITEM_PREFIX):
         prefix = LIVE_ITEM_PREFIX
+    elif object_id.startswith(TWO_DVR_LIVE_PREFIX):
+        mode = "two_dvr"
+        prefix = TWO_DVR_LIVE_PREFIX
     elif object_id.startswith(ALPHA_LIVE_PREFIX):
         mode = "alpha"
         prefix = ALPHA_LIVE_PREFIX
@@ -289,13 +306,21 @@ def _hide_passthrough_for_path(path: Path, child: IndexedChild | None) -> bool:
 
 
 def _passthrough_modes() -> tuple[str, ...]:
-    if PASSTHROUGH_OUTPUT_MODE == "none":
+    raw = str(PASSTHROUGH_OUTPUT_MODE or "none").strip().lower()
+    if raw == "none":
         return ()
-    if PASSTHROUGH_OUTPUT_MODE == "all":
+    if raw == "all":
         return ("green", "alpha")
-    if PASSTHROUGH_OUTPUT_MODE == "alpha":
-        return ("alpha",)
-    return ("green",)
+    out: list[str] = []
+    for token in re.split(r"[,;\s]+", raw):
+        if token == "all":
+            tokens = ("green", "alpha")
+        else:
+            tokens = (token,)
+        for mode in tokens:
+            if mode in {"green", "alpha", "two_dvr"} and mode not in out:
+                out.append(mode)
+    return tuple(out)
 
 
 def _subtitle_item(track: SubtitleTrack) -> dict:
@@ -368,10 +393,14 @@ def _passthrough_seek_title(path: Path, mode: str, width: int = 0, height: int =
 
 
 def _passthrough_live_prefix(mode: str) -> str:
+    if mode == "two_dvr":
+        return TWO_DVR_LIVE_PREFIX
     return ALPHA_LIVE_PREFIX if mode == "alpha" else LIVE_PREFIX
 
 
 def _passthrough_live_item_prefix(mode: str) -> str:
+    if mode == "two_dvr":
+        return TWO_DVR_LIVE_ITEM_PREFIX
     return ALPHA_LIVE_ITEM_PREFIX if mode == "alpha" else LIVE_ITEM_PREFIX
 
 
@@ -381,7 +410,7 @@ def _passthrough_seek_item_prefix(mode: str) -> str:
 
 def _passthrough_live_query(mode: str) -> str:
     version = f"ptv={_DIDL_SCHEMA_VERSION}"
-    if mode in {"green", "alpha"}:
+    if mode in {"green", "alpha", "two_dvr"}:
         return f"mode={mode}&{version}"
     return version
 
@@ -452,7 +481,22 @@ def _passthrough_resolution(width: int, height: int, mode: str) -> str:
     if mode == "alpha" and width > 0 and height > 0:
         out_w, out_h = alpha_output_size(width, height)
         return _resolution_str(out_w, out_h)
+    if mode == "two_dvr" and width > 0 and height > 0:
+        proc_w = min(int(width), 4096)
+        if proc_w != int(width):
+            proc_h = max(2, int(round(int(height) * (proc_w / float(width)))))
+            proc_h -= proc_h & 1
+        else:
+            proc_h = int(height)
+        return _resolution_str(proc_w * 2, proc_h)
     return _resolution_str(width, height)
+
+
+def _is_two_d_source(path: Path, width: int = 0, height: int = 0) -> bool:
+    return (
+        not has_vr_filename_marker(path.stem)
+        and not is_half_equirectangular_source(width, height)
+    )
 
 
 def _live_chapter_offsets(duration: float) -> list[int]:
@@ -577,7 +621,13 @@ def _video_items_from_index(
     live_route_suffix = _live_route_hint_suffix(client_profile)
     live_omit_filelike_attrs = not _is_deovr_cds_client(client_profile)
     for mode in _passthrough_modes():
-        if _seek_passthrough_dlna_enabled():
+        if mode == "two_dvr" and (
+            not _is_two_d_source(path, width, height)
+            or has_offline_two_dvr_output(path, siblings)
+            or width > 4096
+        ):
+            continue
+        if mode != "two_dvr" and _seek_passthrough_dlna_enabled():
             query = _passthrough_seek_query(mode)
             seek_size = max(0, int(PASSTHROUGH_SEEK_HEADER_BYTES)) + pt_size if duration > 0 else 0
             seek_container = _seek_passthrough_container()
@@ -660,6 +710,12 @@ def _live_chapter_items(path: Path, mode: str, client_profile: str | None = None
         width = 0
         height = 0
         source_fps = 0.0
+    if mode == "two_dvr" and (
+        not _is_two_d_source(path, width, height)
+        or has_offline_two_dvr_output(path)
+        or width > 4096
+    ):
+        return []
     pt_bps = _parse_bitrate(PASSTHROUGH_BITRATE)
     if duration > 0:
         _, pt_bps_est, _ = estimate_for_media(path, duration, PYNV_OUTPUT_CODEC)
@@ -667,7 +723,7 @@ def _live_chapter_items(path: Path, mode: str, client_profile: str | None = None
         pt_bps_est = pt_bps
     items: list[dict] = []
     virtual_title = _passthrough_virtual_title(path, mode, width, height)
-    suffix = "alpha" if mode == "alpha" else "green"
+    suffix = {"alpha": "a", "two_dvr": "3"}.get(mode, "g")
     live_route_suffix = _live_route_hint_suffix(client_profile)
     live_omit_filelike_attrs = not _is_deovr_cds_client(client_profile)
     for offset in _live_chapter_offsets(duration):
@@ -675,7 +731,7 @@ def _live_chapter_items(path: Path, mode: str, client_profile: str | None = None
         remain = max(0.0, duration - float(offset)) if duration > 0 else 0.0
         items.append(
             {
-                "id": f"lt{suffix[0]}_{_versioned_rel(rel)}@{offset}",
+                "id": f"lt{suffix}_{_versioned_rel(rel)}@{offset}",
                 "parent_id": parent_id,
                 "title": title,
                 # See note above re: the optional ``.ts`` Skybox pipeline hint.

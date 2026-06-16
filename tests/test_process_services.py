@@ -57,6 +57,21 @@ class HiddenProcessTests(unittest.TestCase):
         self.assertEqual(finished, [0])
         self.assertIsNone(process._proc)
 
+    def test_wait_loop_normalizes_unsigned_windows_exit_code(self) -> None:
+        _app()
+        process = HiddenProcess()
+        proc = _FakeProc(0xFFFFFFFF)
+        finished: list[int] = []
+        process.finished.connect(lambda rc: finished.append(int(rc)))
+        with process._lock:
+            process._generation = 1
+            process._proc = proc  # type: ignore[assignment]
+
+        process._wait_loop(proc, 1)  # type: ignore[arg-type]
+
+        self.assertEqual(finished, [-1])
+        self.assertIsNone(process._proc)
+
 
 class _FakeHiddenProcess:
     def __init__(self, waits: list[bool], pid: int = 123) -> None:

@@ -16,8 +16,9 @@ from ui.metadata import load_app_metadata
 from ui.pages.home_page import HOME_COMPACT_WIDTH, HOME_HEIGHT, HomePage
 from ui.pages.offline_page import OfflinePage
 from ui.pages.subtitle_page import SUBTITLE_PAGE_HEIGHT, SUBTITLE_PAGE_WIDTH, SubtitlePage
+from ui.pages.two_dvr_page import TwoDvrPage
 from ui.resources import app_icon
-from ui.services.offline_process import OfflineProcess
+from ui.services.offline_process import OfflineProcess, TwoDvrProcess
 from ui.services.server_process import ServerProcess
 from ui.services.startup_diagnostics import LOG_PATH as UI_STARTUP_LOG_PATH, log_startup_event
 from ui.services.startup_status_poller import DEFAULT_PORT as STATUS_DEFAULT_PORT, StartupStatusPoller
@@ -50,12 +51,15 @@ class MainWindow(QMainWindow):
         self.i18n = I18n(saved_language)
         self.server = ServerProcess()
         self.offline_process = OfflineProcess()
+        self.two_dvr_process = TwoDvrProcess()
         self.stack = CurrentPageStackedWidget()
         self.home = HomePage(self.i18n, self.settings, self.metadata.display_version)
         self.offline = OfflinePage(self.i18n, self.settings, self.offline_process)
+        self.two_dvr = TwoDvrPage(self.i18n, self.settings, self.two_dvr_process)
         self.subtitle = SubtitlePage(self.i18n, self.settings)
         self.stack.addWidget(self.home)
         self.stack.addWidget(self.offline)
+        self.stack.addWidget(self.two_dvr)
         self.stack.addWidget(self.subtitle)
         self.setCentralWidget(self.stack)
         self.version_label = QLabel(self.metadata.display_version)
@@ -75,9 +79,11 @@ class MainWindow(QMainWindow):
         self.statusBar().addPermanentWidget(self.version_label)
         self.home.server_button.clicked.connect(self.toggle_server)
         self.home.offline_button.clicked.connect(self.open_offline)
+        self.home.two_dvr_button.clicked.connect(self.open_two_dvr)
         self.home.subtitle_style_button.clicked.connect(lambda: self.stack.setCurrentWidget(self.subtitle))
         self.home.language.currentIndexChanged.connect(self.change_language)
         self.offline.back_button.clicked.connect(lambda: self.stack.setCurrentWidget(self.home))
+        self.two_dvr.back_button.clicked.connect(lambda: self.stack.setCurrentWidget(self.home))
         self.subtitle.back_button.clicked.connect(lambda: self.stack.setCurrentWidget(self.home))
         self.stack.currentChanged.connect(self._page_changed)
         self.server.output.connect(self.home.append_log)
@@ -85,6 +91,7 @@ class MainWindow(QMainWindow):
         self.server.state_changed.connect(self.home.set_server_running)
         self.server.state_changed.connect(self._server_state_changed)
         self.offline_process.state_changed.connect(self._offline_state_changed)
+        self.two_dvr_process.state_changed.connect(self._two_dvr_state_changed)
         # Startup overlay + status poller (lazy: created when first needed).
         self.startup_overlay: StartupOverlay | None = None
         self.status_poller = StartupStatusPoller(port=STATUS_DEFAULT_PORT, parent=self)
@@ -146,6 +153,7 @@ class MainWindow(QMainWindow):
         self.home.retranslate()
         self.home.set_server_running(self.server.is_running())
         self.offline.retranslate()
+        self.two_dvr.retranslate()
         self.subtitle.retranslate()
 
     def toggle_server(self) -> None:
@@ -155,7 +163,7 @@ class MainWindow(QMainWindow):
             self._set_server_action_pending("stopping")
             self.server.stop()
             return
-        if self.offline_process.is_running():
+        if self.offline_process.is_running() or self.two_dvr_process.is_running():
             QMessageBox.warning(self, self.i18n.t("dialog.warning"), self.i18n.t("dialog.stop_offline_first"))
             return
         gpu_support = detect_nvidia_gpu_requirement()
@@ -196,6 +204,12 @@ class MainWindow(QMainWindow):
             return
         self.stack.setCurrentWidget(self.offline)
 
+    def open_two_dvr(self) -> None:
+        if self.server.is_running():
+            QMessageBox.warning(self, self.i18n.t("dialog.warning"), self.i18n.t("dialog.stop_server_first"))
+            return
+        self.stack.setCurrentWidget(self.two_dvr)
+
     def _page_changed(self, index: int) -> None:
         if self.stack.widget(index) is self.home:
             self.home.sync_from_settings()
@@ -210,10 +224,17 @@ class MainWindow(QMainWindow):
         elif self.stack.widget(index) is self.offline:
             self.offline.sync_from_settings()
             self.resize(OFFLINE_PAGE_WIDTH, OFFLINE_PAGE_HEIGHT)
+        elif self.stack.widget(index) is self.two_dvr:
+            self.two_dvr.sync_from_settings()
+            self.resize(OFFLINE_PAGE_WIDTH, OFFLINE_PAGE_HEIGHT)
 
     def _offline_state_changed(self, running: bool) -> None:
         if running:
             self.stack.setCurrentWidget(self.offline)
+
+    def _two_dvr_state_changed(self, running: bool) -> None:
+        if running:
+            self.stack.setCurrentWidget(self.two_dvr)
 
     def closeEvent(self, event) -> None:
         self.status_poller.stop()
@@ -221,6 +242,7 @@ class MainWindow(QMainWindow):
             self.startup_overlay.close()
         self.server.stop()
         self.offline_process.stop()
+        self.two_dvr_process.stop()
         super().closeEvent(event)
 
     # ---- Startup overlay glue ----
@@ -454,9 +476,13 @@ class MainWindow(QMainWindow):
             fps = produced_fps if produced_fps > 0 else output_fps
             if fps > 0:
                 parts.append(f"FPS {fps:.1f}")
+            else:
+                parts.append("FPS --")
         if used is not None and total is not None:
             try:
                 parts.append(f"{self.i18n.t('status.vram')} {float(used):.0f}/{float(total):.0f} MB")
             except (TypeError, ValueError):
                 pass
+        elif active:
+            parts.append(f"{self.i18n.t('status.vram')} --")
         self.runtime_status_label.setText(" | ".join(parts))

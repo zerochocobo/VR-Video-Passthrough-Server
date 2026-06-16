@@ -52,6 +52,8 @@ PROJECT_URL = "https://wapok.com"
 PROJECT_LINK_HEIGHT = 28
 ICON_BUTTON_SIZE = 30
 LIGHT_MATCH_DEFAULT_PRESET = str(DEFAULTS["light_match_preset"])
+_UI_TWO_DVR_HOLE_FILL = "soft_shift"
+_TWO_DVR_STRENGTH_OPTIONS = (0.5, 0.75, 1.0, 1.25, 1.5, 1.75, 2.0)
 
 
 def _retain_size_when_hidden(widget: QWidget) -> None:
@@ -483,9 +485,11 @@ class HomePage(QWidget):
 
         self.server_button = QPushButton()
         self.offline_button = QPushButton()
+        self.two_dvr_button = QPushButton()
         self.server_button.setMinimumHeight(58)
         self.server_button.setIconSize(QSize(SERVER_ICON_SIZE, SERVER_ICON_SIZE))
         self.offline_button.setMinimumHeight(58)
+        self.two_dvr_button.setMinimumHeight(58)
 
         self.green_mode = QCheckBox()
         self.alpha_mode = QCheckBox()
@@ -529,6 +533,25 @@ class HomePage(QWidget):
         _retain_size_when_hidden(self.debug_toggle_label)
         self.problem_help_button = QPushButton()
         self.problem_help_button.setFixedWidth(104)
+        self.home_two_dvr_label = QLabel()
+        self.home_two_dvr_toggle = QCheckBox()
+        self.home_two_dvr_toggle.setChecked(bool(settings.data.get("mode_two_dvr")))
+        _apply_switch_style(self.home_two_dvr_toggle)
+        self.home_two_dvr_strength_label = QLabel()
+        self.home_two_dvr_strength = QComboBox()
+        for value in _TWO_DVR_STRENGTH_OPTIONS:
+            self.home_two_dvr_strength.addItem("", value)
+        strength = max(0.5, min(2.0, _float_setting(
+            settings.data.get("two_dvr_live_strength"),
+            DEFAULTS["two_dvr_live_strength"],
+        )))
+        self.home_two_dvr_strength.setCurrentIndex(min(
+            range(len(_TWO_DVR_STRENGTH_OPTIONS)),
+            key=lambda i: abs(_TWO_DVR_STRENGTH_OPTIONS[i] - strength),
+        ))
+        self.home_two_dvr_strength.setFixedWidth(82)
+        _retain_size_when_hidden(self.home_two_dvr_strength_label)
+        _retain_size_when_hidden(self.home_two_dvr_strength)
 
         self.log = QTextEdit()
         self.log.setReadOnly(True)
@@ -548,7 +571,11 @@ class HomePage(QWidget):
         buttons = QVBoxLayout()
         buttons.setSpacing(8)
         buttons.addWidget(self.server_button)
-        buttons.addWidget(self.offline_button)
+        offline_row = QHBoxLayout()
+        offline_row.setSpacing(8)
+        offline_row.addWidget(self.offline_button, 1)
+        offline_row.addWidget(self.two_dvr_button, 1)
+        buttons.addLayout(offline_row)
 
         quick_config = QWidget()
         quick_config.setObjectName("QuickConfig")
@@ -620,22 +647,21 @@ class HomePage(QWidget):
         subtitle_row.addWidget(self.subtitle_enable)
         subtitle_row.addStretch(1)
         subtitle_row.addWidget(self.subtitle_style_button)
-        log_row_widget = QWidget()
-        log_row_widget.setFixedHeight(CONFIG_ROW_HEIGHT)
-        log_row = QHBoxLayout(log_row_widget)
-        log_row.setContentsMargins(0, 0, 0, 0)
-        log_row.addWidget(self.log_toggle_label)
-        log_row.addWidget(self.log_toggle)
-        log_row.addSpacing(16)
-        log_row.addWidget(self.debug_toggle_label)
-        log_row.addWidget(self.debug_toggle)
-        log_row.addStretch(1)
-        log_row.addWidget(self.problem_help_button)
+        home_two_dvr_row_widget = QWidget()
+        home_two_dvr_row_widget.setFixedHeight(CONFIG_ROW_HEIGHT)
+        home_two_dvr_row = QHBoxLayout(home_two_dvr_row_widget)
+        home_two_dvr_row.setContentsMargins(0, 0, 0, 0)
+        home_two_dvr_row.addWidget(self.home_two_dvr_label)
+        home_two_dvr_row.addWidget(self.home_two_dvr_toggle)
+        home_two_dvr_row.addSpacing(10)
+        home_two_dvr_row.addWidget(self.home_two_dvr_strength_label)
+        home_two_dvr_row.addWidget(self.home_two_dvr_strength)
+        home_two_dvr_row.addStretch(1)
         group_layout.addWidget(dirs_row_widget)
         group_layout.addWidget(green_row_widget)
         group_layout.addWidget(alpha_row_widget)
         group_layout.addWidget(subtitle_row_widget)
-        group_layout.addWidget(log_row_widget)
+        group_layout.addWidget(home_two_dvr_row_widget)
         quick_config_layout.addWidget(self.config_header)
         quick_config_layout.addWidget(self.config_content)
         performance_config = QWidget()
@@ -779,7 +805,19 @@ class HomePage(QWidget):
         light_enable_row.addWidget(self.light_match_advanced_button)
         light_enable_row.addStretch(1)
         light_enable_row.addWidget(self.light_match_help)
+        log_row_widget = QWidget()
+        log_row_widget.setFixedHeight(CONFIG_ROW_HEIGHT)
+        log_row = QHBoxLayout(log_row_widget)
+        log_row.setContentsMargins(0, 0, 0, 0)
+        log_row.addWidget(self.log_toggle_label)
+        log_row.addWidget(self.log_toggle)
+        log_row.addSpacing(16)
+        log_row.addWidget(self.debug_toggle_label)
+        log_row.addWidget(self.debug_toggle)
+        log_row.addStretch(1)
+        log_row.addWidget(self.problem_help_button)
         light_content_layout.addWidget(light_enable_row_widget)
+        light_content_layout.addWidget(log_row_widget)
         light_match_layout.addWidget(self.light_match_header)
         light_match_layout.addWidget(self.light_match_content)
         self.light_match_content.setVisible(False)
@@ -788,6 +826,7 @@ class HomePage(QWidget):
             self.green_mode_label,
             self.alpha_mode_label,
             self.subtitle_enable_label,
+            self.home_two_dvr_label,
             self.log_toggle_label,
             self.performance_quality_label,
             self.performance_fps_label,
@@ -844,6 +883,8 @@ class HomePage(QWidget):
         self.alpha_mode.toggled.connect(self._save)
         self.bg_color.currentIndexChanged.connect(self._save)
         self.subtitle_enable.toggled.connect(self._save)
+        self.home_two_dvr_toggle.toggled.connect(self._save)
+        self.home_two_dvr_strength.currentIndexChanged.connect(self._save)
         self.performance_quality.currentIndexChanged.connect(self._save)
         self.performance_fps.currentIndexChanged.connect(self._save)
         self.performance_output_size.currentIndexChanged.connect(self._save)
@@ -858,6 +899,7 @@ class HomePage(QWidget):
         self.light_match_header.toggled.connect(self._toggle_light_match_config)
         self.green_mode.toggled.connect(self._update_enabled)
         self.alpha_mode.toggled.connect(self._update_enabled)
+        self.home_two_dvr_toggle.toggled.connect(self._update_enabled)
         self.subtitle_enable.toggled.connect(self._update_enabled)
         self.log_toggle.toggled.connect(self._update_enabled)
         self.video_dirs_manage_button.clicked.connect(self.manage_video_dirs)
@@ -873,6 +915,13 @@ class HomePage(QWidget):
     def _save(self) -> None:
         self.settings.data["mode_green"] = self.green_mode.isChecked()
         self.settings.data["mode_alpha"] = self.alpha_mode.isChecked()
+        self.settings.data["mode_two_dvr"] = self.home_two_dvr_toggle.isChecked()
+        self.settings.data["two_dvr_live_model"] = DEFAULTS["two_dvr_live_model"]
+        self.settings.data["two_dvr_live_hole_fill"] = _UI_TWO_DVR_HOLE_FILL
+        self.settings.data["two_dvr_live_eye_distance"] = DEFAULTS["two_dvr_live_eye_distance"]
+        self.settings.data["two_dvr_live_strength"] = float(
+            self.home_two_dvr_strength.currentData() or DEFAULTS["two_dvr_live_strength"]
+        )
         self.settings.data["background_color"] = self.bg_color.currentData()
         self.settings.data["quality_speed"] = self.performance_quality.currentData()
         self.settings.data["alpha_stride"] = 1
@@ -1057,6 +1106,9 @@ class HomePage(QWidget):
     def _update_enabled(self) -> None:
         self.bg_color.setVisible(self.green_mode.isChecked())
         self.alpha_2d_button.setVisible(self.alpha_mode.isChecked())
+        two_dvr_enabled = self.home_two_dvr_toggle.isChecked()
+        self.home_two_dvr_strength_label.setVisible(two_dvr_enabled)
+        self.home_two_dvr_strength.setVisible(two_dvr_enabled)
         self.subtitle_style_button.setVisible(self.subtitle_enable.isChecked())
         self.log.setVisible(self.log_toggle.isChecked())
         debug_visible = self.log_toggle.isChecked()
@@ -1181,6 +1233,7 @@ class HomePage(QWidget):
             self.green_mode_label,
             self.alpha_mode_label,
             self.subtitle_enable_label,
+            self.home_two_dvr_label,
             self.log_toggle_label,
             self.performance_quality_label,
             self.performance_fps_label,
@@ -1200,6 +1253,7 @@ class HomePage(QWidget):
         )
         self.server_button.setText(self.i18n.t("button.start_server"))
         self.offline_button.setText(self.i18n.t("button.offline"))
+        self.two_dvr_button.setText(self.i18n.t("button.two_dvr"))
         self._update_quick_config_title()
         self._update_performance_config_title()
         self._update_light_match_config_title()
@@ -1214,6 +1268,11 @@ class HomePage(QWidget):
         self.subtitle_enable_label.setText(self.i18n.t("subtitle.enable"))
         self.subtitle_style_button.setText(self.i18n.t("subtitle.style_config"))
         self.player_support_button.setToolTip(self.i18n.t("player_support.window_title"))
+        self.home_two_dvr_toggle.setText("")
+        self.home_two_dvr_label.setText(self.i18n.t("home.two_dvr_toggle"))
+        self.home_two_dvr_strength_label.setText(self.i18n.t("twodvr.strength"))
+        for i, value in enumerate(_TWO_DVR_STRENGTH_OPTIONS):
+            self.home_two_dvr_strength.setItemText(i, f"{int(round(value * 100))}%")
         self.log_toggle.setText("")
         self.log_toggle_label.setText(self.i18n.t("log.show"))
         self.problem_help_button.setText(self.i18n.t("problem_help.button"))

@@ -15,7 +15,18 @@ dependencies = [
     "opencv-python>=4.10",
     "pillow>=10",
     "PySide6-Essentials>=6.7",
-    "cupy-cuda12x",
+    # Self-contained CUDA 12.x runtime so the venv (and `uv sync`) does not depend
+    # on a system CUDA toolkit, and so Blackwell sm_120 (RTX 50xx) works natively.
+    # The `[ctk]` extra pulls the pip CUDA toolkit (nvrtc, cublas, cudart, cufft,
+    # curand, cusolver, cusparse + headers) at 12.x. The 12.8+ NVRTC emits sm_120
+    # cubins directly, so CuPy's RawKernel/ElementwiseKernel no longer hit
+    # CUDA_ERROR_NO_BINARY_FOR_GPU or the PTX->driver-JIT cold-start (system CUDA
+    # 12.6's NVRTC cannot target sm_120). ONNX Runtime's CUDA EP also needs cuDNN 9
+    # (not part of the toolkit), so it is added explicitly. NOTE: the pipeline uses
+    # only RawKernel/ElementwiseKernel (no cccl/thrust ops), so CuPy 14.0.1's
+    # libcudacxx fp8 header bug that breaks percentile/sort/ndimage is not hit.
+    "cupy-cuda12x[ctk]",
+    "nvidia-cudnn-cu12>=9.7,<10",
     "pynvvideocodec>=2.1.0",
     "pyinstaller>=6.20.0",
     "osam==0.4.0",

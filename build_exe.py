@@ -356,18 +356,60 @@ def copy_named_runtime_dlls(
     return copied
 
 
-def copy_cuda_auxiliary_dlls() -> None:
-    cuda_path = Path(os.environ.get("CUDA_PATH", ""))
-    if cuda_path.exists():
-        include = cuda_path / "include"
-        if include.exists():
-            remove_path(DIST_DIR / "include")
-            copy_tree(
-                include,
-                DIST_DIR / "include",
-                ignore=lambda item, rel: item.suffix.lower() in {".lib", ".pdb"} or item.name == "__pycache__",
-            )
+# pip CUDA wheels (nvidia-*-cu12) that make the package self-contained and
+# Blackwell sm_120-native, independent of any system CUDA toolkit. Each wheel
+# drops its DLLs under site-packages/nvidia/<component>/bin.
+PIP_CUDA_NVIDIA_ROOT = SITE_PACKAGES / "nvidia"
+PIP_CUDA_RUNTIME_INCLUDE = PIP_CUDA_NVIDIA_ROOT / "cuda_runtime" / "include"
 
+
+def copy_cuda_headers() -> None:
+    """Bundle the CUDA headers CuPy's NVRTC JIT needs (cuda_fp16.h, etc.).
+
+    Prefer the pip nvidia-cuda-runtime-cu12 headers (match the bundled pip NVRTC
+    and ship without a system CUDA toolkit); fall back to system CUDA_PATH.
+    """
+    include = PIP_CUDA_RUNTIME_INCLUDE
+    if not include.exists():
+        cuda_path = Path(os.environ.get("CUDA_PATH", ""))
+        include = cuda_path / "include"
+    if include.exists():
+        remove_path(DIST_DIR / "include")
+        copy_tree(
+            include,
+            DIST_DIR / "include",
+            ignore=lambda item, rel: item.suffix.lower() in {".lib", ".pdb"} or item.name == "__pycache__",
+        )
+
+
+def copy_pip_cuda_runtime_dlls() -> None:
+    """Bundle the pip CUDA runtime DLLs (cublas/cudart/cufft/nvrtc/...) so the
+    frozen app uses sm_120-native 12.x libraries instead of the build machine's
+    system CUDA. Copied last so these overwrite any same-named DLLs PyInstaller
+    pulled from a system toolkit (e.g. cublasLt64_12.dll)."""
+    if not PIP_CUDA_NVIDIA_ROOT.exists():
+        fail(
+            "pip CUDA wheels not found under .venv\\Lib\\site-packages\\nvidia.\n"
+            "Run: uv sync  (expects cupy-cuda12x[ctk] + nvidia-cudnn-cu12)"
+        )
+    target = DIST_DIR / "_internal"
+    bundled: list[str] = []
+    for bin_dir in sorted(PIP_CUDA_NVIDIA_ROOT.glob("*/bin")):
+        for dll in bin_dir.glob("*.dll"):
+            copy_file(dll, target / dll.name)
+            bundled.append(dll.name)
+    if not bundled:
+        fail(f"No DLLs found under {PIP_CUDA_NVIDIA_ROOT}\\*\\bin")
+    for required in ("cudart64_12.dll", "cublasLt64_12.dll", "nvrtc64_120_0.dll"):
+        if not (target / required).exists():
+            fail(f"pip CUDA runtime missing {required} under {target}")
+    info(f"Bundled {len(bundled)} pip CUDA runtime DLLs from {PIP_CUDA_NVIDIA_ROOT}")
+
+
+def copy_cuda_auxiliary_dlls() -> None:
+    copy_cuda_headers()
+    # cuTENSOR is optional (only if the build machine has it); nvrtc-builtins is
+    # also provided by the pip NVRTC wheel and picked up via the nvidia search root.
     copy_named_runtime_dlls(
         (
             "cuTENSOR.dll",
@@ -640,6 +682,9 @@ def main() -> int:
         copy_cuda_auxiliary_dlls()
         copy_ort_cuda_ep_dependencies()
         copy_ort_tensorrt_ep_dependencies()
+        # Last CUDA step: overlay the pip sm_120-native runtime DLLs so they win
+        # over any system-toolkit DLLs PyInstaller/auto-collect pulled in.
+        copy_pip_cuda_runtime_dlls()
         verify_base_runtime()
         verify_clip_tokenizer_runtime()
         verify_cuda_auxiliary_runtime()

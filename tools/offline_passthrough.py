@@ -953,7 +953,7 @@ def main() -> int:
     parser.add_argument("--matanyone2-batch", default="1", choices=["auto", "1", "2"],
                         help="MatAnyone2 ONNX batch to auto-select when --model is omitted; auto currently uses bs1")
     parser.add_argument("--mask", default="", help="first-frame object mask for MatAnyone2")
-    parser.add_argument("--matanyone2-prepass", default="sam3", choices=["sam3", "yoloworld_efficientsam", "yolo26m_efficientsam"],
+    parser.add_argument("--matanyone2-prepass", default="sam3", choices=["sam3", "yoloworld_efficientsam", "yolo26m_efficientsam", "yolo26m_birefnet"],
                         help="automatic first-mask prepass backend for MatAnyone2 when --mask is omitted")
     parser.add_argument("--ywes-model-dir", default=str(config.ROOT / "models" / "yoloworld_efficientsam"),
                         help="YOLO-World + EfficientSAM ONNX model directory")
@@ -1045,6 +1045,59 @@ def main() -> int:
     parser.add_argument("--y26es-subprocess", action=argparse.BooleanOptionalAction, default=True,
                         help="run YOLO26m + EfficientSAM prepass in a child process so its CUDA context is released before MatAnyone2")
     parser.add_argument("--y26es-prepass-out", default="", help=argparse.SUPPRESS)
+    parser.add_argument("--y26br-model-dir", default=str(config.ROOT / "models" / "yolo26m"),
+                        help="YOLO26m ONNX model directory")
+    parser.add_argument("--y26br-birefnet-model-dir", default=str(config.ROOT / "models" / "BiRefNet"),
+                        help="BiRefNet ONNX model directory for YOLO26m prepass")
+    parser.add_argument("--y26br-provider", default="cuda", choices=["cuda", "cpu"],
+                        help="execution provider for YOLO26m + BiRefNet prepass")
+    parser.add_argument("--y26br-yolo-model", default="yolo26m_model.onnx",
+                        help="YOLO26m ONNX filename under --y26br-model-dir; default fp32 because the fp16 export silently collapses on ORT CUDAExecutionProvider (person scores ~0.01-0.03)")
+    parser.add_argument("--y26br-birefnet-model", default="model_fp16.onnx",
+                        help="BiRefNet ONNX filename under --y26br-birefnet-model-dir")
+    parser.add_argument("--y26br-yolo-size", type=int, default=640,
+                        help="YOLO26m letterbox input size; exported ONNX graph is fixed at 640")
+    parser.add_argument("--y26br-birefnet-input-size", type=int, default=1024,
+                        help="BiRefNet square input size; the current ONNX graph is fixed at 1024")
+    parser.add_argument("--y26br-score-threshold", type=float, default=0.35,
+                        help="YOLO26m person sigmoid score threshold")
+    parser.add_argument("--y26br-nms-threshold", type=float, default=0.6,
+                        help="YOLO26m fallback NMS IoU threshold")
+    parser.add_argument("--y26br-box-expand", type=float, default=0.08,
+                        help="box expansion ratio before BiRefNet ROI segmentation")
+    parser.add_argument("--y26br-top-k", type=int, default=0,
+                        help="max persons to segment per eye; 0 = unlimited. BiRefNet cost scales per selected ROI, so set a small cap if you need bounded prepass time.")
+    parser.add_argument("--y26br-binarize-mask", action=argparse.BooleanOptionalAction, default=True,
+                        help="binarize BiRefNet mask before writing MatAnyone2 prepass masks")
+    parser.add_argument("--y26br-mask-erode-px", type=int, default=1,
+                        help="morphological erosion iterations after mask binarization")
+    parser.add_argument("--y26br-max-box-area", type=float, default=0.50,
+                        help="reject YOLO26m boxes whose area exceeds this fraction of a per-eye frame; also gates the score fallback. Lower this if 'fill the frame' false-positives slip through.")
+    parser.add_argument("--y26br-cross-eye-area-ratio", type=float, default=1.5,
+                        help="when paired L/R boxes' area ratio exceeds this, project the higher-score side to the other eye to keep masks symmetric")
+    parser.add_argument("--y26br-scan", default="hybrid", choices=["keyframe", "interval", "hybrid"],
+                        help="YOLO26m + BiRefNet prepass sample strategy")
+    parser.add_argument("--y26br-scan-interval-sec", type=float, default=1.0,
+                        help="fallback/interval YOLO26m + BiRefNet scan step in seconds")
+    parser.add_argument("--y26br-active-min-area-ratio", type=float, default=0.001,
+                        help="sample is active if either eye union mask area is at least this ratio")
+    parser.add_argument("--y26br-gap-fill-frames", type=int, default=600,
+                        help="fill inactive YOLO26m samples between two active samples (or at clip start/end) by reusing a neighboring mask; counted in output-fps frames; 0 disables")
+    parser.add_argument("--y26br-fill-boundaries", action=argparse.BooleanOptionalAction, default=True,
+                        help="forward-fill from first active scan point to frame 0 and backward-fill from last active scan point to the tail (capped by --y26br-gap-fill-frames)")
+    parser.add_argument("--y26br-scene-aware-fill", action=argparse.BooleanOptionalAction, default=True,
+                        help="when filling middle gaps that contain a scene cut, use the post-cut neighbor for frames after the cut; also blocks boundary fill across a scene-cut anchor")
+    parser.add_argument("--y26br-debug-dir", default="",
+                        help="optional directory to save YOLO26m + BiRefNet prepass debug files")
+    parser.add_argument("--y26br-cut-on-count-change", action=argparse.BooleanOptionalAction, default=True,
+                        help="start a new MatAnyone2 segment when selected person count changes")
+    parser.add_argument("--y26br-cut-every-active-sample", action="store_true",
+                        help="debug/quality mode: restart MatAnyone2 at every active YOLO26m sample")
+    parser.add_argument("--y26br-fail-on-empty", action=argparse.BooleanOptionalAction, default=True,
+                        help="fail instead of writing an all-background output when no person masks are found")
+    parser.add_argument("--y26br-subprocess", action=argparse.BooleanOptionalAction, default=True,
+                        help="run YOLO26m + BiRefNet prepass in a child process so its CUDA context is released before MatAnyone2")
+    parser.add_argument("--y26br-prepass-out", default="", help=argparse.SUPPRESS)
     parser.add_argument("--sam3-model-dir", default=str(config.ROOT / "models" / "sam3_onnx"),
                         help="SAM3 ONNX model directory for MatAnyone2 first-frame text mask")
     parser.add_argument("--sam3-prompt", default="person", help="SAM3 text prompt for MatAnyone2 first-frame mask")
@@ -1136,6 +1189,7 @@ def main() -> int:
     args._sam3_child = bool(args.sam3_prepass_out)
     args._ywes_child = bool(args.ywes_prepass_out)
     args._y26es_child = bool(args.y26es_prepass_out)
+    args._y26br_child = bool(args.y26br_prepass_out)
     args._tool_name = "offline_passthrough"
 
     import PyNvVideoCodec as nvc
@@ -1273,7 +1327,12 @@ def main() -> int:
         args._matanyone2_in_w = int(manifest.get("width") or 512)
         args._matanyone2_batch_size = int(manifest.get("batch_size") or 1)
     _require_sam3_vram(args)
-    if args.engine == "matanyone2_onnx" and not args.mask and args.matanyone2_prepass == "yolo26m_efficientsam":
+    if args.engine == "matanyone2_onnx" and not args.mask and args.matanyone2_prepass == "yolo26m_birefnet":
+        from offline.yolo26m_birefnet import precompute_segment_masks as _precompute_y26br_segment_masks
+        from offline.yolo26m_birefnet import write_prepass_result as _write_y26br_prepass_result
+
+        sam3_masks, segment_starts = _precompute_y26br_segment_masks(args, src, dec, source_fps, fps, target, cfr_source_index)
+    elif args.engine == "matanyone2_onnx" and not args.mask and args.matanyone2_prepass == "yolo26m_efficientsam":
         from offline.yolo26m_efficientsam import precompute_segment_masks as _precompute_y26es_segment_masks
         from offline.yolo26m_efficientsam import write_prepass_result as _write_y26es_prepass_result
 
@@ -1285,6 +1344,11 @@ def main() -> int:
         sam3_masks, segment_starts = _precompute_ywes_segment_masks(args, src, dec, source_fps, fps, target, cfr_source_index)
     else:
         sam3_masks, segment_starts = _precompute_sam3_segment_masks(args, src, dec, source_fps, fps, target)
+    if args.y26br_prepass_out:
+        _write_y26br_prepass_result(Path(args.y26br_prepass_out).resolve(), sam3_masks, segment_starts)
+        _cleanup_audio_sidecar(audio_sidecar)
+        dec.stop()
+        return 0
     if args.y26es_prepass_out:
         _write_y26es_prepass_result(Path(args.y26es_prepass_out).resolve(), sam3_masks, segment_starts)
         _cleanup_audio_sidecar(audio_sidecar)

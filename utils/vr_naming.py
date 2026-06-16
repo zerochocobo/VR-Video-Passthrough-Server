@@ -33,6 +33,7 @@ LEGACY_LR_180_SOURCE_SUFFIX = "_LR_180"
 GREEN_LIVE_PASSTHROUGH_SUFFIX = "_passthrough"
 GREEN_OFFLINE_PASSTHROUGH_SUFFIX = "_LR_180_SBS_passthrough"
 ALPHA_PASSTHROUGH_SUFFIX = "_LR_180_FISHEYE_F180_alpha"
+TWO_DVR_SUFFIX = "_3D_LR_Screen"
 _VIDEO_SUFFIXES = {".mp4", ".mkv", ".mov", ".m4v", ".avi", ".webm", ".ts", ".m2ts"}
 
 
@@ -87,9 +88,18 @@ def alpha_passthrough_stem(stem_or_name: str) -> str:
     return f"{stem}{ALPHA_PASSTHROUGH_SUFFIX}"
 
 
+def two_dvr_stem(stem_or_name: str) -> str:
+    stem = _as_stem(stem_or_name)
+    if stem.lower().endswith(TWO_DVR_SUFFIX.lower()):
+        return stem
+    return f"{stem}{TWO_DVR_SUFFIX}"
+
+
 def live_passthrough_title(stem_or_name: str, mode: str, width: int = 0, height: int = 0) -> str:
     if mode == "alpha":
         return f"{alpha_passthrough_stem(stem_or_name)}_live"
+    if mode == "two_dvr":
+        return f"[2D>3D]{two_dvr_stem(stem_or_name)}_live"
     return f"{green_passthrough_stem(stem_or_name, width, height)}_live"
 
 

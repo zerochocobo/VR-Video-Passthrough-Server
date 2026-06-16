@@ -124,6 +124,110 @@ def _validate_tensorrt_provider(log) -> bool:
     return False
 
 
+def _passthrough_mode_enabled(mode: str) -> bool:
+    raw = str(config.PASSTHROUGH_OUTPUT_MODE or "none").strip().lower()
+    if raw == "all":
+        return mode in {"green", "alpha"}
+    return mode in {part.strip() for part in raw.replace(";", ",").split(",") if part.strip()}
+
+
+def _warmup_da3_trt_if_needed(log, *, step_total: int, provider_kind: str) -> None:
+    if not _passthrough_mode_enabled("two_dvr"):
+        return
+    try:
+        import onnxruntime as ort
+    except Exception as exc:
+        log.warning("DA3 TensorRT startup warmup skipped: onnxruntime unavailable: %s", exc)
+        return
+    if "TensorrtExecutionProvider" not in set(ort.get_available_providers()):
+        log.warning("DA3 TensorRT startup warmup skipped: TensorRT EP unavailable")
+        return
+    from offline.da3_depth import default_model_path, normalize_model, trt_engine_cached, warmup_depth_engine
+
+    variant = normalize_model(config.TWO_DVR_MODEL)
+    cache_present = trt_engine_cached(variant)
+    message = "warming DA3 realtime engine" if cache_present else "building DA3 TensorRT cache"
+    set_startup_phase(
+        "warming",
+        message,
+        step="da3_trt_warmup",
+        step_index=max(0, step_total - 1),
+        step_total=step_total,
+        progress=0.92,
+        provider_kind=provider_kind,
+        detail=variant,
+    )
+    start_heartbeat(
+        "warming",
+        message,
+        step="da3_trt_warmup",
+        step_index=max(0, step_total - 1),
+        step_total=step_total,
+        progress=0.92,
+        provider_kind=provider_kind,
+        detail=variant,
+    )
+    try:
+        path = default_model_path(variant)
+        if not path.is_file():
+            log.warning("DA3 TensorRT startup warmup skipped missing %s model: %s", variant, path)
+            return
+        t0 = time.perf_counter()
+        set_startup_phase(
+            "warming",
+            f"warming DA3 {variant} realtime engine",
+            step="da3_trt_warmup",
+            step_index=max(0, step_total - 1),
+            step_total=step_total,
+            progress=0.96,
+            provider_kind=provider_kind,
+            detail=variant,
+            monotonic_progress=True,
+        )
+        log.info(
+            "DA3 TensorRT startup warmup begin: variant=%s model=%s cache_present=%s",
+            variant,
+            path,
+            cache_present,
+        )
+        engine = warmup_depth_engine(
+            variant=variant,
+            provider="trt",
+            log=lambda msg: log.info("%s", msg),
+        )
+        log.info(
+            "DA3 TensorRT startup warmup ready: variant=%s provider=%s elapsed=%.1fs cached=%s retained=True",
+            variant,
+            engine.providers[0] if engine.providers else "unknown",
+            time.perf_counter() - t0,
+            trt_engine_cached(variant),
+        )
+    finally:
+        stop_heartbeat()
+
+
+def _warmup_da3_trt_nonfatal(log, *, step_total: int, provider_kind: str) -> None:
+    try:
+        _warmup_da3_trt_if_needed(log, step_total=step_total, provider_kind=provider_kind)
+    except Exception as e:
+        set_startup_phase(
+            "warmed",
+            "DA3 realtime warmup failed; continuing without preloaded 2D->3D engine",
+            step="da3_trt_warning",
+            step_index=max(0, step_total - 1),
+            step_total=step_total,
+            progress=0.94,
+            detail=str(e),
+            provider_kind=provider_kind,
+            monotonic_progress=True,
+        )
+        log.warning(
+            "DA3 TensorRT startup warmup failed; continuing without prewarmed 2D->3D engine: %s",
+            e,
+            exc_info=True,
+        )
+
+
 def _run_legacy_tool(tool_main, tool_name: str, tool_args: list[str]) -> int:
     _force_line_buffered_stdio()
     original_argv = sys.argv[:]
@@ -405,6 +509,7 @@ def main(argv: list[str] | None = None) -> int:
             provider_kind=provider_kind,
         )
         log.info("startup GPU warmup disabled")
+    _warmup_da3_trt_nonfatal(log, step_total=startup_step_total, provider_kind=provider_kind)
     if nvenc_step_enabled:
         set_startup_phase(
             "warming",
