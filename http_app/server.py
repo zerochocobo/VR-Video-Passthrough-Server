@@ -88,6 +88,12 @@ def create_app(startup_hook: StartupHook | None = None) -> FastAPI:
         try:
             yield
         finally:
+            try:
+                from http_app.si_stream import shutdown_si_stream_service
+
+                shutdown_si_stream_service()
+            except Exception as e:
+                log.warning("SI stream shutdown failed: %s", e)
             get_request_history().flush()
 
     app = FastAPI(title="PT VR Passthrough Server", docs_url=None, redoc_url=None, lifespan=lifespan)

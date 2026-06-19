@@ -2,8 +2,9 @@ from __future__ import annotations
 
 import os
 import sys
+import types
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import config
 import main
@@ -58,9 +59,11 @@ class MainArgsTests(unittest.TestCase):
             return 7
 
         original_argv = sys.argv[:]
-        with patch("tools.offline_passthrough.main", side_effect=fake_tool_main) as tool_main:
+        fake_tool = types.ModuleType("tools.offline_passthrough")
+        fake_tool.main = Mock(side_effect=fake_tool_main)
+        with patch.dict(sys.modules, {"tools.offline_passthrough": fake_tool}):
             self.assertEqual(main.main(["tool", "offline_passthrough", "--help"]), 7)
-        tool_main.assert_called_once_with()
+        fake_tool.main.assert_called_once_with()
         self.assertEqual(seen["argv"], ["offline_passthrough", "--help"])
         self.assertEqual(sys.argv, original_argv)
 
@@ -69,14 +72,30 @@ class MainArgsTests(unittest.TestCase):
             self.assertEqual(main.main(["trt_warmup", "--progress-stdout"]), 9)
         warmup_main.assert_called_once_with(["--progress-stdout"])
 
+    def test_main_two_dvr_dispatches_without_starting_server(self) -> None:
+        seen: dict[str, list[str]] = {}
+        fake_two_dvr = types.ModuleType("offline.two_dvr")
+
+        def fake_two_dvr_main(argv: list[str]) -> int:
+            seen["argv"] = argv
+            return 11
+
+        fake_two_dvr.main = fake_two_dvr_main
+        with patch.dict(sys.modules, {"offline.two_dvr": fake_two_dvr}):
+            self.assertEqual(main.main(["two_dvr", "single", "video.mp4"]), 11)
+        self.assertEqual(seen["argv"], ["single", "video.mp4"])
+
     def test_main_tool_forces_line_buffered_output(self) -> None:
         stdout_reconfigure = getattr(sys.stdout, "reconfigure", None)
         stderr_reconfigure = getattr(sys.stderr, "reconfigure", None)
         if stdout_reconfigure is None or stderr_reconfigure is None:
             self.skipTest("stdio reconfigure is unavailable")
         with patch.object(sys.stdout, "reconfigure") as stdout_configure, patch.object(sys.stderr, "reconfigure") as stderr_configure:
-            with patch("tools.offline_passthrough.main", return_value=0):
+            fake_tool = types.ModuleType("tools.offline_passthrough")
+            fake_tool.main = Mock(return_value=0)
+            with patch.dict(sys.modules, {"tools.offline_passthrough": fake_tool}):
                 self.assertEqual(main.main(["tool", "offline_passthrough", "--help"]), 0)
+        fake_tool.main.assert_called_once_with()
         stdout_configure.assert_called_with(line_buffering=True, write_through=True)
         stderr_configure.assert_called_with(line_buffering=True, write_through=True)
 

@@ -158,14 +158,9 @@ def _warmup_da3_trt_if_needed(log, *, step_total: int, provider_kind: str) -> No
         detail=variant,
     )
     start_heartbeat(
-        "warming",
-        message,
-        step="da3_trt_warmup",
-        step_index=max(0, step_total - 1),
-        step_total=step_total,
-        progress=0.92,
-        provider_kind=provider_kind,
-        detail=variant,
+        eta_sec=30.0 if cache_present else 120.0,
+        baseline_progress=0.92,
+        ceiling_progress=0.96,
     )
     try:
         path = default_model_path(variant)
@@ -287,6 +282,11 @@ def main(argv: list[str] | None = None) -> int:
         from offline.convert import main as offline_main
 
         return offline_main(argv[1:])
+    if argv and argv[0] == "two_dvr":
+        _force_line_buffered_stdio()
+        from offline.two_dvr import main as two_dvr_main
+
+        return two_dvr_main(argv[1:])
     if argv and argv[0] == "trt_warmup":
         _force_line_buffered_stdio()
         from ui.services.trt_warmup_process import main as trt_warmup_main

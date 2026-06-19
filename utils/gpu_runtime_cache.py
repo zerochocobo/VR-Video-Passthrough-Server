@@ -164,7 +164,14 @@ def configure_gpu_runtime_cache() -> GpuRuntimeCacheEnv:
     os.environ["CUDA_CACHE_MAXSIZE"] = config.CUDA_CACHE_MAXSIZE
     os.environ["CUDA_CACHE_PATH"] = str(cuda_dir)
     os.environ["CUPY_CACHE_DIR"] = str(cupy_dir)
-    os.environ.setdefault("CUPY_COMPILE_WITH_PTX", "1")
+    # Blackwell/sm_120 needs NVRTC >= 12.8 to emit cubins directly. The uv
+    # environment provides pip NVRTC 12.9; forcing PTX here sends fresh CuPy
+    # kernels through the very slow driver PTX JIT path. HARD set (not
+    # setdefault): a stale `CUPY_COMPILE_WITH_PTX=1` left in the shell from an
+    # earlier NVRTC experiment would otherwise survive and force the slow PTX
+    # path. CuPy captures this into `compiler._use_ptx` at import time, so this
+    # must run before the first `import cupy`.
+    os.environ["CUPY_COMPILE_WITH_PTX"] = "0"
     os.environ["TMP"] = str(tmp_dir)
     os.environ["TEMP"] = str(tmp_dir)
     tmp_dir.mkdir(parents=True, exist_ok=True)

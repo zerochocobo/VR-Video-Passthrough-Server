@@ -49,6 +49,19 @@ class ConfigDefaultTests(unittest.TestCase):
         self.assertEqual(config.PASSTHROUGH_SEEK_CONTAINER, "mpegts")
         self.assertEqual(config.PASSTHROUGH_SEEK_HEADER_BYTES, 2 * 1024 * 1024)
 
+    def test_si_progressive_is_enabled_by_default_for_m1_testing(self) -> None:
+        self.assertTrue(config.SI_PROGRESSIVE_ENABLED)
+        self.assertTrue(config.SI_PROGRESSIVE_DLNA)
+        self.assertEqual(config.SI_AUDIO_EDIT_MODE, "remove")
+        self.assertEqual(config.SI_BROWSE_PREWARM_LIMIT, 1)
+        self.assertEqual(config.SI_PREWARM_QUEUE_MAX, 2)
+        self.assertEqual(config.SI_AUDIO_EXTRACT_MODE, "sequential")
+        self.assertGreaterEqual(config.SI_MIX_PARALLEL_MAX, 1)
+        self.assertLessEqual(config.SI_MIX_PARALLEL_MAX, 8)
+        self.assertEqual(config.SI_MIX_ENCODER, "auto")
+        self.assertFalse(config.SI_MIX_SEGMENTED_AAC)
+        self.assertEqual(config.SI_MIX_SEGMENT_WARMUP_MS, 1000)
+
     def test_dlna_images_are_disabled_by_default(self) -> None:
         self.assertFalse(config.DLNA_IMAGE_ENABLED)
         self.assertIn(".jpg", config.IMAGE_EXTS)

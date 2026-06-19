@@ -33,6 +33,8 @@ dependencies = [
     "tensorrt-cu12>=10.0",
     "onnx>=1.16",
     "py-spy>=0.4.2",
+    "av>=17.1.0",
+    "pymp4>=1.4.0",
 ]
 
 [tool.uv]

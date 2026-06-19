@@ -470,3 +470,63 @@ DLNA client
   systems, and `yoloworld_efficientsam` remains a command-line legacy fallback.
 - Keep handover notes in `prompt/HANDOVER_YYYYMMDD.md` when making meaningful
   project changes.
+
+## CuPy kernel compile "hangs" on sm_120 (NVRTC pitfall)
+
+**Symptom:** the first launch / `get_function()` of any CuPy `RawModule` /
+`RawKernel` -- even a one-line noop kernel -- takes 60-120s (looks hung), while
+already-cached kernels run instantly. Hits the 2D->3D GPU renderer
+(`offline/two_dvr_gpu.py`), matting CuPy kernels, etc.
+
+**Root cause:** on the RTX 5060 Ti (sm_120 / Blackwell), CuPy must compile kernels
+with **NVRTC >= 12.8** to emit sm_120 cubins directly. If CuPy instead uses the
+**system CUDA 12.6 NVRTC** (system `CUDA_PATH` is `...\CUDA\v12.6`), that NVRTC
+doesn't know sm_120, so CuPy falls back to emitting PTX and lets the **driver
+JIT-compile PTX -> sm_120 at launch** -- a cold start that is extremely slow on the
+13.x driver and looks like a hang. Forcing `CUPY_COMPILE_WITH_PTX=1` takes the same
+slow PTX path on purpose. See
+`summary/summary_20260615_CUPY_SM120_NVRTC_UPGRADE_CN.md`.
+
+**Why it works in this repo's uv venv:** `pyproject.toml` pins
+`cupy-cuda12x[ctk]` (+ `nvidia-cudnn-cu12`), which bundles **pip NVRTC 12.9**
+(`nvrtc64_120_0.dll` / `nvrtc-builtins64_129.dll`). Running via `uv run python ...`
+loads that 12.9 NVRTC even though system `CUDA_PATH` still points at 12.6, so a
+fresh kernel compiles in <1s. The frozen build sets `CUPY_COMPILE_WITH_PTX=0` and
+bundles the pip NVRTC (`packaging/runtime_hook_cuda_dlls.py`, `build_exe.py`).
+
+**Run it the way that works:**
+- Always `uv run python ...` / `uv run python -m offline.two_dvr ...` (the project
+  `.venv`); run `uv sync` first so the pip CUDA 12.9 runtime + NVRTC are installed.
+- Do NOT set `CUPY_COMPILE_WITH_PTX=1` (leave unset, or `0`).
+- Do NOT prepend `%CUDA_PATH%\bin` (system 12.6) ahead of the venv on `PATH`, or it
+  can shadow the pip NVRTC. (Note: ORT/TensorRT DLL setup via
+  `apply_runtime_dll_paths()` is unrelated -- it does not change which NVRTC CuPy
+  loads.)
+- Folding a new kernel into an existing cached `RawModule` (e.g.
+  `_SOFT_SHIFT_KERNELS`) and reusing existing `RawKernel`s avoids extra cold
+  compiles.
+
+**3-line self-check in the process that hangs:**
+```python
+import os, cupy as cp
+from cupy.cuda import compiler
+print(cp.cuda.nvrtc.getVersion(), os.environ.get("CUPY_COMPILE_WITH_PTX"),
+      compiler._use_ptx, compiler._get_arch_for_options_for_nvrtc())
+# want: (12, 9)  '0'/None  False  ('-arch=sm_120', 'cubin')
+# (12, 6), '1', _use_ptx True, or ('...compute_120','ptx') => the slow PTX-JIT path.
+```
+A fresh unique-source kernel should compile+launch in <1s; if it's 60-120s you are
+still on PTX -> driver JIT.
+
+**Gotcha -- the env var is a red herring once cupy is imported.** CuPy captures
+`CUPY_COMPILE_WITH_PTX` into `compiler._use_ptx` **at import time** (one read,
+`compiler.py` module level). If a stale `CUPY_COMPILE_WITH_PTX=1` is in the shell
+when `import cupy` first runs, `_use_ptx` is `True` for the whole process even if
+you later set the env var back to `0` and print `0`. The decisive value is
+`compiler._use_ptx`, NOT `os.environ`. Two consequences:
+- `os.environ.setdefault("CUPY_COMPILE_WITH_PTX","0")` does NOT fix a stale `=1`
+  (setdefault is a no-op when the key exists). `configure_gpu_runtime_cache()` and
+  `offline/two_dvr_gpu.py` hard-set it to `"0"` for this reason.
+- If you hit the hang, clear the shell var (`Remove-Item Env:CUPY_COMPILE_WITH_PTX`
+  in PowerShell) or open a fresh shell, then re-run -- and confirm with
+  `compiler._use_ptx is False`.

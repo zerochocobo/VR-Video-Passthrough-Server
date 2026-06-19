@@ -83,6 +83,42 @@ def test_hybrid_fill_reduces_synthetic_row_copy_banding() -> None:
     np.testing.assert_array_equal(out[~hole], soft[~hole])
 
 
+def test_gpu_rim_cleanup_defaults_to_auto_and_allows_override(monkeypatch: pytest.MonkeyPatch) -> None:
+    from offline.two_dvr_gpu import _two_dvr_rim_width
+
+    monkeypatch.delenv("PT_TWO_DVR_RIM", raising=False)
+    assert _two_dvr_rim_width(1920) == 16
+    assert _two_dvr_rim_width(3840) == 32
+    assert _two_dvr_rim_width(720) == 6
+
+    monkeypatch.setenv("PT_TWO_DVR_RIM", "8")
+    assert _two_dvr_rim_width(1920) == 8
+
+    monkeypatch.setenv("PT_TWO_DVR_RIM", "-3")
+    assert _two_dvr_rim_width(1920) == 0
+
+    monkeypatch.setenv("PT_TWO_DVR_RIM", "bad")
+    assert _two_dvr_rim_width(1920) == 0
+
+
+def test_gpu_fg_bad_cleanup_defaults_to_auto_and_allows_override(monkeypatch: pytest.MonkeyPatch) -> None:
+    from offline.two_dvr_gpu import _two_dvr_fg_bad_width
+
+    monkeypatch.delenv("PT_TWO_DVR_FG_BAD", raising=False)
+    assert _two_dvr_fg_bad_width(1920) == 8
+    assert _two_dvr_fg_bad_width(3840) == 16
+    assert _two_dvr_fg_bad_width(720) == 3
+
+    monkeypatch.setenv("PT_TWO_DVR_FG_BAD", "8")
+    assert _two_dvr_fg_bad_width(1920) == 8
+
+    monkeypatch.setenv("PT_TWO_DVR_FG_BAD", "-3")
+    assert _two_dvr_fg_bad_width(1920) == 0
+
+    monkeypatch.setenv("PT_TWO_DVR_FG_BAD", "bad")
+    assert _two_dvr_fg_bad_width(1920) == 0
+
+
 @pytest.mark.parametrize(
     ("soft", "inverse", "zbuf"),
     [

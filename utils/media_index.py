@@ -31,6 +31,8 @@ LARGE_DIRECTORY_WARN_CHILDREN = 5000
 NEW_FILE_PROBE_GRACE_SEC = 2.0
 PENDING_PROBE_RETRY_SEC = 2.0
 PROBE_FAILURE_LOG_LIMIT_PER_SCAN = 5
+SI_SIDECAR_SUFFIX = ".si.wav"
+SI_SIDECAR_SOURCE_EXT = ".mp4"
 
 
 class MediaIndexSchemaError(RuntimeError):
@@ -92,6 +94,12 @@ def _dir_key(path: Path) -> str:
 def _signature(parts: list[str]) -> str:
     raw = "\n".join(parts).encode("utf-8", "surrogatepass")
     return hashlib.sha1(raw).hexdigest()
+
+
+def _si_sidecar_source_name(name: str) -> str:
+    if not name.lower().endswith(SI_SIDECAR_SUFFIX):
+        return ""
+    return f"{name[:-len(SI_SIDECAR_SUFFIX)]}{SI_SIDECAR_SOURCE_EXT}"
 
 
 class MediaIndex:
@@ -309,16 +317,23 @@ class MediaIndex:
             return DirectorySnapshot(directory, key, "error", ())
         if len(children) >= LARGE_DIRECTORY_WARN_CHILDREN:
             log.info("large media directory scan: path=%s entries=%d", directory, len(children))
+        child_names = {child.name.lower() for child in children}
 
         for child in children:
             try:
                 is_dir = child.is_dir()
                 suffix = child.suffix.lower()
-                is_video = child.is_file() and suffix in config.VIDEO_EXTS
-                is_image = child.is_file() and config.DLNA_IMAGE_ENABLED and suffix in config.IMAGE_EXTS
-                if not is_dir and not is_video and not is_image:
+                is_file = child.is_file()
+                is_video = is_file and suffix in config.VIDEO_EXTS
+                is_image = is_file and config.DLNA_IMAGE_ENABLED and suffix in config.IMAGE_EXTS
+                si_source_name = _si_sidecar_source_name(child.name).lower()
+                is_si_sidecar = is_file and bool(si_source_name) and si_source_name in child_names
+                if not is_dir and not is_video and not is_image and not is_si_sidecar:
                     continue
                 st = child.stat()
+                if is_si_sidecar and not is_video and not is_image:
+                    signature_parts.append(f"{child.name}|si-sidecar|{int(st.st_size)}|{int(st.st_mtime_ns)}")
+                    continue
                 child_key = _dir_key(child)
             except (OSError, ValueError) as e:
                 log.debug("index skip %s: %s", child, e)

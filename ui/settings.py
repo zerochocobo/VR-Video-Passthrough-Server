@@ -5,6 +5,14 @@ import sys
 from pathlib import Path
 
 from ui.i18n import system_language
+from utils.si_filter import (
+    DEFAULT_DUCK_ORIGINAL,
+    DEFAULT_ORIGINAL_VOLUME_PERCENT,
+    DEFAULT_SI_DELAY_SECONDS,
+    DEFAULT_SI_MIX_CHANNEL,
+    DEFAULT_SI_MIX_ENABLED,
+    DEFAULT_SI_VOLUME_PERCENT,
+)
 from utils.trt_manifest import TRT_PROVIDER_CHAIN, cache_status
 
 ROOT = Path(sys.executable).resolve().parent if getattr(sys, "frozen", False) else Path(__file__).resolve().parents[1]
@@ -66,6 +74,12 @@ DEFAULTS = {
     "light_match_gamma": 1.0,
     "light_match_saturation": 1.0,
     "light_match_preset": "daylight",
+    "si_enabled": DEFAULT_SI_MIX_ENABLED,
+    "si_mix_channel": DEFAULT_SI_MIX_CHANNEL,
+    "si_original_volume_percent": DEFAULT_ORIGINAL_VOLUME_PERCENT,
+    "si_volume_percent": DEFAULT_SI_VOLUME_PERCENT,
+    "si_delay_seconds": DEFAULT_SI_DELAY_SECONDS,
+    "si_duck_original": DEFAULT_DUCK_ORIGINAL,
     "alpha_2d_projection": "fisheye",
     "alpha_2d_distance_m": 4.0,
     "subtitle_enable": True,
@@ -247,6 +261,14 @@ class Settings:
             "PT_LIGHT_MATCH_GAMMA": str(_setting_value(self.data, "light_match_gamma", 1.0)),
             "PT_LIGHT_MATCH_SATURATION": str(_setting_value(self.data, "light_match_saturation", 1.0)),
             "PT_LIGHT_MATCH_PRESET": str(self.data.get("light_match_preset") or DEFAULTS["light_match_preset"]),
+            "PT_SI_MIX_ENABLED": "1" if self.data.get("si_enabled") else "0",
+            "PT_SI_MIX_CHANNEL": str(self.data.get("si_mix_channel") or DEFAULTS["si_mix_channel"]),
+            "PT_SI_ORIGINAL_VOLUME_PERCENT": str(
+                _setting_value(self.data, "si_original_volume_percent", DEFAULTS["si_original_volume_percent"])
+            ),
+            "PT_SI_VOLUME_PERCENT": str(_setting_value(self.data, "si_volume_percent", DEFAULTS["si_volume_percent"])),
+            "PT_SI_DELAY_SECONDS": str(_setting_value(self.data, "si_delay_seconds", DEFAULTS["si_delay_seconds"])),
+            "PT_SI_DUCK_ORIGINAL": "1" if self.data.get("si_duck_original", DEFAULTS["si_duck_original"]) else "0",
             "PT_ALPHA_2D_PROJECTION": str(self.data.get("alpha_2d_projection") or "fisheye"),
             "PT_ALPHA_2D_DISTANCE_M": str(_setting_value(self.data, "alpha_2d_distance_m", 4.0)),
             "PT_TWO_DVR_MODEL": str(DEFAULTS["two_dvr_live_model"]),

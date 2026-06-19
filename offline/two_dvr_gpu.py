@@ -16,6 +16,15 @@ from __future__ import annotations
 
 import os
 
+# sm_120/Blackwell: CuPy must emit native cubins via NVRTC >= 12.8 (the uv venv
+# ships pip NVRTC 12.9). CuPy reads CUPY_COMPILE_WITH_PTX once, into
+# compiler._use_ptx, when cupy.cuda.compiler is first imported -- so a stale
+# `CUPY_COMPILE_WITH_PTX=1` left in the shell forces the slow PTX->driver-JIT
+# path (a fresh RawModule then "hangs" 60-120s). The standalone offline.two_dvr
+# entry never calls configure_gpu_runtime_cache(), so hard-set it here, before
+# this module's lazy `import cupy`, to neutralize any stale shell value.
+os.environ["CUPY_COMPILE_WITH_PTX"] = "0"
+
 import numpy as np
 
 from offline.two_dvr_render import (
@@ -32,6 +41,48 @@ from offline.two_dvr_render import (
     _smooth_depth,
     make_projection_map,
 )
+
+
+def _two_dvr_rim_width(src_w: int) -> int:
+    """Background-side non-hole rim cleanup width.
+
+    Disocclusion holes can have a thin non-hole seam on the background side:
+    low-near pixels were written by soft_shift, so pure zbuf==0 hybrid filling
+    does not touch them. The kernel only replaces low-near pixels when a hole
+    lies in the eye-specific background-side direction, which keeps foreground
+    silhouettes protected. Set PT_TWO_DVR_RIM=0 to disable for diagnostics.
+    """
+    raw = os.environ.get("PT_TWO_DVR_RIM", "").strip()
+    if not raw:
+        return max(2, round(int(src_w) / 120))
+    try:
+        return max(0, int(raw))
+    except ValueError:
+        return 0
+
+
+def _two_dvr_fg_bad_width(src_w: int) -> int:
+    """Window (full-res px) for the embedded-background cleanup (fw_fg_bad_local).
+
+    soft_shift leaves background-coloured slivers/cracks INSIDE the body -- white
+    vertical stripes through arms/torso, both zbuf==0 cracks and low-near written
+    pixels. fw_fg_bad_local replaces such a pixel with the nearest foreground
+    colour only when foreground encloses it on BOTH horizontal sides within this
+    window, so true background (foreground on at most one side) is never touched.
+
+    Defaults to an auto-scaled window (`1920w -> 8`) because the visible hair
+    edge failure is common in normal soft_shift output. Set PT_TWO_DVR_FG_BAD to
+    a full-res pixel window to override; a non-positive or unparseable value
+    disables it.
+    """
+    raw = os.environ.get("PT_TWO_DVR_FG_BAD", "").strip()
+    if not raw:
+        return max(2, round(int(src_w) / 240))
+    try:
+        return max(0, int(raw))
+    except ValueError:
+        return 0
+
 
 _SBS_INV_WARP_KERNEL = r'''
 extern "C" __global__ void sbs_inv_warp(
@@ -300,6 +351,52 @@ extern "C" __global__ void fw_blend(
     }
 }
 
+// Clean up background contamination embedded INSIDE the foreground body. The
+// soft_shift forward warp leaves two kinds of bad pixels inside a person, both
+// of which read as bright/white vertical slivers cutting through an arm/torso:
+//   (a) zbuf==0 cracks -- foreground pixels that no source disparity warped onto
+//       (later filled from inverse_warp, which can be background-coloured), and
+//   (b) zbuf!=0 but LOW-near pixels -- background colour that warped into the
+//       body region.
+// A pixel is "bad" when it is background-ish (a hole, or near < FG_THR) yet is
+// locally enclosed on BOTH horizontal sides, within `win` px of the same eye, by
+// high-near foreground written pixels. Such a pixel is a sliver embedded in the
+// body, so replace it with the nearest enclosing foreground colour. True
+// background has foreground on at most ONE side (the silhouette), so it is never
+// touched -- this is the targeted, silhouette-safe version of the rim cleanup.
+// Foreground pixels are never bad, so they are never overwritten, which makes the
+// in-place RGB copy free of read-after-write hazards. Runs on the blended SBS
+// (`img`, H x 2W) using the flat zbuf for the near classification.
+extern "C" __global__ void fw_fg_bad_local(
+    unsigned char* img, const int* zbuf, int H, int W, int win)
+{
+    long idx = (long)blockIdx.x*blockDim.x + threadIdx.x;
+    int W2 = 2 * W;
+    if (idx >= (long)H*W2) return;
+    int ox = (int)(idx % W2), y = (int)(idx / W2);
+    const float FG_THR = 0.5f;
+    int zb = zbuf[(long)y*W2 + ox];
+    if (zb != 0 && (float)(zb - 1) * 1e-6f >= FG_THR) return;  // foreground -> keep
+    int eye = ox / W, lo = eye*W, hi = lo + W;
+    int lfg = -1;
+    for (int s = 1; s <= win; ++s) {
+        int nx = ox - s; if (nx < lo) break;
+        int z = zbuf[(long)y*W2 + nx];
+        if (z != 0 && (float)(z - 1) * 1e-6f >= FG_THR) { lfg = nx; break; }
+    }
+    if (lfg < 0) return;                       // open to background on the left
+    int rfg = -1;
+    for (int s = 1; s <= win; ++s) {
+        int nx = ox + s; if (nx >= hi) break;
+        int z = zbuf[(long)y*W2 + nx];
+        if (z != 0 && (float)(z - 1) * 1e-6f >= FG_THR) { rfg = nx; break; }
+    }
+    if (rfg < 0) return;                       // open to background on the right
+    int pick = (ox - lfg <= rfg - ox) ? lfg : rfg;   // nearest foreground source
+    long o = ((long)y*W2 + ox) * 3, p = ((long)y*W2 + pick) * 3;
+    img[o]=img[p]; img[o+1]=img[p+1]; img[o+2]=img[p+2];
+}
+
 // Project the flat (H, 2W) SBS into a VR (side, 2*side) SBS via the projection map.
 extern "C" __global__ void project_flat_lr(
     const unsigned char* flat, const float* mapx, const float* mapy,
@@ -372,12 +469,14 @@ class GpuStereoRenderer:
         # background (=> fill-algorithm question) or by leftover foreground
         # slivers (=> depth/segmentation question). flat3d soft_shift only.
         self._debug_holes = bool(int(os.environ.get("PT_TWO_DVR_DEBUG_HOLES", "0") or 0))
-        # Background-side rim cleanup width (px) for the hybrid hole fill: removes
-        # matting/depth leftover (object-coloured low-depth pixels) clinging to the
-        # background edge of a disocclusion gap. Scales with width (1080p->8,
-        # 4K->16); env PT_TWO_DVR_RIM overrides, 0 disables.
-        _rim_env = os.environ.get("PT_TWO_DVR_RIM", "").strip()
-        self._rim = int(_rim_env) if _rim_env else max(4, round(int(src_w) / 240))
+        # Background-side rim cleanup width (px) for the hybrid hole fill. This
+        # handles low-near non-hole seam pixels next to true disocclusion holes;
+        # PT_TWO_DVR_RIM=0 disables it for diagnostics.
+        self._rim = _two_dvr_rim_width(self.src_w)
+        # Cleanup of background slivers embedded inside the body or hair edge
+        # (white vertical stripes). Auto-enabled by default; set
+        # PT_TWO_DVR_FG_BAD=0 to disable for diagnostics.
+        self._fg_bad = _two_dvr_fg_bad_width(self.src_w)
         self._project = projection != PROJECTION_FLAT_3D
         self._near_g = None
         self._frame_g = cp.empty((self.src_h, self.src_w, 3), cp.uint8)
@@ -405,6 +504,7 @@ class GpuStereoRenderer:
             self._k_fill = mod.get_function("fw_fill")
             self._k_blend = mod.get_function("fw_blend")
             self._k_hole_inv = mod.get_function("fw_hole_from_inv")
+            self._k_fg_bad = mod.get_function("fw_fg_bad_local")
             self._k_project = mod.get_function("project_flat_lr") if self._project else None
             # Hybrid (flat3d): an inverse_warp sub-render supplies the hole pixels
             # so wide disocclusion gaps don't get the row-copy banding/smear.
@@ -461,6 +561,13 @@ class GpuStereoRenderer:
                              (self._flat_g, self._zbuf_g, near_g, self._sh, self._sw, h, w))
             self._k_blend((self._flat_blocks,), (self._threads,),
                           (self._flat_g, self._zbuf_g, self._flatb_g, self._sh, self._sw))
+            if self._fg_bad > 0:
+                # Replace background slivers embedded inside the body (enclosed by
+                # foreground on both sides) with the local foreground colour. Runs
+                # on the blended SBS so nothing downstream re-softens it.
+                self._k_fg_bad((self._flat_blocks,), (self._threads,),
+                               (self._flatb_g, self._zbuf_g, self._sh, self._sw,
+                                np.int32(self._fg_bad)))
             if self._project:
                 self._k_project((self._blocks,), (self._threads,),
                                 (self._flatb_g, self._mapx_g, self._mapy_g, self._mask_g, self._out_g,

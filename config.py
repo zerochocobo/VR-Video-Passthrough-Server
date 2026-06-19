@@ -106,6 +106,14 @@ DEVICE_USN = f"uuid:{DEVICE_UUID}"
 #   separated with `|`. With multiple roots, clients first see virtual folders
 #   named after each physical directory, with numeric suffixes for conflicts.
 from media_library import MediaLibrary, build_media_roots, parse_video_dirs
+from utils.si_filter import (
+    DEFAULT_DUCK_ORIGINAL,
+    DEFAULT_ORIGINAL_VOLUME_PERCENT,
+    DEFAULT_SI_DELAY_SECONDS,
+    DEFAULT_SI_MIX_CHANNEL,
+    DEFAULT_SI_MIX_ENABLED,
+    DEFAULT_SI_VOLUME_PERCENT,
+)
 
 
 VIDEO_DIRS: list[Path] = parse_video_dirs(_env("VIDEO_DIR", ROOT / "videos"), ROOT / "videos")
@@ -800,6 +808,91 @@ LIGHT_MATCH_DICT = {
     "gamma": LIGHT_MATCH_GAMMA,
     "saturation": LIGHT_MATCH_SATURATION,
     "preset": LIGHT_MATCH_PRESET,
+}
+
+# ---- Simultaneous interpretation audio mixing ----
+# PT_SI_MIX_ENABLED:
+#   Exposes virtual [SI] MP4 items in DLNA for MP4 files with same-stem
+#   `.si.wav` sidecar audio. Runtime changes are handled by /control/si_mix.
+SI_MIX_ENABLED = str(
+    _env_any(("SI_MIX_ENABLED", "DLNA_SI_ENABLED"), "1" if DEFAULT_SI_MIX_ENABLED else "0")
+).lower() in {"1", "true", "yes", "on"}
+# PT_SI_PROGRESSIVE_ENABLED:
+#   Enables the M1 progressive virtual MP4 `/media_si` transport. Default 1 so
+#   `[SI]` sidecar entries are immediately testable without enabling the legacy
+#   `/passthrough_seek` experiment.
+SI_PROGRESSIVE_ENABLED = str(_env("SI_PROGRESSIVE_ENABLED", "1")).lower() in {"1", "true", "yes", "on"}
+# PT_SI_PROGRESSIVE_DLNA:
+#   Adds `[SI]` progressive virtual MP4 entries to DLNA Browse when SI mixing is
+#   enabled and a same-stem `.si.wav` exists. Set 0 to keep manual URLs only.
+SI_PROGRESSIVE_DLNA = str(_env("SI_PROGRESSIVE_DLNA", "1")).lower() in {"1", "true", "yes", "on"}
+# PT_SI_BROWSE_PREWARM_LIMIT:
+#   Maximum number of `[SI]` items per DLNA Browse directory listing that may
+#   enqueue background progressive MP4 prewarm. This keeps large folders from
+#   queueing every SI sidecar at once. Set 0 to disable Browse-triggered prewarm.
+SI_BROWSE_PREWARM_LIMIT = max(0, int(_env("SI_BROWSE_PREWARM_LIMIT", 1)))
+# PT_SI_PREWARM_QUEUE_MAX:
+#   Bounded background queue for low-priority SI progressive prewarm jobs. The
+#   playback path still builds on demand with higher priority.
+SI_PREWARM_QUEUE_MAX = max(0, int(_env("SI_PREWARM_QUEUE_MAX", 2)))
+# PT_SI_AUDIO_EXTRACT_MODE:
+#   Source-audio sidecar extraction strategy.
+#   sequential - forward large-buffer scan over the source file span, avoiding
+#                cold random seeks when audio samples are sparse.
+#   runs       - old seek-per-audio-run extractor, useful for A/B diagnostics.
+SI_AUDIO_EXTRACT_MODE = str(_env("SI_AUDIO_EXTRACT_MODE", "sequential")).strip().lower()
+if SI_AUDIO_EXTRACT_MODE not in {"sequential", "runs"}:
+    SI_AUDIO_EXTRACT_MODE = "sequential"
+# PT_SI_MIX_PARALLEL_MAX:
+#   Maximum ffmpeg segment encoders for SI mixed AAC sidecar builds. Set 1 to
+#   force the single-process fallback path.
+SI_MIX_PARALLEL_MAX = max(1, int(_env("SI_MIX_PARALLEL_MAX", min(8, os.cpu_count() or 1))))
+# PT_SI_MIX_ENCODER:
+#   auto   - prefer Windows MediaFoundation AAC when available, else ffmpeg aac.
+#   aac    - ffmpeg native AAC.
+#   aac_mf - Windows MediaFoundation AAC.
+#   Default uses `auto` for best first-play responsiveness on Windows. Quest3
+#   players validated the `aac_mf` fast path; use `aac` explicitly only for
+#   quality/diagnostic A/B tests.
+SI_MIX_ENCODER = str(_env("SI_MIX_ENCODER", "auto")).strip().lower()
+if SI_MIX_ENCODER not in {"auto", "aac", "aac_mf"}:
+    SI_MIX_ENCODER = "auto"
+# PT_SI_MIX_SEGMENTED_AAC:
+#   Enables experimental native-AAC segmented parallel encoding. Default off:
+#   real-file PCM checks showed independent native AAC segments do not decode
+#   sample-identically to one continuous native-AAC encode after seams.
+SI_MIX_SEGMENTED_AAC = str(_env("SI_MIX_SEGMENTED_AAC", "0")).lower() in {"1", "true", "yes", "on"}
+# PT_SI_MIX_SEGMENT_WARMUP_MS:
+#   Leading warmup before non-first AAC mix segments. It absorbs encoder priming
+#   and lets ducking/limiter envelopes settle before kept frames.
+SI_MIX_SEGMENT_WARMUP_MS = max(0, int(_env("SI_MIX_SEGMENT_WARMUP_MS", 1000)))
+# PT_SI_AUDIO_EDIT_MODE:
+#   M1 compatibility switch for the imported AAC sidecar audio track.
+#   preserve - copy the sidecar audio trak including edts/elst exactly.
+#   remove   - drop audio trak edts/elst from the virtual moov only. This tests
+#              players that mishandle AAC priming edit lists differently from
+#              the source video's edit-list/ctts timeline.
+SI_AUDIO_EDIT_MODE = str(_env("SI_AUDIO_EDIT_MODE", "remove")).strip().lower()
+if SI_AUDIO_EDIT_MODE not in {"preserve", "remove"}:
+    SI_AUDIO_EDIT_MODE = "remove"
+SI_MIX_CHANNEL = str(_env_any(("SI_MIX_CHANNEL", "DLNA_SI_MIX_CHANNEL"), DEFAULT_SI_MIX_CHANNEL)).lower()
+SI_ORIGINAL_VOLUME_PERCENT = int(float(_env_any(
+    ("SI_ORIGINAL_VOLUME_PERCENT", "DLNA_SI_ORIGINAL_VOLUME_PERCENT"),
+    DEFAULT_ORIGINAL_VOLUME_PERCENT,
+)))
+SI_VOLUME_PERCENT = int(float(_env_any(("SI_VOLUME_PERCENT", "DLNA_SI_VOLUME_PERCENT"), DEFAULT_SI_VOLUME_PERCENT)))
+SI_DELAY_SECONDS = float(_env_any(("SI_DELAY_SECONDS", "DLNA_SI_DELAY_SECONDS"), DEFAULT_SI_DELAY_SECONDS))
+SI_DUCK_ORIGINAL = str(_env_any(
+    ("SI_DUCK_ORIGINAL", "DLNA_SI_DUCK_ORIGINAL"),
+    "1" if DEFAULT_DUCK_ORIGINAL else "0",
+)).lower() in {"1", "true", "yes", "on"}
+SI_MIX_DICT = {
+    "enabled": SI_MIX_ENABLED,
+    "mix_channel": SI_MIX_CHANNEL,
+    "original_volume_percent": SI_ORIGINAL_VOLUME_PERCENT,
+    "si_volume_percent": SI_VOLUME_PERCENT,
+    "si_delay_seconds": SI_DELAY_SECONDS,
+    "duck_original": SI_DUCK_ORIGINAL,
 }
 
 

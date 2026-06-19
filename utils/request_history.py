@@ -26,6 +26,7 @@ _MEDIA_ROUTE_PREFIXES = (
     "/media/",
     "/thumb/",
     "/subs/",
+    "/media_si/",
     "/passthrough/",
     "/passthrough_live/",
 )

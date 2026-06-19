@@ -59,6 +59,7 @@ from config import (
     PASSTHROUGH_SEEK_HEADER_BYTES,
     PASSTHROUGH_SEEK_PROFILES,
     PASSTHROUGH_SEEK_ROUTE_POLICY,
+    SI_PROGRESSIVE_ENABLED,
     DEBUG_LOGS,
     LIVE_REQUEST_HEADER_DUMP,
     LIGHT_MATCH_FLUSH_QUEUES,
@@ -68,7 +69,9 @@ from config import (
     VIDEO_EXTS,
 )
 from dlna.profiles import passthrough_dlna_pn, passthrough_frame_rate
+from http_app.si_stream import DEFAULT_CHUNK_SIZE, get_si_stream_service, parse_range_header
 from pipeline.ffmpeg_io import probe_cached
+from pipeline.si_virtual_mp4 import build_progressive_si_virtual_mp4, iter_virtual_range
 from pipeline.matting import acquire_matter, release_matter
 from pipeline.stream import PassthroughStream
 from pipeline.pynv_stream import PYNV_BACKEND_LABEL, PYNV_OUTPUT_CODEC, PyNvPassthroughStream
@@ -153,6 +156,7 @@ _live_session_lock = asyncio.Lock()
 _live_sessions: dict[tuple[str, str, float, str, float, str], "LiveSession"] = {}
 _live_starting: dict[tuple[str, str, float, str, float, str], float] = {}
 _LIVE_NPLAYER_START_DEBOUNCE_SEC = max(1.5, _LIVE_FIRST_CHUNK_TIMEOUT_SEC)
+_SI_STARTUP_PROBE_BYTES = 1024 * 1024
 
 
 def _seek_container() -> str:
@@ -177,6 +181,7 @@ def _split_seek_route_name(name: str) -> tuple[str, str | None]:
 
 
 _LIVE_END = object()
+_SI_EOF = object()
 
 
 def _drain_live_queue_nowait(q: asyncio.Queue[bytes | object]) -> tuple[int, int, bool]:
@@ -1146,6 +1151,199 @@ async def media_head(request: Request, name: str, range: str | None = Header(def
         return Response(status_code=206, headers=headers)
     headers["Content-Length"] = str(size)
     return Response(status_code=200, headers=headers)
+
+
+def _si_dlna_content_features() -> str:
+    return (
+        "DLNA.ORG_PN=HEVC_MP4_MAIN;"
+        f"DLNA.ORG_OP={DLNA_OP_BYTE_SEEK};"
+        f"DLNA.ORG_CI=0;DLNA.ORG_FLAGS={DLNA_FLAGS_BASE}"
+    )
+
+
+def _si_base_headers(content_length: int) -> dict[str, str]:
+    features = _si_dlna_content_features()
+    return {
+        "Accept-Ranges": "bytes",
+        "Content-Type": "video/mp4",
+        "Content-Length": str(max(0, int(content_length))),
+        "contentFeatures.dlna.org": features,
+        "transferMode.dlna.org": "Streaming",
+    }
+
+
+def _si_startup_probe_body(path: Path, start: int, total: int) -> tuple[bytes, int, int]:
+    safe_start = min(max(0, int(start)), max(0, int(total) - 1))
+    length = min(_SI_STARTUP_PROBE_BYTES, max(0, int(total) - safe_start))
+    if length <= 0:
+        return b"", safe_start, safe_start
+    body = b""
+    try:
+        with path.open("rb") as fh:
+            fh.seek(safe_start)
+            body = fh.read(length)
+    except OSError:
+        body = b""
+    if len(body) < length:
+        body += b"\x00" * (length - len(body))
+    safe_end = safe_start + len(body) - 1 if body else safe_start
+    return body, safe_start, safe_end
+
+
+def _safe_si_video_path(name: str) -> Path:
+    path = _safe_video_path(name)
+    if path.suffix.lower() != ".mp4":
+        raise HTTPException(404, "SI streaming currently supports MP4 sources only")
+    return path
+
+
+def _si_virtual_disabled() -> bool:
+    return not bool(SI_PROGRESSIVE_ENABLED)
+
+
+def _si_range_headers(layout, start: int, end: int, status_code: int) -> dict[str, str]:
+    content_length = max(0, int(end) - int(start) + 1)
+    headers = _si_base_headers(content_length)
+    headers["ETag"] = f'"{layout.etag}"'
+    headers["X-SI-Enabled"] = "1"
+    headers["X-SI-Transport"] = "progressive-virtual"
+    headers["X-SI-Moov-Bytes"] = str(layout.moov_size)
+    headers["X-SI-Samples"] = f"{layout.video_samples}+{layout.audio_samples}"
+    headers["X-SI-Audio-Edit"] = str(getattr(layout, "audio_edit_mode", "preserve"))
+    if status_code == 206:
+        headers["Content-Range"] = f"bytes {start}-{end}/{layout.content_length}"
+    return headers
+
+
+async def _si_virtual_layout(path: Path):
+    if _si_virtual_disabled():
+        raise HTTPException(404, "SI progressive virtual MP4 is disabled")
+    service = get_si_stream_service()
+    config = service.current_config()
+    si_wav = service.has_si_source(path)
+    if not config.enabled or si_wav is None:
+        raise HTTPException(404, "SI stream not available")
+    try:
+        return await asyncio.to_thread(build_progressive_si_virtual_mp4, path, si_wav, config)
+    except FileNotFoundError as exc:
+        raise HTTPException(404, str(exc)) from exc
+    except subprocess.CalledProcessError as exc:
+        log.warning("SI progressive audio sidecar build failed: %s", exc)
+        raise HTTPException(500, "SI audio sidecar build failed") from exc
+    except Exception as exc:
+        log.warning("SI progressive virtual MP4 build failed for %s: %s", path, exc)
+        raise HTTPException(500, "SI virtual MP4 build failed") from exc
+
+
+def _si_resolve_range(range_header: str | None, total: int) -> tuple[int, int, bool, int]:
+    start, end, range_requested = parse_range_header(range_header)
+    if total <= 0:
+        return 0, -1, range_requested, 416 if range_requested else 200
+    safe_start = max(0, int(start))
+    if range_requested and safe_start >= total:
+        return safe_start, total - 1, True, 416
+    safe_start = min(safe_start, total - 1)
+    safe_end = min(int(end), total - 1) if end is not None else total - 1
+    if safe_end < safe_start:
+        safe_end = total - 1
+    return safe_start, safe_end, range_requested, 206 if range_requested else 200
+
+
+@router.head("/media_si/{name:path}")
+async def media_si_head(request: Request, name: str, range: str | None = Header(default=None)):
+    path = _safe_si_video_path(name)
+    annotate_request(request, media_name=path.name, media_path=str(path), passthrough_route="si_mix")
+    layout = await _si_virtual_layout(path)
+    start, end, range_requested, status_code = _si_resolve_range(range, layout.content_length)
+    annotate_request(request, total_estimated_size=layout.content_length)
+    if status_code == 416:
+        return Response(
+            status_code=416,
+            headers={
+                "Accept-Ranges": "bytes",
+                "Content-Range": f"bytes */{layout.content_length}",
+                "ETag": f'"{layout.etag}"',
+            },
+        )
+    headers = _si_range_headers(layout, start, end, status_code)
+    return Response(status_code=status_code, headers=headers, media_type="video/mp4")
+
+
+@router.get("/media_si/{name:path}")
+async def media_si_get(
+    request: Request,
+    name: str,
+    range: str | None = Header(default=None),
+    user_agent: str | None = Header(default=None, alias="User-Agent"),
+    time_seek_range: str | None = Header(default=None, alias="TimeSeekRange.dlna.org"),
+    transfer_mode: str | None = Header(default=None, alias="transferMode.dlna.org"),
+    get_content_features: str | None = Header(default=None, alias="getcontentFeatures.dlna.org"),
+):
+    rid = next(_request_ids)
+    path = _safe_si_video_path(name)
+    client_id = request.client.host if request.client else ""
+    annotate_request(request, media_name=path.name, media_path=str(path), passthrough_route="si_mix")
+    layout = await _si_virtual_layout(path)
+    start, end, range_requested, status_code = _si_resolve_range(range, layout.content_length)
+    annotate_request(request, total_estimated_size=layout.content_length)
+    if status_code == 416:
+        return Response(
+            status_code=416,
+            headers={
+                "Accept-Ranges": "bytes",
+                "Content-Range": f"bytes */{layout.content_length}",
+                "ETag": f'"{layout.etag}"',
+            },
+        )
+    headers = _si_range_headers(layout, start, end, status_code)
+    log.info(
+        "media_si[%d] progressive virtual start: path=%s status=%d range=%r resolved=%d-%d/%d client=%s client_id=%s ua=%r time_seek=%r transfer=%r getfeatures=%r moov=%d samples=%d+%d",
+        rid,
+        path.name,
+        status_code,
+        range,
+        start,
+        end,
+        layout.content_length,
+        request.client,
+        client_id,
+        (user_agent or "")[:160],
+        time_seek_range,
+        transfer_mode,
+        get_content_features,
+        layout.moov_size,
+        layout.video_samples,
+        layout.audio_samples,
+    )
+
+    async def gen():
+        sent = 0
+        iterator = iter_virtual_range(layout.regions, start, end, chunk_size=DEFAULT_CHUNK_SIZE)
+        content_length = max(0, end - start + 1)
+        try:
+            while sent < content_length:
+                chunk = await asyncio.to_thread(next, iterator, _SI_EOF)
+                if chunk is _SI_EOF:
+                    break
+                if not chunk:
+                    break
+                if sent + len(chunk) > content_length:
+                    chunk = chunk[: content_length - sent]
+                sent += len(chunk)
+                yield chunk
+        finally:
+            close = getattr(iterator, "close", None)
+            if callable(close):
+                await asyncio.to_thread(close)
+            log.info(
+                "media_si[%d] progressive virtual end: path=%s sent=%d content_length=%d",
+                rid,
+                path.name,
+                sent,
+                content_length,
+            )
+
+    return StreamingResponse(gen(), status_code=status_code, headers=headers, media_type="video/mp4")
 
 
 @router.get("/media/{name:path}")

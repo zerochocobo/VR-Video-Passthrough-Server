@@ -6,6 +6,7 @@ import threading
 
 import config
 from pipeline.light_match import LightMatchParams, normalize_light_match_params
+from utils.si_filter import SIMixParams, normalize_si_mix_params
 
 
 @dataclass(frozen=True)
@@ -36,31 +37,82 @@ class LightMatchRuntime:
         return asdict(self)
 
 
+@dataclass(frozen=True)
+class SIMixRuntime:
+    enabled: bool
+    mix_channel: str
+    original_volume_percent: int
+    si_volume_percent: int
+    si_delay_seconds: float
+    duck_original: bool
+    version: int = 0
+
+    def params(self) -> SIMixParams:
+        return SIMixParams(
+            enabled=self.enabled,
+            mix_channel=self.mix_channel,
+            original_volume_percent=self.original_volume_percent,
+            si_volume_percent=self.si_volume_percent,
+            si_delay_seconds=self.si_delay_seconds,
+            duck_original=self.duck_original,
+        )
+
+    def to_dict(self) -> dict:
+        return asdict(self)
+
+
 _lock = threading.RLock()
-_state = LightMatchRuntime(
+_light_match_state = LightMatchRuntime(
     **normalize_light_match_params(config.LIGHT_MATCH_DICT).__dict__,
+    version=0,
+)
+_si_mix_state = SIMixRuntime(
+    **normalize_si_mix_params(config.SI_MIX_DICT).to_dict(),
     version=0,
 )
 
 
 def reset_for_test(data: dict | LightMatchParams | None = None) -> LightMatchRuntime:
-    global _state
+    global _light_match_state
     params = normalize_light_match_params(config.LIGHT_MATCH_DICT if data is None else data)
     with _lock:
-        _state = LightMatchRuntime(**params.__dict__, version=0)
-        return _state
+        _light_match_state = LightMatchRuntime(**params.__dict__, version=0)
+        return _light_match_state
 
 
 def get_light_match() -> LightMatchRuntime:
     with _lock:
-        return _state
+        return _light_match_state
 
 
 def set_light_match(data: dict | LightMatchParams) -> LightMatchRuntime:
-    global _state
+    global _light_match_state
     params = normalize_light_match_params(data)
     with _lock:
-        if params == _state.params():
-            return _state
-        _state = LightMatchRuntime(**params.__dict__, version=_state.version + 1)
-        return _state
+        if params == _light_match_state.params():
+            return _light_match_state
+        _light_match_state = LightMatchRuntime(**params.__dict__, version=_light_match_state.version + 1)
+        return _light_match_state
+
+
+def reset_si_mix_for_test(data: dict | SIMixParams | None = None) -> SIMixRuntime:
+    global _si_mix_state
+    params = normalize_si_mix_params(config.SI_MIX_DICT if data is None else data)
+    with _lock:
+        _si_mix_state = SIMixRuntime(**params.to_dict(), version=0)
+        return _si_mix_state
+
+
+def get_si_mix() -> SIMixRuntime:
+    with _lock:
+        return _si_mix_state
+
+
+def set_si_mix(data: dict | SIMixParams) -> SIMixRuntime:
+    global _si_mix_state
+    params = normalize_si_mix_params(data)
+    with _lock:
+        if params == _si_mix_state.params():
+            return _si_mix_state
+        _si_mix_state = SIMixRuntime(**params.to_dict(), version=_si_mix_state.version + 1)
+        return _si_mix_state

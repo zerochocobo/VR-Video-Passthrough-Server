@@ -38,6 +38,7 @@ from ui.player_support import load_player_support
 from ui.resources import SWITCH_OFF_IMAGE_PATH, SWITCH_ON_IMAGE_PATH
 from ui.settings import DEFAULTS, LIGHT_MATCH_PRESETS, ROOT as UI_ROOT, quality_speed_value
 from ui.widgets.trt_cache_dialog import TensorRTConfigDialog
+from utils.si_filter import ORIGINAL_VOLUME_CHOICES, SI_DELAY_SECONDS_CHOICES, SI_MIX_CHANNELS, SI_VOLUME_CHOICES
 from utils.trt_manifest import cache_status, manifest_path
 
 
@@ -49,6 +50,7 @@ HOME_HEIGHT = 560
 CONFIG_ROW_HEIGHT = 34
 SERVER_ICON_SIZE = 22
 PROJECT_URL = "https://wapok.com"
+SI_TOOLBOX_URL = "https://github.com/zerochocobo/VR-Video-Toolbox-CE"
 PROJECT_LINK_HEIGHT = 28
 ICON_BUTTON_SIZE = 30
 LIGHT_MATCH_DEFAULT_PRESET = str(DEFAULTS["light_match_preset"])
@@ -321,6 +323,116 @@ class Alpha2DSettingsDialog(QDialog):
 
     def selected_distance_m(self) -> float:
         return float(self.distance_slider.value())
+
+
+class SISettingsDialog(QDialog):
+    def __init__(self, i18n, settings, parent=None) -> None:
+        super().__init__(parent)
+        self.i18n = i18n
+        self.settings = settings
+        self.setModal(True)
+        self.setWindowTitle(self.i18n.t("si.dialog_title"))
+
+        self.channel = QComboBox()
+        for value in SI_MIX_CHANNELS:
+            self.channel.addItem(self.i18n.t(f"si.channel_{value}"), value)
+        idx = self.channel.findData(str(settings.data.get("si_mix_channel") or DEFAULTS["si_mix_channel"]))
+        self.channel.setCurrentIndex(max(0, idx))
+
+        self.original_volume = QComboBox()
+        for value in ORIGINAL_VOLUME_CHOICES:
+            self.original_volume.addItem(f"{value}%", value)
+        idx = self.original_volume.findData(_int_setting(
+            settings.data.get("si_original_volume_percent"),
+            DEFAULTS["si_original_volume_percent"],
+        ))
+        self.original_volume.setCurrentIndex(max(0, idx))
+
+        self.si_volume = QComboBox()
+        for value in SI_VOLUME_CHOICES:
+            self.si_volume.addItem(f"{value}%", value)
+        idx = self.si_volume.findData(_int_setting(settings.data.get("si_volume_percent"), DEFAULTS["si_volume_percent"]))
+        self.si_volume.setCurrentIndex(max(0, idx))
+
+        self.delay = QComboBox()
+        for value in SI_DELAY_SECONDS_CHOICES:
+            self.delay.addItem(f"{value:g}s", value)
+        delay = round(_float_setting(settings.data.get("si_delay_seconds"), DEFAULTS["si_delay_seconds"]), 1)
+        idx = self.delay.findData(delay)
+        self.delay.setCurrentIndex(max(0, idx))
+
+        self.duck_original = QCheckBox(self.i18n.t("si.duck_original"))
+        self.duck_original.setToolTip(self.i18n.t("si.duck_original_tooltip"))
+        self.duck_original.setChecked(bool(settings.data.get("si_duck_original", DEFAULTS["si_duck_original"])))
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(16, 14, 16, 14)
+        layout.setSpacing(10)
+        for label_key, widget in (
+            ("si.mix_channel", self.channel),
+            ("si.original_volume", self.original_volume),
+            ("si.si_volume", self.si_volume),
+            ("si.delay", self.delay),
+        ):
+            row = QHBoxLayout()
+            label = QLabel(self.i18n.t(label_key))
+            label.setFixedWidth(110)
+            label.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+            row.addWidget(label)
+            row.addWidget(widget, 1)
+            layout.addLayout(row)
+        duck_row = QHBoxLayout()
+        duck_row.addSpacing(110)
+        duck_row.addWidget(self.duck_original)
+        duck_row.addStretch(1)
+        layout.addLayout(duck_row)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel)
+        buttons.button(QDialogButtonBox.StandardButton.Save).setText(self.i18n.t("button.save"))
+        buttons.button(QDialogButtonBox.StandardButton.Cancel).setText(self.i18n.t("button.cancel"))
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+        self.resize(360, 220)
+
+    def payload(self) -> dict:
+        return {
+            "mix_channel": str(self.channel.currentData() or DEFAULTS["si_mix_channel"]),
+            "original_volume_percent": int(self.original_volume.currentData() or DEFAULTS["si_original_volume_percent"]),
+            "si_volume_percent": int(self.si_volume.currentData() or DEFAULTS["si_volume_percent"]),
+            "si_delay_seconds": float(self.delay.currentData() or DEFAULTS["si_delay_seconds"]),
+            "duck_original": self.duck_original.isChecked(),
+        }
+
+
+class SIHelpDialog(QDialog):
+    def __init__(self, i18n, parent=None) -> None:
+        super().__init__(parent)
+        self.i18n = i18n
+        self.setModal(True)
+        self.setWindowTitle(self.i18n.t("si.help_title"))
+
+        message = self.i18n.t("si.help_message").format(
+            link=f'<a href="{SI_TOOLBOX_URL}">{SI_TOOLBOX_URL}</a>'
+        )
+        label = QLabel(message)
+        label.setWordWrap(True)
+        label.setTextFormat(Qt.TextFormat.RichText)
+        label.setTextInteractionFlags(Qt.TextInteractionFlag.TextBrowserInteraction)
+        label.setOpenExternalLinks(False)
+        label.linkActivated.connect(lambda value: QDesktopServices.openUrl(QUrl(value)))
+        label.setMinimumWidth(560)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
+        buttons.button(QDialogButtonBox.StandardButton.Close).setText(self.i18n.t("button.close"))
+        buttons.rejected.connect(self.reject)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(16, 14, 16, 14)
+        layout.setSpacing(12)
+        layout.addWidget(label)
+        layout.addWidget(buttons)
+        self.resize(640, 220)
 
 
 class LightMatchAdvancedDialog(QDialog):
@@ -725,6 +837,13 @@ class HomePage(QWidget):
         self.light_match_enabled_label = QLabel()
         self.light_match_help = _icon_button(_question_icon())
         self.light_match_advanced_button = QPushButton()
+        self.si_mix_enabled = QCheckBox()
+        self.si_mix_enabled.setChecked(bool(settings.data.get("si_enabled")))
+        _apply_switch_style(self.si_mix_enabled)
+        self.si_mix_enabled_label = QLabel()
+        self.si_mix_settings_button = QPushButton()
+        self.si_mix_settings_button.setFixedWidth(94)
+        self.si_mix_help = _icon_button(_question_icon())
         self.light_match_preset = QComboBox()
         for key in ("home_warm", "daylight", "night_cool", "custom"):
             self.light_match_preset.addItem("", key)
@@ -805,6 +924,15 @@ class HomePage(QWidget):
         light_enable_row.addWidget(self.light_match_advanced_button)
         light_enable_row.addStretch(1)
         light_enable_row.addWidget(self.light_match_help)
+        si_row_widget = QWidget()
+        si_row_widget.setFixedHeight(CONFIG_ROW_HEIGHT)
+        si_row = QHBoxLayout(si_row_widget)
+        si_row.setContentsMargins(0, 0, 0, 0)
+        si_row.addWidget(self.si_mix_enabled_label)
+        si_row.addWidget(self.si_mix_enabled)
+        si_row.addStretch(1)
+        si_row.addWidget(self.si_mix_settings_button)
+        si_row.addWidget(self.si_mix_help)
         log_row_widget = QWidget()
         log_row_widget.setFixedHeight(CONFIG_ROW_HEIGHT)
         log_row = QHBoxLayout(log_row_widget)
@@ -817,6 +945,7 @@ class HomePage(QWidget):
         log_row.addStretch(1)
         log_row.addWidget(self.problem_help_button)
         light_content_layout.addWidget(light_enable_row_widget)
+        light_content_layout.addWidget(si_row_widget)
         light_content_layout.addWidget(log_row_widget)
         light_match_layout.addWidget(self.light_match_header)
         light_match_layout.addWidget(self.light_match_content)
@@ -833,6 +962,7 @@ class HomePage(QWidget):
             self.performance_output_size_label,
             self.trt_enabled_label,
             self.light_match_enabled_label,
+            self.si_mix_enabled_label,
         ):
             label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
 
@@ -893,6 +1023,9 @@ class HomePage(QWidget):
         self.light_match_enabled.toggled.connect(self._save_light_match)
         self.light_match_preset.currentIndexChanged.connect(self._preset_light_match)
         self.light_match_advanced_button.clicked.connect(self.show_light_match_advanced)
+        self.si_mix_enabled.toggled.connect(self._save_si_mix)
+        self.si_mix_settings_button.clicked.connect(self.show_si_mix_settings)
+        self.si_mix_help.clicked.connect(self.show_si_mix_help)
         self.performance_fps_help.clicked.connect(self._show_fps_help)
         self.config_header.toggled.connect(self._toggle_quick_config)
         self.performance_header.toggled.connect(self._toggle_performance_config)
@@ -1020,6 +1153,45 @@ class HomePage(QWidget):
 
         threading.Thread(target=worker, name="light-match-live-update", daemon=True).start()
 
+    def _si_mix_payload(self) -> dict:
+        return {
+            "enabled": self.si_mix_enabled.isChecked(),
+            "mix_channel": str(self.settings.data.get("si_mix_channel") or DEFAULTS["si_mix_channel"]),
+            "original_volume_percent": _int_setting(
+                self.settings.data.get("si_original_volume_percent"),
+                DEFAULTS["si_original_volume_percent"],
+            ),
+            "si_volume_percent": _int_setting(self.settings.data.get("si_volume_percent"), DEFAULTS["si_volume_percent"]),
+            "si_delay_seconds": _float_setting(self.settings.data.get("si_delay_seconds"), DEFAULTS["si_delay_seconds"]),
+            "duck_original": bool(self.settings.data.get("si_duck_original", DEFAULTS["si_duck_original"])),
+        }
+
+    def _save_si_mix(self) -> None:
+        self.settings.data["si_enabled"] = self.si_mix_enabled.isChecked()
+        self.settings.save()
+        self._send_si_mix_live_update()
+
+    def _send_si_mix_live_update(self, payload: dict | None = None) -> None:
+        payload = payload or self._si_mix_payload()
+        port = str(os.environ.get("PT_HTTP_PORT") or "8200").strip() or "8200"
+        url = f"http://127.0.0.1:{port}/control/si_mix"
+
+        def worker() -> None:
+            try:
+                data = json.dumps(payload).encode("utf-8")
+                request = urllib.request.Request(
+                    url,
+                    data=data,
+                    method="PUT",
+                    headers={"Content-Type": "application/json"},
+                )
+                with urllib.request.urlopen(request, timeout=0.35) as response:
+                    response.read(2048)
+            except Exception:
+                pass
+
+        threading.Thread(target=worker, name="si-mix-live-update", daemon=True).start()
+
     def _preset_light_match(self) -> None:
         preset = str(self.light_match_preset.currentData() or LIGHT_MATCH_DEFAULT_PRESET)
         self._update_light_match_visibility()
@@ -1036,6 +1208,24 @@ class HomePage(QWidget):
             self._apply_light_match_payload(dialog.payload(), save=True)
             return
         self._apply_light_match_payload(before, save=False)
+
+    def show_si_mix_settings(self) -> None:
+        dialog = SISettingsDialog(self.i18n, self.settings, self)
+        if dialog.exec() != SISettingsDialog.DialogCode.Accepted:
+            return
+        payload = dialog.payload()
+        self.settings.data["si_mix_channel"] = payload["mix_channel"]
+        self.settings.data["si_original_volume_percent"] = payload["original_volume_percent"]
+        self.settings.data["si_volume_percent"] = payload["si_volume_percent"]
+        self.settings.data["si_delay_seconds"] = payload["si_delay_seconds"]
+        self.settings.data["si_duck_original"] = payload["duck_original"]
+        self.settings.save()
+        live_payload = self._si_mix_payload()
+        live_payload.update(payload)
+        self._send_si_mix_live_update(live_payload)
+
+    def show_si_mix_help(self) -> None:
+        SIHelpDialog(self.i18n, self).exec()
 
     def _update_light_match_visibility(self) -> None:
         enabled = self.light_match_enabled.isChecked()
@@ -1240,6 +1430,7 @@ class HomePage(QWidget):
             self.performance_output_size_label,
             self.trt_enabled_label,
             self.light_match_enabled_label,
+            self.si_mix_enabled_label,
         )
         width = max(label.sizeHint().width() for label in labels)
         for label in labels:
@@ -1289,6 +1480,10 @@ class HomePage(QWidget):
         self.light_match_enabled_label.setText(self.i18n.t("light_match.enabled"))
         self.light_match_help.setToolTip(self.i18n.t("light_match.help"))
         self.light_match_advanced_button.setText(self.i18n.t("light_match.advanced"))
+        self.si_mix_enabled.setText("")
+        self.si_mix_enabled_label.setText(self.i18n.t("si.enabled"))
+        self.si_mix_settings_button.setText(self.i18n.t("si.audio_settings"))
+        self.si_mix_help.setToolTip(self.i18n.t("si.help_title"))
         self.performance_fps.setItemText(0, self.i18n.t("performance.output_fps_unlimited"))
         for i, key in enumerate(("quality_speed.ultrafast", "quality_speed.medium")):
             self.performance_quality.setItemText(i, self.i18n.t(key))

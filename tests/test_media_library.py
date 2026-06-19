@@ -87,6 +87,25 @@ class MediaLibraryTests(unittest.TestCase):
             self.assertEqual([child.name for child in snapshot.children], ["photo.jpg"])
             self.assertIsNone(snapshot.children[0].video)
 
+    def test_media_index_signature_tracks_si_sidecar_without_listing_it(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            movie = root / "movie.mp4"
+            movie.write_bytes(b"video")
+            library = MediaLibrary(build_media_roots([root]))
+            index = MediaIndex(root / "index.db")
+            try:
+                with patch("utils.media_index.config.MEDIA_LIBRARY", library):
+                    before = index.list_directory(root)
+                    movie.with_suffix(".si.wav").write_bytes(b"si")
+                    after = index.list_directory(root)
+            finally:
+                index.close()
+
+            self.assertEqual([child.name for child in before.children], ["movie.mp4"])
+            self.assertEqual([child.name for child in after.children], ["movie.mp4"])
+            self.assertNotEqual(before.signature, after.signature)
+
 
 if __name__ == "__main__":
     unittest.main()

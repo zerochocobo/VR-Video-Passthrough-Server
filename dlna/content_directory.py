@@ -35,6 +35,9 @@ from config import (
     PASSTHROUGH_SEEK_CONTAINER,
     PASSTHROUGH_SEEK_HEADER_BYTES,
     PASSTHROUGH_SEEK_MODE,
+    SI_BROWSE_PREWARM_LIMIT,
+    SI_PROGRESSIVE_DLNA,
+    SI_PROGRESSIVE_ENABLED,
     MEDIA_LIBRARY,
     VIDEO_DIR,
     VIDEO_EXTS,
@@ -42,6 +45,7 @@ from config import (
 from dlna.profiles import passthrough_frame_rate
 from pipeline.alpha_packer import alpha_output_size
 from pipeline.ffmpeg_io import probe_cached
+from pipeline.si_virtual_mp4 import prewarm_progressive_si_virtual_mp4
 from utils.bitrate_estimator import estimate_for_media
 from utils.logger import get
 from utils.media_index import IndexedChild, get_media_index
@@ -50,6 +54,7 @@ from utils.offline_outputs import (
     has_offline_two_dvr_output,
     is_offline_passthrough_output_name,
 )
+from utils.runtime_settings import get_si_mix
 from utils.subtitles import SubtitleTrack, find_external_subtitles, subtitle_output_enabled
 from utils.video_metadata import probe_video_metadata, select_backend
 from utils.vr_naming import (
@@ -75,6 +80,7 @@ TWO_DVR_LIVE_ITEM_PREFIX = "l3_"
 SEEK_ITEM_PREFIX = "sg_"
 ALPHA_SEEK_ITEM_PREFIX = "sa_"
 IMAGE_ITEM_PREFIX = "img_"
+SI_ITEM_PREFIX = "si_"
 PYNV_OUTPUT_CODEC = "hevc"
 DLNA_FLAGS_BASE = "01700000000000000000000000000000"
 DLNA_FLAGS_TIME_SEEK = "41700000000000000000000000000000"
@@ -98,6 +104,14 @@ _LIVE_MAX_SIDE = 8192
 _NO_LIVE_PREFIX = "[NoLive] "
 _OFFLINE_PREFIX = "[Offline] "
 _CDS_CLIENT_DEOVR = "deovr"
+
+
+def clear_dir_items_cache() -> None:
+    _dir_items_cache.clear()
+
+
+def _system_update_id() -> int:
+    return _SYSTEM_UPDATE_ID + int(get_si_mix().version)
 
 
 def _parse_bitrate(s: str) -> int:
@@ -233,6 +247,17 @@ def _id_to_image(object_id: str) -> Path | None:
     return None
 
 
+def _id_to_si(object_id: str) -> Path | None:
+    if not object_id.startswith(SI_ITEM_PREFIX):
+        return None
+    rel = object_id[len(SI_ITEM_PREFIX):].replace("\\", "/").strip("/")
+    rel = _strip_object_id_version(rel)
+    path = MEDIA_LIBRARY.key_to_path(rel)
+    if path is not None and MEDIA_LIBRARY.contains(path) and path.is_file() and _has_si_sidecar(path):
+        return path
+    return None
+
+
 def _parent_id_for_dir(path: Path) -> str:
     path = path.resolve()
     if MEDIA_LIBRARY.multi_root:
@@ -246,16 +271,17 @@ def _parent_id_for_dir(path: Path) -> str:
 
 
 def _video_item_count(path: Path, child: IndexedChild | None = None) -> int:
+    si_items = 1 if _si_dlna_enabled() and get_si_mix().enabled and _has_si_sidecar(path) else 0
     if (
         is_offline_passthrough_output_name(path.name)
         or PASSTHROUGH_OUTPUT_MODE == "none"
         or has_offline_passthrough_output(path)
         or _hide_passthrough_for_path(path, child)
     ):
-        return 1
+        return 1 + si_items
     passthrough_modes = len(_passthrough_modes())
     seek_items = passthrough_modes if _seek_passthrough_dlna_enabled() else 0
-    return 1 + passthrough_modes + seek_items
+    return 1 + si_items + passthrough_modes + seek_items
 
 
 def _marked_original_title(path: Path, child: IndexedChild | None = None) -> str:
@@ -349,6 +375,22 @@ def _image_protocol_info(path: Path) -> str:
     )
 
 
+def _si_protocol_info() -> str:
+    return (
+        "http-get:*:video/mp4:DLNA.ORG_PN=HEVC_MP4_MAIN;"
+        f"DLNA.ORG_OP={DLNA_OP_BYTE_SEEK};"
+        f"DLNA.ORG_CI=0;DLNA.ORG_FLAGS={DLNA_FLAGS_BASE}"
+    )
+
+
+def _has_si_sidecar(path: Path) -> bool:
+    return path.suffix.lower() == ".mp4" and path.with_suffix(".si.wav").is_file()
+
+
+def _si_dlna_enabled() -> bool:
+    return bool(SI_PROGRESSIVE_ENABLED and SI_PROGRESSIVE_DLNA)
+
+
 def _image_resolution(path: Path) -> str:
     try:
         from PIL import Image
@@ -378,6 +420,55 @@ def _image_item_from_index(path: Path, parent_id: str, child: IndexedChild | Non
         "mime": _image_mime(path),
         "protocol_info": _image_protocol_info(path),
         "upnp_class": "object.item.imageItem.photo",
+    }
+
+
+def _estimated_si_size(source_size: int, duration: float) -> int:
+    # The progressive SI file replaces the source audio track with a mixed AAC
+    # track; it does not append another full audio stream. The HTTP route
+    # reports the exact virtual Content-Length after build, while Browse needs a
+    # cheap stable estimate that will not inflate client byte-seek mapping.
+    return max(0, int(source_size))
+
+
+def _si_item_from_video(
+    path: Path,
+    parent_id: str,
+    *,
+    size: int,
+    duration: float,
+    width: int,
+    height: int,
+    resolution: str,
+    source_fps: float,
+    prewarm: bool = True,
+) -> dict:
+    base = f"http://{LAN_IP}:{HTTP_PORT}"
+    rel = _rel_key(path)
+    quoted = quote(rel)
+    estimated_size = _estimated_si_size(size, duration)
+    if prewarm:
+        try:
+            prewarm_progressive_si_virtual_mp4(path, path.with_suffix(".si.wav"), get_si_mix().params(), reason="dlna-browse")
+        except Exception as exc:
+            log.warning("failed to queue SI progressive prewarm for %s: %s", path, exc)
+    return {
+        "id": f"{SI_ITEM_PREFIX}{_versioned_rel(rel)}",
+        "parent_id": parent_id,
+        "title": f"[SI]{source_display_stem(path.stem, width, height)}",
+        "url": f"{base}/media_si/{quoted}",
+        "thumb": f"{base}/thumb/{quoted}",
+        "size": estimated_size,
+        "duration": duration,
+        "resolution": resolution,
+        "bitrate": int(estimated_size * 8 / duration) if duration > 0 and estimated_size > 0 else 0,
+        "mime": "video/mp4",
+        "dlna_pn": "HEVC_MP4_MAIN",
+        "frame_rate": passthrough_frame_rate(source_fps),
+        "passthrough": True,
+        "passthrough_mode": "si_mix",
+        "protocol_info": _si_protocol_info(),
+        "subtitles": [_subtitle_item(track) for track in find_external_subtitles(path)],
     }
 
 
@@ -545,6 +636,7 @@ def _video_items_from_index(
     child: IndexedChild | None,
     siblings: list[Path] | None = None,
     client_profile: str | None = None,
+    prewarm_si: bool = True,
 ) -> list[dict]:
     base = f"http://{LAN_IP}:{HTTP_PORT}"
     pt_bps = _parse_bitrate(PASSTHROUGH_BITRATE)
@@ -602,6 +694,20 @@ def _video_items_from_index(
             "subtitles": [_subtitle_item(track) for track in find_external_subtitles(path)],
         }
     ]
+    if _si_dlna_enabled() and get_si_mix().enabled and _has_si_sidecar(path):
+        items.append(
+            _si_item_from_video(
+                path,
+                parent_id,
+                size=size,
+                duration=duration,
+                width=width,
+                height=height,
+                resolution=resolution,
+                source_fps=source_fps,
+                prewarm=prewarm_si,
+            )
+        )
     if (
         is_offline_passthrough_output_name(path.name)
         or has_offline_passthrough_output(path, siblings)
@@ -771,6 +877,7 @@ def _children_for_dir(directory: Path, client_profile: str | None = None) -> lis
         int(PASSTHROUGH_LIVE_CHAPTER_MAX_ITEMS),
         int(PASSTHROUGH_LIVE_CHAPTER_MIN_INTERVAL_SEC),
         int(DLNA_IMAGE_ENABLED),
+        int(get_si_mix().version),
         _DIDL_SCHEMA_VERSION,
         str(client_profile or ""),
     )
@@ -778,6 +885,7 @@ def _children_for_dir(directory: Path, client_profile: str | None = None) -> lis
     if cached is not None:
         return list(cached)
     sibling_paths = [child.path for child in snapshot.children]
+    si_prewarm_remaining = max(0, int(SI_BROWSE_PREWARM_LIMIT))
     for child in snapshot.children:
         if child.is_dir:
             items.append(
@@ -790,7 +898,18 @@ def _children_for_dir(directory: Path, client_profile: str | None = None) -> lis
                 }
             )
         elif child.path.suffix.lower() in VIDEO_EXTS:
-            items.extend(_video_items_from_index(child.path, parent_id, child, sibling_paths, client_profile))
+            allow_si_prewarm = si_prewarm_remaining > 0
+            child_items = _video_items_from_index(
+                child.path,
+                parent_id,
+                child,
+                sibling_paths,
+                client_profile,
+                prewarm_si=allow_si_prewarm,
+            )
+            items.extend(child_items)
+            if allow_si_prewarm and any(str(item.get("id", "")).startswith(SI_ITEM_PREFIX) for item in child_items):
+                si_prewarm_remaining -= 1
         elif DLNA_IMAGE_ENABLED and child.path.suffix.lower() in IMAGE_EXTS:
             items.append(_image_item_from_index(child.path, parent_id, child))
     if len(_dir_items_cache) >= _DIR_ITEMS_CACHE_MAX:
@@ -1034,6 +1153,7 @@ def handle_soap(soap_action: str, body: bytes, client_profile: str | None = None
         directory = _id_to_dir(object_id)
         live = _id_to_live(object_id)
         seek = _id_to_seek(object_id)
+        si = _id_to_si(object_id)
         image = _id_to_image(object_id)
 
         if live is not None:
@@ -1070,6 +1190,12 @@ def handle_soap(soap_action: str, body: bytes, client_profile: str | None = None
                     didl = _metadata_didl_for_item(live_items[0]) if live_items else _didl_for([])
             elif image is not None:
                 didl = _metadata_didl_for_item(_image_item_from_index(image, _folder_id(image.parent)))
+            elif si is not None:
+                si_items = [
+                    item for item in _video_items(si, _folder_id(si.parent), client_profile)
+                    if item.get("passthrough_mode") == "si_mix"
+                ]
+                didl = _metadata_didl_for_item(si_items[0]) if si_items else _didl_for([])
             else:
                 didl = _metadata_didl_for_dir(directory or _root())
             return _wrap_soap(
@@ -1077,7 +1203,7 @@ def handle_soap(soap_action: str, body: bytes, client_profile: str | None = None
                 f"<Result>{html.escape(didl)}</Result>"
                 f"<NumberReturned>1</NumberReturned>"
                 f"<TotalMatches>1</TotalMatches>"
-                f"<UpdateID>{_SYSTEM_UPDATE_ID}</UpdateID>",
+                f"<UpdateID>{_system_update_id()}</UpdateID>",
             ), 200
 
         end = start + count if count > 0 else len(all_items)
@@ -1087,7 +1213,7 @@ def handle_soap(soap_action: str, body: bytes, client_profile: str | None = None
             f"<Result>{html.escape(didl)}</Result>"
             f"<NumberReturned>{len(page)}</NumberReturned>"
             f"<TotalMatches>{len(all_items)}</TotalMatches>"
-            f"<UpdateID>{_SYSTEM_UPDATE_ID}</UpdateID>"
+            f"<UpdateID>{_system_update_id()}</UpdateID>"
         )
         return _wrap_soap("Browse", body_xml), 200
 
@@ -1096,7 +1222,7 @@ def handle_soap(soap_action: str, body: bytes, client_profile: str | None = None
     if action == "GetSortCapabilities":
         return _wrap_soap("GetSortCapabilities", "<SortCaps></SortCaps>"), 200
     if action == "GetSystemUpdateID":
-        return _wrap_soap("GetSystemUpdateID", f"<Id>{_SYSTEM_UPDATE_ID}</Id>"), 200
+        return _wrap_soap("GetSystemUpdateID", f"<Id>{_system_update_id()}</Id>"), 200
 
     fault = (
         '<?xml version="1.0" encoding="utf-8"?>'

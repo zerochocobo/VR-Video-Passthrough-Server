@@ -52,6 +52,31 @@ class BuildExeTests(unittest.TestCase):
         with self.assertRaises(build_exe.BuildError):
             build_exe.verify_ort_tensorrt_ep_runtime()
 
+    def test_build_server_embeds_internal_python_modules_without_source_data(self) -> None:
+        calls: list[list[str]] = []
+
+        def fake_run(cmd: list[str], *, env: dict[str, str]) -> None:
+            calls.append(cmd)
+
+        with patch.object(build_exe, "run", side_effect=fake_run):
+            build_exe.build_server(["pyinstaller"], {})
+
+        self.assertEqual(len(calls), 1)
+        cmd = calls[0]
+        add_data = [cmd[index + 1] for index, token in enumerate(cmd) if token == "--add-data"]
+        hidden_imports = [cmd[index + 1] for index, token in enumerate(cmd) if token == "--hidden-import"]
+        collected_submodules = [cmd[index + 1] for index, token in enumerate(cmd) if token == "--collect-submodules"]
+        self.assertIn("resources;resources", add_data)
+        self.assertNotIn("tools;tools", add_data)
+        self.assertNotIn("offline;offline", add_data)
+        self.assertIn("offline.convert", hidden_imports)
+        self.assertIn("offline.two_dvr", hidden_imports)
+        self.assertIn("tools.offline_passthrough", hidden_imports)
+        self.assertIn("tools.offline_alpha_passthrough", hidden_imports)
+        self.assertIn("tools.warmup_offline_trt", hidden_imports)
+        self.assertIn("tools.generate_yoloworld_person_txt_feats", hidden_imports)
+        self.assertIn("offline", collected_submodules)
+
 
 if __name__ == "__main__":
     unittest.main()
