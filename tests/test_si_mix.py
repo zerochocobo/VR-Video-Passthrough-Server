@@ -372,7 +372,7 @@ class SIMixTests(unittest.TestCase):
                 patch.object(cds, "prewarm_progressive_si_virtual_mp4") as prewarm,
             ):
                 items = cds._video_items_from_index(video, "0", child)
-        self.assertEqual(items[1]["id"], "si_ptv9_movie.mp4")
+        self.assertEqual(items[1]["id"], "si_ptv10_movie.mp4")
         self.assertEqual(items[1]["title"], "[SI]movie_LR_180_SBS")
         self.assertIn("/media_si/movie.mp4", items[1]["url"])
         self.assertEqual(items[1]["dlna_pn"], "HEVC_MP4_MAIN")
@@ -407,7 +407,7 @@ class SIMixTests(unittest.TestCase):
                 patch.object(cds, "prewarm_progressive_si_virtual_mp4") as prewarm,
             ):
                 items = cds._video_items_from_index(video, "0", child, prewarm_si=False)
-        self.assertEqual(items[1]["id"], "si_ptv9_movie.mp4")
+        self.assertEqual(items[1]["id"], "si_ptv10_movie.mp4")
         prewarm.assert_not_called()
 
 

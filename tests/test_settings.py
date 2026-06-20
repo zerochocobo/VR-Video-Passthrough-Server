@@ -67,6 +67,28 @@ class SettingsTests(unittest.TestCase):
         self.assertEqual(env["PT_PASSTHROUGH_SEEK_ROUTE_POLICY"], "all")
         self.assertEqual(env["PT_PASSTHROUGH_SEEK_CONTAINER"], "mp4")
 
+    def test_legacy_seekable_passthrough_dlna_migrates_off(self) -> None:
+        root = Path("runtime_cache/test_ui_settings_seek_dlna_migration")
+        root.mkdir(parents=True, exist_ok=True)
+        self.addCleanup(lambda: shutil.rmtree(root, ignore_errors=True))
+        settings_path = root / "ui_settings.json"
+        meta_path = root / "ui_settings_meta.json"
+        settings_path.write_text(
+            '{"passthrough_seek_enabled": true, "passthrough_seek_dlna": true}',
+            encoding="utf-8",
+        )
+
+        with (
+            patch.object(settings_module, "SETTINGS_PATH", settings_path),
+            patch.object(settings_module, "SETTINGS_META_PATH", meta_path),
+        ):
+            s = settings_module.Settings()
+
+        self.assertTrue(s.data["passthrough_seek_enabled"])
+        self.assertFalse(s.data["passthrough_seek_dlna"])
+        self.assertEqual(s.server_env()["PT_PASSTHROUGH_SEEK_ENABLED"], "1")
+        self.assertEqual(s.server_env()["PT_PASSTHROUGH_SEEK_DLNA"], "0")
+
     def test_server_env_contains_video_dirs(self) -> None:
         s = self._settings()
         s.set_video_dirs([r"D:\VR", r"E:\VR"])

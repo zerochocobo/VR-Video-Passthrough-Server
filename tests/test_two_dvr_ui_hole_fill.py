@@ -143,12 +143,20 @@ class TwoDvrUiHoleFillTests(unittest.TestCase):
                 self.assertFalse(hasattr(page, "batch_hole_fill"))
                 self.assertFalse(hasattr(page, "single_eye_distance"))
                 self.assertFalse(hasattr(page, "batch_eye_distance"))
+                self.assertFalse(hasattr(page, "single_quality"))
+                self.assertFalse(hasattr(page, "batch_quality"))
                 self.assertNotIn("hole_fill", page.single_labels)
                 self.assertNotIn("hole_fill", page.batch_labels)
                 self.assertNotIn("eye", page.single_labels)
                 self.assertNotIn("eye", page.batch_labels)
+                self.assertNotIn("quality", page.single_labels)
+                self.assertNotIn("quality", page.batch_labels)
                 self.assertIn("strength", page.single_labels)
                 self.assertIn("strength", page.batch_labels)
+                self.assertEqual(page.single_labels["performance"].text(), page.i18n.t("performance.quality_speed"))
+                self.assertEqual(page.batch_labels["performance"].text(), page.i18n.t("performance.quality_speed"))
+                self.assertEqual(page.single_quality_speed.currentData(), "medium")
+                self.assertEqual(page.batch_quality_speed.currentData(), "medium")
                 for combo in page.findChildren(QComboBox):
                     values = {combo.itemData(index) for index in range(combo.count())}
                     self.assertNotIn("inverse_warp", values)
@@ -164,7 +172,10 @@ class TwoDvrUiHoleFillTests(unittest.TestCase):
                 args = process.started_args or []
                 self.assertEqual(args[args.index("--hole-fill") + 1], "soft_shift")
                 self.assertEqual(args[args.index("--strength") + 1], "1.00")
+                self.assertEqual(args[args.index("--max-side") + 1], "0")
+                self.assertEqual(args[args.index("--preset") + 1], "p4")
                 self.assertNotIn("--eye-distance", args)
+                self.assertEqual(process.started_env, {"PT_PASSTHROUGH_PYNV_PRESET": "P4"})
             finally:
                 page.close()
                 app.processEvents()

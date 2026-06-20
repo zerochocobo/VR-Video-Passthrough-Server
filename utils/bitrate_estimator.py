@@ -55,6 +55,29 @@ def parse_bitrate(value: str | int | float | None, default: int = 20_000_000) ->
         return default
 
 
+def projection_capped_bitrate(
+    configured: str | int | float | None,
+    src_path: Path,
+    projection: str,
+    mult_3d: float = 3.0,
+    mult_vr: float = 4.0,
+) -> int:
+    """Cap the 2D->3D output bitrate at a multiple of the source bitrate.
+
+    flat3d -> mult_3d (SBS, ~2x pixels), VR projections (fisheye/hequirect) ->
+    mult_vr. Returns min(configured, mult * source). A 0/unknown multiplier or an
+    unreadable source falls back to the configured bitrate unchanged.
+    """
+    cfg = parse_bitrate(configured)
+    mult = float(mult_vr if str(projection).lower() in {"fisheye", "hequirect"} else mult_3d)
+    if mult <= 0:
+        return cfg
+    source_bps = source_video_bitrate(Path(src_path))
+    if not source_bps:
+        return cfg
+    return min(cfg, max(1, int(source_bps * mult)))
+
+
 def _default_bitrate_for_codec(codec: str = "") -> str:
     return PASSTHROUGH_HEVC_BITRATE if codec.lower() in {"hevc", "h265", "pynv_hevc"} else PASSTHROUGH_BITRATE
 

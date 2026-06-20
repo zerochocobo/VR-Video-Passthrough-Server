@@ -71,6 +71,11 @@ class PlayerCompatProfileTests(unittest.TestCase):
         self.assertEqual(fields["Filter"], "res,res@size,res@duration,dc:date,upnp:albumArtURI")
         self.assertEqual(routes_dlna._cds_client_profile({}, fields), "deovr")  # noqa: SLF001
 
+    def test_cds_ui_language_prefers_accept_language_quality(self) -> None:
+        headers = {"Accept-Language": "en-US;q=0.3, zh-CN;q=0.9, ja-JP;q=0.5"}
+
+        self.assertEqual(routes_dlna._cds_ui_language(headers), "zh_CN")  # noqa: SLF001
+
     def test_skybox_player_ua_matches_versioned_skybox(self) -> None:
         # Real Skybox playback path.
         self.assertTrue(player_compat.is_skybox_player_ua("SKYBOX/2.0.2"))

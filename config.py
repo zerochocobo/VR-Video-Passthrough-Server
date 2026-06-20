@@ -569,6 +569,87 @@ TWO_DVR_EYE_DISTANCE_MM = max(1.0, float(_env("TWO_DVR_EYE_DISTANCE_MM", 65.0)))
 #   render code still clamps final pixel disparity per output width.
 TWO_DVR_STRENGTH = max(0.1, min(3.0, float(_env("TWO_DVR_STRENGTH", 1.0))))
 
+# PT_TWO_DVR_BITRATE_MULT_3D / _VR:
+#   Cap the 2D->3D output bitrate at this multiple of the SOURCE video bitrate.
+#   SBS (flat3d) doubles the pixels, VR projections (fisheye/hequirect) stretch
+#   more, so 3x / 4x of source keeps quality without the heavy over-spend that
+#   made high-bitrate output stutter on playback. The configured/--bitrate value
+#   is still the ceiling. 0 disables the cap (use the configured bitrate as-is).
+TWO_DVR_BITRATE_MULT_3D = max(0.0, float(_env("TWO_DVR_BITRATE_MULT_3D", 3.0)))
+TWO_DVR_BITRATE_MULT_VR = max(0.0, float(_env("TWO_DVR_BITRATE_MULT_VR", 4.0)))
+
+# PT_TWO_DVR_SCENE_CUT / _THRESHOLD:
+#   Reset the depth temporal state (normalization band, base EMA, motion comp) on
+#   a detected hard cut, so the new shot doesn't blend with the previous one's
+#   depth. Uses the HSV-histogram SceneCutDetector. 0 disables.
+TWO_DVR_SCENE_CUT = _env("TWO_DVR_SCENE_CUT", "1") != "0"
+TWO_DVR_SCENE_CUT_THRESHOLD = max(0.0, float(_env("TWO_DVR_SCENE_CUT_THRESHOLD", 0.4)))
+
+# PT_TWO_DVR_BAND_LOOKAHEAD:
+#   Offline only (needs the symmetric window). Replace the causal 5/95 depth-range
+#   EMA with a zero-phase symmetric smoothing over the window's raw bands -- the
+#   normalization band sees future frames, removing the causal EMA's lag. The
+#   causal band EMA is turned off and the window re-normalizes each frame to the
+#   symmetric band. 0 keeps the causal band EMA.
+TWO_DVR_BAND_LOOKAHEAD = _env("TWO_DVR_BAND_LOOKAHEAD", "1") != "0"
+
+# PT_TWO_DVR_TEMPORAL_NORM:
+#   1 smooths the depth percentile normalization band across frames. This is the
+#   default because per-frame normalization directly amplifies DA3 scale flicker.
+TWO_DVR_TEMPORAL_NORM = _env("TWO_DVR_TEMPORAL_NORM", "1") != "0"
+
+# PT_TWO_DVR_TEMPORAL_NORM_ALPHA:
+#   EMA alpha for temporal normalization. Lower values are steadier but slower
+#   to adapt; scene-cut reset below prevents long tails on large jumps.
+TWO_DVR_TEMPORAL_NORM_ALPHA = max(0.0, min(1.0, float(_env("TWO_DVR_TEMPORAL_NORM_ALPHA", 0.10))))
+
+# PT_TWO_DVR_TEMPORAL_NORM_RESET:
+#   Reset normalization state when raw lo/hi moves by this many previous band
+#   spans. 1.0 catches hard scene changes without resetting on ordinary motion.
+TWO_DVR_TEMPORAL_NORM_RESET = max(0.0, float(_env("TWO_DVR_TEMPORAL_NORM_RESET", 1.0)))
+
+# PT_TWO_DVR_DEPTH_STABILIZER / PT_TWO_DVR_TEMPORAL_DEPTH / PT_TWO_DVR_TEMPORAL_DEPTH_MODE:
+#   Stabilize the normalized near/disparity map itself. `flow` aligns the
+#   previous near map to the current frame using OpenCV Farneback flow before
+#   blending, which targets DA3's per-frame disparity flicker. Set
+#   PT_TWO_DVR_DEPTH_STABILIZER=0, PT_TWO_DVR_TEMPORAL_DEPTH=0, or mode=off to
+#   hard-bypass the stabilizer. Default is on: the stabilizer is now the
+#   base/detail rewrite (smooth low-frequency base, re-inject current detail),
+#   which fixes the V1-lite foreground locking + soft_shift hole artifacts. The
+#   per-pixel px limiters below stay 0 by default.
+_TWO_DVR_TEMPORAL_DEPTH_FLAG = _env_any(("TWO_DVR_DEPTH_STABILIZER", "TWO_DVR_TEMPORAL_DEPTH"), "1") != "0"
+TWO_DVR_TEMPORAL_DEPTH_MODE = str(
+    _env("TWO_DVR_TEMPORAL_DEPTH_MODE", "ema" if _TWO_DVR_TEMPORAL_DEPTH_FLAG else "off")
+).strip().lower()
+if TWO_DVR_TEMPORAL_DEPTH_MODE not in {"off", "ema", "flow"}:
+    TWO_DVR_TEMPORAL_DEPTH_MODE = "ema" if _TWO_DVR_TEMPORAL_DEPTH_FLAG else "off"
+TWO_DVR_TEMPORAL_DEPTH = _TWO_DVR_TEMPORAL_DEPTH_FLAG and TWO_DVR_TEMPORAL_DEPTH_MODE != "off"
+TWO_DVR_TEMPORAL_DEPTH_ALPHA = max(0.0, min(1.0, float(_env("TWO_DVR_TEMPORAL_DEPTH_ALPHA", 0.20))))
+
+# PT_TWO_DVR_TEMPORAL_FLOW_*:
+#   Flow-mode rejection gates. DIFF rejects warped previous pixels when luma
+#   changes too much; CONSISTENCY enables optional forward/backward flow check;
+#   MOTION_GATE raises current-frame weight for very large motion. 0 disables.
+TWO_DVR_TEMPORAL_FLOW_DIFF = max(0.0, float(_env("TWO_DVR_TEMPORAL_FLOW_DIFF", 35.0)))
+TWO_DVR_TEMPORAL_FLOW_CONSISTENCY = max(0.0, float(_env("TWO_DVR_TEMPORAL_FLOW_CONSISTENCY", 0.0)))
+TWO_DVR_TEMPORAL_FLOW_MOTION_GATE = max(0.0, float(_env("TWO_DVR_TEMPORAL_FLOW_MOTION_GATE", 0.0)))
+
+# PT_TWO_DVR_TEMPORAL_AFFINE:
+#   1 enables a cheap global scale/bias correction of the current near map
+#   against the previous stable near map, estimated on luma-stable pixels. This
+#   specifically targets subtle whole-frame disparity gain drift.
+TWO_DVR_TEMPORAL_AFFINE = _env("TWO_DVR_TEMPORAL_AFFINE", "1") != "0"
+TWO_DVR_TEMPORAL_AFFINE_MAX_SCALE = max(0.0, float(_env("TWO_DVR_TEMPORAL_AFFINE_MAX_SCALE", 0.20)))
+TWO_DVR_TEMPORAL_AFFINE_MAX_BIAS = max(0.0, float(_env("TWO_DVR_TEMPORAL_AFFINE_MAX_BIAS", 0.12)))
+
+# PT_TWO_DVR_TEMPORAL_*_PX:
+#   Stabilizer thresholds in output stereo disparity pixels. These are converted
+#   to near-map units using the current max_shift, so the same setting behaves
+#   consistently across output sizes and 3D strengths.
+TWO_DVR_TEMPORAL_STATIC_DEADBAND_PX = max(0.0, float(_env("TWO_DVR_TEMPORAL_STATIC_DEADBAND_PX", 0.0)))
+TWO_DVR_TEMPORAL_STATIC_MAX_STEP_PX = max(0.0, float(_env("TWO_DVR_TEMPORAL_STATIC_MAX_STEP_PX", 0.0)))
+TWO_DVR_TEMPORAL_MOTION_MAX_STEP_PX = max(0.0, float(_env("TWO_DVR_TEMPORAL_MOTION_MAX_STEP_PX", 0.0)))
+
 # PT_RVM_IOBINDING:
 #   1 enables ORT IOBinding for the RVM path. This usually reduces copies and
 #   improves GPU throughput.

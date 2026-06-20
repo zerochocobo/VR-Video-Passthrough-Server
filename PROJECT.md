@@ -530,3 +530,83 @@ you later set the env var back to `0` and print `0`. The decisive value is
 - If you hit the hang, clear the shell var (`Remove-Item Env:CUPY_COMPILE_WITH_PTX`
   in PowerShell) or open a fresh shell, then re-run -- and confirm with
   `compiler._use_ptx is False`.
+
+**Gotcha -- the default user CuPy cache can also make a correct NVRTC path look
+hung.** On 2026-06-18, `_GPU_NEAR_KERNELS` was tested with the correct fast-path
+diagnostics:
+
+```text
+nvrtc=(12, 9)
+compiler._use_ptx=False
+arch=('-arch=sm_120', 'cubin')
+```
+
+but `RawModule.get_function(...)` still appeared to hang when CuPy used the
+default cache:
+
+```text
+C:\Users\dennis\.cupy\kernel_cache
+```
+
+Switching only `CUPY_CACHE_DIR` to a fresh project-local directory made the same
+11-kernel RawModule compile in about 1.25s. The practical lesson is:
+
+```text
+Do not rely on the default user CuPy cache for project tools.
+Always call utils.gpu_runtime_cache.configure_gpu_runtime_cache()
+before the first import cupy / RawModule / RawKernel.
+```
+
+For standalone modules that may be imported outside `main.py`, set the runtime
+cache at module import before any lazy CuPy import. `offline/two_dvr_gpu.py` does
+this because offline 2DVR tools can bypass the normal server startup path.
+
+If a kernel still looks hung despite the NVRTC self-check being correct, run one
+more self-check with an explicit fresh cache:
+
+```powershell
+$env:CUPY_CACHE_DIR="G:\GIT\debug\PTMediaServer\runtime_cache\cupy_jit_probe"
+uv run python your_probe.py
+```
+
+If the fresh cache is fast, the cause is stale/locked/corrupt default CuPy cache
+state, not CUDA source code and not the NVRTC/PTX path.
+
+**"It hangs for me but not for you" -- developer triage checklist.** This is almost
+always an environment delta, NOT a kernel bug and NOT directory permissions. A
+brand-new multi-kernel `RawModule` (e.g. `_GPU_NEAR_KERNELS` in
+`offline/two_dvr_gpu.py`) is one compile and is fine on the fast path. Run the
+3-line self-check **in the exact launcher that hangs** (same interpreter + same
+shell/IDE run config -- a clean terminal won't reproduce the env delta), then walk
+these in order:
+
+1. **Wrong interpreter (most common).** `print(sys.executable)` must be
+   `...\PTMediaServer\.venv\Scripts\python.exe`. Running via an IDE (PyCharm/VSCode)
+   with a different interpreter, or bare `python x.py`, loads a CuPy whose only
+   NVRTC is the **system CUDA 12.6** one -> PTX -> driver JIT -> 60-120s "hang".
+   Fix: launch with `uv run python ...` or activate the project `.venv`.
+2. **`uv sync` never ran in their checkout.** The pip NVRTC 12.9 must exist at
+   `.venv\Lib\site-packages\nvidia\cuda_nvrtc\bin\nvrtc64_120_0.dll` (~89 MB). Run
+   `uv sync` first.
+3. **DLL shadowing on PATH.** System CUDA 12.6 `bin` ahead of the venv on PATH wins
+   the `nvrtc64_120_0.dll` name (same filename in both!) even with the right venv.
+   `cp.cuda.nvrtc.getVersion()` returning `(12, 6)` is the tell.
+4. **Stale `CUPY_COMPILE_WITH_PTX=1`** captured at import (see gotcha above) --
+   `Remove-Item Env:CUPY_COMPILE_WITH_PTX`, restart the process.
+
+**Is it a slow compile or a real deadlock?** Don't kill it -- let it run 2-3 min
+once. If it finishes AND a second launch of the same kernel is instant, it was
+PTX->driver JIT (env problem above), not a deadlock; `nvidia-smi` shows the python
+process busy meanwhile.
+
+**Permissions are a red herring for the hang.** A non-writable `CUPY_CACHE_DIR` only
+defeats *caching* (you recompile every run); on the fast NVRTC 12.9 path that's
+still <1s/run. It cannot turn a cubin compile into the 60-120s PTX-JIT path -- fix
+the NVRTC path first.
+
+**One-shot fix:**
+```powershell
+uv sync
+Remove-Item Env:CUPY_COMPILE_WITH_PTX -EA SilentlyContinue
+uv run python <script>   # self-check should print (12, 9) ... False ('-arch=sm_120', 'cubin')
+```

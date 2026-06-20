@@ -67,6 +67,25 @@ class ConfigDefaultTests(unittest.TestCase):
         self.assertIn(".jpg", config.IMAGE_EXTS)
         self.assertEqual(config.IMAGE_MIME_BY_EXT[".png"], "image/png")
 
+    def test_two_dvr_temporal_stability_defaults_enable_base_detail_stabilizer(self) -> None:
+        self.assertTrue(config.TWO_DVR_TEMPORAL_NORM)
+        self.assertEqual(config.TWO_DVR_TEMPORAL_NORM_ALPHA, 0.10)
+        self.assertEqual(config.TWO_DVR_TEMPORAL_NORM_RESET, 1.0)
+        # On by default: the base/detail rewrite (mode=ema). The per-pixel px
+        # limiters stay 0 so the stabilizer only smooths the low-frequency base.
+        self.assertTrue(config.TWO_DVR_TEMPORAL_DEPTH)
+        self.assertEqual(config.TWO_DVR_TEMPORAL_DEPTH_MODE, "ema")
+        self.assertEqual(config.TWO_DVR_TEMPORAL_DEPTH_ALPHA, 0.20)
+        self.assertEqual(config.TWO_DVR_TEMPORAL_FLOW_DIFF, 35.0)
+        self.assertEqual(config.TWO_DVR_TEMPORAL_FLOW_CONSISTENCY, 0.0)
+        self.assertEqual(config.TWO_DVR_TEMPORAL_FLOW_MOTION_GATE, 0.0)
+        self.assertTrue(config.TWO_DVR_TEMPORAL_AFFINE)
+        self.assertEqual(config.TWO_DVR_TEMPORAL_AFFINE_MAX_SCALE, 0.20)
+        self.assertEqual(config.TWO_DVR_TEMPORAL_AFFINE_MAX_BIAS, 0.12)
+        self.assertEqual(config.TWO_DVR_TEMPORAL_STATIC_DEADBAND_PX, 0.0)
+        self.assertEqual(config.TWO_DVR_TEMPORAL_STATIC_MAX_STEP_PX, 0.0)
+        self.assertEqual(config.TWO_DVR_TEMPORAL_MOTION_MAX_STEP_PX, 0.0)
+
 
 if __name__ == "__main__":
     unittest.main()

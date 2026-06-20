@@ -4,6 +4,43 @@ This file only keeps version releases, major bug fixes, major UI/UX updates, and
 
 ## English
 
+### 2026-06-20
+
+- **2D-to-3D / VR model update:** Added NVDS ONNX temporal stabilization for offline 16:9 jobs, split backbone/head runtime support, a 512x288 default NVDS tier, the DA3 Large 1036 preset, and a pre-run model download dialog for missing DA3/NVDS files.
+- **DLNA Live time index:** Passthrough Live entries are now directories with localized `[Select Time Index]` folders, 10-minute groups, minute folders, and 5-second playable start points. Green and alpha Live directories show `[GREEN]` and `[ALPHA]` prefixes.
+- **Default and wording cleanup:** Experimental `passthrough_seek` DLNA entries are hidden by default, and the 2DVR skip-existing checkbox now refers to the target file instead of a passthrough file.
+
+### 2026-06-19
+
+- **2DVR stabilizer iteration:** Added a GPU near-map stabilizer experiment, then defaulted the destructive stabilizer behavior off after real-device artifact validation while keeping diagnostic controls available.
+- **Offline 2DVR UI update:** Replaced the old processing-precision selector with a quality-speed control shared by single and batch 2DVR jobs.
+- **Offline 2DVR playback fix:** Investigated generated-output stutter and fixed the current PyNv HEVC path by repeating VPS/SPS/PPS parameter sets (`repeatspspps=1`) without changing the GOP-length defaults.
+
+### 2026-06-18
+
+- **SI progressive transport default-on:** Added SI-specific progressive virtual MP4 switches, enabled `/media_si` and DLNA `[SI]` entries by default for same-stem `.si.wav` sidecars, and separated this path from the legacy seekable passthrough experiment.
+- **SI first-play and sync improvements:** Added background prewarm with bounded queues, sample-table/layout caching, source-audio sidecar decoupling, AAC mix acceleration, audio edit-list controls, better size estimates, and UI wording/help updates.
+- **2DVR temporal stability update:** Added renderer-side depth normalization and near-map temporal stabilization, scene-cut resets, offline progress logging, and a GPU near-preprocessing baseline for later optimization.
+
+### 2026-06-17
+
+- **SI feature groundwork:** Added same-stem `.si.wav` detection, `[SI]` DLNA entries, local SI mix control APIs, Home-page SI settings, and the first `/media_si` implementation before pivoting the transport layer to progressive virtual MP4.
+- **Progressive MP4 research path:** Added PyAV prototype tooling, player Phase 0 sample generation, PyInstaller/PyAV compatibility probes, and the first `pipeline.si_virtual_mp4` sample-table and virtual-range primitives.
+- **2DVR artifact cleanup:** Added GPU cleanup for vertical stripe/rim contamination, hardened CuPy sm_120 direct-cubin behavior, and fixed the DA3 startup heartbeat call so realtime DA3 prewarm can run.
+
+### 2026-06-16
+
+- **Realtime 2D-to-3D UI:** Added realtime 2D-to-3D settings, server environment propagation, a user-facing 3D strength control, and DA3 engine prewarm to reduce first-play startup latency.
+- **2DVR soft-shift quality fixes:** Fixed per-eye hole-fill direction, depth-edge smearing, hard-silhouette/background-seam handling, foreground dilation, hybrid inverse-warp hole fill, and background-side rim cleanup. The UI now treats soft-shift as the product path and hides `inverse_warp`.
+- **DA3 model preset update:** Added normal/HD DA3 presets, per-preset TensorRT caches, Hugging Face / mirror-aware model downloads, and updated DA3 exporter documentation.
+
+### 2026-06-15
+
+- **Offline 2D-to-3D / VR generation:** Added DA3 ONNX-based offline 2D-to-SBS 3D/VR conversion with CLI and PySide UI support for single, batch, start/duration, and segment workflows.
+- **GPU-resident 2DVR pipeline:** Added the PyNv/CuPy GPU path for decode, DA3 depth, stereo rendering, NVENC output, and VR projections, with TensorRT as the default DA3 acceleration path.
+- **Realtime 2D-to-3D groundwork:** Added the `two_dvr` passthrough mode, DLNA `[2D>3D]` live entries, `/passthrough_live mode=two_dvr`, offline output detection/naming, and DA3 TensorRT startup prewarm.
+- **CUDA runtime hardening:** Moved toward self-contained pip CUDA runtime components for CuPy/ONNX Runtime and sm_120-class GPUs, reducing dependence on a system CUDA toolkit.
+
 ### 2026-06-01
 
 - **v0.1.0 released.**
@@ -203,6 +240,43 @@ This file only keeps version releases, major bug fixes, major UI/UX updates, and
 - **Core update:** Added initial DLNA time-seek metadata, passthrough HEAD support, and `PT_CONTAINER` support for MP4 and MPEG-TS passthrough output.
 
 ## 中文
+
+### 2026-06-20
+
+- **2D 转 3D / VR 模型更新：** 新增面向离线 16:9 任务的 NVDS ONNX 时域稳定、backbone/head 拆分运行支持、默认 512x288 NVDS 档位、DA3 Large 1036 预设，以及运行前缺失 DA3/NVDS 模型下载对话框。
+- **DLNA Live 时间索引：** Passthrough Live 入口现在统一显示为目录，包含本地化的 `[选择时间索引]` 目录、10 分钟分组、分钟目录和 5 秒一个的可播放起点；绿幕和 Alpha Live 目录分别显示 `[GREEN]` 与 `[ALPHA]` 前缀。
+- **默认值与文案清理：** 实验性 `passthrough_seek` DLNA 入口默认隐藏，2DVR“存在则跳过”复选框改为描述目标文件，而不是透视文件。
+
+### 2026-06-19
+
+- **2DVR 稳定器迭代：** 新增 GPU near-map 稳定器实验；真机验证发现破坏性伪影后，将该稳定器默认关闭，同时保留诊断控制。
+- **离线 2DVR UI 更新：** 旧的处理精度选择改为画质速度控制，并在单文件和批量 2DVR 任务之间共享设置。
+- **离线 2DVR 播放修复：** 排查生成文件卡顿问题，并通过在 PyNv HEVC 输出中重复 VPS/SPS/PPS 参数集（`repeatspspps=1`）修复当前路径，同时保持 GOP 长度默认值不变。
+
+### 2026-06-18
+
+- **SI progressive 传输默认开启：** 新增 SI 专用 progressive virtual MP4 开关，默认启用 `/media_si` 和基于同名 `.si.wav` sidecar 的 DLNA `[SI]` 入口，并与旧的可 seek passthrough 实验解耦。
+- **SI 首播与同步改进：** 新增后台预热和有界队列、样本表/布局缓存、源音频 sidecar 解耦、AAC 混音加速、音频 edit-list 控制、更准确的大小估算，以及 UI 文案和帮助说明更新。
+- **2DVR 时域稳定更新：** 新增渲染端深度归一化和 near-map 时域稳定、场景切换重置、离线进度日志，以及后续优化用的 GPU near 预处理基线。
+
+### 2026-06-17
+
+- **SI 功能基座：** 新增同名 `.si.wav` 检测、DLNA `[SI]` 入口、本地 SI 混音控制 API、首页 SI 设置，以及第一版 `/media_si` 实现；随后传输层方向切换为 progressive virtual MP4。
+- **Progressive MP4 预研路径：** 新增 PyAV 原型工具、播放器 Phase 0 样本生成、PyInstaller/PyAV 兼容探针，以及首版 `pipeline.si_virtual_mp4` 样本表和虚拟 Range 基础件。
+- **2DVR 伪影清理：** 新增 GPU 竖线/边缘污染清理，强化 CuPy sm_120 direct-cubin 行为，并修复 DA3 启动 heartbeat 调用，使实时 DA3 预热可以正常运行。
+
+### 2026-06-16
+
+- **实时 2D 转 3D UI：** 新增实时 2D 转 3D 设置、服务端环境变量传递、面向用户的 3D 强度控制，以及用于降低首次播放等待的 DA3 引擎预热。
+- **2DVR soft-shift 质量修复：** 修复左右眼 hole-fill 方向、深度边缘拖影、硬轮廓/背景接缝处理、前景膨胀、混合 inverse-warp 补洞，以及背景侧 rim 清理；UI 现在把 soft-shift 作为产品路径，并隐藏 `inverse_warp`。
+- **DA3 模型预设更新：** 新增普通/高清 DA3 预设、按预设隔离的 TensorRT 缓存、Hugging Face / 镜像感知模型下载，并更新 DA3 导出文档。
+
+### 2026-06-15
+
+- **离线 2D 转 3D / VR 生成：** 新增基于 DA3 ONNX 的离线 2D 转 SBS 3D/VR，支持 CLI 和 PySide UI 中的单文件、批量、开始/时长和片段流程。
+- **GPU 常驻 2DVR 链路：** 新增 PyNv/CuPy GPU 路径，覆盖解码、DA3 深度、立体渲染、NVENC 输出和 VR 投影，并默认使用 TensorRT 加速 DA3。
+- **实时 2D 转 3D 基座：** 新增 `two_dvr` passthrough 模式、DLNA `[2D>3D]` live 入口、`/passthrough_live mode=two_dvr`、离线输出识别/命名，以及 DA3 TensorRT 启动预热。
+- **CUDA 运行时加固：** 转向使用自包含的 pip CUDA 运行时组件支持 CuPy/ONNX Runtime 和 sm_120 级 GPU，降低对系统 CUDA toolkit 的依赖。
 
 ### 2026-06-01
 

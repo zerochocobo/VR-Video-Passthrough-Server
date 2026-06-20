@@ -5,15 +5,7 @@ from PyInstaller.utils.hooks import collect_all
 
 datas = [('resources', 'resources')]
 binaries = []
-hiddenimports = [
-    'offline.convert',
-    'offline.two_dvr',
-    'tools.offline_passthrough',
-    'tools.offline_alpha_passthrough',
-    'tools.warmup_offline_trt',
-    'tools.generate_yoloworld_person_txt_feats',
-    'cupy_backends.cuda._softlink',
-]
+hiddenimports = ['offline.convert', 'offline.two_dvr', 'tools.offline_passthrough', 'tools.offline_alpha_passthrough', 'tools.warmup_offline_trt', 'tools.generate_yoloworld_person_txt_feats', 'cupy_backends.cuda._softlink']
 datas += collect_data_files('osam')
 hiddenimports += collect_submodules('offline')
 hiddenimports += collect_submodules('pipeline')

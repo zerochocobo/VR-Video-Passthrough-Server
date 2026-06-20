@@ -52,6 +52,7 @@ DEFAULTS = {
     "alpha_stride": 1,
     "quality_speed": "ultrafast",
     "offline_quality_speed": "medium",
+    "two_dvr_depth_stabilizer": "default",
     "offline_sam3_prompt": "person",
     "offline_single_time_segments": [],
     "offline_single_trt_rvm_enabled": True,
@@ -201,6 +202,9 @@ class Settings:
                         self.data["two_dvr_live_hole_fill"] = DEFAULTS["two_dvr_live_hole_fill"]
                         self.data["two_dvr_live_eye_distance"] = DEFAULTS["two_dvr_live_eye_distance"]
                         self._mark_migration_done("20260616_two_dvr_strength")
+                    if not self._migration_done("20260620_seek_dlna_default_off", loaded):
+                        self.data["passthrough_seek_dlna"] = False
+                        self._mark_migration_done("20260620_seek_dlna_default_off")
             except Exception:
                 pass
 

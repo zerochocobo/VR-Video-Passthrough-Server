@@ -8,7 +8,7 @@ VR视频透视服务器 的目标是让所有VR视频都可以透视，实现混
 
 ![VR视频透视服务器概览](assets/intro_cn_s.png)
 
-它是以 Windows 为主要运行平台的 VR DLNA 本地媒体服务器，兼顾桌面控制和离线生成流程。它通过 DLNA/UPnP 暴露本地视频库，并支持实时透视流输出，可在绿幕合成和 Alpha 直通之间切换，同时支持实时字幕嵌入。VR视频透视服务器 主要面向 VR180 半等柱体投影（half-equirectangular）视频源。
+它是以 Windows 为主要运行平台的 VR DLNA 本地媒体服务器，兼顾桌面控制和离线生成流程。它通过 DLNA/UPnP 暴露本地视频库，并支持实时透视流输出，可在绿幕合成和 Alpha 直通之间切换，同时支持实时字幕嵌入。它还包含实时/离线 2D 转 3D / VR、可选深度稳定，以及基于同名 `.si.wav` sidecar 的同声传译播放。VR视频透视服务器 主要面向 VR180 半等柱体投影（half-equirectangular）视频源。
 
 ## 项目起源
 
@@ -25,6 +25,10 @@ VR视频透视服务器 的目标是让所有VR视频都可以透视，实现混
 - 实时透视流内嵌字幕
 - 绿幕模式与 Alpha 直通模式
 - 离线透视视频生成
+- 基于 DA3 深度和 GPU 立体渲染的实时与离线 2D 转 3D / VR
+- 2D 转 3D 可选深度稳定，包括内置时域稳定和面向离线 16:9 任务的 NVDS ONNX 稳定
+- 基于同名 `.si.wav` sidecar 的同声传译播放，并在 DLNA 中显示 `[SI]` 入口
+- DLNA Live 时间索引目录，可按 10 分钟分组、分钟目录和 5 秒播放点选择开始播放时间
 - 支持多个本地视频根目录
 - PySide6 桌面 UI，支持中文、英文、日文
 - 字幕预览与字幕样式配置
@@ -45,7 +49,7 @@ VR视频透视服务器 的目标是让所有VR视频都可以透视，实现混
 
 - Windows 10 / 11
 - Python 3.12
-- NVIDIA GPU，用于实时处理链路。粗略建议使用 RTX 20 系列及以上，具体型号请查询 NVIDIA 官方列表：<https://developer.nvidia.com/cuda/gpus>。推荐显存：实时服务器和 RVM 离线生成建议 6 GB 以上，MatAnyone2 / SAM3 离线流程建议约 15 GB 以上。
+- NVIDIA GPU，用于实时处理链路。粗略建议使用 RTX 20 系列及以上，具体型号请查询 NVIDIA 官方列表：<https://developer.nvidia.com/cuda/gpus>。推荐显存：实时服务器、RVM 离线生成和普通 DA3 2D 转 3D 建议 6 GB 以上，MatAnyone2 / SAM3 离线流程建议约 15 GB 以上。HD/Large DA3 和 NVDS 时域稳定偏离线使用，可能需要明显更多显存；NVDS 面向 16 GB 以上显卡。
 - FFmpeg / FFprobe
 
 ## 快速启动
@@ -111,8 +115,11 @@ netsh advfirewall firewall add rule name="PTServer SSDP Private" dir=in action=a
 ## 配置说明
 
 - `PT_VIDEO_DIR` 支持用 `|` 分隔的多个目录
-- `PT_PASSTHROUGH_OUTPUT_MODE` 支持 `none`、`green`、`alpha`、`all`
+- `PT_PASSTHROUGH_OUTPUT_MODE` 支持 `none`、`green`、`alpha`、`two_dvr`，也支持 `green,alpha,two_dvr` 这类逗号分隔组合；旧的 `all` 表示 green + alpha
 - Alpha 模式下虚拟条目标题为 `Alpha Passthrough`
+- 实时 2D 转 3D 使用 `PT_TWO_DVR_MODEL`、`PT_TWO_DVR_STRENGTH` 和相关 `PT_TWO_DVR_*` 设置；离线 2D 转 3D / VR 在桌面 UI 中提供模型、画质速度、时域稳定和“目标文件存在则跳过”等控制。
+- 同名 `.si.wav` 文件会通过 progressive virtual MP4 `/media_si` 路由启用 `[SI]` DLNA 入口；主要开关是 `PT_SI_MIX_ENABLED`、`PT_SI_PROGRESSIVE_ENABLED` 和 `PT_SI_PROGRESSIVE_DLNA`。
+- DLNA Live 目录会用 `[GREEN]` / `[ALPHA]` 标识透视模式，并提供本地化的 `[选择时间索引]` 目录用于选择开始时间。
 - TensorRT 加速在桌面 UI 的“性能配置”中控制。请先进入 `TensorRT -> 配置` 构建缓存；首次构建可能需要数分钟。如果驱动、CUDA、TensorRT 或模型变化导致缓存缺失/过期，服务器会自动回退到 CUDA。
 - UI 配置与后台运行配置分离保存
 
@@ -147,6 +154,8 @@ VR视频透视服务器 本身不训练抠像模型，只使用下列上游项�
 | Robust Video Matting (RVM) | 实时主抠像路径，包括 `rvm_mobilenetv3_fp32.onnx` 和 `rvm_resnet50_fp32.onnx` | [GitHub](https://github.com/PeterL1n/RobustVideoMatting) |
 | MatAnyone2 | 离线转换与实验流程中使用的更慢但通常更高质量的抠像路径 | [GitHub](https://github.com/pq-yang/MatAnyone2) |
 | Segment Anything Model 3 (SAM 3) | 用于实验性 Alpha 工具和预处理流程的辅助分割模型 | [GitHub](https://github.com/facebookresearch/sam3) |
+| Depth Anything 3 (DA3) | 实时与离线 2D 转 3D / VR 使用的单目深度模型 | [GitHub](https://github.com/ByteDance-Seed/Depth-Anything-3) |
+| NVDS | 面向 16:9 源的离线 2D 转 3D 深度 / near-map 时域稳定器 | [GitHub](https://github.com/RaymondWang987/NVDS) |
 
 ## 引用的依赖
 
@@ -156,6 +165,7 @@ VR视频透视服务器 本身不训练抠像模型，只使用下列上游项�
 - [ONNX Runtime](https://github.com/microsoft/onnxruntime)
 - [CuPy](https://github.com/cupy/cupy)
 - [PyNvVideoCodec](https://github.com/NVIDIA/VideoProcessingFramework)
+- [PyAV](https://github.com/PyAV-Org/PyAV)
 
 ## 说明
 
