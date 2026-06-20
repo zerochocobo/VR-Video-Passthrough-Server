@@ -1,0 +1,16 @@
+Depth Anything 3 model resources
+
+Original project:
+https://github.com/RaymondWang987/NVDS
+
+ONNX model downloads used by this project:
+https://huggingface.co/zerochocobo/NVDS_onnx
+
+
+@InProceedings{NVDS,
+    author    = {Wang, Yiran and Shi, Min and Li, Jiaqi and Huang, Zihao and Cao, Zhiguo and Zhang, Jianming and Xian, Ke and Lin, Guosheng},
+    title     = {Neural Video Depth Stabilizer},
+    booktitle = {Proceedings of the IEEE/CVF International Conference on Computer Vision (ICCV)},
+    month     = {October},
+    year      = {2023},
+    pages     = {9466-9476}}

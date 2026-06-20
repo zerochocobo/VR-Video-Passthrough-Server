@@ -1,0 +1,71 @@
+{
+  "model": "NVDS_Stabilizer_split",
+  "checkpoint": "G:\\GIT\\debug\\PTMediaServer\\models\\NVDS\\NVDS_Stabilizer.pth",
+  "source_root": "G:\\GIT\\debug\\PTMediaServer\\reference\\NVDS",
+  "backbone": "G:\\GIT\\debug\\PTMediaServer\\models\\NVDS\\NVDS_Backbone_512x288.onnx",
+  "head": "G:\\GIT\\debug\\PTMediaServer\\models\\NVDS\\NVDS_Head_512x288.onnx",
+  "backbone_input": {
+    "name": "frame_rgbd",
+    "shape": [
+      1,
+      4,
+      288,
+      512
+    ]
+  },
+  "backbone_outputs": [
+    "feat0",
+    "feat1",
+    "feat2",
+    "feat3"
+  ],
+  "head_inputs": {
+    "features": [
+      "feat0",
+      "feat1",
+      "feat2",
+      "feat3"
+    ],
+    "feature_batch": 4,
+    "last_rgb": [
+      1,
+      3,
+      288,
+      512
+    ]
+  },
+  "head_output": {
+    "name": "stabilized_depth",
+    "shape": [
+      1,
+      1,
+      288,
+      512
+    ]
+  },
+  "sequence_length": 4,
+  "rgb_preprocess": {
+    "range": "0..1",
+    "mean": [
+      0.485,
+      0.456,
+      0.406
+    ],
+    "std": [
+      0.229,
+      0.224,
+      0.225
+    ]
+  },
+  "opset": 17,
+  "ort_check": {
+    "max_abs_diff": 2.6494264602661133e-05,
+    "mean_abs_diff": 2.764318196568638e-06,
+    "output_shape": [
+      1,
+      1,
+      288,
+      512
+    ]
+  }
+}
