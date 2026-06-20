@@ -58,6 +58,7 @@ DEFAULT_OUT_DIR = Path(__file__).resolve().parent.parent / "models" / "DA3"
 VARIANTS = {
     "small": {"src": "Small", "onnx": "da3_small.onnx"},
     "base": {"src": "Base", "onnx": "da3_base.onnx"},
+    "large": {"src": "Large", "onnx": "da3_large.onnx"},
 }
 
 IMAGENET_MEAN = np.asarray([0.485, 0.456, 0.406], dtype=np.float32)
@@ -244,7 +245,7 @@ def validate_variant(wrapper: nn.Module, out_path: Path, size: int, device: str,
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--variant", choices=["small", "base", "both"], default="both")
+    p.add_argument("--variant", choices=["small", "base", "large", "both"], default="both")
     p.add_argument("--src-root", type=Path, default=DEFAULT_SRC_ROOT,
                    help="Folder holding Small/ and Base/ DA3 weight dirs")
     p.add_argument("--vendor", type=Path, default=DEFAULT_VENDOR,

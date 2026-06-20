@@ -77,6 +77,10 @@ TWO_DVR_LIVE_PREFIX = "pl3_"
 LIVE_ITEM_PREFIX = "lg_"
 ALPHA_LIVE_ITEM_PREFIX = "la_"
 TWO_DVR_LIVE_ITEM_PREFIX = "l3_"
+LIVE_TIME_INDEX_PREFIX = "lix_"
+LIVE_TIME_GROUP_PREFIX = "lig_"
+LIVE_TIME_MINUTE_PREFIX = "lim_"
+LIVE_TIME_POINT_PREFIX = "li5_"
 SEEK_ITEM_PREFIX = "sg_"
 ALPHA_SEEK_ITEM_PREFIX = "sa_"
 IMAGE_ITEM_PREFIX = "img_"
@@ -96,7 +100,7 @@ DLNA_OP_BYTE_AND_TIME_SEEK = "11"
 DIDL_NS = "urn:schemas-upnp-org:metadata-1-0/DIDL-Lite/"
 
 _DIR_ITEMS_CACHE_MAX = 256
-_DIDL_SCHEMA_VERSION = 9
+_DIDL_SCHEMA_VERSION = 10
 _SYSTEM_UPDATE_ID = _DIDL_SCHEMA_VERSION
 _OBJECT_ID_VERSION_PREFIX = f"ptv{_DIDL_SCHEMA_VERSION}_"
 _dir_items_cache: dict[tuple, list[dict]] = {}
@@ -104,6 +108,16 @@ _LIVE_MAX_SIDE = 8192
 _NO_LIVE_PREFIX = "[NoLive] "
 _OFFLINE_PREFIX = "[Offline] "
 _CDS_CLIENT_DEOVR = "deovr"
+_TIME_INDEX_GROUP_SEC = 10 * 60
+_TIME_INDEX_MINUTE_SEC = 60
+_TIME_INDEX_POINT_SEC = 5
+_LIVE_TIME_MODE_TOKEN_BY_MODE = {"green": "g", "alpha": "a", "two_dvr": "3"}
+_LIVE_TIME_MODE_BY_TOKEN = {token: mode for mode, token in _LIVE_TIME_MODE_TOKEN_BY_MODE.items()}
+_SELECT_TIME_INDEX_LABELS = {
+    "en_US": "Select Time Index",
+    "zh_CN": "选择时间索引",
+    "ja_JP": "時間インデックス選択",
+}
 
 
 def clear_dir_items_cache() -> None:
@@ -141,6 +155,29 @@ def _fmt_title_time(sec: int) -> str:
     h = sec // 3600
     m = (sec % 3600) // 60
     return f"{h:02d}:{m:02d}"
+
+
+def _fmt_index_time(sec: int, force_hours: bool = False) -> str:
+    sec = max(0, int(sec))
+    h = sec // 3600
+    m = (sec % 3600) // 60
+    s = sec % 60
+    if force_hours or h > 0:
+        return f"{h}:{m:02d}:{s:02d}"
+    return f"{m:02d}:{s:02d}"
+
+
+def _normalise_ui_language(language: str | None) -> str:
+    value = str(language or "").strip().lower().replace("-", "_")
+    if value.startswith("zh"):
+        return "zh_CN"
+    if value.startswith("ja"):
+        return "ja_JP"
+    return "en_US"
+
+
+def _select_time_index_label(language: str | None = None) -> str:
+    return _SELECT_TIME_INDEX_LABELS[_normalise_ui_language(language)]
 
 
 def _root() -> Path:
@@ -216,6 +253,60 @@ def _id_to_live(object_id: str) -> tuple[Path, str] | None:
     path = MEDIA_LIBRARY.key_to_path(rel)
     if path is not None and MEDIA_LIBRARY.contains(path) and path.is_file() and path.suffix.lower() in VIDEO_EXTS:
         return path, mode
+    return None
+
+
+def _live_time_index_id(prefix: str, rel: str, mode: str, payload: str | None = None) -> str:
+    token = _LIVE_TIME_MODE_TOKEN_BY_MODE.get(mode, _LIVE_TIME_MODE_TOKEN_BY_MODE["green"])
+    object_id = f"{prefix}{token}_{_versioned_rel(rel)}"
+    return f"{object_id}@{payload}" if payload else object_id
+
+
+def _id_to_live_time_index(object_id: str) -> tuple[Path, str, str, int, int] | None:
+    prefixes = (
+        (LIVE_TIME_INDEX_PREFIX, "index"),
+        (LIVE_TIME_GROUP_PREFIX, "group"),
+        (LIVE_TIME_MINUTE_PREFIX, "minute"),
+    )
+    prefix = ""
+    level = ""
+    for candidate, candidate_level in prefixes:
+        if object_id.startswith(candidate):
+            prefix = candidate
+            level = candidate_level
+            break
+    if not prefix:
+        return None
+
+    rest = object_id[len(prefix):]
+    payload = ""
+    if level != "index":
+        if "@" not in rest:
+            return None
+        rest, payload = rest.rsplit("@", 1)
+    if "_" not in rest:
+        return None
+    token, rel = rest.split("_", 1)
+    mode = _LIVE_TIME_MODE_BY_TOKEN.get(token)
+    if mode is None:
+        return None
+
+    start = 0
+    end = 0
+    try:
+        if level == "group":
+            start_text, end_text = payload.split("-", 1)
+            start = max(0, int(start_text))
+            end = max(start, int(end_text))
+        elif level == "minute":
+            start = max(0, int(payload))
+    except ValueError:
+        return None
+
+    rel = _strip_object_id_version(rel).replace("\\", "/").strip("/")
+    path = MEDIA_LIBRARY.key_to_path(rel)
+    if path is not None and MEDIA_LIBRARY.contains(path) and path.is_file() and path.suffix.lower() in VIDEO_EXTS:
+        return path, mode, level, start, end
     return None
 
 
@@ -618,6 +709,59 @@ def _uses_live_chapter_container(duration: float) -> bool:
     return len(_live_chapter_offsets(duration)) > 1
 
 
+def _duration_seconds(duration: float) -> int:
+    return max(0, int(math.ceil(float(duration or 0.0))))
+
+
+def _live_time_group_ranges(duration: float) -> list[tuple[int, int]]:
+    duration_sec = _duration_seconds(duration)
+    if duration_sec <= 0:
+        return [(0, 0)]
+    ranges: list[tuple[int, int]] = []
+    start = 0
+    while start < duration_sec:
+        end = min(start + _TIME_INDEX_GROUP_SEC, duration_sec)
+        ranges.append((start, end))
+        start += _TIME_INDEX_GROUP_SEC
+    return ranges or [(0, 0)]
+
+
+def _live_time_minute_offsets(start: int, end: int) -> list[int]:
+    start = max(0, int(start))
+    end = max(start, int(end))
+    offsets = list(range(start, end, _TIME_INDEX_MINUTE_SEC))
+    return offsets or [start]
+
+
+def _live_time_point_offsets(minute_start: int, duration: float) -> list[int]:
+    duration_sec = _duration_seconds(duration)
+    minute_start = max(0, int(minute_start))
+    if duration_sec <= 0:
+        return [minute_start]
+    if minute_start >= duration_sec:
+        return []
+    minute_end = min(minute_start + _TIME_INDEX_MINUTE_SEC, duration_sec)
+    offsets = list(range(minute_start, minute_end, _TIME_INDEX_POINT_SEC))
+    return offsets or [minute_start]
+
+
+def _live_time_force_hours(duration: float) -> bool:
+    return _duration_seconds(duration) >= 3600
+
+
+def _live_time_index_child_count(duration: float, level: str, start: int = 0, end: int = 0) -> int:
+    if level == "index":
+        groups = _live_time_group_ranges(duration)
+        if len(groups) == 1:
+            return len(_live_time_minute_offsets(*groups[0]))
+        return len(groups)
+    if level == "group":
+        return len(_live_time_minute_offsets(start, end))
+    if level == "minute":
+        return len(_live_time_point_offsets(start, duration))
+    return 0
+
+
 def _child_count(path: Path) -> int:
     try:
         return get_media_index().child_count(path)
@@ -724,8 +868,6 @@ def _video_items_from_index(
     # seekable passthrough testing is explicitly enabled, add /passthrough_seek
     # beside the live entry instead of replacing it, so unknown or blocked
     # clients still have the stable /passthrough_live fallback visible.
-    live_route_suffix = _live_route_hint_suffix(client_profile)
-    live_omit_filelike_attrs = not _is_deovr_cds_client(client_profile)
     for mode in _passthrough_modes():
         if mode == "two_dvr" and (
             not _is_two_d_source(path, width, height)
@@ -756,47 +898,245 @@ def _video_items_from_index(
                     "protocol_info": _seek_passthrough_protocol_info(),
                 }
             )
-        query = _passthrough_live_query(mode)
-        if _uses_live_chapter_container(duration):
-            live_id = f"{_passthrough_live_prefix(mode)}{_versioned_rel(rel)}"
-            items.append(
-                {
-                    "container": True,
-                    "id": live_id,
-                    "parent_id": parent_id,
-                    "title": _passthrough_virtual_title(path, mode, width, height),
-                    "child_count": len(_live_chapter_offsets(duration)),
-                }
-            )
-        else:
-            items.append(
-                {
-                    "id": f"{_passthrough_live_item_prefix(mode)}{_versioned_rel(rel)}",
-                    "parent_id": parent_id,
-                    "title": _passthrough_virtual_title(path, mode, width, height),
-                    # The default ``.ts`` suffix is a client-pipeline hint for
-                    # Skybox. DeoVR gets the legacy unsuffixed URL because it
-                    # filters these virtual entries during CDS Browse.
-                    "url": f"{base}/passthrough_live/{quoted}{live_route_suffix}" + (f"?{query}" if query else ""),
-                    "thumb": f"{base}/thumb/{quoted}",
-                    "size": 0,
-                    "duration": duration,
-                    "resolution": _passthrough_resolution(width, height, mode),
-                    "bitrate": pt_bps_est,
-                    "mime": "video/MP2T",
-                    "dlna_pn": "HEVC_TS_NA_ISO",
-                    "frame_rate": passthrough_frame_rate(source_fps),
-                    "passthrough": True,
-                    "passthrough_mode": mode,
-                    "protocol_info": _live_passthrough_protocol_info(client_profile),
-                    "omit_duration": live_omit_filelike_attrs,
-                    "omit_bitrate": live_omit_filelike_attrs,
-                }
-            )
+        live_id = f"{_passthrough_live_prefix(mode)}{_versioned_rel(rel)}"
+        items.append(
+            {
+                "container": True,
+                "id": live_id,
+                "parent_id": parent_id,
+                "title": _prefixed_live_directory_title(path, mode, width, height),
+                "child_count": len(_live_chapter_offsets(duration)) + 1,
+            }
+        )
     return items
 
 
-def _live_chapter_items(path: Path, mode: str, client_profile: str | None = None) -> list[dict]:
+def _probe_live_directory_context(path: Path, rel: str) -> tuple[float, int, int, float]:
+    try:
+        info = probe_cached(path)
+        return (
+            float(info.duration),
+            int(info.width),
+            int(info.height),
+            float(getattr(info, "fps", 0.0) or 0.0),
+        )
+    except Exception as e:
+        log.warning("probe live directory %s failed: %s", rel, e)
+        return 0.0, 0, 0, 0.0
+
+
+def _live_time_index_title(path: Path, mode: str, width: int, height: int, language: str | None = None) -> str:
+    return f"[{_select_time_index_label(language)}]_{_prefixed_live_directory_title(path, mode, width, height)}"
+
+
+def _live_directory_prefix(mode: str) -> str:
+    if mode == "alpha":
+        return "[ALPHA]"
+    if mode == "green":
+        return "[GREEN]"
+    return ""
+
+
+def _prefixed_live_directory_title(path: Path, mode: str, width: int = 0, height: int = 0) -> str:
+    title = _passthrough_virtual_title(path, mode, width, height)
+    prefix = _live_directory_prefix(mode)
+    return f"{prefix}_{title}" if prefix else title
+
+
+def _prefixed_time_index_directory_title(prefix: str, mode: str, virtual_title: str) -> str:
+    mode_prefix = _live_directory_prefix(mode)
+    return f"{prefix}_{mode_prefix}_{virtual_title}" if mode_prefix else f"{prefix}_{virtual_title}"
+
+
+def _live_time_index_root_item(
+    path: Path,
+    mode: str,
+    parent_id: str,
+    duration: float,
+    width: int,
+    height: int,
+    language: str | None = None,
+) -> dict:
+    rel = _rel_key(path)
+    return {
+        "container": True,
+        "id": _live_time_index_id(LIVE_TIME_INDEX_PREFIX, rel, mode),
+        "parent_id": parent_id,
+        "title": _live_time_index_title(path, mode, width, height, language),
+        "child_count": _live_time_index_child_count(duration, "index"),
+    }
+
+
+def _live_time_parent_group_range(minute_start: int, duration: float) -> tuple[int, int]:
+    groups = _live_time_group_ranges(duration)
+    for group_start, group_end in groups:
+        if group_start <= minute_start < group_end or (group_start == group_end == minute_start):
+            return group_start, group_end
+    return groups[-1]
+
+
+def _live_time_minute_items(
+    path: Path,
+    mode: str,
+    parent_id: str,
+    start: int,
+    end: int,
+    duration: float,
+    virtual_title: str,
+) -> list[dict]:
+    rel = _rel_key(path)
+    force_hours = _live_time_force_hours(duration)
+    items: list[dict] = []
+    for minute in _live_time_minute_offsets(start, end):
+        items.append(
+            {
+                "container": True,
+                "id": _live_time_index_id(LIVE_TIME_MINUTE_PREFIX, rel, mode, str(minute)),
+                "parent_id": parent_id,
+                "title": _prefixed_time_index_directory_title(_fmt_index_time(minute, force_hours), mode, virtual_title),
+                "child_count": _live_time_index_child_count(duration, "minute", minute),
+            }
+        )
+    return items
+
+
+def _live_time_index_items(
+    path: Path,
+    mode: str,
+    level: str,
+    start: int = 0,
+    end: int = 0,
+    client_profile: str | None = None,
+    language: str | None = None,
+) -> list[dict]:
+    if has_offline_passthrough_output(path):
+        return []
+    base = f"http://{LAN_IP}:{HTTP_PORT}"
+    rel = _rel_key(path)
+    quoted = quote(rel)
+    duration, width, height, source_fps = _probe_live_directory_context(path, rel)
+    if mode == "two_dvr" and (
+        not _is_two_d_source(path, width, height)
+        or has_offline_two_dvr_output(path)
+        or width > 4096
+    ):
+        return []
+
+    virtual_title = _passthrough_virtual_title(path, mode, width, height)
+    force_hours = _live_time_force_hours(duration)
+    if level == "index":
+        parent_id = _live_time_index_id(LIVE_TIME_INDEX_PREFIX, rel, mode)
+        groups = _live_time_group_ranges(duration)
+        if len(groups) == 1:
+            group_start, group_end = groups[0]
+            return _live_time_minute_items(path, mode, parent_id, group_start, group_end, duration, virtual_title)
+        return [
+            {
+                "container": True,
+                "id": _live_time_index_id(LIVE_TIME_GROUP_PREFIX, rel, mode, f"{group_start}-{group_end}"),
+                "parent_id": parent_id,
+                "title": (
+                    _prefixed_time_index_directory_title(
+                        f"{_fmt_index_time(group_start, force_hours)}-{_fmt_index_time(group_end, force_hours)}",
+                        mode,
+                        virtual_title,
+                    )
+                ),
+                "child_count": _live_time_index_child_count(duration, "group", group_start, group_end),
+            }
+            for group_start, group_end in groups
+        ]
+    if level == "group":
+        parent_id = _live_time_index_id(LIVE_TIME_GROUP_PREFIX, rel, mode, f"{start}-{end}")
+        return _live_time_minute_items(path, mode, parent_id, start, end, duration, virtual_title)
+    if level != "minute":
+        return []
+
+    pt_bps = _parse_bitrate(PASSTHROUGH_BITRATE)
+    if duration > 0:
+        _, pt_bps_est, _ = estimate_for_media(path, duration, PYNV_OUTPUT_CODEC)
+    else:
+        pt_bps_est = pt_bps
+    query = _passthrough_live_query(mode)
+    parent_id = _live_time_index_id(LIVE_TIME_MINUTE_PREFIX, rel, mode, str(start))
+    live_route_suffix = _live_route_hint_suffix(client_profile)
+    live_omit_filelike_attrs = not _is_deovr_cds_client(client_profile)
+    items: list[dict] = []
+    for offset in _live_time_point_offsets(start, duration):
+        remain = max(0.0, duration - float(offset)) if duration > 0 else 0.0
+        items.append(
+            {
+                "id": _live_time_index_id(LIVE_TIME_POINT_PREFIX, rel, mode, str(offset)),
+                "parent_id": parent_id,
+                "title": f"{_fmt_index_time(offset, force_hours)}_{virtual_title}",
+                "url": f"{base}/passthrough_live/{quoted}{live_route_suffix}?t={offset}" + (f"&{query}" if query else ""),
+                "thumb": f"{base}/thumb/{quoted}",
+                "size": 0,
+                "duration": remain,
+                "resolution": _passthrough_resolution(width, height, mode),
+                "bitrate": pt_bps_est,
+                "mime": "video/MP2T",
+                "dlna_pn": "HEVC_TS_NA_ISO",
+                "frame_rate": passthrough_frame_rate(source_fps),
+                "passthrough": True,
+                "passthrough_mode": mode,
+                "protocol_info": _live_passthrough_protocol_info(client_profile),
+                "omit_duration": live_omit_filelike_attrs,
+                "omit_bitrate": live_omit_filelike_attrs,
+            }
+        )
+    return items
+
+
+def _live_time_index_metadata_item(
+    path: Path,
+    mode: str,
+    level: str,
+    start: int = 0,
+    end: int = 0,
+    language: str | None = None,
+) -> dict | None:
+    rel = _rel_key(path)
+    duration, width, height, _source_fps = _probe_live_directory_context(path, rel)
+    live_parent_id = f"{_passthrough_live_prefix(mode)}{_versioned_rel(rel)}"
+    virtual_title = _passthrough_virtual_title(path, mode, width, height)
+    force_hours = _live_time_force_hours(duration)
+    if level == "index":
+        return _live_time_index_root_item(path, mode, live_parent_id, duration, width, height, language)
+    if level == "group":
+        return {
+            "container": True,
+            "id": _live_time_index_id(LIVE_TIME_GROUP_PREFIX, rel, mode, f"{start}-{end}"),
+            "parent_id": _live_time_index_id(LIVE_TIME_INDEX_PREFIX, rel, mode),
+            "title": _prefixed_time_index_directory_title(
+                f"{_fmt_index_time(start, force_hours)}-{_fmt_index_time(end, force_hours)}",
+                mode,
+                virtual_title,
+            ),
+            "child_count": _live_time_index_child_count(duration, "group", start, end),
+        }
+    if level == "minute":
+        groups = _live_time_group_ranges(duration)
+        parent_id = _live_time_index_id(LIVE_TIME_INDEX_PREFIX, rel, mode)
+        if len(groups) > 1:
+            group_start, group_end = _live_time_parent_group_range(start, duration)
+            parent_id = _live_time_index_id(LIVE_TIME_GROUP_PREFIX, rel, mode, f"{group_start}-{group_end}")
+        return {
+            "container": True,
+            "id": _live_time_index_id(LIVE_TIME_MINUTE_PREFIX, rel, mode, str(start)),
+            "parent_id": parent_id,
+            "title": _prefixed_time_index_directory_title(_fmt_index_time(start, force_hours), mode, virtual_title),
+            "child_count": _live_time_index_child_count(duration, "minute", start),
+        }
+    return None
+
+
+def _live_chapter_items(
+    path: Path,
+    mode: str,
+    client_profile: str | None = None,
+    language: str | None = None,
+) -> list[dict]:
     if has_offline_passthrough_output(path):
         return []
     base = f"http://{LAN_IP}:{HTTP_PORT}"
@@ -832,6 +1172,7 @@ def _live_chapter_items(path: Path, mode: str, client_profile: str | None = None
     suffix = {"alpha": "a", "two_dvr": "3"}.get(mode, "g")
     live_route_suffix = _live_route_hint_suffix(client_profile)
     live_omit_filelike_attrs = not _is_deovr_cds_client(client_profile)
+    items.append(_live_time_index_root_item(path, mode, parent_id, duration, width, height, language))
     for offset in _live_chapter_offsets(duration):
         title = f"{_fmt_title_time(offset)}_{virtual_title}"
         remain = max(0.0, duration - float(offset)) if duration > 0 else 0.0
@@ -1134,14 +1475,19 @@ def _metadata_didl_for_live(path: Path, mode: str) -> str:
         'xmlns:upnp="urn:schemas-upnp-org:metadata-1-0/upnp/">'
         f'<container id="{html.escape(live_id)}" '
         f'parentID="{html.escape(_folder_id(path.parent))}" '
-        f'childCount="{len(_live_chapter_offsets(duration))}" restricted="1">'
-        f"<dc:title>{html.escape(_passthrough_virtual_title(path, mode, width, height))}</dc:title>"
+        f'childCount="{len(_live_chapter_offsets(duration)) + 1}" restricted="1">'
+        f"<dc:title>{html.escape(_prefixed_live_directory_title(path, mode, width, height))}</dc:title>"
         "<upnp:class>object.container.storageFolder</upnp:class>"
         "</container></DIDL-Lite>"
     )
 
 
-def handle_soap(soap_action: str, body: bytes, client_profile: str | None = None) -> tuple[bytes, int]:
+def handle_soap(
+    soap_action: str,
+    body: bytes,
+    client_profile: str | None = None,
+    language: str | None = None,
+) -> tuple[bytes, int]:
     action = soap_action.strip('"').split("#")[-1]
     args = _parse_soap_args(body)
 
@@ -1152,13 +1498,25 @@ def handle_soap(soap_action: str, body: bytes, client_profile: str | None = None
         count = int(args.get("RequestedCount", "0") or 0)
         directory = _id_to_dir(object_id)
         live = _id_to_live(object_id)
+        time_index = _id_to_live_time_index(object_id)
         seek = _id_to_seek(object_id)
         si = _id_to_si(object_id)
         image = _id_to_image(object_id)
 
-        if live is not None:
+        if time_index is not None:
+            index_path, index_mode, index_level, index_start, index_end = time_index
+            all_items = _live_time_index_items(
+                index_path,
+                index_mode,
+                index_level,
+                index_start,
+                index_end,
+                client_profile,
+                language,
+            )
+        elif live is not None:
             live_path, live_mode = live
-            all_items = _live_chapter_items(live_path, live_mode, client_profile)
+            all_items = _live_chapter_items(live_path, live_mode, client_profile, language)
         elif object_id == ROOT_ID and MEDIA_LIBRARY.multi_root:
             all_items = _root_items(client_profile)
         elif directory is None or not directory.is_dir():
@@ -1173,21 +1531,20 @@ def handle_soap(soap_action: str, body: bytes, client_profile: str | None = None
                     if item.get("passthrough") and item.get("passthrough_mode") == seek_mode and "/passthrough_seek/" in item.get("url", "")
                 ]
                 didl = _metadata_didl_for_item(seek_items[0]) if seek_items else _didl_for([])
+            elif time_index is not None:
+                index_path, index_mode, index_level, index_start, index_end = time_index
+                item = _live_time_index_metadata_item(
+                    index_path,
+                    index_mode,
+                    index_level,
+                    index_start,
+                    index_end,
+                    language,
+                )
+                didl = _metadata_didl_for_item(item) if item else _didl_for([])
             elif live is not None:
                 live_path, live_mode = live
-                try:
-                    info = probe_cached(live_path)
-                    duration = info.duration
-                except Exception:
-                    duration = 0.0
-                if _uses_live_chapter_container(duration):
-                    didl = _metadata_didl_for_live(live_path, live_mode)
-                else:
-                    live_items = [
-                        item for item in _video_items(live_path, _folder_id(live_path.parent), client_profile)
-                        if item.get("passthrough") and item.get("passthrough_mode") == live_mode
-                    ]
-                    didl = _metadata_didl_for_item(live_items[0]) if live_items else _didl_for([])
+                didl = _metadata_didl_for_live(live_path, live_mode)
             elif image is not None:
                 didl = _metadata_didl_for_item(_image_item_from_index(image, _folder_id(image.parent)))
             elif si is not None:

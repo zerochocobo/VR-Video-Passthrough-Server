@@ -36,6 +36,7 @@ DA3_PRESETS: dict[str, dict] = {
     "small":    {"variant": "small", "size": 518,  "file": "da3_small.onnx"},
     "base_hd":  {"variant": "base",  "size": 1036, "file": "da3_base_1036.onnx"},
     "small_hd": {"variant": "small", "size": 1036, "file": "da3_small_1036.onnx"},
+    "large_hd": {"variant": "large", "size": 1036, "file": "da3_large_1036.onnx"},
 }
 DEFAULT_MODEL = "base"
 # Back-compat alias (only da3_depth referenced it).
@@ -122,6 +123,18 @@ def model_download_urls(model: str) -> list[str]:
 
 def model_download_url(model: str) -> str:
     return model_download_urls(model)[0]
+
+
+def download_target(model: str, language: str | None = None) -> tuple[str, Path, list[str]]:
+    """``(filename, dest_path, urls)`` for a preset, for the UI download dialog.
+
+    ``language`` lets the in-process UI force mirror selection; the existing
+    ``model_download_urls`` keeps using the env-based endpoint logic.
+    """
+    from utils import hf_download
+
+    filename = model_preset(model)["file"]
+    return filename, default_model_path(model), hf_download.hf_resolve_urls(HF_REPO, filename, language)
 
 
 def download_model(model: str, log=print, progress=None) -> Path:

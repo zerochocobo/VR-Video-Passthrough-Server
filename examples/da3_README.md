@@ -4,15 +4,16 @@ This document describes the Depth Anything 3 (DA3) ONNX export used by
 PTMediaServer for image, video, and 2D-to-3D/VR depth estimation.
 
 The exporter is [examples/da3_to_onnx.py](da3_to_onnx.py). It converts the
-ONNX-friendly depth branch of DA3 Small/Base into fixed-resolution ONNX Runtime
-graphs so inference does not need PyTorch at runtime.
+ONNX-friendly depth branch of DA3 Small/Base/Large into fixed-resolution ONNX
+Runtime graphs so inference does not need PyTorch at runtime.
 
 ## Upstream
 
 - Official project: <https://github.com/ByteDance-Seed/depth-anything-3>
-- This exporter targets the DA3 Main Series `DA3-SMALL` and `DA3-BASE`
-  checkpoints.
-- The upstream model cards list `DA3-SMALL` and `DA3-BASE` as Apache 2.0.
+- This exporter targets the DA3 Main Series `DA3-SMALL`, `DA3-BASE`, and
+  `DA3-LARGE` checkpoints.
+- The upstream model cards list `DA3-SMALL`, `DA3-BASE`, and `DA3-LARGE` as
+  Apache 2.0.
 - These ONNX files are derived from Depth Anything 3 weights and should be used
   according to the upstream license, model cards, and citation requirements.
 
@@ -23,6 +24,7 @@ examples/da3_to_onnx.py
 examples/da3_README.md
 models/DA3/da3_small.onnx
 models/DA3/da3_base.onnx
+models/DA3/da3_large_1036.onnx
 ```
 
 The conversion script defaults are currently:
@@ -32,6 +34,9 @@ The conversion script defaults are currently:
 | DA3 source tree | `G:/GIT/debug/VR_Video_Toolbox_NE/tool_2dvr/_vendor/da3` |
 | PyTorch weights | `G:/GIT/debug/VR_Video_Toolbox_NE/models/DA3/Small` and `Base` |
 | ONNX output | `models/DA3` in this repository |
+
+The `Large` weights live in this repository at `models/DA3/Large`, so the Large
+export is run with `--src-root models/DA3` (see Convert From PyTorch Weights).
 
 Canonical output names at the default size:
 
@@ -45,7 +50,11 @@ For non-default export sizes, the script appends the side length:
 ```text
 models/DA3/da3_small_700.onnx
 models/DA3/da3_base_1036.onnx
+models/DA3/da3_large_1036.onnx
 ```
+
+`Large` is shipped only at the high-detail `1036` size (`da3_large_1036.onnx`),
+which is the highest-quality depth tier PTMediaServer exposes.
 
 ## Exported Graph
 
@@ -62,7 +71,7 @@ ref_view_strategy="middle"
 
 Only the depth-only sub-graph is exported:
 
-- DINOv2 encoder, ViT-S for Small and ViT-B for Base.
+- DINOv2 encoder, ViT-S for Small, ViT-B for Base, and ViT-L for Large.
 - DualDPT depth head.
 - Single-view input, `S=1`, one independent view per frame.
 - Dynamic batch axis only.
@@ -210,6 +219,14 @@ python examples/da3_to_onnx.py --variant small --validate
 python examples/da3_to_onnx.py --variant base --validate
 ```
 
+Export the Large high-detail model (weights are in this repo's `models/DA3`):
+
+```bash
+G:/GIT/debug/VR_Video_Toolbox_NE/.venv/Scripts/python.exe \
+  examples/da3_to_onnx.py --variant large --size 1036 \
+  --src-root models/DA3 --out-dir models/DA3 --device cuda --validate
+```
+
 Export folded-preprocess models for PTMediaServer's fast video paths:
 
 ```bash
@@ -225,8 +242,8 @@ python examples/da3_to_onnx.py --variant base --size 700 --validate --fold-prepr
 Useful options:
 
 ```text
---variant small|base|both
---src-root PATH       Folder containing Small/ and Base/ weight directories.
+--variant small|base|large|both
+--src-root PATH       Folder containing Small/, Base/, and Large/ weight directories.
 --vendor PATH         Vendored DA3 source root containing depth_anything_3/.
 --out-dir PATH        Output folder for da3_*.onnx.
 --size 518            Fixed square input side. Must be a multiple of 14.
@@ -244,7 +261,11 @@ DA3/
     model.safetensors
   Base/
     model.safetensors
+  Large/
+    model.safetensors
 ```
+
+Note: `--variant both` only exports Small and Base. Export `large` explicitly.
 
 ## Validation
 

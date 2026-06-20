@@ -2647,7 +2647,6 @@ class PyNvPassthroughStream:
                 DEFAULT_FLAT_FOV_DEG,
                 PROJECTION_FLAT_3D,
                 effective_eye_distance_mm,
-                near_from_depth,
                 strength_multiplier,
             )
 
@@ -2692,6 +2691,23 @@ class PyNvPassthroughStream:
             hole_fill = config.TWO_DVR_HOLE_FILL if config.TWO_DVR_HOLE_FILL in {"inverse_warp", "soft_shift"} else "soft_shift"
             strength = strength_multiplier(config.TWO_DVR_STRENGTH)
             eye_distance = effective_eye_distance_mm(config.TWO_DVR_EYE_DISTANCE_MM, strength)
+            temporal_kwargs = {
+                "temporal_norm": bool(config.TWO_DVR_TEMPORAL_NORM),
+                "temporal_norm_alpha": float(config.TWO_DVR_TEMPORAL_NORM_ALPHA),
+                "temporal_norm_reset": float(config.TWO_DVR_TEMPORAL_NORM_RESET),
+                "temporal_depth": bool(config.TWO_DVR_TEMPORAL_DEPTH),
+                "temporal_depth_mode": str(config.TWO_DVR_TEMPORAL_DEPTH_MODE),
+                "temporal_depth_alpha": float(config.TWO_DVR_TEMPORAL_DEPTH_ALPHA),
+                "temporal_flow_diff": float(config.TWO_DVR_TEMPORAL_FLOW_DIFF),
+                "temporal_flow_consistency": float(config.TWO_DVR_TEMPORAL_FLOW_CONSISTENCY),
+                "temporal_flow_motion_gate": float(config.TWO_DVR_TEMPORAL_FLOW_MOTION_GATE),
+                "temporal_affine": bool(config.TWO_DVR_TEMPORAL_AFFINE),
+                "temporal_affine_max_scale": float(config.TWO_DVR_TEMPORAL_AFFINE_MAX_SCALE),
+                "temporal_affine_max_bias": float(config.TWO_DVR_TEMPORAL_AFFINE_MAX_BIAS),
+                "temporal_static_deadband_px": float(config.TWO_DVR_TEMPORAL_STATIC_DEADBAND_PX),
+                "temporal_static_max_step_px": float(config.TWO_DVR_TEMPORAL_STATIC_MAX_STEP_PX),
+                "temporal_motion_max_step_px": float(config.TWO_DVR_TEMPORAL_MOTION_MAX_STEP_PX),
+            }
             log.info("[PYNV][%d] 2D->3D live model=%s ensure available", self.sid, model_variant)
             if not ensure_model_available(model_variant, log=lambda m: log.info("[PYNV][%d] %s", self.sid, m)):
                 raise RuntimeError(f"DA3 model {model_variant} unavailable and download failed")
@@ -2714,7 +2730,13 @@ class PyNvPassthroughStream:
                 eye_distance,
                 hole_fill,
                 DEFAULT_FLAT_FOV_DEG,
+                **temporal_kwargs,
             )
+            renderer.reset()
+            cut_detector = None
+            if config.TWO_DVR_SCENE_CUT:
+                from utils.scene_detection import SceneCutDetector
+                cut_detector = SceneCutDetector(threshold=config.TWO_DVR_SCENE_CUT_THRESHOLD)
             out_w, out_h = int(renderer.out_w), int(renderer.out_h)
             if out_w > 8192:
                 raise RuntimeError(f"2D->3D live output width exceeds 8K: {out_w}")
@@ -2736,9 +2758,12 @@ class PyNvPassthroughStream:
             enc_kwargs = _pynv_encoder_kwargs(bitrate=bitrate, fps=f"{fps:.6f}")
             self._enc = nvc.CreateEncoder(out_w, out_h, "NV12", False, **enc_kwargs)
             self._log_vram("two_dvr_encoder_created")
+            temporal_depth_on = temporal_kwargs["temporal_depth"] and temporal_kwargs["temporal_depth_mode"] != "off"
             log.info(
                 "[PYNV][%d] 2D->3D live start: source=%dx%d output=%dx%d source_fps=%.3f output_fps=%.3f "
-                "target=%d model=%s provider=%s hole_fill=%s strength=%.2f eye_distance=%.1fmm container=%s",
+                "target=%d model=%s provider=%s hole_fill=%s strength=%.2f eye_distance=%.1fmm "
+                "temporal_norm=%s norm_alpha=%.2f temporal_depth=%s depth_mode=%s depth_alpha=%.2f "
+                "affine=%s deadband_px=%.2f static_step_px=%.2f motion_step_px=%.2f container=%s",
                 self.sid,
                 width,
                 height,
@@ -2752,6 +2777,15 @@ class PyNvPassthroughStream:
                 hole_fill,
                 strength,
                 eye_distance,
+                "on" if temporal_kwargs["temporal_norm"] else "off",
+                temporal_kwargs["temporal_norm_alpha"],
+                "on" if temporal_depth_on else "off",
+                temporal_kwargs["temporal_depth_mode"],
+                temporal_kwargs["temporal_depth_alpha"],
+                "on" if temporal_kwargs["temporal_affine"] else "off",
+                temporal_kwargs["temporal_static_deadband_px"],
+                temporal_kwargs["temporal_static_max_step_px"],
+                temporal_kwargs["temporal_motion_max_step_px"],
                 self.container,
             )
 
@@ -2828,9 +2862,13 @@ class PyNvPassthroughStream:
                     ),
                 )
                 canvas = canvas_g.get()[None]
+                if cut_detector is not None and cut_detector.step(canvas[0]):
+                    renderer.reset()  # scene-cut: re-seed depth band/base for the new shot
                 depth = engine.session.run([engine.output_name], {engine.input_name: canvas})[0][0]
-                near = near_from_depth(depth[y0:y0 + nh, x0:x0 + nw], hole_fill)
-                near_g = cp.asarray(near)
+                near_g = renderer.prepare_near_gpu(
+                    depth[y0:y0 + nh, x0:x0 + nw],
+                    canvas_g[y0:y0 + nh, x0:x0 + nw],
+                )
                 t2 = time.perf_counter()
                 if i == 0:
                     log.info("[PYNV][%d] 2D->3D first frame render begin depth_ms=%.1f", self.sid, (t2 - t1) * 1000.0)

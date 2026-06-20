@@ -15,6 +15,7 @@ router = APIRouter()
 XML_MEDIA_TYPE = "text/xml; charset=utf-8"
 _SOAP_FIELD_RE = re.compile(rb"<(?:\w+:)?(ObjectID|BrowseFlag|Filter|RequestedCount|StartingIndex)>(.*?)</(?:\w+:)?\1>", re.IGNORECASE | re.DOTALL)
 _DEOVR_CDS_FILTER = {"res", "res@size", "res@duration", "dc:date", "upnp:albumarturi"}
+_SUPPORTED_CDS_UI_LANGUAGES = ("zh_CN", "ja_JP", "en_US")
 
 
 def _soap_history_fields(body: bytes) -> dict[str, str]:
@@ -29,6 +30,47 @@ def _soap_history_fields(body: bytes) -> dict[str, str]:
 
 def _normalise_filter_set(value: str) -> set[str]:
     return {part.strip().lower() for part in str(value or "").split(",") if part.strip()}
+
+
+def _header_value(headers: Mapping[str, str], name: str) -> str:
+    return str(headers.get(name) or headers.get(name.lower()) or headers.get(name.title()) or "")
+
+
+def _normalise_cds_ui_language(value: str) -> str | None:
+    language = str(value or "").strip().lower().replace("-", "_")
+    if not language:
+        return None
+    if language.startswith("zh"):
+        return "zh_CN"
+    if language.startswith("ja"):
+        return "ja_JP"
+    if language.startswith("en"):
+        return "en_US"
+    return None
+
+
+def _cds_ui_language(headers: Mapping[str, str]) -> str | None:
+    accept_language = _header_value(headers, "accept-language")
+    candidates: list[tuple[float, int, str]] = []
+    for index, raw_part in enumerate(accept_language.split(",")):
+        part = raw_part.strip()
+        if not part:
+            continue
+        language, *params = [piece.strip() for piece in part.split(";")]
+        q = 1.0
+        for param in params:
+            if param.lower().startswith("q="):
+                try:
+                    q = float(param[2:])
+                except ValueError:
+                    q = 0.0
+        normalised = _normalise_cds_ui_language(language)
+        if normalised in _SUPPORTED_CDS_UI_LANGUAGES and q > 0:
+            candidates.append((q, index, normalised))
+    if not candidates:
+        return None
+    candidates.sort(key=lambda item: (-item[0], item[1]))
+    return candidates[0][2]
 
 
 def _cds_client_profile(headers: Mapping[str, str], fields: dict[str, str]) -> str | None:
@@ -73,8 +115,11 @@ async def control_cds(request: Request):
     annotations = dict(fields)
     if client_profile:
         annotations["cds_client_profile"] = client_profile
+    ui_language = _cds_ui_language(request.headers)
+    if ui_language:
+        annotations["cds_ui_language"] = ui_language
     annotate_request(request, soap_action=soap_action, **annotations)
-    payload, status = handle_cds_soap(soap_action, body, client_profile=client_profile)
+    payload, status = handle_cds_soap(soap_action, body, client_profile=client_profile, language=ui_language)
     return Response(
         content=payload,
         status_code=status,

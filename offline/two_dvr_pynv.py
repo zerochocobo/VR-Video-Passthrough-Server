@@ -30,17 +30,64 @@ import config
 from offline.da3_depth import Da3DepthEngine
 from offline.two_dvr_gpu import GpuStereoRenderer, gpu_available
 from offline.two_dvr_render import (
+    DEFAULT_TEMPORAL_DEPTH,
+    DEFAULT_TEMPORAL_DEPTH_ALPHA,
+    DEFAULT_TEMPORAL_DEPTH_MODE,
+    DEFAULT_TEMPORAL_AFFINE,
+    DEFAULT_TEMPORAL_AFFINE_MAX_BIAS,
+    DEFAULT_TEMPORAL_AFFINE_MAX_SCALE,
+    DEFAULT_TEMPORAL_FLOW_CONSISTENCY,
+    DEFAULT_TEMPORAL_FLOW_DIFF,
+    DEFAULT_TEMPORAL_FLOW_MOTION_GATE,
+    DEFAULT_TEMPORAL_MOTION_MAX_STEP_PX,
+    DEFAULT_TEMPORAL_WINDOW,
+    DEFAULT_TEMPORAL_NORM,
+    DEFAULT_TEMPORAL_NORM_ALPHA,
+    DEFAULT_TEMPORAL_NORM_RESET,
+    DEFAULT_TEMPORAL_STATIC_DEADBAND_PX,
+    DEFAULT_TEMPORAL_STATIC_MAX_STEP_PX,
     HOLE_FILL_INVERSE_WARP,
     HOLE_FILL_SOFT_SHIFT,
     PROJECTION_FLAT_3D,
     effective_eye_distance_mm,
-    near_from_depth,
     strength_multiplier,
 )
 from utils.subprocess_hidden import hidden_subprocess_kwargs
 
 FFMPEG = shutil.which("ffmpeg") or "ffmpeg"
 DA3_SIZE = 518
+
+
+def _format_duration(seconds: float | None) -> str:
+    if seconds is None:
+        return "--:--"
+    try:
+        value = float(seconds)
+    except (TypeError, ValueError):
+        return "--:--"
+    if not np.isfinite(value):
+        return "--:--"
+    total = max(0, int(round(value)))
+    h, rem = divmod(total, 3600)
+    m, s = divmod(rem, 60)
+    if h > 0:
+        return f"{h:02d}:{m:02d}:{s:02d}"
+    return f"{m:02d}:{s:02d}"
+
+
+def _progress_message(done: int, total: int, started: float) -> str:
+    elapsed = max(0.0, time.time() - started)
+    fps = float(done) / max(1e-6, elapsed)
+    if total > 0:
+        percent = min(100.0, max(0.0, float(done) * 100.0 / float(total)))
+        remaining = max(0, int(total) - int(done))
+        eta = (float(remaining) / fps) if fps > 1e-6 and remaining > 0 else 0.0
+        return (
+            f"{done}/{total} frames ({percent:5.1f}%) "
+            f"elapsed={_format_duration(elapsed)} eta={_format_duration(eta)} {fps:.1f} fps"
+        )
+    return f"{done} frames elapsed={_format_duration(elapsed)} eta=--:-- {fps:.1f} fps"
+
 
 # BT.709 limited-range conversion (1080p+). Decode and encode use the same
 # matrix so the RGB round-trip is consistent.
@@ -132,7 +179,9 @@ def _letterbox_box(W: int, H: int, size: int = DA3_SIZE) -> tuple[int, int, int,
 
 def _encoder_kwargs(bitrate: str, fps: float) -> dict:
     kwargs = {"codec": "hevc", "bitrate": str(bitrate), "fps": f"{fps:.6f}",
-              "gop": str(config.PASSTHROUGH_GOP)}
+              "gop": str(config.PASSTHROUGH_GOP),
+              "bf": str(config.PASSTHROUGH_HEVC_BF),
+              "repeatspspps": "1"}
     if config.PASSTHROUGH_PYNV_PRESET:
         kwargs["preset"] = str(config.PASSTHROUGH_PYNV_PRESET)
     if config.PASSTHROUGH_PYNV_RC:
@@ -151,7 +200,7 @@ def _open_muxer(out: Path, fps: float, src: Path, start: float, duration: float,
         cmd += ["-i", str(src), "-map", "0:v:0", "-map", "1:a:0?", "-c:a", "aac", "-b:a", "192k"]
     else:
         cmd += ["-map", "0:v:0"]
-    cmd += ["-c:v", "copy", "-movflags", "+faststart", str(out)]
+    cmd += ["-c:v", "copy", "-tag:v", "hvc1", "-movflags", "+faststart", str(out)]
     return subprocess.Popen(cmd, stdin=subprocess.PIPE, stderr=subprocess.PIPE,
                             **hidden_subprocess_kwargs())
 
@@ -182,17 +231,77 @@ def convert_clip_pynv(src: Path, out: Path, engine: Da3DepthEngine, args,
 
     strength = strength_multiplier(getattr(args, "strength", 1.0))
     eye_distance = effective_eye_distance_mm(args.eye_distance, strength)
-    renderer = GpuStereoRenderer(W, H, args.projection, eye_distance, args.hole_fill, args.flat_fov)
+    temporal_kwargs = {
+        "temporal_norm": bool(getattr(args, "temporal_norm", DEFAULT_TEMPORAL_NORM)),
+        "temporal_norm_alpha": float(getattr(args, "temporal_norm_alpha", DEFAULT_TEMPORAL_NORM_ALPHA)),
+        "temporal_norm_reset": float(getattr(args, "temporal_norm_reset", DEFAULT_TEMPORAL_NORM_RESET)),
+        "temporal_depth": bool(getattr(args, "temporal_depth", DEFAULT_TEMPORAL_DEPTH)),
+        "temporal_depth_mode": str(getattr(args, "temporal_depth_mode", DEFAULT_TEMPORAL_DEPTH_MODE)),
+        "temporal_depth_alpha": float(getattr(args, "temporal_depth_alpha", DEFAULT_TEMPORAL_DEPTH_ALPHA)),
+        "temporal_flow_diff": float(getattr(args, "temporal_flow_diff", DEFAULT_TEMPORAL_FLOW_DIFF)),
+        "temporal_flow_consistency": float(getattr(args, "temporal_flow_consistency", DEFAULT_TEMPORAL_FLOW_CONSISTENCY)),
+        "temporal_flow_motion_gate": float(getattr(args, "temporal_flow_motion_gate", DEFAULT_TEMPORAL_FLOW_MOTION_GATE)),
+        "temporal_affine": bool(getattr(args, "temporal_affine", DEFAULT_TEMPORAL_AFFINE)),
+        "temporal_affine_max_scale": float(getattr(args, "temporal_affine_max_scale", DEFAULT_TEMPORAL_AFFINE_MAX_SCALE)),
+        "temporal_affine_max_bias": float(getattr(args, "temporal_affine_max_bias", DEFAULT_TEMPORAL_AFFINE_MAX_BIAS)),
+        "temporal_static_deadband_px": float(
+            getattr(args, "temporal_static_deadband_px", DEFAULT_TEMPORAL_STATIC_DEADBAND_PX)
+        ),
+        "temporal_static_max_step_px": float(
+            getattr(args, "temporal_static_max_step_px", DEFAULT_TEMPORAL_STATIC_MAX_STEP_PX)
+        ),
+        "temporal_motion_max_step_px": float(
+            getattr(args, "temporal_motion_max_step_px", DEFAULT_TEMPORAL_MOTION_MAX_STEP_PX)
+        ),
+    }
+    # Offline symmetric temporal window (8.5.3 B): replaces the causal base/detail
+    # stabilizer with a lag-free symmetric base median. When on, disable the causal
+    # depth stabilizer so prepare_near_gpu returns the un-smoothed near.
+    window_radius = max(0, min(10, int(getattr(args, "temporal_window", DEFAULT_TEMPORAL_WINDOW))))
+    band_lookahead = window_radius > 0 and config.TWO_DVR_BAND_LOOKAHEAD
+    if window_radius > 0:
+        temporal_kwargs["temporal_depth"] = False
+        temporal_kwargs["temporal_depth_mode"] = "off"
+        if band_lookahead:
+            # raw per-frame band; the symmetric window does the (lookahead) smoothing.
+            temporal_kwargs["temporal_norm"] = False
+    renderer = GpuStereoRenderer(W, H, args.projection, eye_distance, args.hole_fill, args.flat_fov, **temporal_kwargs)
+    renderer.reset()
+    window = None
+    if window_radius > 0:
+        from offline.two_dvr_gpu import GpuSymmetricWindow
+        window = GpuSymmetricWindow(renderer._near_pre, radius=window_radius)
+    cut_detector = None
+    if config.TWO_DVR_SCENE_CUT:
+        from utils.scene_detection import SceneCutDetector
+        cut_detector = SceneCutDetector(threshold=config.TWO_DVR_SCENE_CUT_THRESHOLD)
     out_w, out_h = renderer.out_w, renderer.out_h
     da3_size = int(engine.size)   # 518 (base/small) or 1036 (hd presets)
     x0, y0, nw, nh = _letterbox_box(W, H, da3_size)
     out.parent.mkdir(parents=True, exist_ok=True)
+    temporal_depth_on = temporal_kwargs["temporal_depth"] and temporal_kwargs["temporal_depth_mode"] != "off"
     log(f"{src.name}: {W}x{H}@{fps:.3f} -> SBS {out_w}x{out_h} proj={args.projection} "
-        f"fill={args.hole_fill} strength={strength:.2f} model={args.model} "
+        f"fill={args.hole_fill} strength={strength:.2f} "
+        f"temporal_norm={'on' if temporal_kwargs['temporal_norm'] else 'off'} "
+        f"temporal_depth={'on' if temporal_depth_on else 'off'} "
+        f"sym_window={window_radius if window_radius > 0 else 'off'} "
+        f"depth_mode={temporal_kwargs['temporal_depth_mode']} "
+        f"affine={'on' if temporal_kwargs['temporal_affine'] else 'off'} "
+        f"deadband_px={temporal_kwargs['temporal_static_deadband_px']:.2f} "
+        f"static_step_px={temporal_kwargs['temporal_static_max_step_px']:.2f} "
+        f"motion_step_px={temporal_kwargs['temporal_motion_max_step_px']:.2f} model={args.model} "
         f"depth={engine.providers[0]} pipeline=pynv-gpu")
 
     dec = PyNvThreadedSerialDecoder(src, start_frame=start_frame, info=info_obj, num_frames=total_frames)
-    enc = nvc.CreateEncoder(out_w, out_h, "NV12", False, **_encoder_kwargs(args.bitrate, fps))
+    from utils.bitrate_estimator import parse_bitrate, projection_capped_bitrate
+    eff_bitrate = projection_capped_bitrate(
+        args.bitrate, src, args.projection,
+        config.TWO_DVR_BITRATE_MULT_3D, config.TWO_DVR_BITRATE_MULT_VR,
+    )
+    if str(eff_bitrate) != str(parse_bitrate(args.bitrate)):
+        log(f"{src.name}: bitrate capped {args.bitrate} -> {eff_bitrate/1e6:.1f}M "
+            f"(<= {'4x' if str(args.projection).lower() in ('fisheye','hequirect') else '3x'} source)")
+    enc = nvc.CreateEncoder(out_w, out_h, "NV12", False, **_encoder_kwargs(eff_bitrate, fps))
     has_audio = _has_audio(src)
     mux = _open_muxer(out, fps, src, start, duration, has_audio)
 
@@ -207,6 +316,19 @@ def convert_clip_pynv(src: Path, out: Path, engine: Da3DepthEngine, args,
 
     started = time.time()
     count = 0
+
+    def _encode_pair(near_c, rgb_c) -> None:
+        nonlocal count
+        sbs_rgb = renderer.render_into_gpu(rgb_c, near_c)
+        k_to_nv12(grid_out, bx, (sbs_rgb, out_nv12, np.int32(out_w), np.int32(out_h)))
+        flags = (int(nvc.NV_ENC_PIC_FLAGS.FORCEIDR) | int(nvc.NV_ENC_PIC_FLAGS.OUTPUT_SPSPPS)) if count == 0 else 0
+        bitstream = enc.Encode(GpuNv12AppFrame(out_nv12, out_w, out_h), flags) if flags else enc.Encode(GpuNv12AppFrame(out_nv12, out_w, out_h))
+        if bitstream:
+            mux.stdin.write(bitstream)
+        count += 1
+        if count % 64 == 0:
+            log(f"  {_progress_message(count, n_frames, started)}")
+
     try:
         for idx in range(start_frame, start_frame + n_frames):
             frame = dec.frame_at(idx).owned_copy()
@@ -216,21 +338,31 @@ def convert_clip_pynv(src: Path, out: Path, engine: Da3DepthEngine, args,
             k_lb(grid_lb, bx, (y_g, uv_g, canvas_g, np.int32(W), np.int32(H), np.int32(da3_size),
                                np.int32(x0), np.int32(y0), np.int32(nw), np.int32(nh)))
             canvas = canvas_g.get()[None]  # (1,518,518,3) uint8
+            # scene-cut reset before normalization so the new shot re-seeds the
+            # depth band (the symmetric window's residual mask handles the base).
+            if cut_detector is not None and cut_detector.step(canvas[0]):
+                renderer.reset()
             depth = engine.session.run([engine.output_name], {engine.input_name: canvas})[0][0]
-            near = near_from_depth(depth[y0:y0 + nh, x0:x0 + nw], args.hole_fill)
-            near_g = cp.asarray(near)
+            near_g = renderer.prepare_near_gpu(
+                depth[y0:y0 + nh, x0:x0 + nw],
+                canvas_g[y0:y0 + nh, x0:x0 + nw],
+            )
             # full-res NV12 -> RGB, then GPU stereo warp -> SBS RGB
             k_to_rgb(grid, bx, (y_g, uv_g, rgb_g, np.int32(W), np.int32(H)))
-            sbs_rgb = renderer.render_into_gpu(rgb_g, near_g)
-            # SBS RGB -> packed NV12 -> NVENC
-            k_to_nv12(grid_out, bx, (sbs_rgb, out_nv12, np.int32(out_w), np.int32(out_h)))
-            flags = (int(nvc.NV_ENC_PIC_FLAGS.FORCEIDR) | int(nvc.NV_ENC_PIC_FLAGS.OUTPUT_SPSPPS)) if count == 0 else 0
-            bitstream = enc.Encode(GpuNv12AppFrame(out_nv12, out_w, out_h), flags) if flags else enc.Encode(GpuNv12AppFrame(out_nv12, out_w, out_h))
-            if bitstream:
-                mux.stdin.write(bitstream)
-            count += 1
-            if count % 64 == 0:
-                log(f"  {count} frames ({count / max(1e-6, time.time() - started):.1f} fps)")
+            if window is None:
+                _encode_pair(near_g, rgb_g)
+            else:
+                # symmetric window: align by the DA3-input crop, render the buffered
+                # full-res rgb. Output trails input by `window_radius` frames.
+                band = None
+                if band_lookahead:
+                    lo_raw, hi_raw = (float(v) for v in renderer._near_pre.band_g[:2].get())
+                    band = (lo_raw, hi_raw, lo_raw, hi_raw)
+                for near_c, rgb_c, _p in window.push(near_g, canvas_g[y0:y0 + nh, x0:x0 + nw], rgb_g, idx, band=band):
+                    _encode_pair(near_c, rgb_c)
+        if window is not None:
+            for near_c, rgb_c, _p in window.flush():
+                _encode_pair(near_c, rgb_c)
         tail = enc.EndEncode()
         if tail:
             mux.stdin.write(tail)
