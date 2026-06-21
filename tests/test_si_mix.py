@@ -346,7 +346,7 @@ class SIMixTests(unittest.TestCase):
         self.assertEqual(body, b"0123456789012345")
         self.assertFalse(service.opened)
 
-    def test_dlna_adds_si_virtual_item_with_vr_name(self) -> None:
+    def test_dlna_adds_si_directory_container_with_vr_name(self) -> None:
         runtime_settings.reset_si_mix_for_test({"enabled": True})
         with tempfile.TemporaryDirectory() as tmp:
             video = Path(tmp) / "movie.mp4"
@@ -369,46 +369,63 @@ class SIMixTests(unittest.TestCase):
                 patch.object(cds, "_rel_key", return_value="movie.mp4"),
                 patch.object(cds, "PASSTHROUGH_OUTPUT_MODE", "none"),
                 patch.object(cds, "find_external_subtitles", return_value=[]),
-                patch.object(cds, "prewarm_progressive_si_virtual_mp4") as prewarm,
             ):
                 items = cds._video_items_from_index(video, "0", child)
-        self.assertEqual(items[1]["id"], "si_ptv10_movie.mp4")
+        # The [SI] entry is now a realtime directory (chapters + time index),
+        # not a single cached item.
+        self.assertTrue(items[1].get("container"))
+        self.assertEqual(items[1]["id"], "six_ptv10_movie.mp4")
         self.assertEqual(items[1]["title"], "[SI]movie_LR_180_SBS")
-        self.assertIn("/media_si/movie.mp4", items[1]["url"])
-        self.assertEqual(items[1]["dlna_pn"], "HEVC_MP4_MAIN")
-        self.assertIn("DLNA.ORG_CI=0", items[1]["protocol_info"])
-        self.assertEqual(items[1]["size"], 1000)
-        self.assertEqual(items[1]["bitrate"], int(1000 * 8 / 60.0))
-        prewarm.assert_called_once()
+        # 60s source -> one quick chapter (t=0) + one "Select Time Index" entry.
+        self.assertEqual(items[1]["child_count"], 2)
+        self.assertNotIn("url", items[1])
 
-    def test_dlna_si_item_can_skip_browse_prewarm(self) -> None:
+    def test_dlna_si_container_lists_chapters_and_time_index(self) -> None:
         runtime_settings.reset_si_mix_for_test({"enabled": True})
         with tempfile.TemporaryDirectory() as tmp:
             video = Path(tmp) / "movie.mp4"
             video.write_bytes(b"video")
             video.with_suffix(".si.wav").write_bytes(b"si")
-            child = SimpleNamespace(
-                size=1000,
-                video=SimpleNamespace(
-                    duration=60.0,
-                    fps=24.0,
-                    width=3840,
-                    height=1920,
-                    resolution="3840x1920",
-                    backend_verdict="pynv_hevc",
-                    probe_error="",
-                    mkv_needs_fix=False,
-                ),
-            )
             with (
                 patch.object(cds, "_rel_key", return_value="movie.mp4"),
-                patch.object(cds, "PASSTHROUGH_OUTPUT_MODE", "none"),
-                patch.object(cds, "find_external_subtitles", return_value=[]),
-                patch.object(cds, "prewarm_progressive_si_virtual_mp4") as prewarm,
+                patch.object(cds, "_probe_live_directory_context", return_value=(60.0, 3840, 1920, 24.0)),
+                patch.object(cds, "estimate_for_media", return_value=(0, 1000, 0)),
             ):
-                items = cds._video_items_from_index(video, "0", child, prewarm_si=False)
-        self.assertEqual(items[1]["id"], "si_ptv10_movie.mp4")
-        prewarm.assert_not_called()
+                children = cds._si_chapter_items(video)
+        # First child is the "Select Time Index" subdirectory.
+        self.assertTrue(children[0].get("container"))
+        self.assertEqual(children[0]["id"], "sxi_ptv10_movie.mp4")
+        self.assertIn("[SI]movie_LR_180_SBS", children[0]["title"])
+        # Then up to N quick-play chapter leaves hitting /si_live.
+        self.assertEqual(children[1]["id"], "sic_ptv10_movie.mp4@0")
+        self.assertIn("/si_live/movie.mp4", children[1]["url"])
+        self.assertIn("t=0", children[1]["url"])
+        self.assertEqual(children[1]["mime"], "video/MP2T")
+        self.assertEqual(children[1]["passthrough_mode"], "si_mix")
+
+    def test_dlna_si_time_index_leaf_plays_si_live(self) -> None:
+        runtime_settings.reset_si_mix_for_test({"enabled": True})
+        with tempfile.TemporaryDirectory() as tmp:
+            video = Path(tmp) / "movie.mp4"
+            video.write_bytes(b"video")
+            video.with_suffix(".si.wav").write_bytes(b"si")
+            with (
+                patch.object(cds, "_rel_key", return_value="movie.mp4"),
+                patch.object(cds, "_probe_live_directory_context", return_value=(60.0, 3840, 1920, 24.0)),
+                patch.object(cds, "estimate_for_media", return_value=(0, 1000, 0)),
+            ):
+                index_items = cds._si_time_index_items(video, "index")
+                minute_items = cds._si_time_index_items(video, "minute", start=0)
+        # 60s -> a single 10-min group, so [SI] shows the minute directories directly.
+        self.assertTrue(index_items[0].get("container"))
+        self.assertEqual(index_items[0]["id"], "sin_ptv10_movie.mp4@0")
+        # Each 5s point is a playable leaf hitting the realtime MPEG-TS route.
+        first_leaf = minute_items[0]
+        self.assertEqual(first_leaf["id"], "sit_ptv10_movie.mp4@0")
+        self.assertIn("/si_live/movie.mp4", first_leaf["url"])
+        self.assertIn("t=0", first_leaf["url"])
+        self.assertEqual(first_leaf["mime"], "video/MP2T")
+        self.assertEqual(first_leaf["passthrough_mode"], "si_mix")
 
 
 if __name__ == "__main__":

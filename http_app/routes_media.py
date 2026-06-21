@@ -69,7 +69,7 @@ from config import (
     VIDEO_EXTS,
 )
 from dlna.profiles import passthrough_dlna_pn, passthrough_frame_rate
-from http_app.si_stream import DEFAULT_CHUNK_SIZE, get_si_stream_service, parse_range_header
+from http_app.si_stream import DEFAULT_CHUNK_SIZE, get_si_stream_service, iter_si_mpegts, parse_range_header
 from pipeline.ffmpeg_io import probe_cached
 from pipeline.si_virtual_mp4 import build_progressive_si_virtual_mp4, iter_virtual_range
 from pipeline.matting import acquire_matter, release_matter
@@ -1344,6 +1344,56 @@ async def media_si_get(
             )
 
     return StreamingResponse(gen(), status_code=status_code, headers=headers, media_type="video/mp4")
+
+
+def _si_live_content_features() -> str:
+    return (
+        "DLNA.ORG_PN=HEVC_TS_NA_ISO;"
+        "DLNA.ORG_OP=10;DLNA.ORG_CI=0;"
+        "DLNA.ORG_FLAGS=41700000000000000000000000000000"
+    )
+
+
+@router.get("/si_live/{name:path}")
+async def si_live_get(
+    request: Request,
+    name: str,
+    t: float = 0.0,
+    user_agent: str | None = Header(default=None, alias="User-Agent"),
+):
+    """Realtime MPEG-TS SI mix stream.
+
+    Unlike the cached progressive `/media_si` path, this mixes the SI audio on the
+    fly and streams MPEG-TS (video/MP2T) like `/passthrough_live`, so playback
+    starts in ~1-2s with no sidecar cache. Seeking is done by re-requesting a new
+    `?t=<seconds>` offset (the DLNA `[SI]` time-index leaves do exactly that).
+    """
+    for suffix in _LIVE_ROUTE_HINT_SUFFIXES:
+        if name.lower().endswith(suffix):
+            name = name[: -len(suffix)]
+            break
+    path = _safe_si_video_path(name)
+    annotate_request(request, media_name=path.name, media_path=str(path), passthrough_route="si_live")
+    service = get_si_stream_service()
+    config = service.current_config()
+    si_wav = service.has_si_source(path)
+    if not config.enabled or si_wav is None:
+        raise HTTPException(404, "SI stream not available")
+    start_time = max(0.0, float(t or 0.0))
+    log.info("si_live start: path=%s t=%.3f si=%s ua=%r", path, start_time, si_wav, user_agent)
+    headers = {
+        "Accept-Ranges": "none",
+        "X-SI-Enabled": "1",
+        "X-SI-Transport": "mpegts-live",
+        "contentFeatures.dlna.org": _si_live_content_features(),
+        "transferMode.dlna.org": "Streaming",
+    }
+    return StreamingResponse(
+        iter_si_mpegts(path, si_wav, config, start_time, chunk_size=DEFAULT_CHUNK_SIZE),
+        status_code=200,
+        headers=headers,
+        media_type="video/MP2T",
+    )
 
 
 @router.get("/media/{name:path}")

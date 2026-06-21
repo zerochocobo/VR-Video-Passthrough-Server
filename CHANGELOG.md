@@ -4,6 +4,12 @@ This file only keeps version releases, major bug fixes, major UI/UX updates, and
 
 ## English
 
+### 2026-06-21
+
+- **SI realtime MPEG-TS transport:** Added the `/si_live/{name}` streaming route for same-stem `.si.wav` sidecars, switching SI playback from full-file progressive virtual MP4 preparation to zero-cache realtime MPEG-TS with `?t=` start offsets.
+- **DLNA `[SI]` time index:** `[SI]` entries are now directories with a `[Select Time Index]` folder, quick chapter leaves, 10-minute groups, minute folders, and 5-second playable start points that all target `/si_live/*.ts`.
+- **SI cache path cleanup:** Kept the older `/media_si` progressive virtual MP4 route as a dormant fallback, while removing DLNA-side SI prewarm wiring and dead progressive-cache item helpers from the active browse path.
+
 ### 2026-06-20
 
 - **2D-to-3D / VR model update:** Added NVDS ONNX temporal stabilization for offline 16:9 jobs, split backbone/head runtime support, a 512x288 default NVDS tier, the DA3 Large 1036 preset, and a pre-run model download dialog for missing DA3/NVDS files.
@@ -240,6 +246,12 @@ This file only keeps version releases, major bug fixes, major UI/UX updates, and
 - **Core update:** Added initial DLNA time-seek metadata, passthrough HEAD support, and `PT_CONTAINER` support for MP4 and MPEG-TS passthrough output.
 
 ## 中文
+
+### 2026-06-21
+
+- **SI 实时 MPEG-TS 传输：** 新增 `/si_live/{name}` 流式路由，基于同名 `.si.wav` sidecar 实时输出 SI 混音 MPEG-TS，将 SI 播放从整片 progressive virtual MP4 预生成切换为零缓存实时传输，并支持 `?t=` 起播偏移。
+- **DLNA `[SI]` 时间索引：** `[SI]` 入口现在显示为目录，包含 `[选择时间索引]` 文件夹、快速章节叶子、10 分钟分组、分钟目录和 5 秒一个的可播放起点，播放 URL 统一指向 `/si_live/*.ts`。
+- **SI 缓存路径清理：** 保留旧 `/media_si` progressive virtual MP4 路由作为休眠 fallback，同时从当前 DLNA 浏览路径移除 SI 预热接线和 progressive cache 旧 item helper。
 
 ### 2026-06-20
 

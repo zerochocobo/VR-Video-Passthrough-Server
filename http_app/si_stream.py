@@ -99,6 +99,13 @@ class LiveStreamSession:
 
     def _start_ffmpeg(self, start_time: float) -> None:
         seek = f"{max(0.0, start_time):.3f}"
+        # Output MPEG-TS, not fragmented MP4. SKYBOX (and the other VR players we
+        # captured in tools/si_proto) handle a linear MPEG-TS live stream cleanly,
+        # but treated fMP4 as a pseudo-file and issued overlapping Range probes
+        # (3.6x-6.35x the byte volume) that stalled playback. This mirrors the
+        # passthrough_live transport, which already serves video/MP2T. Video is
+        # stream-copied; only the SI mix audio is encoded, so the stream is
+        # produced faster than realtime with no full-file cache.
         cmd = [
             FFMPEG,
             "-hide_banner",
@@ -128,10 +135,12 @@ class LiveStreamSession:
             "48000",
             "-ac",
             "2",
-            "-movflags",
-            "+frag_keyframe+empty_moov+default_base_moof",
+            "-muxpreload",
+            "0",
+            "-muxdelay",
+            "0",
             "-f",
-            "mp4",
+            "mpegts",
             "pipe:1",
         ]
         self.proc = subprocess.Popen(
@@ -453,6 +462,38 @@ class SIStreamService:
             self._sessions.clear()
         for session in sessions:
             self._close_session(session)
+
+
+def iter_si_mpegts(
+    video: Path,
+    si_wav: Path,
+    config: SIMixParams,
+    start_time: float,
+    *,
+    chunk_size: int = DEFAULT_CHUNK_SIZE,
+) -> Iterator[bytes]:
+    """Yield a realtime MPEG-TS SI mix stream starting at ``start_time`` seconds.
+
+    Each call spawns one ffmpeg process (source video copied, SI mix encoded) and
+    streams its stdout until EOF. Seeking is handled by the caller re-requesting a
+    new ``?t=`` offset, exactly like the passthrough_live transport.
+    """
+    session = LiveStreamSession(
+        video=Path(video),
+        si_wav=Path(si_wav),
+        config=config,
+        start_time=max(0.0, float(start_time)),
+        estimated_total=1,
+        start_byte=0,
+    )
+    try:
+        while True:
+            chunk = session.read(max(1, int(chunk_size)))
+            if not chunk:
+                break
+            yield chunk
+    finally:
+        session.close()
 
 
 _service_lock = threading.Lock()

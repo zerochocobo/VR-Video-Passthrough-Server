@@ -35,7 +35,6 @@ from config import (
     PASSTHROUGH_SEEK_CONTAINER,
     PASSTHROUGH_SEEK_HEADER_BYTES,
     PASSTHROUGH_SEEK_MODE,
-    SI_BROWSE_PREWARM_LIMIT,
     SI_PROGRESSIVE_DLNA,
     SI_PROGRESSIVE_ENABLED,
     MEDIA_LIBRARY,
@@ -45,7 +44,6 @@ from config import (
 from dlna.profiles import passthrough_frame_rate
 from pipeline.alpha_packer import alpha_output_size
 from pipeline.ffmpeg_io import probe_cached
-from pipeline.si_virtual_mp4 import prewarm_progressive_si_virtual_mp4
 from utils.bitrate_estimator import estimate_for_media
 from utils.logger import get
 from utils.media_index import IndexedChild, get_media_index
@@ -85,6 +83,17 @@ SEEK_ITEM_PREFIX = "sg_"
 ALPHA_SEEK_ITEM_PREFIX = "sa_"
 IMAGE_ITEM_PREFIX = "img_"
 SI_ITEM_PREFIX = "si_"
+# Realtime SI ([SI]) directory + time-index object ids. The [SI] entry is a
+# container whose children are a time-index tree (group -> minute -> 5s point);
+# each point leaf plays the realtime MPEG-TS `/si_live` stream at that offset.
+# None of these prefixes start with "si_"/"sg_"/"sa_", so they never collide with
+# the legacy SI item, seek, or alpha-seek dispatch.
+SI_DIR_PREFIX = "six_"
+SI_CHAPTER_ITEM_PREFIX = "sic_"
+SI_TIME_INDEX_PREFIX = "sxi_"
+SI_TIME_GROUP_PREFIX = "sig_"
+SI_TIME_MINUTE_PREFIX = "sin_"
+SI_TIME_POINT_PREFIX = "sit_"
 PYNV_OUTPUT_CODEC = "hevc"
 DLNA_FLAGS_BASE = "01700000000000000000000000000000"
 DLNA_FLAGS_TIME_SEEK = "41700000000000000000000000000000"
@@ -349,6 +358,74 @@ def _id_to_si(object_id: str) -> Path | None:
     return None
 
 
+def _si_time_index_id(prefix: str, rel: str, payload: str | None = None) -> str:
+    object_id = f"{prefix}{_versioned_rel(rel)}"
+    return f"{object_id}@{payload}" if payload else object_id
+
+
+def _si_path_from_rel(rel: str) -> Path | None:
+    rel = _strip_object_id_version(rel.replace("\\", "/").strip("/"))
+    path = MEDIA_LIBRARY.key_to_path(rel)
+    if path is not None and MEDIA_LIBRARY.contains(path) and path.is_file() and _has_si_sidecar(path):
+        return path
+    return None
+
+
+def _id_to_si_dir(object_id: str) -> Path | None:
+    if not object_id.startswith(SI_DIR_PREFIX):
+        return None
+    return _si_path_from_rel(object_id[len(SI_DIR_PREFIX):])
+
+
+def _id_to_si_time_index(object_id: str) -> tuple[Path, str, int, int] | None:
+    if object_id.startswith(SI_TIME_INDEX_PREFIX):
+        path = _si_path_from_rel(object_id[len(SI_TIME_INDEX_PREFIX):])
+        return (path, "index", 0, 0) if path is not None else None
+    for prefix, level in ((SI_TIME_GROUP_PREFIX, "group"), (SI_TIME_MINUTE_PREFIX, "minute")):
+        if not object_id.startswith(prefix):
+            continue
+        rest = object_id[len(prefix):]
+        if "@" not in rest:
+            return None
+        rel, payload = rest.rsplit("@", 1)
+        path = _si_path_from_rel(rel)
+        if path is None:
+            return None
+        start = 0
+        end = 0
+        try:
+            if level == "group":
+                start_text, end_text = payload.split("-", 1)
+                start = max(0, int(start_text))
+                end = max(start, int(end_text))
+            else:
+                start = max(0, int(payload))
+        except ValueError:
+            return None
+        return path, level, start, end
+    return None
+
+
+def _id_to_si_point(object_id: str) -> tuple[Path, int, str] | None:
+    """Resolve a playable SI leaf id (quick chapter ``sic_`` or 5s point ``sit_``)."""
+    for prefix in (SI_CHAPTER_ITEM_PREFIX, SI_TIME_POINT_PREFIX):
+        if not object_id.startswith(prefix):
+            continue
+        rest = object_id[len(prefix):]
+        if "@" not in rest:
+            return None
+        rel, payload = rest.rsplit("@", 1)
+        path = _si_path_from_rel(rel)
+        if path is None:
+            return None
+        try:
+            offset = max(0, int(payload))
+        except ValueError:
+            return None
+        return path, offset, prefix
+    return None
+
+
 def _parent_id_for_dir(path: Path) -> str:
     path = path.resolve()
     if MEDIA_LIBRARY.multi_root:
@@ -466,14 +543,6 @@ def _image_protocol_info(path: Path) -> str:
     )
 
 
-def _si_protocol_info() -> str:
-    return (
-        "http-get:*:video/mp4:DLNA.ORG_PN=HEVC_MP4_MAIN;"
-        f"DLNA.ORG_OP={DLNA_OP_BYTE_SEEK};"
-        f"DLNA.ORG_CI=0;DLNA.ORG_FLAGS={DLNA_FLAGS_BASE}"
-    )
-
-
 def _has_si_sidecar(path: Path) -> bool:
     return path.suffix.lower() == ".mp4" and path.with_suffix(".si.wav").is_file()
 
@@ -514,53 +583,267 @@ def _image_item_from_index(path: Path, parent_id: str, child: IndexedChild | Non
     }
 
 
-def _estimated_si_size(source_size: int, duration: float) -> int:
-    # The progressive SI file replaces the source audio track with a mixed AAC
-    # track; it does not append another full audio stream. The HTTP route
-    # reports the exact virtual Content-Length after build, while Browse needs a
-    # cheap stable estimate that will not inflate client byte-seek mapping.
-    return max(0, int(source_size))
+def _si_directory_title(path: Path, width: int = 0, height: int = 0) -> str:
+    return f"[SI]{source_display_stem(path.stem, width, height)}"
 
 
-def _si_item_from_video(
+def _si_time_index_title(path: Path, width: int, height: int, language: str | None = None) -> str:
+    return f"[{_select_time_index_label(language)}]_{_si_directory_title(path, width, height)}"
+
+
+def _si_directory_child_count(duration: float) -> int:
+    # Mirror the Live container: N quick-play chapter leaves + 1 "Select Time
+    # Index" subdirectory.
+    return len(_live_chapter_offsets(duration)) + 1
+
+
+def _si_container_item(path: Path, parent_id: str, duration: float, width: int, height: int) -> dict:
+    """The `[SI]` directory shown beside the source video.
+
+    Like the Live container, it lists up to N quick-play chapter leaves plus a
+    "Select Time Index" subdirectory. Every leaf plays the realtime `/si_live`
+    MPEG-TS stream from its offset; no sidecar cache is built.
+    """
+    rel = _rel_key(path)
+    return {
+        "container": True,
+        "id": _si_time_index_id(SI_DIR_PREFIX, rel),
+        "parent_id": parent_id,
+        "title": _si_directory_title(path, width, height),
+        "child_count": _si_directory_child_count(duration),
+    }
+
+
+def _si_time_index_root_item(
     path: Path,
     parent_id: str,
-    *,
-    size: int,
     duration: float,
     width: int,
     height: int,
-    resolution: str,
+    language: str | None = None,
+) -> dict:
+    rel = _rel_key(path)
+    return {
+        "container": True,
+        "id": _si_time_index_id(SI_TIME_INDEX_PREFIX, rel),
+        "parent_id": parent_id,
+        "title": _si_time_index_title(path, width, height, language),
+        "child_count": _live_time_index_child_count(duration, "index"),
+    }
+
+
+def _si_play_leaf(
+    path: Path,
+    item_id: str,
+    parent_id: str,
+    title: str,
+    offset: int,
+    duration: float,
+    width: int,
+    height: int,
     source_fps: float,
-    prewarm: bool = True,
+    pt_bps_est: int,
+    client_profile: str | None,
 ) -> dict:
     base = f"http://{LAN_IP}:{HTTP_PORT}"
-    rel = _rel_key(path)
-    quoted = quote(rel)
-    estimated_size = _estimated_si_size(size, duration)
-    if prewarm:
-        try:
-            prewarm_progressive_si_virtual_mp4(path, path.with_suffix(".si.wav"), get_si_mix().params(), reason="dlna-browse")
-        except Exception as exc:
-            log.warning("failed to queue SI progressive prewarm for %s: %s", path, exc)
+    quoted = quote(_rel_key(path))
+    live_route_suffix = _live_route_hint_suffix(client_profile)
+    omit_filelike_attrs = not _is_deovr_cds_client(client_profile)
+    remain = max(0.0, duration - float(offset)) if duration > 0 else 0.0
     return {
-        "id": f"{SI_ITEM_PREFIX}{_versioned_rel(rel)}",
+        "id": item_id,
         "parent_id": parent_id,
-        "title": f"[SI]{source_display_stem(path.stem, width, height)}",
-        "url": f"{base}/media_si/{quoted}",
+        "title": title,
+        "url": f"{base}/si_live/{quoted}{live_route_suffix}?t={offset}&ptv={_DIDL_SCHEMA_VERSION}",
         "thumb": f"{base}/thumb/{quoted}",
-        "size": estimated_size,
-        "duration": duration,
-        "resolution": resolution,
-        "bitrate": int(estimated_size * 8 / duration) if duration > 0 and estimated_size > 0 else 0,
-        "mime": "video/mp4",
-        "dlna_pn": "HEVC_MP4_MAIN",
+        "size": 0,
+        "duration": remain,
+        "resolution": _resolution_str(width, height),
+        "bitrate": pt_bps_est,
+        "mime": "video/MP2T",
+        "dlna_pn": "HEVC_TS_NA_ISO",
         "frame_rate": passthrough_frame_rate(source_fps),
         "passthrough": True,
         "passthrough_mode": "si_mix",
-        "protocol_info": _si_protocol_info(),
-        "subtitles": [_subtitle_item(track) for track in find_external_subtitles(path)],
+        "protocol_info": _live_passthrough_protocol_info(client_profile),
+        "omit_duration": omit_filelike_attrs,
+        "omit_bitrate": omit_filelike_attrs,
     }
+
+
+def _si_chapter_items(
+    path: Path,
+    client_profile: str | None = None,
+    language: str | None = None,
+) -> list[dict]:
+    """Children of the `[SI]` container: a Select-Time-Index entry + quick chapters."""
+    rel = _rel_key(path)
+    duration, width, height, source_fps = _probe_live_directory_context(path, rel)
+    parent_id = _si_time_index_id(SI_DIR_PREFIX, rel)
+    virtual_title = source_display_stem(path.stem, width, height)
+    if duration > 0:
+        _, pt_bps_est, _ = estimate_for_media(path, duration, PYNV_OUTPUT_CODEC)
+    else:
+        pt_bps_est = _parse_bitrate(PASSTHROUGH_BITRATE)
+    items: list[dict] = [_si_time_index_root_item(path, parent_id, duration, width, height, language)]
+    for offset in _live_chapter_offsets(duration):
+        items.append(
+            _si_play_leaf(
+                path,
+                _si_time_index_id(SI_CHAPTER_ITEM_PREFIX, rel, str(offset)),
+                parent_id,
+                f"{_fmt_title_time(offset)}_[SI]{virtual_title}",
+                offset,
+                duration,
+                width,
+                height,
+                source_fps,
+                pt_bps_est,
+                client_profile,
+            )
+        )
+    return items
+
+
+def _si_time_minute_items(
+    path: Path,
+    parent_id: str,
+    start: int,
+    end: int,
+    duration: float,
+    virtual_title: str,
+) -> list[dict]:
+    rel = _rel_key(path)
+    force_hours = _live_time_force_hours(duration)
+    items: list[dict] = []
+    for minute in _live_time_minute_offsets(start, end):
+        items.append(
+            {
+                "container": True,
+                "id": _si_time_index_id(SI_TIME_MINUTE_PREFIX, rel, str(minute)),
+                "parent_id": parent_id,
+                "title": f"{_fmt_index_time(minute, force_hours)}_[SI]{virtual_title}",
+                "child_count": _live_time_index_child_count(duration, "minute", minute),
+            }
+        )
+    return items
+
+
+def _si_time_index_items(
+    path: Path,
+    level: str,
+    start: int = 0,
+    end: int = 0,
+    client_profile: str | None = None,
+    language: str | None = None,
+) -> list[dict]:
+    rel = _rel_key(path)
+    duration, width, height, source_fps = _probe_live_directory_context(path, rel)
+    virtual_title = source_display_stem(path.stem, width, height)
+    force_hours = _live_time_force_hours(duration)
+    if level == "index":
+        parent_id = _si_time_index_id(SI_TIME_INDEX_PREFIX, rel)
+        groups = _live_time_group_ranges(duration)
+        if len(groups) == 1:
+            group_start, group_end = groups[0]
+            return _si_time_minute_items(path, parent_id, group_start, group_end, duration, virtual_title)
+        return [
+            {
+                "container": True,
+                "id": _si_time_index_id(SI_TIME_GROUP_PREFIX, rel, f"{group_start}-{group_end}"),
+                "parent_id": parent_id,
+                "title": (
+                    f"{_fmt_index_time(group_start, force_hours)}-{_fmt_index_time(group_end, force_hours)}"
+                    f"_[SI]{virtual_title}"
+                ),
+                "child_count": _live_time_index_child_count(duration, "group", group_start, group_end),
+            }
+            for group_start, group_end in groups
+        ]
+    if level == "group":
+        parent_id = _si_time_index_id(SI_TIME_GROUP_PREFIX, rel, f"{start}-{end}")
+        return _si_time_minute_items(path, parent_id, start, end, duration, virtual_title)
+    if level != "minute":
+        return []
+
+    if duration > 0:
+        _, pt_bps_est, _ = estimate_for_media(path, duration, PYNV_OUTPUT_CODEC)
+    else:
+        pt_bps_est = _parse_bitrate(PASSTHROUGH_BITRATE)
+    parent_id = _si_time_index_id(SI_TIME_MINUTE_PREFIX, rel, str(start))
+    items: list[dict] = []
+    for offset in _live_time_point_offsets(start, duration):
+        items.append(
+            _si_play_leaf(
+                path,
+                _si_time_index_id(SI_TIME_POINT_PREFIX, rel, str(offset)),
+                parent_id,
+                f"{_fmt_index_time(offset, force_hours)}_[SI]{virtual_title}",
+                offset,
+                duration,
+                width,
+                height,
+                source_fps,
+                pt_bps_est,
+                client_profile,
+            )
+        )
+    return items
+
+
+def _si_time_index_metadata_item(
+    path: Path,
+    level: str,
+    start: int = 0,
+    end: int = 0,
+    language: str | None = None,
+) -> dict | None:
+    rel = _rel_key(path)
+    duration, width, height, _source_fps = _probe_live_directory_context(path, rel)
+    virtual_title = source_display_stem(path.stem, width, height)
+    force_hours = _live_time_force_hours(duration)
+    if level == "index":
+        return _si_time_index_root_item(
+            path, _si_time_index_id(SI_DIR_PREFIX, rel), duration, width, height, language
+        )
+    if level == "group":
+        return {
+            "container": True,
+            "id": _si_time_index_id(SI_TIME_GROUP_PREFIX, rel, f"{start}-{end}"),
+            "parent_id": _si_time_index_id(SI_TIME_INDEX_PREFIX, rel),
+            "title": (
+                f"{_fmt_index_time(start, force_hours)}-{_fmt_index_time(end, force_hours)}_[SI]{virtual_title}"
+            ),
+            "child_count": _live_time_index_child_count(duration, "group", start, end),
+        }
+    if level == "minute":
+        groups = _live_time_group_ranges(duration)
+        parent_id = _si_time_index_id(SI_TIME_INDEX_PREFIX, rel)
+        if len(groups) > 1:
+            group_start, group_end = _live_time_parent_group_range(start, duration)
+            parent_id = _si_time_index_id(SI_TIME_GROUP_PREFIX, rel, f"{group_start}-{group_end}")
+        return {
+            "container": True,
+            "id": _si_time_index_id(SI_TIME_MINUTE_PREFIX, rel, str(start)),
+            "parent_id": parent_id,
+            "title": f"{_fmt_index_time(start, force_hours)}_[SI]{virtual_title}",
+            "child_count": _live_time_index_child_count(duration, "minute", start),
+        }
+    return None
+
+
+def _si_point_metadata_item(path: Path, offset: int, prefix: str) -> dict | None:
+    suffix = f"@{int(offset)}"
+    if prefix == SI_CHAPTER_ITEM_PREFIX:
+        candidates = _si_chapter_items(path)
+    else:
+        minute_start = (max(0, int(offset)) // _TIME_INDEX_MINUTE_SEC) * _TIME_INDEX_MINUTE_SEC
+        candidates = _si_time_index_items(path, "minute", start=minute_start)
+    for item in candidates:
+        item_id = str(item.get("id", ""))
+        if item_id.startswith(prefix) and item_id.endswith(suffix):
+            return item
+    return None
 
 
 def _passthrough_virtual_title(path: Path, mode: str, width: int = 0, height: int = 0) -> str:
@@ -780,7 +1063,6 @@ def _video_items_from_index(
     child: IndexedChild | None,
     siblings: list[Path] | None = None,
     client_profile: str | None = None,
-    prewarm_si: bool = True,
 ) -> list[dict]:
     base = f"http://{LAN_IP}:{HTTP_PORT}"
     pt_bps = _parse_bitrate(PASSTHROUGH_BITRATE)
@@ -839,19 +1121,7 @@ def _video_items_from_index(
         }
     ]
     if _si_dlna_enabled() and get_si_mix().enabled and _has_si_sidecar(path):
-        items.append(
-            _si_item_from_video(
-                path,
-                parent_id,
-                size=size,
-                duration=duration,
-                width=width,
-                height=height,
-                resolution=resolution,
-                source_fps=source_fps,
-                prewarm=prewarm_si,
-            )
-        )
+        items.append(_si_container_item(path, parent_id, duration, width, height))
     if (
         is_offline_passthrough_output_name(path.name)
         or has_offline_passthrough_output(path, siblings)
@@ -1226,7 +1496,6 @@ def _children_for_dir(directory: Path, client_profile: str | None = None) -> lis
     if cached is not None:
         return list(cached)
     sibling_paths = [child.path for child in snapshot.children]
-    si_prewarm_remaining = max(0, int(SI_BROWSE_PREWARM_LIMIT))
     for child in snapshot.children:
         if child.is_dir:
             items.append(
@@ -1239,18 +1508,15 @@ def _children_for_dir(directory: Path, client_profile: str | None = None) -> lis
                 }
             )
         elif child.path.suffix.lower() in VIDEO_EXTS:
-            allow_si_prewarm = si_prewarm_remaining > 0
-            child_items = _video_items_from_index(
-                child.path,
-                parent_id,
-                child,
-                sibling_paths,
-                client_profile,
-                prewarm_si=allow_si_prewarm,
+            items.extend(
+                _video_items_from_index(
+                    child.path,
+                    parent_id,
+                    child,
+                    sibling_paths,
+                    client_profile,
+                )
             )
-            items.extend(child_items)
-            if allow_si_prewarm and any(str(item.get("id", "")).startswith(SI_ITEM_PREFIX) for item in child_items):
-                si_prewarm_remaining -= 1
         elif DLNA_IMAGE_ENABLED and child.path.suffix.lower() in IMAGE_EXTS:
             items.append(_image_item_from_index(child.path, parent_id, child))
     if len(_dir_items_cache) >= _DIR_ITEMS_CACHE_MAX:
@@ -1482,6 +1748,23 @@ def _metadata_didl_for_live(path: Path, mode: str) -> str:
     )
 
 
+def _metadata_didl_for_si_dir(path: Path) -> str:
+    rel = _rel_key(path)
+    duration, width, height, _fps = _probe_live_directory_context(path, rel)
+    si_id = _si_time_index_id(SI_DIR_PREFIX, rel)
+    return (
+        f'<DIDL-Lite xmlns="{DIDL_NS}" '
+        'xmlns:dc="http://purl.org/dc/elements/1.1/" '
+        'xmlns:upnp="urn:schemas-upnp-org:metadata-1-0/upnp/">'
+        f'<container id="{html.escape(si_id)}" '
+        f'parentID="{html.escape(_folder_id(path.parent))}" '
+        f'childCount="{_si_directory_child_count(duration)}" restricted="1">'
+        f"<dc:title>{html.escape(_si_directory_title(path, width, height))}</dc:title>"
+        "<upnp:class>object.container.storageFolder</upnp:class>"
+        "</container></DIDL-Lite>"
+    )
+
+
 def handle_soap(
     soap_action: str,
     body: bytes,
@@ -1501,6 +1784,9 @@ def handle_soap(
         time_index = _id_to_live_time_index(object_id)
         seek = _id_to_seek(object_id)
         si = _id_to_si(object_id)
+        si_dir = _id_to_si_dir(object_id)
+        si_time = _id_to_si_time_index(object_id)
+        si_point = _id_to_si_point(object_id)
         image = _id_to_image(object_id)
 
         if time_index is not None:
@@ -1514,6 +1800,11 @@ def handle_soap(
                 client_profile,
                 language,
             )
+        elif si_time is not None:
+            si_path, si_level, si_start, si_end = si_time
+            all_items = _si_time_index_items(si_path, si_level, si_start, si_end, client_profile, language)
+        elif si_dir is not None:
+            all_items = _si_chapter_items(si_dir, client_profile, language)
         elif live is not None:
             live_path, live_mode = live
             all_items = _live_chapter_items(live_path, live_mode, client_profile, language)
@@ -1547,6 +1838,16 @@ def handle_soap(
                 didl = _metadata_didl_for_live(live_path, live_mode)
             elif image is not None:
                 didl = _metadata_didl_for_item(_image_item_from_index(image, _folder_id(image.parent)))
+            elif si_point is not None:
+                point_path, point_offset, point_prefix = si_point
+                point_item = _si_point_metadata_item(point_path, point_offset, point_prefix)
+                didl = _metadata_didl_for_item(point_item) if point_item else _didl_for([])
+            elif si_time is not None:
+                meta_path, meta_level, meta_start, meta_end = si_time
+                meta_item = _si_time_index_metadata_item(meta_path, meta_level, meta_start, meta_end, language)
+                didl = _metadata_didl_for_item(meta_item) if meta_item else _didl_for([])
+            elif si_dir is not None:
+                didl = _metadata_didl_for_si_dir(si_dir)
             elif si is not None:
                 si_items = [
                     item for item in _video_items(si, _folder_id(si.parent), client_profile)
