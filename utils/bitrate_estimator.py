@@ -20,6 +20,7 @@ from typing import Any
 
 import config
 from config import PASSTHROUGH_BITRATE, PASSTHROUGH_HEVC_BITRATE, PASSTHROUGH_MAX_FPS
+from media_library import safe_resolve_path
 from utils.cache_key import stat_key
 from utils.ffprobe_json import run_ffprobe_json
 
@@ -142,7 +143,7 @@ def _effective_vcodec_for_key(codec: str = "") -> str:
 
 
 def make_key(path: Path, codec: str = "", params: dict[str, Any] | None = None) -> str:
-    p = Path(path).resolve()
+    p = safe_resolve_path(Path(path))
     stat = stat_key(p)
     parts = [
         stat[0],

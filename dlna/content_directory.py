@@ -42,6 +42,7 @@ from config import (
     VIDEO_EXTS,
 )
 from dlna.profiles import passthrough_frame_rate
+from media_library import safe_resolve_path
 from pipeline.alpha_packer import alpha_output_size
 from pipeline.ffmpeg_io import probe_cached
 from utils.bitrate_estimator import estimate_for_media
@@ -52,7 +53,7 @@ from utils.offline_outputs import (
     has_offline_two_dvr_output,
     is_offline_passthrough_output_name,
 )
-from utils.runtime_settings import get_si_mix
+from utils.runtime_settings import get_rm, get_si_mix
 from utils.subtitles import SubtitleTrack, find_external_subtitles, subtitle_output_enabled
 from utils.video_metadata import probe_video_metadata, select_backend
 from utils.vr_naming import (
@@ -72,9 +73,11 @@ LEGACY_LIVE_PREFIX = "pl:"
 ALPHA_LIVE_PREFIX = "pla_"
 LEGACY_ALPHA_LIVE_PREFIX = "pla:"
 TWO_DVR_LIVE_PREFIX = "pl3_"
+RM_LIVE_PREFIX = "plr_"
 LIVE_ITEM_PREFIX = "lg_"
 ALPHA_LIVE_ITEM_PREFIX = "la_"
 TWO_DVR_LIVE_ITEM_PREFIX = "l3_"
+RM_LIVE_ITEM_PREFIX = "lr_"
 LIVE_TIME_INDEX_PREFIX = "lix_"
 LIVE_TIME_GROUP_PREFIX = "lig_"
 LIVE_TIME_MINUTE_PREFIX = "lim_"
@@ -120,7 +123,7 @@ _CDS_CLIENT_DEOVR = "deovr"
 _TIME_INDEX_GROUP_SEC = 10 * 60
 _TIME_INDEX_MINUTE_SEC = 60
 _TIME_INDEX_POINT_SEC = 5
-_LIVE_TIME_MODE_TOKEN_BY_MODE = {"green": "g", "alpha": "a", "two_dvr": "3"}
+_LIVE_TIME_MODE_TOKEN_BY_MODE = {"green": "g", "alpha": "a", "two_dvr": "3", "rm": "r"}
 _LIVE_TIME_MODE_BY_TOKEN = {token: mode for mode, token in _LIVE_TIME_MODE_TOKEN_BY_MODE.items()}
 _SELECT_TIME_INDEX_LABELS = {
     "en_US": "Select Time Index",
@@ -134,7 +137,7 @@ def clear_dir_items_cache() -> None:
 
 
 def _system_update_id() -> int:
-    return _SYSTEM_UPDATE_ID + int(get_si_mix().version)
+    return _SYSTEM_UPDATE_ID + int(get_si_mix().version) + int(get_rm().version)
 
 
 def _parse_bitrate(s: str) -> int:
@@ -190,7 +193,7 @@ def _select_time_index_label(language: str | None = None) -> str:
 
 
 def _root() -> Path:
-    return VIDEO_DIR.resolve()
+    return safe_resolve_path(VIDEO_DIR)
 
 
 def _rel_key(path: Path) -> str:
@@ -235,7 +238,10 @@ def _id_to_dir(object_id: str) -> Path | None:
 def _id_to_live(object_id: str) -> tuple[Path, str] | None:
     mode = "green"
     prefix = LIVE_PREFIX
-    if object_id.startswith(TWO_DVR_LIVE_ITEM_PREFIX):
+    if object_id.startswith(RM_LIVE_ITEM_PREFIX):
+        mode = "rm"
+        prefix = RM_LIVE_ITEM_PREFIX
+    elif object_id.startswith(TWO_DVR_LIVE_ITEM_PREFIX):
         mode = "two_dvr"
         prefix = TWO_DVR_LIVE_ITEM_PREFIX
     elif object_id.startswith(ALPHA_LIVE_ITEM_PREFIX):
@@ -243,6 +249,9 @@ def _id_to_live(object_id: str) -> tuple[Path, str] | None:
         prefix = ALPHA_LIVE_ITEM_PREFIX
     elif object_id.startswith(LIVE_ITEM_PREFIX):
         prefix = LIVE_ITEM_PREFIX
+    elif object_id.startswith(RM_LIVE_PREFIX):
+        mode = "rm"
+        prefix = RM_LIVE_PREFIX
     elif object_id.startswith(TWO_DVR_LIVE_PREFIX):
         mode = "two_dvr"
         prefix = TWO_DVR_LIVE_PREFIX
@@ -427,7 +436,7 @@ def _id_to_si_point(object_id: str) -> tuple[Path, int, str] | None:
 
 
 def _parent_id_for_dir(path: Path) -> str:
-    path = path.resolve()
+    path = safe_resolve_path(path)
     if MEDIA_LIBRARY.multi_root:
         for root in MEDIA_LIBRARY.roots:
             if path == root.path:
@@ -449,7 +458,9 @@ def _video_item_count(path: Path, child: IndexedChild | None = None) -> int:
         return 1 + si_items
     passthrough_modes = len(_passthrough_modes())
     seek_items = passthrough_modes if _seek_passthrough_dlna_enabled() else 0
-    return 1 + si_items + passthrough_modes + seek_items
+    width, height = _indexed_video_dimensions(child)
+    rm_items = 1 if _rm_dlna_enabled(path, width, height) else 0
+    return 1 + si_items + rm_items + passthrough_modes + seek_items
 
 
 def _marked_original_title(path: Path, child: IndexedChild | None = None) -> str:
@@ -858,12 +869,16 @@ def _passthrough_seek_title(path: Path, mode: str, width: int = 0, height: int =
 
 
 def _passthrough_live_prefix(mode: str) -> str:
+    if mode == "rm":
+        return RM_LIVE_PREFIX
     if mode == "two_dvr":
         return TWO_DVR_LIVE_PREFIX
     return ALPHA_LIVE_PREFIX if mode == "alpha" else LIVE_PREFIX
 
 
 def _passthrough_live_item_prefix(mode: str) -> str:
+    if mode == "rm":
+        return RM_LIVE_ITEM_PREFIX
     if mode == "two_dvr":
         return TWO_DVR_LIVE_ITEM_PREFIX
     return ALPHA_LIVE_ITEM_PREFIX if mode == "alpha" else LIVE_ITEM_PREFIX
@@ -875,7 +890,7 @@ def _passthrough_seek_item_prefix(mode: str) -> str:
 
 def _passthrough_live_query(mode: str) -> str:
     version = f"ptv={_DIDL_SCHEMA_VERSION}"
-    if mode in {"green", "alpha", "two_dvr"}:
+    if mode in {"green", "alpha", "two_dvr", "rm"}:
         return f"mode={mode}&{version}"
     return version
 
@@ -962,6 +977,12 @@ def _is_two_d_source(path: Path, width: int = 0, height: int = 0) -> bool:
         not has_vr_filename_marker(path.stem)
         and not is_half_equirectangular_source(width, height)
     )
+
+
+def _rm_dlna_enabled(path: Path, width: int = 0, height: int = 0) -> bool:
+    """A [RM] live entry is offered for 2D sources when mosaic restoration is on.
+    2:1 half-equirectangular VR sources are excluded (handled by _is_two_d_source)."""
+    return bool(get_rm().enabled) and _is_two_d_source(path, width, height)
 
 
 def _live_chapter_offsets(duration: float) -> list[int]:
@@ -1129,6 +1150,17 @@ def _video_items_from_index(
     ):
         return items
 
+    if _rm_dlna_enabled(path, width, height):
+        items.append(
+            {
+                "container": True,
+                "id": f"{RM_LIVE_PREFIX}{_versioned_rel(rel)}",
+                "parent_id": parent_id,
+                "title": _prefixed_live_directory_title(path, "rm", width, height),
+                "child_count": len(_live_chapter_offsets(duration)) + 1,
+            }
+        )
+
     estimate_codec = PYNV_OUTPUT_CODEC
     if duration > 0:
         pt_size, pt_bps_est, _ = estimate_for_media(path, duration, estimate_codec)
@@ -1291,6 +1323,8 @@ def _live_time_index_items(
         or width > 4096
     ):
         return []
+    if mode == "rm" and not _rm_dlna_enabled(path, width, height):
+        return []
 
     virtual_title = _passthrough_virtual_title(path, mode, width, height)
     force_hours = _live_time_force_hours(duration)
@@ -1432,6 +1466,8 @@ def _live_chapter_items(
         or width > 4096
     ):
         return []
+    if mode == "rm" and not _rm_dlna_enabled(path, width, height):
+        return []
     pt_bps = _parse_bitrate(PASSTHROUGH_BITRATE)
     if duration > 0:
         _, pt_bps_est, _ = estimate_for_media(path, duration, PYNV_OUTPUT_CODEC)
@@ -1439,7 +1475,7 @@ def _live_chapter_items(
         pt_bps_est = pt_bps
     items: list[dict] = []
     virtual_title = _passthrough_virtual_title(path, mode, width, height)
-    suffix = {"alpha": "a", "two_dvr": "3"}.get(mode, "g")
+    suffix = {"alpha": "a", "two_dvr": "3", "rm": "r"}.get(mode, "g")
     live_route_suffix = _live_route_hint_suffix(client_profile)
     live_omit_filelike_attrs = not _is_deovr_cds_client(client_profile)
     items.append(_live_time_index_root_item(path, mode, parent_id, duration, width, height, language))
@@ -1472,7 +1508,7 @@ def _live_chapter_items(
 
 
 def _children_for_dir(directory: Path, client_profile: str | None = None) -> list[dict]:
-    directory = directory.resolve()
+    directory = safe_resolve_path(directory)
     parent_id = _folder_id(directory)
     items: list[dict] = []
     try:
@@ -1708,7 +1744,7 @@ def _metadata_didl_for_dir(directory: Path) -> str:
             "<upnp:class>object.container.storageFolder</upnp:class>"
             "</container></DIDL-Lite>"
         )
-    directory = (directory or _root()).resolve()
+    directory = safe_resolve_path(directory or _root())
     title = "PT Videos" if directory == _root() and not MEDIA_LIBRARY.multi_root else _rel_key(directory).split("/", 1)[0] if MEDIA_LIBRARY.multi_root and directory in [root.path for root in MEDIA_LIBRARY.roots] else directory.name
     return (
         f'<DIDL-Lite xmlns="{DIDL_NS}" '

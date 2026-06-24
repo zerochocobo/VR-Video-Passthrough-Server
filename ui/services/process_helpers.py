@@ -40,6 +40,13 @@ def two_dvr_command() -> tuple[str, list[str]]:
     return python_executable(), [str(ROOT / "offline" / "two_dvr.py")]
 
 
+def rm_offline_command() -> tuple[str, list[str]]:
+    if getattr(sys, "frozen", False):
+        server, args = server_command()
+        return server, [*args, "rm_offline"]
+    return python_executable(), [str(ROOT / "offline" / "demosaic_offline.py")]
+
+
 def trt_warmup_command() -> tuple[str, list[str]]:
     if getattr(sys, "frozen", False):
         server, args = server_command()

@@ -844,6 +844,12 @@ class HomePage(QWidget):
         self.si_mix_settings_button = QPushButton()
         self.si_mix_settings_button.setFixedWidth(94)
         self.si_mix_help = _icon_button(_question_icon())
+        self.rm_enabled = QCheckBox()
+        self.rm_enabled.setChecked(bool(settings.data.get("rm_enabled", DEFAULTS["rm_enabled"])))
+        _apply_switch_style(self.rm_enabled)
+        self.rm_enabled_label = QLabel()
+        self.rm_offline_button = QPushButton()
+        self.rm_offline_button.setFixedWidth(94)
         self.light_match_preset = QComboBox()
         for key in ("home_warm", "daylight", "night_cool", "custom"):
             self.light_match_preset.addItem("", key)
@@ -933,6 +939,15 @@ class HomePage(QWidget):
         si_row.addStretch(1)
         si_row.addWidget(self.si_mix_settings_button)
         si_row.addWidget(self.si_mix_help)
+        self.rm_row_widget = QWidget()
+        self.rm_row_widget.setFixedHeight(CONFIG_ROW_HEIGHT)
+        rm_row = QHBoxLayout(self.rm_row_widget)
+        rm_row.setContentsMargins(0, 0, 0, 0)
+        rm_row.addWidget(self.rm_enabled_label)
+        rm_row.addWidget(self.rm_enabled)
+        rm_row.addStretch(1)
+        rm_row.addWidget(self.rm_offline_button)
+        self.rm_row_widget.setVisible(False)
         log_row_widget = QWidget()
         log_row_widget.setFixedHeight(CONFIG_ROW_HEIGHT)
         log_row = QHBoxLayout(log_row_widget)
@@ -946,6 +961,7 @@ class HomePage(QWidget):
         log_row.addWidget(self.problem_help_button)
         light_content_layout.addWidget(light_enable_row_widget)
         light_content_layout.addWidget(si_row_widget)
+        light_content_layout.addWidget(self.rm_row_widget)
         light_content_layout.addWidget(log_row_widget)
         light_match_layout.addWidget(self.light_match_header)
         light_match_layout.addWidget(self.light_match_content)
@@ -1026,6 +1042,7 @@ class HomePage(QWidget):
         self.si_mix_enabled.toggled.connect(self._save_si_mix)
         self.si_mix_settings_button.clicked.connect(self.show_si_mix_settings)
         self.si_mix_help.clicked.connect(self.show_si_mix_help)
+        self.rm_enabled.toggled.connect(self._save_rm)
         self.performance_fps_help.clicked.connect(self._show_fps_help)
         self.config_header.toggled.connect(self._toggle_quick_config)
         self.performance_header.toggled.connect(self._toggle_performance_config)
@@ -1191,6 +1208,32 @@ class HomePage(QWidget):
                 pass
 
         threading.Thread(target=worker, name="si-mix-live-update", daemon=True).start()
+
+    def _save_rm(self) -> None:
+        self.settings.data["rm_enabled"] = self.rm_enabled.isChecked()
+        self.settings.save()
+        self._send_rm_live_update()
+
+    def _send_rm_live_update(self) -> None:
+        payload = {"enabled": bool(self.rm_enabled.isChecked())}
+        port = str(os.environ.get("PT_HTTP_PORT") or "8200").strip() or "8200"
+        url = f"http://127.0.0.1:{port}/control/rm"
+
+        def worker() -> None:
+            try:
+                data = json.dumps(payload).encode("utf-8")
+                request = urllib.request.Request(
+                    url,
+                    data=data,
+                    method="PUT",
+                    headers={"Content-Type": "application/json"},
+                )
+                with urllib.request.urlopen(request, timeout=0.35) as response:
+                    response.read(2048)
+            except Exception:
+                pass
+
+        threading.Thread(target=worker, name="rm-live-update", daemon=True).start()
 
     def _preset_light_match(self) -> None:
         preset = str(self.light_match_preset.currentData() or LIGHT_MATCH_DEFAULT_PRESET)
@@ -1484,6 +1527,9 @@ class HomePage(QWidget):
         self.si_mix_enabled_label.setText(self.i18n.t("si.enabled"))
         self.si_mix_settings_button.setText(self.i18n.t("si.audio_settings"))
         self.si_mix_help.setToolTip(self.i18n.t("si.help_title"))
+        self.rm_enabled.setText("")
+        self.rm_enabled_label.setText(self.i18n.t("rm.enabled"))
+        self.rm_offline_button.setText(self.i18n.t("rm.offline_generate"))
         self.performance_fps.setItemText(0, self.i18n.t("performance.output_fps_unlimited"))
         for i, key in enumerate(("quality_speed.ultrafast", "quality_speed.medium")):
             self.performance_quality.setItemText(i, self.i18n.t(key))

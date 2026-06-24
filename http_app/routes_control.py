@@ -3,7 +3,14 @@ from __future__ import annotations
 
 from fastapi import APIRouter, HTTPException, Request
 
-from utils.runtime_settings import get_light_match, get_si_mix, set_light_match, set_si_mix
+from utils.runtime_settings import (
+    get_light_match,
+    get_rm,
+    get_si_mix,
+    set_light_match,
+    set_rm,
+    set_si_mix,
+)
 from utils.logger import get
 
 
@@ -98,6 +105,52 @@ async def put_si_mix_control(request: Request):
             clear_dir_items_cache()
         except Exception as exc:
             log.warning("si_mix DLNA cache clear failed: %s", exc)
+    result = payload.to_dict()
+    result["ok"] = True
+    return result
+
+
+@router.get("/control/rm")
+async def get_rm_control(request: Request):
+    if not _is_local_request(request):
+        raise HTTPException(status_code=403, detail="local control only")
+    payload = get_rm().to_dict()
+    payload["ok"] = True
+    return payload
+
+
+@router.put("/control/rm")
+async def put_rm_control(request: Request):
+    if not _is_local_request(request):
+        raise HTTPException(status_code=403, detail="local control only")
+    try:
+        data = await request.json()
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail="invalid json") from exc
+    if not isinstance(data, dict):
+        raise HTTPException(status_code=400, detail="json object required")
+    unknown = sorted(str(key) for key in data.keys() if str(key) != "enabled")
+    if unknown:
+        log.warning("rm control ignored unknown keys: %s", ", ".join(unknown))
+    before = get_rm()
+    payload = set_rm(data)
+    if payload.version != before.version:
+        try:
+            from dlna.content_directory import clear_dir_items_cache
+
+            clear_dir_items_cache()
+        except Exception as exc:
+            log.warning("rm DLNA cache clear failed: %s", exc)
+        if payload.enabled:
+            # Prime the TensorRT engine cache in the background so the first
+            # [RM] playback after enabling at runtime doesn't pay the (slow)
+            # first-time TRT build on the stream path. Non-blocking.
+            try:
+                from pipeline.demosaic import prewarm_rm_async
+
+                prewarm_rm_async(log=lambda m: log.info("%s", m))
+            except Exception as exc:
+                log.warning("rm background warmup trigger failed: %s", exc)
     result = payload.to_dict()
     result["ok"] = True
     return result

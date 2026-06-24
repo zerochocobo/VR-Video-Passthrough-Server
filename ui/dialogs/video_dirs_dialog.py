@@ -6,6 +6,7 @@ from PySide6.QtWidgets import (
     QDialog,
     QFileDialog,
     QHBoxLayout,
+    QLabel,
     QListWidget,
     QPushButton,
     QVBoxLayout,
@@ -17,6 +18,9 @@ class VideoDirsDialog(QDialog):
         super().__init__(parent)
         self.i18n = i18n
         self.setModal(True)
+        self.note_label = QLabel()
+        self.note_label.setWordWrap(True)
+        self.note_label.setStyleSheet("color: #5f6368; font-size: 8.5pt;")
         self.list_widget = QListWidget()
         for directory in directories:
             if directory.strip():
@@ -45,8 +49,9 @@ class VideoDirsDialog(QDialog):
         layout = QVBoxLayout(self)
         layout.addWidget(self.list_widget)
         layout.addLayout(action_row)
+        layout.addWidget(self.note_label)
         layout.addLayout(bottom_row)
-        self.resize(520, 320)
+        self.resize(520, 360)
         self.retranslate()
 
     def directories(self) -> list[str]:
@@ -75,6 +80,7 @@ class VideoDirsDialog(QDialog):
 
     def retranslate(self) -> None:
         self.setWindowTitle(self.i18n.t("video_dirs.dialog_title"))
+        self.note_label.setText(self.i18n.t("video_dirs.mount_timeout_note"))
         self.add_button.setText(self.i18n.t("button.add"))
         self.remove_button.setText(self.i18n.t("button.remove"))
         self.save_button.setText(self.i18n.t("button.save"))

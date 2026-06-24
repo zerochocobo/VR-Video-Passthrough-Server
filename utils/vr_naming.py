@@ -100,6 +100,8 @@ def live_passthrough_title(stem_or_name: str, mode: str, width: int = 0, height:
         return f"{alpha_passthrough_stem(stem_or_name)}_live"
     if mode == "two_dvr":
         return f"[2D>3D]{two_dvr_stem(stem_or_name)}_live"
+    if mode == "rm":
+        return f"[RM]{_as_stem(stem_or_name)}_live"
     return f"{green_passthrough_stem(stem_or_name, width, height)}_live"
 
 

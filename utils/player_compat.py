@@ -195,6 +195,8 @@ def live_response_profile_from_ua(user_agent: str, default_profile: str = "vlc")
         return "avpro"
     if "libmpv" in ua or "skybox" in ua:
         return "libmpv"
+    if "4xvr" in ua:
+        return "4xvr"
     if "heresphere" in ua:
         return "4xvr"
     if "dalvik/" in ua:
@@ -267,6 +269,9 @@ def match_profile(user_agent: str, default_profile: str = "vlc") -> ProfileMatch
         confidence = 0.9
     elif "libmpv" in ua or "skybox" in ua:
         rules.append("ua_contains_libmpv_or_skybox")
+        confidence = 0.9
+    elif "4xvr" in ua:
+        rules.append("ua_contains_4xvr")
         confidence = 0.9
     elif "heresphere" in ua:
         rules.append("ua_contains_heresphere")

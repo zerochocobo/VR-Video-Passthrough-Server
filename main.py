@@ -153,14 +153,14 @@ def _warmup_da3_trt_if_needed(log, *, step_total: int, provider_kind: str) -> No
         step="da3_trt_warmup",
         step_index=max(0, step_total - 1),
         step_total=step_total,
-        progress=0.92,
+        progress=0.90,
         provider_kind=provider_kind,
         detail=variant,
     )
     start_heartbeat(
         eta_sec=30.0 if cache_present else 120.0,
-        baseline_progress=0.92,
-        ceiling_progress=0.96,
+        baseline_progress=0.90,
+        ceiling_progress=0.93,
     )
     try:
         path = default_model_path(variant)
@@ -174,7 +174,7 @@ def _warmup_da3_trt_if_needed(log, *, step_total: int, provider_kind: str) -> No
             step="da3_trt_warmup",
             step_index=max(0, step_total - 1),
             step_total=step_total,
-            progress=0.96,
+            progress=0.93,
             provider_kind=provider_kind,
             detail=variant,
             monotonic_progress=True,
@@ -211,13 +211,74 @@ def _warmup_da3_trt_nonfatal(log, *, step_total: int, provider_kind: str) -> Non
             step="da3_trt_warning",
             step_index=max(0, step_total - 1),
             step_total=step_total,
-            progress=0.94,
+            progress=0.93,
             detail=str(e),
             provider_kind=provider_kind,
             monotonic_progress=True,
         )
         log.warning(
             "DA3 TensorRT startup warmup failed; continuing without prewarmed 2D->3D engine: %s",
+            e,
+            exc_info=True,
+        )
+
+
+def _warmup_rm_trt_if_needed(log, *, step_total: int, provider_kind: str) -> None:
+    from utils.runtime_settings import get_rm
+
+    if not get_rm().enabled:
+        return
+    try:
+        import onnxruntime as ort
+    except Exception as exc:
+        log.warning("RM TensorRT startup warmup skipped: onnxruntime unavailable: %s", exc)
+        return
+    if "TensorrtExecutionProvider" not in set(ort.get_available_providers()):
+        log.warning("RM TensorRT startup warmup skipped: TensorRT EP unavailable")
+        return
+    from pipeline.demosaic import get_shared_engines, models_available, rm_trt_cached
+
+    if not models_available():
+        log.warning("RM TensorRT startup warmup skipped: demosaic models not found")
+        return
+    cache_present = rm_trt_cached()
+    message = "warming mosaic restoration engines" if cache_present else "building mosaic restoration TensorRT cache"
+    set_startup_phase(
+        "warming",
+        message,
+        step="rm_trt_warmup",
+        step_index=max(0, step_total - 1),
+        step_total=step_total,
+        progress=0.93,
+        provider_kind=provider_kind,
+        detail="demosaic",
+    )
+    start_heartbeat(
+        eta_sec=30.0 if cache_present else 180.0,
+        baseline_progress=0.93,
+        ceiling_progress=0.96,
+    )
+    try:
+        t0 = time.perf_counter()
+        log.info("RM TensorRT startup warmup begin: cache_present=%s", cache_present)
+        engines = get_shared_engines(provider="trt", log=lambda msg: log.info("%s", msg))
+        log.info(
+            "RM TensorRT startup warmup ready: detector_provider=%s elapsed=%.1fs cached=%s",
+            engines.detector.providers[0] if engines.detector.providers else "unknown",
+            time.perf_counter() - t0,
+            rm_trt_cached(),
+        )
+    finally:
+        stop_heartbeat()
+
+
+def _warmup_rm_trt_nonfatal(log, *, step_total: int, provider_kind: str) -> None:
+    try:
+        _warmup_rm_trt_if_needed(log, step_total=step_total, provider_kind=provider_kind)
+    except Exception as e:
+        stop_heartbeat()
+        log.warning(
+            "RM TensorRT startup warmup failed; continuing without prewarmed engines: %s",
             e,
             exc_info=True,
         )
@@ -287,6 +348,11 @@ def main(argv: list[str] | None = None) -> int:
         from offline.two_dvr import main as two_dvr_main
 
         return two_dvr_main(argv[1:])
+    if argv and argv[0] == "rm_offline":
+        _force_line_buffered_stdio()
+        from offline.demosaic_offline import main as rm_offline_main
+
+        return rm_offline_main(argv[1:])
     if argv and argv[0] == "trt_warmup":
         _force_line_buffered_stdio()
         from ui.services.trt_warmup_process import main as trt_warmup_main
@@ -510,6 +576,7 @@ def main(argv: list[str] | None = None) -> int:
         )
         log.info("startup GPU warmup disabled")
     _warmup_da3_trt_nonfatal(log, step_total=startup_step_total, provider_kind=provider_kind)
+    _warmup_rm_trt_nonfatal(log, step_total=startup_step_total, provider_kind=provider_kind)
     if nvenc_step_enabled:
         set_startup_phase(
             "warming",

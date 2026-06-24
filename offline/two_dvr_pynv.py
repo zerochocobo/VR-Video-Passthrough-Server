@@ -135,6 +135,54 @@ extern "C" __global__ void nv12_to_rgb_letterbox(
     rgb[o+2]=(unsigned char)fminf(fmaxf(B,0.f),255.f);
 }
 
+// 10-bit P016/P010 (uint16 Y + interleaved uint16 UV) -> 8-bit RGB. The 10-bit
+// sample sits in the high bits of the 16-bit container, so a right shift (8 for
+// NVIDIA P016) brings it to 8-bit before the same BT.709 limited-range YUV->RGB
+// used by nv12_to_rgb. Used for SDR 10-bit sources.
+extern "C" __global__ void p016_to_rgb(
+    const unsigned short* Y, const unsigned short* UV, unsigned char* rgb,
+    int W, int H, int shift)
+{
+    int x = blockIdx.x*blockDim.x + threadIdx.x;
+    int y = blockIdx.y*blockDim.y + threadIdx.y;
+    if (x>=W || y>=H) return;
+    float c = (float)((int)Y[(long)y*W+x] >> shift) - 16.0f;
+    int cy=y>>1, cx=(x>>1)<<1;
+    float du = (float)((int)UV[(long)cy*W+cx]   >> shift) - 128.0f;
+    float dv = (float)((int)UV[(long)cy*W+cx+1] >> shift) - 128.0f;
+    float R = 1.16438356f*c + 1.79274107f*dv;
+    float G = 1.16438356f*c - 0.21324861f*du - 0.53290933f*dv;
+    float B = 1.16438356f*c + 2.11240179f*du;
+    long o=((long)y*W+x)*3;
+    rgb[o+0]=(unsigned char)fminf(fmaxf(R,0.f),255.f);
+    rgb[o+1]=(unsigned char)fminf(fmaxf(G,0.f),255.f);
+    rgb[o+2]=(unsigned char)fminf(fmaxf(B,0.f),255.f);
+}
+
+// 10-bit P016/P010 letterbox into a square (size x size) RGB canvas (DA3 depth).
+extern "C" __global__ void p016_to_rgb_letterbox(
+    const unsigned short* Y, const unsigned short* UV, unsigned char* rgb,
+    int W, int H, int size, int x0, int y0, int nw, int nh, int shift)
+{
+    int ox = blockIdx.x*blockDim.x + threadIdx.x;
+    int oy = blockIdx.y*blockDim.y + threadIdx.y;
+    if (ox>=size || oy>=size) return;
+    long o=((long)oy*size+ox)*3;
+    if (ox<x0 || ox>=x0+nw || oy<y0 || oy>=y0+nh){ rgb[o]=0; rgb[o+1]=0; rgb[o+2]=0; return; }
+    float sx = (float)(ox-x0)*(float)W/(float)nw;
+    float sy = (float)(oy-y0)*(float)H/(float)nh;
+    int xi=min((int)sx,W-1), yi=min((int)sy,H-1);
+    float c = (float)((int)Y[(long)yi*W+xi] >> shift) - 16.0f;
+    int cy=yi>>1, cx=(xi>>1)<<1;
+    float du=(float)((int)UV[(long)cy*W+cx] >> shift)-128.0f, dv=(float)((int)UV[(long)cy*W+cx+1] >> shift)-128.0f;
+    float R=1.16438356f*c+1.79274107f*dv;
+    float G=1.16438356f*c-0.21324861f*du-0.53290933f*dv;
+    float B=1.16438356f*c+2.11240179f*du;
+    rgb[o+0]=(unsigned char)fminf(fmaxf(R,0.f),255.f);
+    rgb[o+1]=(unsigned char)fminf(fmaxf(G,0.f),255.f);
+    rgb[o+2]=(unsigned char)fminf(fmaxf(B,0.f),255.f);
+}
+
 // Pack RGB (H,W,3) into NV12 (Y on top H rows, interleaved UV on H/2 rows).
 extern "C" __global__ void rgb_to_nv12(
     const unsigned char* rgb, unsigned char* nv12, int W, int H)
@@ -209,7 +257,8 @@ def convert_clip_pynv(src: Path, out: Path, engine: Da3DepthEngine, args,
                       start: float, duration: float, log=print) -> int:
     import cupy as cp
     import PyNvVideoCodec as nvc
-    from pipeline.pynv_io import GpuNv12AppFrame, PyNvThreadedSerialDecoder
+    from pipeline.pynv_io import GpuNv12AppFrame, GpuP016Frame, PyNvThreadedSerialDecoder
+    from utils.video_metadata import probe_video_metadata
 
     if not engine.folded:
         raise RuntimeError("pynv pipeline requires the folded-preprocess DA3 model")
@@ -217,11 +266,19 @@ def convert_clip_pynv(src: Path, out: Path, engine: Da3DepthEngine, args,
     mod = cp.RawModule(code=_NV12_RGB_KERNELS)
     k_to_rgb = mod.get_function("nv12_to_rgb")
     k_lb = mod.get_function("nv12_to_rgb_letterbox")
+    k_p016_to_rgb = mod.get_function("p016_to_rgb")
+    k_p016_lb = mod.get_function("p016_to_rgb_letterbox")
     k_to_nv12 = mod.get_function("rgb_to_nv12")
 
     from pipeline.pynv_io import PyNvSimpleDecoder
 
-    sp = PyNvSimpleDecoder(src)
+    try:
+        _meta = probe_video_metadata(src)
+        bit_depth = int(_meta.codec.bit_depth if _meta.codec and _meta.codec.bit_depth > 0 else 8)
+    except Exception:
+        bit_depth = 8
+    shift_bits = int(config.PASSTHROUGH_PYNV_10BIT_SHIFT)
+    sp = PyNvSimpleDecoder(src, bit_depth=bit_depth)
     info_obj = sp.info
     W, H, fps, total_frames = sp.info.width, sp.info.height, sp.info.fps, len(sp)
     sp.stop()
@@ -292,7 +349,7 @@ def convert_clip_pynv(src: Path, out: Path, engine: Da3DepthEngine, args,
         f"motion_step_px={temporal_kwargs['temporal_motion_max_step_px']:.2f} model={args.model} "
         f"depth={engine.providers[0]} pipeline=pynv-gpu")
 
-    dec = PyNvThreadedSerialDecoder(src, start_frame=start_frame, info=info_obj, num_frames=total_frames)
+    dec = PyNvThreadedSerialDecoder(src, bit_depth=bit_depth, start_frame=start_frame, info=info_obj, num_frames=total_frames)
     from utils.bitrate_estimator import parse_bitrate, projection_capped_bitrate
     eff_bitrate = projection_capped_bitrate(
         args.bitrate, src, args.projection,
@@ -332,11 +389,18 @@ def convert_clip_pynv(src: Path, out: Path, engine: Da3DepthEngine, args,
     try:
         for idx in range(start_frame, start_frame + n_frames):
             frame = dec.frame_at(idx).owned_copy()
-            y_g = frame.y.as_cupy(cp.uint8).reshape(H, W)
-            uv_g = frame.uv.as_cupy(cp.uint8).reshape(H // 2, W)
-            # depth: NV12 -> 518 letterbox RGB -> ORT (small host round-trip)
-            k_lb(grid_lb, bx, (y_g, uv_g, canvas_g, np.int32(W), np.int32(H), np.int32(da3_size),
-                               np.int32(x0), np.int32(y0), np.int32(nw), np.int32(nh)))
+            is_p016 = isinstance(frame, GpuP016Frame)
+            if is_p016:                                  # 10-bit -> 8-bit RGB
+                y_g = frame.y.as_cupy(cp.uint16).reshape(H, W)
+                uv_g = frame.uv.as_cupy(cp.uint16).reshape(H // 2, W)
+                k_p016_lb(grid_lb, bx, (y_g, uv_g, canvas_g, np.int32(W), np.int32(H), np.int32(da3_size),
+                                        np.int32(x0), np.int32(y0), np.int32(nw), np.int32(nh), np.int32(shift_bits)))
+            else:
+                y_g = frame.y.as_cupy(cp.uint8).reshape(H, W)
+                uv_g = frame.uv.as_cupy(cp.uint8).reshape(H // 2, W)
+                # depth: NV12 -> 518 letterbox RGB -> ORT (small host round-trip)
+                k_lb(grid_lb, bx, (y_g, uv_g, canvas_g, np.int32(W), np.int32(H), np.int32(da3_size),
+                                   np.int32(x0), np.int32(y0), np.int32(nw), np.int32(nh)))
             canvas = canvas_g.get()[None]  # (1,518,518,3) uint8
             # scene-cut reset before normalization so the new shot re-seeds the
             # depth band (the symmetric window's residual mask handles the base).
@@ -347,8 +411,11 @@ def convert_clip_pynv(src: Path, out: Path, engine: Da3DepthEngine, args,
                 depth[y0:y0 + nh, x0:x0 + nw],
                 canvas_g[y0:y0 + nh, x0:x0 + nw],
             )
-            # full-res NV12 -> RGB, then GPU stereo warp -> SBS RGB
-            k_to_rgb(grid, bx, (y_g, uv_g, rgb_g, np.int32(W), np.int32(H)))
+            # full-res (NV12 or P016) -> RGB, then GPU stereo warp -> SBS RGB
+            if is_p016:
+                k_p016_to_rgb(grid, bx, (y_g, uv_g, rgb_g, np.int32(W), np.int32(H), np.int32(shift_bits)))
+            else:
+                k_to_rgb(grid, bx, (y_g, uv_g, rgb_g, np.int32(W), np.int32(H)))
             if window is None:
                 _encode_pair(near_g, rgb_g)
             else:

@@ -5,6 +5,7 @@ import json
 from pathlib import Path
 
 import config
+from media_library import safe_resolve_path
 
 
 SUBTITLE_MIME_BY_SUFFIX = {
@@ -79,7 +80,7 @@ def find_external_subtitles(video_path: Path) -> list[SubtitleTrack]:
         candidates.extend(sorted(parent.glob(f"{stem}.*{suffix}")))
         for path in candidates:
             try:
-                resolved = path.resolve()
+                resolved = safe_resolve_path(path)
             except Exception:
                 continue
             key = str(resolved).casefold()

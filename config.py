@@ -976,6 +976,22 @@ SI_MIX_DICT = {
     "duck_original": SI_DUCK_ORIGINAL,
 }
 
+# ---- Realtime mosaic restoration (RM) ----
+# PT_RM_ENABLED:
+#   Exposes virtual [RM] live items in DLNA for 2D source videos. The mosaic
+#   detector + restoration ONNX models (models/demosaic/) run on the GPU NV12
+#   decode path. Default off; runtime changes handled by /control/rm.
+RM_ENABLED = str(_env("RM_ENABLED", "0")).lower() in {"1", "true", "yes", "on"}
+# PT_RM_CONF:
+#   Detector confidence threshold for mosaic regions.
+RM_CONF = float(_env("RM_CONF", "0.25"))
+# PT_RM_DETECT_INTERVAL:
+#   Run the (expensive) mosaic detector every N frames; between detections the
+#   previous frame's boxes + masks are reused while restoration still runs on the
+#   fresh temporal window. 1 = detect every frame. Higher = faster, but a box
+#   lags for up to N-1 frames on fast motion.
+RM_DETECT_INTERVAL = max(1, int(_env("RM_DETECT_INTERVAL", "2")))
+
 
 # ---- Passthrough encoding and DLNA behavior ----
 # PT_CONTAINER:

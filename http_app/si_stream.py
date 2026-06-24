@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from media_library import safe_resolve_path
 from pipeline.ffmpeg_io import FFMPEG, probe_cached
 from utils.logger import get
 from utils.runtime_settings import SIMixRuntime, get_si_mix
@@ -244,7 +245,7 @@ class SIStreamService:
         return sibling if sibling.is_file() else None
 
     def estimate_output_size(self, video: Path) -> int:
-        video = Path(video).resolve()
+        video = safe_resolve_path(Path(video))
         try:
             stat = video.stat()
             mtime_ns = int(stat.st_mtime_ns)
@@ -282,7 +283,7 @@ class SIStreamService:
         return ratio * duration
 
     def _session_key(self, video: Path, client_id: str | None = None) -> str:
-        base = str(Path(video).resolve())
+        base = str(safe_resolve_path(Path(video)))
         normalized_client = str(client_id or "").strip()
         return f"{base}\0{normalized_client}" if normalized_client else base
 
@@ -400,7 +401,7 @@ class SIStreamService:
         client_id: str | None = None,
         chunk_size: int = DEFAULT_CHUNK_SIZE,
     ) -> SIStreamOpenResult:
-        video = Path(video).resolve()
+        video = safe_resolve_path(Path(video))
         config = self.current_config()
         if not config.enabled:
             raise FileNotFoundError("SI streaming is disabled")

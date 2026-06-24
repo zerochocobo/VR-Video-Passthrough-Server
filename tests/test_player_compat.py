@@ -24,6 +24,7 @@ class PlayerCompatProfileTests(unittest.TestCase):
             ("AVProMobileVideo/2.0", "avpro"),
             ("ExoPlayerLib/2.18", "avpro"),
             ("Mozilla/5.0 SkyboxVR libmpv", "libmpv"),
+            ("Vision4XVR/2 CFNetwork/3860.600.12 Darwin/25.5.0", "4xvr"),
             ("Dalvik/2.1.0 (Linux; U; Android 12; Quest 3)", "4xvr"),
             ("com.heresphere.vrvideoplayerdemo/29 (Linux; U; Android 14; Quest 3; Cronet/95.0)", "4xvr"),
             ("VLC/3.0 LibVLC/3.0", "vlc"),

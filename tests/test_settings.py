@@ -52,6 +52,24 @@ class SettingsTests(unittest.TestCase):
         self.assertEqual(env["PT_DLNA_IMAGE_ENABLED"], "0")
         self.assertEqual(env["PT_DECODE_MAX_SIDE"], "4096")
         self.assertEqual(env["PT_LIGHT_MATCH_PRESET"], "daylight")
+        self.assertEqual(env["PT_RM_ENABLED"], "0")
+
+    def test_legacy_enabled_rm_migrates_off(self) -> None:
+        root = Path("runtime_cache/test_ui_settings_rm_migration")
+        root.mkdir(parents=True, exist_ok=True)
+        self.addCleanup(lambda: shutil.rmtree(root, ignore_errors=True))
+        settings_path = root / "ui_settings.json"
+        meta_path = root / "ui_settings_meta.json"
+        settings_path.write_text('{"rm_enabled": true}', encoding="utf-8")
+
+        with (
+            patch.object(settings_module, "SETTINGS_PATH", settings_path),
+            patch.object(settings_module, "SETTINGS_META_PATH", meta_path),
+        ):
+            s = settings_module.Settings()
+
+        self.assertFalse(s.data["rm_enabled"])
+        self.assertEqual(s.server_env()["PT_RM_ENABLED"], "0")
 
     def test_server_env_can_enable_seekable_passthrough_for_ui_start(self) -> None:
         s = self._settings()

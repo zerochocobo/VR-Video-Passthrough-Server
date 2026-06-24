@@ -61,6 +61,17 @@ class SIMixRuntime:
         return asdict(self)
 
 
+@dataclass(frozen=True)
+class RmRuntime:
+    """Realtime mosaic-restoration toggle. ``version`` bumps on every change so
+    the DLNA SystemUpdateID refreshes and clients re-Browse."""
+    enabled: bool
+    version: int = 0
+
+    def to_dict(self) -> dict:
+        return asdict(self)
+
+
 _lock = threading.RLock()
 _light_match_state = LightMatchRuntime(
     **normalize_light_match_params(config.LIGHT_MATCH_DICT).__dict__,
@@ -70,6 +81,7 @@ _si_mix_state = SIMixRuntime(
     **normalize_si_mix_params(config.SI_MIX_DICT).to_dict(),
     version=0,
 )
+_rm_state = RmRuntime(enabled=bool(config.RM_ENABLED), version=0)
 
 
 def reset_for_test(data: dict | LightMatchParams | None = None) -> LightMatchRuntime:
@@ -116,3 +128,31 @@ def set_si_mix(data: dict | SIMixParams) -> SIMixRuntime:
             return _si_mix_state
         _si_mix_state = SIMixRuntime(**params.to_dict(), version=_si_mix_state.version + 1)
         return _si_mix_state
+
+
+def reset_rm_for_test(enabled: bool | None = None) -> RmRuntime:
+    global _rm_state
+    with _lock:
+        _rm_state = RmRuntime(
+            enabled=bool(config.RM_ENABLED if enabled is None else enabled),
+            version=0,
+        )
+        return _rm_state
+
+
+def get_rm() -> RmRuntime:
+    with _lock:
+        return _rm_state
+
+
+def set_rm(data: dict | bool) -> RmRuntime:
+    global _rm_state
+    if isinstance(data, dict):
+        enabled = bool(data.get("enabled", _rm_state.enabled))
+    else:
+        enabled = bool(data)
+    with _lock:
+        if enabled == _rm_state.enabled:
+            return _rm_state
+        _rm_state = RmRuntime(enabled=enabled, version=_rm_state.version + 1)
+        return _rm_state

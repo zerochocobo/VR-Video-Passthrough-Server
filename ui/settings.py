@@ -81,6 +81,7 @@ DEFAULTS = {
     "si_volume_percent": DEFAULT_SI_VOLUME_PERCENT,
     "si_delay_seconds": DEFAULT_SI_DELAY_SECONDS,
     "si_duck_original": DEFAULT_DUCK_ORIGINAL,
+    "rm_enabled": False,
     "alpha_2d_projection": "fisheye",
     "alpha_2d_distance_m": 4.0,
     "subtitle_enable": True,
@@ -205,6 +206,9 @@ class Settings:
                     if not self._migration_done("20260620_seek_dlna_default_off", loaded):
                         self.data["passthrough_seek_dlna"] = False
                         self._mark_migration_done("20260620_seek_dlna_default_off")
+                    if not self._migration_done("20260624_rm_default_off", loaded):
+                        self.data["rm_enabled"] = False
+                        self._mark_migration_done("20260624_rm_default_off")
             except Exception:
                 pass
 
@@ -273,6 +277,7 @@ class Settings:
             "PT_SI_VOLUME_PERCENT": str(_setting_value(self.data, "si_volume_percent", DEFAULTS["si_volume_percent"])),
             "PT_SI_DELAY_SECONDS": str(_setting_value(self.data, "si_delay_seconds", DEFAULTS["si_delay_seconds"])),
             "PT_SI_DUCK_ORIGINAL": "1" if self.data.get("si_duck_original", DEFAULTS["si_duck_original"]) else "0",
+            "PT_RM_ENABLED": "1" if self.data.get("rm_enabled", DEFAULTS["rm_enabled"]) else "0",
             "PT_ALPHA_2D_PROJECTION": str(self.data.get("alpha_2d_projection") or "fisheye"),
             "PT_ALPHA_2D_DISTANCE_M": str(_setting_value(self.data, "alpha_2d_distance_m", 4.0)),
             "PT_TWO_DVR_MODEL": str(DEFAULTS["two_dvr_live_model"]),

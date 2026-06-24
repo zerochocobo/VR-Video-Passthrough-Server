@@ -1,11 +1,12 @@
 ﻿from __future__ import annotations
 
+import os
 import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from media_library import MediaLibrary, build_media_roots, parse_video_dirs
+from media_library import MediaLibrary, build_media_roots, parse_video_dirs, safe_resolve_path
 from utils.media_index import MediaIndex
 
 
@@ -17,34 +18,49 @@ class MediaLibraryTests(unittest.TestCase):
         self.assertTrue(str(roots[0]).endswith("D:\\VR"))
         self.assertTrue(str(roots[1]).endswith("E:\\VR"))
 
-    def test_parse_skips_unusable_video_dir(self) -> None:
+    def test_safe_resolve_falls_back_for_virtual_drive_root(self) -> None:
         original_resolve = Path.resolve
 
         def fake_resolve(path: Path, *args, **kwargs) -> Path:
-            if str(path) == r"R:\PikPak":
+            if str(path) == "Y:\\":
                 raise OSError(1005, "bad rclone mount")
             return original_resolve(path, *args, **kwargs)
 
         with patch.object(Path, "resolve", autospec=True, side_effect=fake_resolve):
-            roots = parse_video_dirs(r"R:\PikPak|D:\VR", Path("videos"))
+            resolved = safe_resolve_path(Path("Y:\\"))
 
-        self.assertEqual(len(roots), 1)
-        self.assertTrue(str(roots[0]).endswith("D:\\VR"))
+        self.assertEqual(resolved, Path(os.path.abspath("Y:\\")))
 
-    def test_parse_falls_back_when_all_video_dirs_are_unusable(self) -> None:
-        default = Path("videos")
-        expected = default.resolve()
+    def test_parse_preserves_video_dir_when_resolve_fails(self) -> None:
         original_resolve = Path.resolve
 
         def fake_resolve(path: Path, *args, **kwargs) -> Path:
-            if str(path) == r"R:\PikPak":
+            if str(path) == "Y:\\":
                 raise OSError(1005, "bad rclone mount")
             return original_resolve(path, *args, **kwargs)
 
         with patch.object(Path, "resolve", autospec=True, side_effect=fake_resolve):
-            roots = parse_video_dirs(r"R:\PikPak", default)
+            roots = parse_video_dirs("Y:\\|D:\\VR", Path("videos"))
 
-        self.assertEqual(roots, [expected])
+        self.assertEqual(len(roots), 2)
+        self.assertEqual(roots[0], Path(os.path.abspath("Y:\\")))
+        self.assertTrue(str(roots[1]).endswith("D:\\VR"))
+
+    def test_virtual_drive_key_roundtrip_when_resolve_fails(self) -> None:
+        original_resolve = Path.resolve
+
+        def fake_resolve(path: Path, *args, **kwargs) -> Path:
+            if str(path).casefold().startswith("y:\\"):
+                raise OSError(1005, "bad rclone mount")
+            return original_resolve(path, *args, **kwargs)
+
+        with patch.object(Path, "resolve", autospec=True, side_effect=fake_resolve):
+            library = MediaLibrary(build_media_roots([Path("Y:\\")]))
+            video = Path(r"Y:\movie.mp4")
+
+            self.assertEqual(library.path_to_key(video), "movie.mp4")
+            self.assertEqual(library.key_to_path("movie.mp4"), Path(os.path.abspath(r"Y:\movie.mp4")))
+            self.assertTrue(library.contains(video))
 
     def test_duplicate_names_are_numbered(self) -> None:
         roots = build_media_roots([Path(r"D:\VR"), Path(r"E:\VR"), Path(r"F:\Movies")])

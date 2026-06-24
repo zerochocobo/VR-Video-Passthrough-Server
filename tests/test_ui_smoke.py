@@ -26,6 +26,27 @@ if hasattr(os, "add_dll_directory"):
 
 
 class UiSmokeTests(unittest.TestCase):
+    def test_video_dirs_dialog_has_mount_timeout_note(self) -> None:
+        from PySide6.QtWidgets import QApplication
+        from ui.dialogs.video_dirs_dialog import VideoDirsDialog
+        from ui.i18n import I18n
+
+        app = QApplication.instance() or QApplication([])
+        i18n = I18n("zh_CN")
+        dialog = VideoDirsDialog(i18n, ["Y:\\"])
+        try:
+            dialog.show()
+            app.processEvents()
+            self.assertEqual(dialog.note_label.text(), i18n.t("video_dirs.mount_timeout_note"))
+            self.assertTrue(dialog.note_label.wordWrap())
+            self.assertIn("font-size: 8.5pt", dialog.note_label.styleSheet())
+            self.assertTrue(dialog.note_label.text().startswith("提示："))
+            self.assertIn("网盘挂载", dialog.note_label.text())
+            self.assertGreater(dialog.note_label.y(), dialog.add_button.y())
+            self.assertLess(dialog.note_label.y(), dialog.save_button.y())
+        finally:
+            dialog.deleteLater()
+
     def test_main_window_constructs(self) -> None:
         from PySide6.QtWidgets import QApplication
         from ui import settings as settings_module
@@ -108,6 +129,8 @@ class UiSmokeTests(unittest.TestCase):
             self.assertEqual(window.home.light_match_preset.currentData(), "daylight")
             self.assertTrue(window.home.light_match_advanced_button.text())
             self.assertGreaterEqual(window.home.light_match_header.minimumHeight(), 42)
+            self.assertTrue(window.home.rm_row_widget.isHidden())
+            self.assertFalse(window.settings.data["rm_enabled"])
             window.home.light_match_enabled.setChecked(False)
             app.processEvents()
             self.assertTrue(window.home.light_match_preset.isHidden())

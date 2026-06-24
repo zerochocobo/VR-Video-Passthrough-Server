@@ -69,6 +69,7 @@ from config import (
     VIDEO_EXTS,
 )
 from dlna.profiles import passthrough_dlna_pn, passthrough_frame_rate
+from media_library import safe_resolve_path
 from http_app.si_stream import DEFAULT_CHUNK_SIZE, get_si_stream_service, iter_si_mpegts, parse_range_header
 from pipeline.ffmpeg_io import probe_cached
 from pipeline.si_virtual_mp4 import build_progressive_si_virtual_mp4, iter_virtual_range
@@ -910,7 +911,7 @@ def _safe_video_path_from_key(name: str) -> Path:
     p = MEDIA_LIBRARY.key_to_path(name)
     if p is None:
         raise HTTPException(403, "forbidden")
-    p = p.resolve()
+    p = safe_resolve_path(p)
     # Reject path traversal outside configured media roots.
     if not MEDIA_LIBRARY.contains(p):
         raise HTTPException(403, "forbidden")
@@ -964,7 +965,7 @@ def _safe_media_path_from_key(name: str) -> Path:
     p = MEDIA_LIBRARY.key_to_path(name)
     if p is None:
         raise HTTPException(403, "forbidden")
-    p = p.resolve()
+    p = safe_resolve_path(p)
     if not MEDIA_LIBRARY.contains(p):
         raise HTTPException(403, "forbidden")
     suffix = p.suffix.lower()
@@ -989,7 +990,7 @@ def _safe_subtitle_path(name: str) -> Path:
     p = MEDIA_LIBRARY.key_to_path(name)
     if p is None:
         raise HTTPException(403, "forbidden")
-    p = p.resolve()
+    p = safe_resolve_path(p)
     if not MEDIA_LIBRARY.contains(p):
         raise HTTPException(403, "forbidden")
     if not p.is_file() or not is_subtitle_path(p):
@@ -1584,7 +1585,7 @@ def _passthrough_backend_verdict(path: Path) -> str:
 
 def _probe_cache_key(path: Path, codec: str, duration: float) -> str:
     total = _estimated_passthrough_size(path, duration, codec)
-    return f"{path.resolve()}|{codec}|{total}"
+    return f"{safe_resolve_path(path)}|{codec}|{total}"
 
 
 def _seek_declared_size_key(path: Path, codec: str, duration: float, client_host: str, container: str | None = None) -> tuple:
@@ -1594,7 +1595,7 @@ def _seek_declared_size_key(path: Path, codec: str, duration: float, client_host
     except OSError:
         stat_part = (0, 0)
     return (
-        str(path.resolve()),
+        str(safe_resolve_path(path)),
         stat_part[0],
         stat_part[1],
         codec,
@@ -1619,7 +1620,7 @@ def _estimated_seek_passthrough_size(path: Path, duration: float, codec: str, cl
 
 
 def _seek_probe_cache_key(path: Path, codec: str, duration: float, total: int, container: str | None = None) -> str:
-    return f"seek|{container or _seek_container()}|{path.resolve()}|{codec}|{round(float(duration or 0.0), 3)}|{total}"
+    return f"seek|{container or _seek_container()}|{safe_resolve_path(path)}|{codec}|{round(float(duration or 0.0), 3)}|{total}"
 
 
 def _seek_route_allowed(user_agent: str) -> tuple[bool, str, str]:
@@ -2020,11 +2021,8 @@ def _two_dvr_live_block_reason(path: Path, meta) -> str:
         return "offline 2D->3D output already exists"
     if int(codec.width or 0) > 4096:
         return "2D->3D live source width exceeds 4096px; SBS output would exceed 8K"
-    bit_depth = int(codec.bit_depth if codec and codec.bit_depth > 0 else 8)
-    if bit_depth > 8:
-        return "2D->3D live currently supports 8-bit NV12 sources only"
-    # 2D->3D live only runs on the GPU NV12 (PyNv) path; sources the backend would
-    # route to the ffmpeg fallback (VFR, unsupported codec/pixel format, HDR/10-bit)
+    # 2D->3D live only runs on the GPU NV12/P016 (PyNv) path; sources the backend
+    # would route to the ffmpeg fallback (VFR, unsupported codec/pixel format)
     # cannot be served and must be rejected cleanly instead of failing at startup.
     try:
         decision = select_backend(meta.timing, meta.codec, meta.color)
@@ -2032,6 +2030,25 @@ def _two_dvr_live_block_reason(path: Path, meta) -> str:
         return f"2D->3D live source probe failed: {e}"
     if decision.verdict != "pynv_hevc":
         return f"2D->3D live requires the GPU NV12 path (source ineligible: {decision.reason})"
+    return ""
+
+
+def _rm_live_block_reason(path: Path, meta) -> str:
+    """RM (realtime mosaic restoration) live runs on the GPU NV12 (PyNv) path and
+    only for 2D source videos (2:1 half-equirectangular VR is excluded)."""
+    from utils.runtime_settings import get_rm
+
+    if not get_rm().enabled:
+        return "mosaic restoration is disabled"
+    codec = meta.codec
+    if not _is_two_d_source(path, codec.width, codec.height):
+        return "RM live is only available for 2D source videos"
+    try:
+        decision = select_backend(meta.timing, meta.codec, meta.color)
+    except Exception as e:
+        return f"RM live source probe failed: {e}"
+    if decision.verdict != "pynv_hevc":
+        return f"RM live requires the GPU NV12 path (source ineligible: {decision.reason})"
     return ""
 
 
@@ -2054,7 +2071,7 @@ def _select_passthrough_stream(
     output_mode = (output_mode or PASSTHROUGH_OUTPUT_MODE).lower()
     if output_mode == "all":
         output_mode = "green"
-    elif output_mode not in {"green", "alpha", "two_dvr"}:
+    elif output_mode not in {"green", "alpha", "two_dvr", "rm"}:
         output_mode = _select_live_output_mode("")
     fallback_container = "mpegts" if container == "mpegts" else None
     fallback_max_fps = max_fps
@@ -2071,6 +2088,8 @@ def _select_passthrough_stream(
             raise RuntimeError("alpha passthrough requires the PyNv NV12 live path")
         if output_mode == "two_dvr":
             raise RuntimeError("2D->3D live requires the PyNv NV12 live path")
+        if output_mode == "rm":
+            raise RuntimeError("RM live requires the PyNv NV12 live path")
         return PassthroughStream(
             path,
             start_sec,
@@ -2203,7 +2222,12 @@ async def passthrough_live_get(
     if info.duration > 0:
         t = min(t, max(0.0, info.duration - 0.01))
     requested_mode = (mode or "").lower()
-    live_output_mode = _select_live_output_mode(requested_mode)
+    # RM (realtime mosaic restoration) is a runtime-toggled mode independent of
+    # the server-configured passthrough modes, so it bypasses _select_live_output_mode.
+    if requested_mode == "rm":
+        live_output_mode = "rm"
+    else:
+        live_output_mode = _select_live_output_mode(requested_mode)
 
     user_agent = request.headers.get("user-agent", "")
     accept = request.headers.get("accept", "")
@@ -2247,6 +2271,16 @@ async def passthrough_live_get(
                 two_dvr_block_reason,
             )
             return Response(f"2D->3D live unsupported: {two_dvr_block_reason}", status_code=409)
+    if live_output_mode == "rm":
+        rm_block_reason = _rm_live_block_reason(path, live_meta)
+        if rm_block_reason:
+            log.info(
+                "passthrough_live[%d] reject unsupported RM live source: %s reason=%s",
+                rid,
+                path.name,
+                rm_block_reason,
+            )
+            return Response(f"RM live unsupported: {rm_block_reason}", status_code=409)
     live_max_fps = _live_adaptive_max_fps(path, live_meta)
     live_profile = _live_response_profile(user_agent)
     is_nplayer = _is_nplayer_client(user_agent)
@@ -2293,7 +2327,7 @@ async def passthrough_live_get(
 
     client_host = request.client.host if request.client else ""
     live_key = (
-        str(path.resolve()),
+        str(safe_resolve_path(path)),
         client_host,
         round(float(t), 3),
         PYNV_OUTPUT_CODEC,
@@ -2460,9 +2494,9 @@ async def passthrough_live_get(
         live_acquire_timeout = max(PASSTHROUGH_BUSY_WAIT_SEC, 1.0)
 
         def build_stream():
-            matter = None if live_output_mode == "two_dvr" else acquire_matter(blocking=True, timeout=live_acquire_timeout)
+            matter = None if live_output_mode in {"two_dvr", "rm"} else acquire_matter(blocking=True, timeout=live_acquire_timeout)
             if matter is None:
-                if live_output_mode != "two_dvr":
+                if live_output_mode not in {"two_dvr", "rm"}:
                     return None
             try:
                 stream_tuple = _select_passthrough_stream(
@@ -3229,7 +3263,7 @@ async def passthrough_seek_get(
         rid, path.name, t, route_profile, output_mode, range_header, user_agent[:160], accept[:160], time_seek_range, transfer_mode,
     )
     slot_token = object()
-    owner = (str(path.resolve()), client_host, "seek")
+    owner = (str(safe_resolve_path(path)), client_host, "seek")
     preempted = await _take_active_slot(
         slot_token,
         who=f"seek:{path.name}@{t:.2f}s",
@@ -3597,7 +3631,7 @@ async def passthrough_get(
         return Response(body, status_code=206, headers=headers, media_type=media_type)
 
     slot_token = object()
-    owner = (str(path.resolve()), request.client.host if request.client else "")
+    owner = (str(safe_resolve_path(path)), request.client.host if request.client else "")
     preempted = await _take_active_slot(slot_token, who=f"{path.name}@{t:.2f}s", owner=owner)
     if preempted is False:
         log.info("passthrough[%d] return 503 busy", rid)

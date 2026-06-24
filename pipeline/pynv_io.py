@@ -11,6 +11,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from media_library import safe_resolve_path
+
 
 def cuda_device_summary(gpu_id: int = 0) -> str:
     """Return a compact CUDA device summary for diagnostics."""
@@ -265,7 +267,7 @@ class PyNvSimpleDecoder:
     def __init__(self, src: Path, gpu_id: int = 0, bit_depth: int = 8):
         import PyNvVideoCodec as nvc
 
-        self.src = Path(src).resolve()
+        self.src = safe_resolve_path(Path(src))
         self.gpu_id = gpu_id
         self.bit_depth = int(bit_depth or 8)
         self._decoder = nvc.SimpleDecoder(
@@ -326,7 +328,7 @@ class PyNvThreadedSerialDecoder:
     ):
         import PyNvVideoCodec as nvc
 
-        self.src = Path(src).resolve()
+        self.src = safe_resolve_path(Path(src))
         self.gpu_id = int(gpu_id)
         self.bit_depth = int(bit_depth or 8)
         self.batch_size = max(1, int(batch_size))
@@ -421,7 +423,7 @@ class FfmpegNv12SequentialDecoder:
         config.DECODE_PIX_FMT = "nv12"
         from pipeline.ffmpeg_io import DecoderProcess, probe
 
-        self.src = Path(src).resolve()
+        self.src = safe_resolve_path(Path(src))
         self.start_sec = max(0.0, float(start_sec or 0.0))
         self._probe_info = probe(self.src)
         self._decoder = DecoderProcess(self.src, self.start_sec, self._probe_info, max_fps=max_fps)

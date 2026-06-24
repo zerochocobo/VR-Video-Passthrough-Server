@@ -17,6 +17,7 @@ from datetime import datetime
 from pathlib import Path
 
 import config
+from media_library import safe_resolve_path
 from utils.logger import get
 from utils.mkv_cues import MkvCuesInfo, probe_mkv_cues
 from utils.offline_outputs import has_offline_passthrough_output, is_offline_passthrough_output_name
@@ -104,7 +105,7 @@ def _si_sidecar_source_name(name: str) -> str:
 
 class MediaIndex:
     def __init__(self, db_path: Path | None = None) -> None:
-        self.db_path = (db_path or config.LIBRARY_INDEX_DB).resolve()
+        self.db_path = safe_resolve_path(db_path or config.LIBRARY_INDEX_DB)
         self._lock = threading.RLock()
         self._conn: sqlite3.Connection | None = None
         self._scan_probe_failures = 0
@@ -301,7 +302,7 @@ class MediaIndex:
             return self._list_directory_once(directory)
 
     def _list_directory_once(self, directory: Path) -> DirectorySnapshot:
-        directory = directory.resolve()
+        directory = safe_resolve_path(directory)
         try:
             key = _dir_key(directory)
         except ValueError as e:

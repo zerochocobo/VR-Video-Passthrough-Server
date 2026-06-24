@@ -15,6 +15,7 @@ import numpy as np
 from PIL import Image, ImageDraw, ImageFont
 
 import config
+from media_library import safe_resolve_path
 from utils.logger import get
 from utils.subtitles import subtitle_output_enabled
 
@@ -52,10 +53,7 @@ def find_subtitle_for_video(video_path: Path) -> Path | None:
     for ext in config.SUBTITLE_EXTS:
         candidate = video_path.parent / f"{video_path.stem}{ext}"
         tried.append(candidate)
-        try:
-            resolved = candidate.resolve()
-        except OSError:
-            resolved = candidate
+        resolved = safe_resolve_path(candidate)
         if resolved in seen:
             continue
         seen.add(resolved)
