@@ -38,3 +38,4 @@ reference/
 baseline/
 
 VR_Video_Passthrough_Server_compare/
+/models/rtx_vsr/native/diagnostics

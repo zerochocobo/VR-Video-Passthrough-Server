@@ -23,17 +23,24 @@ class SettingsTests(unittest.TestCase):
 
     def test_passthrough_mode_mapping(self) -> None:
         s = self._settings()
-        self.assertEqual(s.passthrough_mode(), "all")
+        # Defaults enable green + alpha + two_dvr; only exactly green+alpha
+        # collapses to the legacy "all" alias.
+        self.assertEqual(s.passthrough_mode(), "green,alpha,two_dvr")
         cases = [
-            (False, False, "none"),
-            (True, False, "green"),
-            (False, True, "alpha"),
-            (True, True, "all"),
+            (False, False, False, "none"),
+            (True, False, False, "green"),
+            (False, True, False, "alpha"),
+            (True, True, False, "all"),
+            (False, False, True, "two_dvr"),
+            (True, False, True, "green,two_dvr"),
+            (False, True, True, "alpha,two_dvr"),
+            (True, True, True, "green,alpha,two_dvr"),
         ]
-        for green, alpha, expected in cases:
-            with self.subTest(green=green, alpha=alpha):
+        for green, alpha, two_dvr, expected in cases:
+            with self.subTest(green=green, alpha=alpha, two_dvr=two_dvr):
                 s.data["mode_green"] = green
                 s.data["mode_alpha"] = alpha
+                s.data["mode_two_dvr"] = two_dvr
                 self.assertEqual(s.passthrough_mode(), expected)
 
     def test_server_env_omits_blank_subtitle_color(self) -> None:
@@ -53,9 +60,30 @@ class SettingsTests(unittest.TestCase):
         self.assertEqual(env["PT_DECODE_MAX_SIDE"], "4096")
         self.assertEqual(env["PT_LIGHT_MATCH_PRESET"], "daylight")
         self.assertEqual(env["PT_RM_ENABLED"], "0")
+        self.assertEqual(env["PT_RTX_VSR_QUALITY"], "4")
+        self.assertEqual(env["PT_RTX_VSR_TARGET_HEIGHT"], "4096")
+        self.assertEqual(env["PT_RTX_VSR_HDR_LOOK"], "natural")
+        self.assertEqual(env["PT_ALPHA_2D_ENABLE"], "1")
 
-    def test_legacy_enabled_rm_migrates_off(self) -> None:
-        root = Path("runtime_cache/test_ui_settings_rm_migration")
+        s.data["mode_2d"] = False
+        self.assertEqual(s.server_env()["PT_ALPHA_2D_ENABLE"], "0")
+
+    def test_old_superres_default_migrates_to_adaptive_8k(self) -> None:
+        root = Path("runtime_cache/test_ui_settings_superres_target_migration")
+        root.mkdir(parents=True, exist_ok=True)
+        self.addCleanup(lambda: shutil.rmtree(root, ignore_errors=True))
+        settings_path = root / "ui_settings.json"
+        meta_path = root / "ui_settings_meta.json"
+        settings_path.write_text('{"superres_target_height": 2160}', encoding="utf-8")
+        with (
+            patch.object(settings_module, "SETTINGS_PATH", settings_path),
+            patch.object(settings_module, "SETTINGS_META_PATH", meta_path),
+        ):
+            s = settings_module.Settings()
+        self.assertEqual(s.data["superres_target_height"], 4096)
+
+    def test_saved_enabled_rm_survives_load(self) -> None:
+        root = Path("runtime_cache/test_ui_settings_rm_enabled")
         root.mkdir(parents=True, exist_ok=True)
         self.addCleanup(lambda: shutil.rmtree(root, ignore_errors=True))
         settings_path = root / "ui_settings.json"
@@ -68,8 +96,8 @@ class SettingsTests(unittest.TestCase):
         ):
             s = settings_module.Settings()
 
-        self.assertFalse(s.data["rm_enabled"])
-        self.assertEqual(s.server_env()["PT_RM_ENABLED"], "0")
+        self.assertTrue(s.data["rm_enabled"])
+        self.assertEqual(s.server_env()["PT_RM_ENABLED"], "1")
 
     def test_server_env_can_enable_seekable_passthrough_for_ui_start(self) -> None:
         s = self._settings()
@@ -107,6 +135,28 @@ class SettingsTests(unittest.TestCase):
         self.assertEqual(s.server_env()["PT_PASSTHROUGH_SEEK_ENABLED"], "1")
         self.assertEqual(s.server_env()["PT_PASSTHROUGH_SEEK_DLNA"], "0")
 
+    def test_server_env_default_dlna_identity(self) -> None:
+        s = self._settings()
+        env = s.server_env()
+        self.assertEqual(env["PT_HTTP_PORT"], "8200")
+        # Blank server name keeps the server-side default; the env var is omitted.
+        self.assertNotIn("PT_SERVER_NAME", env)
+
+    def test_server_env_custom_dlna_identity(self) -> None:
+        s = self._settings()
+        s.data["server_name"] = "  Living Room VR  "
+        s.data["http_port"] = 8300
+        env = s.server_env()
+        self.assertEqual(env["PT_SERVER_NAME"], "Living Room VR")
+        self.assertEqual(env["PT_HTTP_PORT"], "8300")
+
+    def test_invalid_http_port_falls_back_to_default(self) -> None:
+        s = self._settings()
+        for bad in ("abc", 0, -1, 65536, None, ""):
+            with self.subTest(port=bad):
+                s.data["http_port"] = bad
+                self.assertEqual(s.http_port(), 8200)
+
     def test_server_env_contains_video_dirs(self) -> None:
         s = self._settings()
         s.set_video_dirs([r"D:\VR", r"E:\VR"])
@@ -114,6 +164,23 @@ class SettingsTests(unittest.TestCase):
 
         self.assertEqual(env["PT_VIDEO_DIR"], r"D:\VR|E:\VR")
         self.assertNotIn("PT_DEBUG_LOGS", env)
+
+    def test_video_dirs_filter_unc_paths(self) -> None:
+        s = self._settings()
+        s.set_video_dirs([r"\\nas\VR", r"//nas/Movies", r"D:\VR"])
+        env = s.server_env()
+
+        self.assertEqual(s.video_dirs(), [r"D:\VR"])
+        self.assertEqual(env["PT_VIDEO_DIR"], r"D:\VR")
+
+    def test_loaded_video_dirs_filter_unc_paths(self) -> None:
+        s = self._settings()
+        s.data["video_dirs"] = [r"\\nas\VR", r"Y:\VR"]
+
+        self.assertEqual(s.video_dirs(), [r"Y:\VR"])
+
+        s.data["video_dirs"] = r"\\nas\VR|//nas/Movies"
+        self.assertEqual(s.video_dirs(), [str(settings_module.ROOT / "videos")])
 
     def test_server_env_keeps_zero_decode_max_side(self) -> None:
         s = self._settings()

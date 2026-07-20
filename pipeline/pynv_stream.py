@@ -2013,6 +2013,69 @@ class PyNvPassthroughStream:
             fps = float(timing.effective_fps(fps_cap))
             producer_pacing = bool(config.PASSTHROUGH_PRODUCER_REALTIME_PACING or fps_cap > 0)
             out_w, out_h = self.matter.pynv_scaled_size(info.width, info.height)
+            sr_bridge = None
+            sr_k_to_rgb = sr_k_to_nv12 = sr_k_hdr = None
+            sr_rgb = sr_rgba = sr_out_nv12 = None
+            sr_left_eye = sr_right_eye = sr_split_output = None
+            sr_split_eyes = False
+            sr_eye_in_w = sr_eye_out_w = 0
+            sr_out_nv12_ring = None
+            if self.output_mode == "superres":
+                from offline.two_dvr_pynv import _NV12_RGB_KERNELS
+                from pipeline.hdr_look import HDR_LOOK_CUDA, normalize_hdr_look
+                from utils.rtx_vsr import source_block_reason, target_dimensions
+                from utils.vr_naming import has_vr_filename_marker, is_half_equirectangular_source
+
+                sr_is_sbs_vr = is_half_equirectangular_source(info.width, info.height)
+                reason = source_block_reason(
+                    info.width,
+                    info.height,
+                    is_vr=has_vr_filename_marker(self.src.stem) or sr_is_sbs_vr,
+                    is_10bit=bool(bit_depth > 8),
+                    allow_vr=True,
+                )
+                if reason:
+                    raise RuntimeError(f"RTX VSR source rejected: {reason}")
+                out_w, out_h = target_dimensions(info.width, info.height)
+                sr_split_eyes = bool(
+                    sr_is_sbs_vr and int(config.RTX_VSR_TARGET_HEIGHT) >= 2160 and out_w == out_h * 2
+                )
+                if sr_split_eyes and info.width % 2:
+                    raise RuntimeError(f"split-eye RTX VSR requires even-width SBS input: {info.width}x{info.height}")
+                import cupy as cp
+
+                from utils.rtx_vsr import load_bridge
+
+                sr_bridge = load_bridge()
+                if not sr_bridge.initialize_cupy(cp):
+                    raise RuntimeError("RTX VSR feature unavailable")
+                sr_mod = cp.RawModule(code=_NV12_RGB_KERNELS + HDR_LOOK_CUDA)
+                sr_k_to_rgb = sr_mod.get_function("nv12_to_rgb")
+                sr_k_to_nv12 = sr_mod.get_function("rgba_to_nv12")
+                sr_hdr_mode = normalize_hdr_look(config.RTX_VSR_HDR_LOOK)
+                if sr_hdr_mode != "off":
+                    sr_k_hdr = sr_mod.get_function("hdr_look_rgba")
+                sr_rgb = cp.empty((info.height, info.width, 3), cp.uint8)
+                if sr_split_eyes:
+                    sr_eye_in_w = info.width // 2
+                    sr_eye_out_w = out_w // 2
+                    sr_left_eye = cp.empty((info.height, sr_eye_in_w, 4), cp.uint8)
+                    sr_right_eye = cp.empty((info.height, sr_eye_in_w, 4), cp.uint8)
+                    sr_split_output = cp.empty((out_h, out_w, 4), cp.uint8)
+                else:
+                    sr_rgba = cp.empty((info.height, info.width, 4), cp.uint8)
+                # NVENC may retain an input surface asynchronously after
+                # Encode() returns. Keep a ring of distinct surfaces instead
+                # of overwriting one buffer on the next frame.
+                sr_out_nv12_ring = [
+                    cp.empty((out_h * 3 // 2, out_w), cp.uint8)
+                    for _ in range(2 if out_w >= 8192 else max(1, int(config.PASSTHROUGH_NV12_RING_SLOTS)))
+                ]
+                log.info(
+                    "[PYNV][%d] RTX VSR active source=%dx%d output=%dx%d quality=%d hdr_look=%s split_eyes=%s",
+                    self.sid, info.width, info.height, out_w, out_h, config.RTX_VSR_QUALITY, sr_hdr_mode,
+                    f"{sr_eye_out_w}x{out_h}+{sr_eye_out_w}x{out_h}" if sr_split_eyes else "off",
+                )
             alpha_projection_mode = ""
             alpha_process_w, alpha_process_h = out_w, out_h
             if self.output_mode == "alpha":
@@ -2154,7 +2217,14 @@ class PyNvPassthroughStream:
                     subtitle_renderer = None
                     log.warning("[PYNV][%d] subtitle load failed: %s error=%s", self.sid, subtitle_path.name, e)
             bitrate_estimate = effective_default_bitrate(self.src, PYNV_BACKEND_LABEL)
-            bitrate = str(bitrate_estimate.bps)
+            bitrate_bps = int(bitrate_estimate.bps)
+            if self.output_mode == "superres":
+                pixel_ratio = (out_w * out_h) / max(1.0, float(info.width * info.height))
+                bitrate_bps = max(
+                    20_000_000,
+                    min(120_000_000, int(bitrate_bps * max(1.0, pixel_ratio) * 1.15)),
+                )
+            bitrate = str(bitrate_bps)
             enc_kwargs = _pynv_encoder_kwargs(bitrate=bitrate, fps=f"{fps:.6f}")
             self._enc = nvc.CreateEncoder(out_w, out_h, "NV12", False, **enc_kwargs)
             log.info(
@@ -2374,7 +2444,44 @@ class PyNvPassthroughStream:
                 if self._stop.is_set():
                     break
                 nv12_slot = None
-                if alpha_packer is not None:
+                if self.output_mode == "superres":
+                    assert sr_bridge is not None and sr_k_to_rgb is not None and sr_k_to_nv12 is not None
+                    assert sr_rgb is not None and sr_out_nv12_ring is not None
+                    if isinstance(frame, GpuP016Frame):
+                        raise RuntimeError("RTX VSR realtime currently requires 8-bit NV12 input")
+                    import cupy as cp
+
+                    y = frame.y.as_cupy(cp.uint8).reshape(info.height, info.width)
+                    uv = frame.uv.as_cupy(cp.uint8).reshape(info.height // 2, info.width)
+                    block = (16, 16, 1)
+                    grid = ((info.width + 15) // 16, (info.height + 15) // 16, 1)
+                    sr_k_to_rgb(grid, block, (y, uv, sr_rgb, info.width, info.height))
+                    if sr_split_eyes:
+                        assert sr_left_eye is not None and sr_right_eye is not None and sr_split_output is not None
+                        sr_left_eye[:, :, :3] = sr_rgb[:, :sr_eye_in_w]
+                        sr_left_eye[:, :, 3] = 255
+                        sr_right_eye[:, :, :3] = sr_rgb[:, sr_eye_in_w:]
+                        sr_right_eye[:, :, 3] = 255
+                        sr_split_output[:, :sr_eye_out_w] = sr_bridge.process_cupy_rgba(
+                            sr_left_eye, (sr_eye_out_w, out_h), config.RTX_VSR_QUALITY,
+                        )
+                        sr_split_output[:, sr_eye_out_w:] = sr_bridge.process_cupy_rgba(
+                            sr_right_eye, (sr_eye_out_w, out_h), config.RTX_VSR_QUALITY,
+                        )
+                        sr_out = sr_split_output
+                    else:
+                        assert sr_rgba is not None
+                        sr_rgba[:, :, :3] = sr_rgb
+                        sr_rgba[:, :, 3] = 255
+                        sr_out = sr_bridge.process_cupy_rgba(sr_rgba, (out_w, out_h), config.RTX_VSR_QUALITY)
+                    if sr_k_hdr is not None:
+                        from pipeline.hdr_look import apply_hdr_look
+                        apply_hdr_look(sr_k_hdr, sr_out, config.RTX_VSR_HDR_LOOK)
+                    grid_out = ((out_w + 15) // 16, (out_h + 15) // 16, 1)
+                    sr_out_nv12 = sr_out_nv12_ring[out_idx % len(sr_out_nv12_ring)]
+                    sr_k_to_nv12(grid_out, block, (sr_out, sr_out_nv12, out_w, out_h))
+                    out_nv12, timing = sr_out_nv12, None
+                elif alpha_packer is not None:
                     if alpha_threaded_owned_copy:
                         frame = frame.owned_copy()
                     subtitle_overlay = self._subtitle_overlay_for_time(
@@ -3019,8 +3126,8 @@ class PyNvPassthroughStream:
 
     def _worker_loop_rm(self) -> None:
         """Realtime mosaic restoration: NVDEC NV12 -> RGB -> YOLO11-seg detect +
-        sliding-window restoration (ONNX) -> NVENC. Mirrors the 2D->3D worker but
-        keeps the source resolution and uses a CENTER-frame temporal window."""
+        chunk restoration (ONNX) -> NVENC. Mirrors the 2D->3D worker but keeps
+        the source resolution and processes 8-frame restoration chunks."""
         reader_started = False
         try:
             import numpy as np
@@ -3032,7 +3139,6 @@ class PyNvPassthroughStream:
                 get_shared_engines,
                 GpuRmProcessor,
                 WINDOW,
-                CENTER,
                 rm_trt_cached,
             )
 
@@ -3057,7 +3163,7 @@ class PyNvPassthroughStream:
             start_out = min(max(0, int(round(self.start_sec * fps))), max(0, dec_len - 1))
             target = max(1, dec_len - start_out)
             last_src = dec_len - 1
-            s0 = max(0, start_out - CENTER)
+            s0 = start_out
             meta_dec.stop()
             self._dec = PyNvThreadedSerialDecoder(
                 self.src,
@@ -3101,8 +3207,8 @@ class PyNvPassthroughStream:
             self._log_vram("rm_encoder_created")
             log.info(
                 "[PYNV][%d] RM live start: source=%dx%d output=%dx%d source_fps=%.3f output_fps=%.3f "
-                "target=%d window=%d center=%d container=%s",
-                self.sid, width, height, out_w, out_h, source_fps, fps, target, WINDOW, CENTER, self.container,
+                "target=%d chunk=%d container=%s",
+                self.sid, width, height, out_w, out_h, source_fps, fps, target, WINDOW, self.container,
             )
 
             mux_duration = max(0.0, float(timing.duration or info.duration or 0.0) - self.start_sec)
@@ -3127,7 +3233,7 @@ class PyNvPassthroughStream:
             grid_out = ((out_w + 15) // 16, (out_h + 15) // 16, 1)
             processor = GpuRmProcessor(engines, detect_interval=config.RM_DETECT_INTERVAL)
 
-            # Edge-padded temporal-window cache keyed by source frame index. Frames
+            # Edge-padded chunk cache keyed by source frame index. Frames
             # stay resident on the GPU (cupy) so the RM pipeline never downloads a
             # full frame -- only the small detector blob and 256px crops cross PCIe.
             # The serial decoder is fed monotonically increasing indices; boundary
@@ -3155,74 +3261,79 @@ class PyNvPassthroughStream:
             interval_start = t_start
             interval_bytes = 0
             sum_decode = sum_infer = sum_encode = sum_mux = 0.0
-            for i in range(target):
+            for chunk_base in range(0, target, WINDOW):
                 if self._stop.is_set():
                     break
-                if producer_pacing and self.container == "mpegts" and fps > 0:
-                    due = t_start + (i / fps)
-                    now = time.perf_counter()
-                    if due > now:
-                        self._stop.wait(due - now)
-                        if self._stop.is_set():
-                            break
-                center_idx = start_out + i
-                out_idx = center_idx
+                actual = min(WINDOW, target - chunk_base)
+                chunk_start_idx = start_out + chunk_base
                 t0 = time.perf_counter()
-                window = [rgb_at(center_idx - CENTER + k) for k in range(WINDOW)]
+                chunk = [rgb_at(chunk_start_idx + k) for k in range(WINDOW)]
                 t1 = time.perf_counter()
-                out_rgb_g = processor.process(window, conf)
+                out_chunk_g = processor.process_chunk(chunk, conf)
                 t2 = time.perf_counter()
-                k_to_nv12(grid_out, bx, (out_rgb_g, out_nv12, np.int32(out_w), np.int32(out_h)))
-                self._apply_subtitle_overlay(out_nv12, subtitle_renderer, out_idx / fps if fps > 0 else 0.0)
-                cp.cuda.get_current_stream().synchronize()
-                flags = 0
-                if i == 0:
-                    flags = int(nvc.NV_ENC_PIC_FLAGS.FORCEIDR) | int(nvc.NV_ENC_PIC_FLAGS.OUTPUT_SPSPPS)
-                with self._encoder_lock:
-                    bitstream = self._enc.Encode(GpuNv12AppFrame(out_nv12, out_w, out_h), flags)
-                t3 = time.perf_counter()
-                if bitstream:
-                    mux_stdin = self._video_mux.stdin if self._video_mux is not None else self._mux.stdin
-                    if self._stop.is_set() or not mux_stdin or mux_stdin.closed:
-                        break
-                    try:
-                        self._mark_first_write()
-                        mux_stdin.write(bitstream)
-                        if not self._real_video_started.is_set():
-                            self._real_video_started.set()
-                            self._log_vram("first_rm_video_bitstream")
-                        interval_bytes += len(bitstream)
-                    except (BrokenPipeError, OSError, ValueError) as e:
-                        log.info("[PYNV][%d] RM mux stdin write stopped at frame=%d: %s", self.sid, i + 1, e)
-                        break
-                t4 = time.perf_counter()
-                self.frames_produced = i + 1
-                # evict frames no longer needed by the next window
-                lo = (center_idx + 1) - CENTER
-                for key in [k for k in cache if k < lo]:
-                    del cache[key]
                 sum_decode += t1 - t0
                 sum_infer += t2 - t1
-                sum_encode += t3 - t2
-                sum_mux += t4 - t3
-                if config.DEBUG_LOGS and self.frames_produced % _DIAG_INTERVAL == 0:
-                    elapsed = max(0.001, time.perf_counter() - t_start)
-                    interval_elapsed = max(0.001, time.perf_counter() - interval_start)
-                    log.info(
-                        "[PYNV][%d] RM frame %d/%d fps=%.2f interval_fps=%.2f out_bps=%.1fM "
-                        "stage_avg_ms decode=%.2f infer=%.2f encode=%.2f mux=%.2f",
-                        self.sid, self.frames_produced, target,
-                        self.frames_produced / elapsed,
-                        _DIAG_INTERVAL / interval_elapsed,
-                        (interval_bytes * 8.0 / interval_elapsed) / 1_000_000.0,
-                        (sum_decode / _DIAG_INTERVAL) * 1000.0,
-                        (sum_infer / _DIAG_INTERVAL) * 1000.0,
-                        (sum_encode / _DIAG_INTERVAL) * 1000.0,
-                        (sum_mux / _DIAG_INTERVAL) * 1000.0,
-                    )
-                    interval_start = time.perf_counter()
-                    interval_bytes = 0
-                    sum_decode = sum_infer = sum_encode = sum_mux = 0.0
+                for j in range(actual):
+                    if self._stop.is_set():
+                        break
+                    i = chunk_base + j
+                    if producer_pacing and self.container == "mpegts" and fps > 0:
+                        due = t_start + (i / fps)
+                        now = time.perf_counter()
+                        if due > now:
+                            self._stop.wait(due - now)
+                            if self._stop.is_set():
+                                break
+                    out_idx = start_out + i
+                    t_enc0 = time.perf_counter()
+                    k_to_nv12(grid_out, bx, (out_chunk_g[j], out_nv12, np.int32(out_w), np.int32(out_h)))
+                    self._apply_subtitle_overlay(out_nv12, subtitle_renderer, out_idx / fps if fps > 0 else 0.0)
+                    cp.cuda.get_current_stream().synchronize()
+                    flags = 0
+                    if i == 0:
+                        flags = int(nvc.NV_ENC_PIC_FLAGS.FORCEIDR) | int(nvc.NV_ENC_PIC_FLAGS.OUTPUT_SPSPPS)
+                    with self._encoder_lock:
+                        bitstream = self._enc.Encode(GpuNv12AppFrame(out_nv12, out_w, out_h), flags)
+                    t3 = time.perf_counter()
+                    if bitstream:
+                        mux_stdin = self._video_mux.stdin if self._video_mux is not None else self._mux.stdin
+                        if self._stop.is_set() or not mux_stdin or mux_stdin.closed:
+                            break
+                        try:
+                            self._mark_first_write()
+                            mux_stdin.write(bitstream)
+                            if not self._real_video_started.is_set():
+                                self._real_video_started.set()
+                                self._log_vram("first_rm_video_bitstream")
+                            interval_bytes += len(bitstream)
+                        except (BrokenPipeError, OSError, ValueError) as e:
+                            log.info("[PYNV][%d] RM mux stdin write stopped at frame=%d: %s", self.sid, i + 1, e)
+                            break
+                    t4 = time.perf_counter()
+                    self.frames_produced = i + 1
+                    sum_encode += t3 - t_enc0
+                    sum_mux += t4 - t3
+                    if config.DEBUG_LOGS and self.frames_produced % _DIAG_INTERVAL == 0:
+                        elapsed = max(0.001, time.perf_counter() - t_start)
+                        interval_elapsed = max(0.001, time.perf_counter() - interval_start)
+                        log.info(
+                            "[PYNV][%d] RM frame %d/%d fps=%.2f interval_fps=%.2f out_bps=%.1fM "
+                            "stage_avg_ms decode=%.2f infer=%.2f encode=%.2f mux=%.2f",
+                            self.sid, self.frames_produced, target,
+                            self.frames_produced / elapsed,
+                            _DIAG_INTERVAL / interval_elapsed,
+                            (interval_bytes * 8.0 / interval_elapsed) / 1_000_000.0,
+                            (sum_decode / _DIAG_INTERVAL) * 1000.0,
+                            (sum_infer / _DIAG_INTERVAL) * 1000.0,
+                            (sum_encode / _DIAG_INTERVAL) * 1000.0,
+                            (sum_mux / _DIAG_INTERVAL) * 1000.0,
+                        )
+                        interval_start = time.perf_counter()
+                        interval_bytes = 0
+                        sum_decode = sum_infer = sum_encode = sum_mux = 0.0
+                lo = chunk_start_idx + actual
+                for key in [k for k in cache if k < lo]:
+                    del cache[key]
             if not self._stop.is_set():
                 log.info("[PYNV][%d] RM EndEncode begin frames=%d", self.sid, self.frames_produced)
                 with self._encoder_lock:

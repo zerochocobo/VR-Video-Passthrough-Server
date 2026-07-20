@@ -85,10 +85,12 @@ class LiveStreamSession:
         start_time: float,
         estimated_total: int,
         start_byte: int = 0,
+        duck_key: Path | None = None,
     ) -> None:
         self.video = video
         self.si_wav = si_wav
         self.config = config
+        self.duck_key = Path(duck_key) if duck_key is not None else None
         self.estimated_total = max(1, int(estimated_total))
         self.start_time = max(0.0, float(start_time))
         self.byte_cursor = max(0, int(start_byte))
@@ -100,6 +102,7 @@ class LiveStreamSession:
 
     def _start_ffmpeg(self, start_time: float) -> None:
         seek = f"{max(0.0, start_time):.3f}"
+        use_duck_key = self.duck_key is not None
         # Output MPEG-TS, not fragmented MP4. SKYBOX (and the other VR players we
         # captured in tools/si_proto) handle a linear MPEG-TS live stream cleanly,
         # but treated fMP4 as a pseudo-file and issued overlapping Range probes
@@ -120,8 +123,12 @@ class LiveStreamSession:
             seek,
             "-i",
             str(self.si_wav),
+        ]
+        if use_duck_key:
+            cmd += ["-ss", seek, "-i", str(self.duck_key)]
+        cmd += [
             "-filter_complex",
-            self.config.filter_string(),
+            self.config.filter_string(duck_key_input=use_duck_key),
             "-map",
             "0:v",
             "-c:v",
@@ -244,6 +251,26 @@ class SIStreamService:
         sibling = video.with_suffix(".si.wav")
         return sibling if sibling.is_file() else None
 
+    def has_duck_key(self, video: Path) -> Path | None:
+        """Locate the sibling ``<video>.si.duck.wav`` duck-key file, if any."""
+        video = Path(video)
+        if video.suffix.lower() not in SI_VIDEO_EXTS:
+            return None
+        sibling = video.with_suffix(".si.duck.wav")
+        return sibling if sibling.is_file() else None
+
+    def resolve_stream(self, video: Path) -> tuple[SIMixParams, Path | None]:
+        """Return the effective ``(config, duck_key)`` for a video, switching to
+        the dubbing variant when dubbing mode is on and a ``.si.duck.wav`` key
+        exists next to it."""
+        config = self.current_config()
+        if not config.dub_mode_enabled:
+            return config, None
+        duck_key = self.has_duck_key(video)
+        if duck_key is None:
+            return config, None
+        return config.dubbing_variant(), duck_key
+
     def estimate_output_size(self, video: Path) -> int:
         video = safe_resolve_path(Path(video))
         try:
@@ -323,10 +350,14 @@ class SIStreamService:
         # them as seeks causes a restart storm and starves the main stream.
         return int(range_start) < total_size, total_size
 
-    def _can_reuse(self, session: Any, config: SIMixParams, si_wav: Path, range_start: int) -> bool:
+    def _can_reuse(
+        self, session: Any, config: SIMixParams, si_wav: Path, duck_key: Path | None, range_start: int
+    ) -> bool:
         if getattr(session, "config", None) != config:
             return False
         if Path(getattr(session, "si_wav", "")) != si_wav:
+            return False
+        if getattr(session, "duck_key", None) != duck_key:
             return False
         if hasattr(session, "is_usable") and not session.is_usable():
             return False
@@ -347,11 +378,12 @@ class SIStreamService:
         range_start: int,
         total_size: int,
         client_id: str | None,
+        duck_key: Path | None = None,
     ) -> tuple[Any, float]:
         key = self._session_key(video, client_id)
         with self._sessions_lock:
             session = self._sessions.get(key)
-            if session is not None and self._can_reuse(session, config, si_wav, range_start):
+            if session is not None and self._can_reuse(session, config, si_wav, duck_key, range_start):
                 return session, float(getattr(session, "start_time", 0.0))
             if session is not None:
                 self._close_session(session)
@@ -370,6 +402,7 @@ class SIStreamService:
                 start_time=start_time,
                 estimated_total=total_size,
                 start_byte=range_start,
+                duck_key=duck_key,
             )
             self._sessions[key] = session
             self._last_start_at[key] = time.monotonic()
@@ -402,7 +435,7 @@ class SIStreamService:
         chunk_size: int = DEFAULT_CHUNK_SIZE,
     ) -> SIStreamOpenResult:
         video = safe_resolve_path(Path(video))
-        config = self.current_config()
+        config, duck_key = self.resolve_stream(video)
         if not config.enabled:
             raise FileNotFoundError("SI streaming is disabled")
         si_wav = self.has_si_source(video)
@@ -416,7 +449,9 @@ class SIStreamService:
             safe_end = total_size - 1
         content_length = max(0, safe_end - safe_start + 1)
         status_code = 206 if range_requested else 200
-        session, start_time = self._get_or_start_session(video, si_wav, config, safe_start, total_size, client_id)
+        session, start_time = self._get_or_start_session(
+            video, si_wav, config, safe_start, total_size, client_id, duck_key=duck_key
+        )
 
         def chunks() -> Iterator[bytes]:
             remaining = content_length
@@ -471,13 +506,15 @@ def iter_si_mpegts(
     config: SIMixParams,
     start_time: float,
     *,
+    duck_key: Path | None = None,
     chunk_size: int = DEFAULT_CHUNK_SIZE,
 ) -> Iterator[bytes]:
     """Yield a realtime MPEG-TS SI mix stream starting at ``start_time`` seconds.
 
     Each call spawns one ffmpeg process (source video copied, SI mix encoded) and
     streams its stdout until EOF. Seeking is handled by the caller re-requesting a
-    new ``?t=`` offset, exactly like the passthrough_live transport.
+    new ``?t=`` offset, exactly like the passthrough_live transport. When ``duck_key``
+    is provided (dubbing mode), it is fed as a third input driving the sidechain.
     """
     session = LiveStreamSession(
         video=Path(video),
@@ -486,6 +523,7 @@ def iter_si_mpegts(
         start_time=max(0.0, float(start_time)),
         estimated_total=1,
         start_byte=0,
+        duck_key=Path(duck_key) if duck_key is not None else None,
     )
     try:
         while True:

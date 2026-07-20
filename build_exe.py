@@ -194,6 +194,7 @@ def build_ui(pyi: list[str], env: dict[str, str]) -> None:
             "--additional-hooks-dir", "packaging\\hooks",
             "--runtime-hook", "packaging\\runtime_hook_cuda_dlls.py",
             "--add-data", "resources;resources",
+            "--add-data", "models\\rtx_vsr\\runtime;models\\rtx_vsr\\runtime",
             "--add-data", "ui\\app_metadata.json;ui",
             "--add-data", "ui\\translations;ui\\translations",
             "--add-data", "ui\\styles;ui\\styles",
@@ -221,6 +222,7 @@ def build_server(pyi: list[str], env: dict[str, str]) -> None:
             "--additional-hooks-dir", "packaging\\hooks",
             "--runtime-hook", "packaging\\runtime_hook_cuda_dlls.py",
             "--add-data", "resources;resources",
+            "--add-data", "models\\rtx_vsr\\runtime;models\\rtx_vsr\\runtime",
             "--hidden-import", "offline.convert",
             "--hidden-import", "offline.two_dvr",
             "--hidden-import", "tools.offline_passthrough",
@@ -493,6 +495,21 @@ def verify_base_runtime() -> None:
         fail("Missing onnxruntime_providers_shared.dll.")
 
 
+def verify_rtx_vsr_runtime() -> None:
+    runtime = DIST_DIR / "_internal" / "models" / "rtx_vsr" / "runtime"
+    required = (
+        "pt_rtx_vsr_bridge.dll",
+        "nvngx_vsr.dll",
+        "NVIDIA_RTX_Video_SDK_License.pdf",
+        "VERSION.txt",
+    )
+    for name in required:
+        if not (runtime / name).exists():
+            fail(f"Missing RTX VSR runtime asset: {runtime / name}")
+    if not list(runtime.glob("cudart64_*.dll")):
+        fail(f"Missing CUDA runtime DLL for RTX VSR bridge under {runtime}")
+
+
 def verify_clip_tokenizer_runtime() -> None:
     osam_bpe = DIST_DIR / "_internal" / "osam" / "_models" / "yoloworld" / "clip" / "bpe_simple_vocab_16e6.txt.gz"
     fallback_bpe = DIST_DIR / "_internal" / "runtime_cache" / "clip_text_onnx" / "bpe_simple_vocab_16e6.txt.gz"
@@ -682,6 +699,7 @@ def main() -> int:
         remove_stale_icu()
         verify_no_duplicate_critical_dlls()
         prepare_resources_and_models()
+        verify_rtx_vsr_runtime()
         copy_clip_tokenizer_cache()
         copy_cuda_auxiliary_dlls()
         copy_ort_cuda_ep_dependencies()

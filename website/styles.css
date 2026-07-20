@@ -273,24 +273,27 @@ h3 {
 
 .hero-visual {
   position: relative;
-  min-height: 540px;
+  display: flex;
+  align-items: flex-end;
+  min-height: 0;
+  padding: 150px 0 72px;
   perspective: 1200px;
 }
 
 .hero-logo {
   position: absolute;
-  top: 2%;
+  top: 0;
   right: 3%;
-  width: 170px;
+  width: 138px;
   opacity: 0.92;
   filter: drop-shadow(0 18px 28px rgba(38, 104, 46, 0.22));
   animation: floatLogo 6s ease-in-out infinite;
 }
 
 .hero-screen {
-  position: absolute;
-  left: 0;
-  bottom: 6%;
+  position: relative;
+  z-index: 1;
+  display: block;
   width: min(620px, 100%);
   border: 1px solid rgba(255, 255, 255, 0.86);
   border-radius: 8px;
@@ -301,8 +304,9 @@ h3 {
 
 .signal-card {
   position: absolute;
+  z-index: 2;
   right: 6%;
-  bottom: 12%;
+  bottom: 12px;
   display: inline-flex;
   align-items: center;
   gap: 10px;
@@ -657,7 +661,8 @@ html[lang="zh-CN"] .download-link {
   }
 
   .hero-visual {
-    min-height: 470px;
+    min-height: 0;
+    padding: 150px 0 72px;
   }
 
   .feature-grid,
@@ -700,16 +705,17 @@ html[lang="zh-CN"] .download-link {
   }
 
   .hero-visual {
-    min-height: 350px;
+    min-height: 0;
+    padding: 110px 0 60px;
   }
 
   .hero-logo {
-    width: 118px;
+    width: 100px;
   }
 
   .signal-card {
     right: 0;
-    bottom: 2%;
+    bottom: 0;
   }
 
   .showcase,

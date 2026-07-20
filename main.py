@@ -353,6 +353,11 @@ def main(argv: list[str] | None = None) -> int:
         from offline.demosaic_offline import main as rm_offline_main
 
         return rm_offline_main(argv[1:])
+    if argv and argv[0] == "superres_offline":
+        _force_line_buffered_stdio()
+        from offline.superres_offline import main as superres_offline_main
+
+        return superres_offline_main(argv[1:])
     if argv and argv[0] == "trt_warmup":
         _force_line_buffered_stdio()
         from ui.services.trt_warmup_process import main as trt_warmup_main
@@ -369,6 +374,8 @@ def main(argv: list[str] | None = None) -> int:
             from tools.offline_alpha_passthrough import main as tool_main
         elif tool_name == "warmup_offline_trt":
             from tools.warmup_offline_trt import main as tool_main
+        elif tool_name == "rtx_vsr_probe":
+            from tools.rtx_vsr_probe import main as tool_main
         else:
             raise SystemExit(f"unknown tool: {tool_name}")
         return _run_legacy_tool(tool_main, tool_name, tool_args)
@@ -388,6 +395,21 @@ def main(argv: list[str] | None = None) -> int:
     log.info("GPU_RUNTIME_CACHE=%s", cache_env)
     _validate_tensorrt_provider(log)
     log.info("ONNX providers active_after_validation=%s MODEL_PATH=%s", config.ONNX_PROVIDERS, config.MODEL_PATH)
+    # Probe one actual NGX evaluation in an isolated process before exposing
+    # realtime SuperRes.  A broken SDK/driver must be reported as unavailable
+    # rather than hanging a long-lived PyNv worker on its first frame.
+    output_modes = {part.strip().lower() for part in str(config.PASSTHROUGH_OUTPUT_MODE or "").split(",")}
+    if config.RTX_VSR_REALTIME_ENABLED and "superres" in output_modes:
+        try:
+            from utils.rtx_vsr import run_evaluation_preflight
+
+            preflight = run_evaluation_preflight()
+            if preflight.get("ok"):
+                log.info("RTX VSR evaluate preflight succeeded: %s", preflight)
+            else:
+                log.warning("RTX VSR evaluate preflight failed; realtime SuperRes will be rejected: %s", preflight)
+        except Exception as exc:
+            log.warning("RTX VSR evaluate preflight unavailable: %s", exc)
     provider_kind = provider_kind_from_config()
     startup_step_total = startup_warmup_step_total(provider_kind)
     nvenc_step_enabled = bool(config.USE_PYNV and config.NVENC_PREFLIGHT_ENABLE)

@@ -1193,6 +1193,7 @@ def _params_cache_dict(params: SIMixParams) -> dict:
         "si_volume_percent": params.si_volume_percent,
         "si_delay_seconds": params.si_delay_seconds,
         "duck_original": params.duck_original,
+        "duck_preset": getattr(params, "duck_preset", "normal"),
     }
 
 
@@ -1782,6 +1783,7 @@ def _encode_mix_segment(
         params.si_volume_percent,
         params.si_delay_seconds,
         params.duck_original,
+        params.duck_preset,
     )
     cmd = [
         FFMPEG,
@@ -2007,7 +2009,7 @@ def build_mixed_audio_sidecar(
     output = cache_dir / f"{digest}.audio.mp4"
     if output.is_file() and output.stat().st_size > 0:
         log.info(
-            "reusing SI mixed AAC sidecar: video=%s si=%s out=%s digest=%s delay=%.1f mix=%s orig_vol=%s si_vol=%s duck=%s",
+            "reusing SI mixed AAC sidecar: video=%s si=%s out=%s digest=%s delay=%.1f mix=%s orig_vol=%s si_vol=%s duck=%s duck_preset=%s",
             video,
             si_wav,
             output,
@@ -2017,6 +2019,7 @@ def build_mixed_audio_sidecar(
             params.original_volume_percent,
             params.si_volume_percent,
             params.duck_original,
+            params.duck_preset,
         )
         return output
 
@@ -2075,6 +2078,7 @@ def build_mixed_audio_sidecar(
         params.si_volume_percent,
         params.si_delay_seconds,
         params.duck_original,
+        params.duck_preset,
     )
     cmd = [
         FFMPEG,
@@ -2105,7 +2109,7 @@ def build_mixed_audio_sidecar(
         str(temp),
     ]
     log.info(
-        "building SI mixed AAC sidecar: video=%s audio_input=%s input_kind=%s encoder=%s si=%s out=%s digest=%s delay=%.1f mix=%s orig_vol=%s si_vol=%s duck=%s",
+        "building SI mixed AAC sidecar: video=%s audio_input=%s input_kind=%s encoder=%s si=%s out=%s digest=%s delay=%.1f mix=%s orig_vol=%s si_vol=%s duck=%s duck_preset=%s",
         video,
         audio_input_arg,
         audio_input_kind,
@@ -2118,6 +2122,7 @@ def build_mixed_audio_sidecar(
         params.original_volume_percent,
         params.si_volume_percent,
         params.duck_original,
+        params.duck_preset,
     )
     try:
         if audio_input_kind == "source-audio-pipe":

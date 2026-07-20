@@ -8,9 +8,12 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QListWidget,
+    QMessageBox,
     QPushButton,
     QVBoxLayout,
 )
+
+from media_library import is_unc_path
 
 
 class VideoDirsDialog(QDialog):
@@ -23,8 +26,9 @@ class VideoDirsDialog(QDialog):
         self.note_label.setStyleSheet("color: #5f6368; font-size: 8.5pt;")
         self.list_widget = QListWidget()
         for directory in directories:
-            if directory.strip():
-                self.list_widget.addItem(directory.strip())
+            text = directory.strip()
+            if text and not is_unc_path(text):
+                self.list_widget.addItem(text)
 
         self.add_button = QPushButton()
         self.remove_button = QPushButton()
@@ -59,7 +63,7 @@ class VideoDirsDialog(QDialog):
         seen: set[str] = set()
         for index in range(self.list_widget.count()):
             text = self.list_widget.item(index).text().strip()
-            if not text:
+            if not text or is_unc_path(text):
                 continue
             key = str(Path(text).expanduser()).casefold()
             if key in seen:
@@ -70,8 +74,19 @@ class VideoDirsDialog(QDialog):
 
     def add_directory(self) -> None:
         path = QFileDialog.getExistingDirectory(self, self.i18n.t("file.select_directory"))
-        if path:
-            self.list_widget.addItem(path)
+        if not path:
+            return
+        if is_unc_path(path):
+            self._show_unc_warning(path)
+            return
+        self.list_widget.addItem(path)
+
+    def _show_unc_warning(self, path: str) -> None:
+        QMessageBox.warning(
+            self,
+            self.i18n.t("dialog.warning"),
+            self.i18n.t("video_dirs.unc_blocked_message").format(path=path),
+        )
 
     def remove_selected(self) -> None:
         for item in self.list_widget.selectedItems():

@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import json
 import os
@@ -6,25 +6,31 @@ import threading
 import urllib.request
 from pathlib import Path
 
-from PySide6.QtCore import Qt, QTimer, Signal
+from PySide6.QtCore import QSize, QTimer, Signal
 from PySide6.QtGui import QFont
-from PySide6.QtWidgets import QLabel, QMainWindow, QMessageBox, QWidget
+from PySide6.QtWidgets import QHBoxLayout, QLabel, QMainWindow, QMessageBox, QWidget
 
 from ui.diagnostics import build_diagnostic_report
 from ui.i18n import I18n, system_language
 from ui.metadata import load_app_metadata
-from ui.pages.home_page import HOME_COMPACT_WIDTH, HOME_HEIGHT, HomePage
+from ui.pages.dashboard_page import DASHBOARD_HEIGHT, DASHBOARD_WIDTH, DashboardPage
+from ui.pages.log_page import LogPage
 from ui.pages.offline_page import OfflinePage
+from ui.pages.rm_page import RmPage
+from ui.pages.superres_page import SuperResPage
+from ui.pages.settings_page import SETTINGS_PAGE_HEIGHT, SettingsPage
 from ui.pages.subtitle_page import SUBTITLE_PAGE_HEIGHT, SUBTITLE_PAGE_WIDTH, SubtitlePage
+from ui.pages.tools_page import ToolsPage
 from ui.pages.two_dvr_page import TwoDvrPage
 from ui.resources import app_icon
-from ui.services.offline_process import OfflineProcess, TwoDvrProcess
+from ui.services.offline_process import OfflineProcess, RmProcess, SuperResProcess, TwoDvrProcess
 from ui.services.server_process import ServerProcess
 from ui.services.startup_diagnostics import LOG_PATH as UI_STARTUP_LOG_PATH, log_startup_event
 from ui.services.startup_status_poller import DEFAULT_PORT as STATUS_DEFAULT_PORT, StartupStatusPoller
 from ui.settings import ROOT as UI_ROOT, Settings
 from ui.styles import font_for_language
 from ui.widgets.current_page_stack import CurrentPageStackedWidget
+from ui.widgets.nav_rail import NAV_WIDTH, NavRail
 from ui.widgets.startup_overlay import StartupOverlay
 from utils.gpu_requirements import (
     detect_nvidia_gpu_requirement,
@@ -32,7 +38,6 @@ from utils.gpu_requirements import (
 
 
 SUPPORTED_LANGUAGES = ("zh_CN", "en_US", "ja_JP")
-QT_MAX_WIDGET_SIZE = 16777215
 OFFLINE_PAGE_WIDTH = 600
 OFFLINE_PAGE_HEIGHT = 600
 STARTUP_BOOTSTRAP_HINT_ERRORS = 4      # 500 ms poll interval * 4 ~= 2 seconds.
@@ -45,6 +50,7 @@ class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
         self.settings = Settings()
+        os.environ["PT_HTTP_PORT"] = str(self.settings.http_port())
         self.metadata = load_app_metadata()
         self.setWindowIcon(app_icon())
         saved_language = self._configured_language()
@@ -52,46 +58,84 @@ class MainWindow(QMainWindow):
         self.server = ServerProcess()
         self.offline_process = OfflineProcess()
         self.two_dvr_process = TwoDvrProcess()
+        self.rm_process = RmProcess()
+        self.superres_process = SuperResProcess()
+
         self.stack = CurrentPageStackedWidget()
-        self.home = HomePage(self.i18n, self.settings, self.metadata.display_version)
+        self.dashboard = DashboardPage(self.i18n, self.settings)
+        self.tools = ToolsPage(self.i18n, self.settings)
         self.offline = OfflinePage(self.i18n, self.settings, self.offline_process)
         self.two_dvr = TwoDvrPage(self.i18n, self.settings, self.two_dvr_process)
+        self.rm = RmPage(self.i18n, self.settings, self.rm_process)
+        self.superres = SuperResPage(self.i18n, self.settings, self.superres_process)
         self.subtitle = SubtitlePage(self.i18n, self.settings)
-        self.stack.addWidget(self.home)
-        self.stack.addWidget(self.offline)
-        self.stack.addWidget(self.two_dvr)
-        self.stack.addWidget(self.subtitle)
-        self.setCentralWidget(self.stack)
+        self.log_page = LogPage(self.i18n)
+        self.settings_page = SettingsPage(self.i18n, self.settings)
+        for page in (
+            self.dashboard,
+            self.tools,
+            self.subtitle,
+            self.log_page,
+            self.settings_page,
+            self.offline,
+            self.two_dvr,
+            self.rm,
+            self.superres,
+        ):
+            self.stack.addWidget(page)
+
+        self.nav = NavRail()
+        self.nav.add_item("home", "home")
+        self.nav.add_item("tools", "tools")
+        self.nav.add_item("subtitle", "subtitle")
+        self.nav.add_item("log", "log")
+        self.nav.add_item("settings", "settings", bottom=True)
+        self.nav.page_selected.connect(self._nav_selected)
+        self._nav_pages = {
+            "home": self.dashboard,
+            "tools": self.tools,
+            "subtitle": self.subtitle,
+            "log": self.log_page,
+            "settings": self.settings_page,
+        }
+
+        central = QWidget()
+        central_layout = QHBoxLayout(central)
+        central_layout.setContentsMargins(0, 0, 0, 0)
+        central_layout.setSpacing(0)
+        central_layout.addWidget(self.nav)
+        central_layout.addWidget(self.stack, 1)
+        self.setCentralWidget(central)
+
         self.version_label = QLabel(self.metadata.display_version)
         self.version_label.setObjectName("VersionStatus")
         self.version_label.setStyleSheet("QLabel#VersionStatus { font-size: 9pt; }")
-        self.runtime_status_label = QLabel("")
-        self.runtime_status_label.setObjectName("RuntimeStatus")
-        self.runtime_status_label.setStyleSheet("QLabel#RuntimeStatus { font-size: 9pt; }")
-        self.runtime_status_label.setAlignment(Qt.AlignCenter)
-        self.home.language.setFixedHeight(22)
-        self.home.language.setStyleSheet("QComboBox { font-size: 9pt; padding: 0 6px; }")
-        self.status_left_spacer = QWidget()
-        self.status_left_spacer.setFixedWidth(20)
-        self.statusBar().addWidget(self.status_left_spacer)
-        self.statusBar().addWidget(self.home.language)
-        self.statusBar().addWidget(self.runtime_status_label, 1)
         self.statusBar().addPermanentWidget(self.version_label)
-        self.home.server_button.clicked.connect(self.toggle_server)
-        self.home.offline_button.clicked.connect(self.open_offline)
-        self.home.two_dvr_button.clicked.connect(self.open_two_dvr)
-        self.home.subtitle_style_button.clicked.connect(lambda: self.stack.setCurrentWidget(self.subtitle))
-        self.home.language.currentIndexChanged.connect(self.change_language)
-        self.offline.back_button.clicked.connect(lambda: self.stack.setCurrentWidget(self.home))
-        self.two_dvr.back_button.clicked.connect(lambda: self.stack.setCurrentWidget(self.home))
-        self.subtitle.back_button.clicked.connect(lambda: self.stack.setCurrentWidget(self.home))
-        self.stack.currentChanged.connect(self._page_changed)
-        self.server.output.connect(self.home.append_log)
+
+        self.dashboard.server_button.clicked.connect(self.toggle_server)
+        self.dashboard.open_subtitle_page.connect(lambda: self._show_page("subtitle"))
+        self.tools.open_offline.connect(self.open_offline)
+        self.tools.open_two_dvr.connect(self.open_two_dvr)
+        self.tools.open_rm.connect(self.open_rm)
+        self.tools.open_superres.connect(self.open_superres)
+        self.settings_page.language.currentIndexChanged.connect(self.change_language)
+        self.settings_page.rm_card_visibility_changed.connect(self.dashboard.set_rm_card_visible)
+        self.settings_page.rm_card_visibility_changed.connect(self.tools.set_rm_card_visible)
+        self.offline.back_button.clicked.connect(lambda: self._show_page("tools"))
+        self.two_dvr.back_button.clicked.connect(lambda: self._show_page("tools"))
+        self.rm.back_button.clicked.connect(lambda: self._show_page("tools"))
+        self.superres.back_button.clicked.connect(lambda: self._show_page("home"))
+        self.subtitle.back_button.clicked.connect(lambda: self._show_page("home"))
+
+        self.server.output.connect(self.log_page.append_log)
         self.server.output.connect(self._scan_server_output_for_ready)
-        self.server.state_changed.connect(self.home.set_server_running)
+        self.server.state_changed.connect(self.dashboard.set_server_running)
         self.server.state_changed.connect(self._server_state_changed)
         self.offline_process.state_changed.connect(self._offline_state_changed)
         self.two_dvr_process.state_changed.connect(self._two_dvr_state_changed)
+        self.rm_process.state_changed.connect(self._rm_state_changed)
+        self.superres_process.state_changed.connect(self._superres_state_changed)
+
         # Startup overlay + status poller (lazy: created when first needed).
         self.startup_overlay: StartupOverlay | None = None
         self.status_poller = StartupStatusPoller(port=STATUS_DEFAULT_PORT, parent=self)
@@ -118,16 +162,16 @@ class MainWindow(QMainWindow):
             "QGroupBox { font-weight: 600; } "
             "QComboBox, QLineEdit, QDoubleSpinBox { padding: 4px; }"
         )
-        self.home.apply_heading_fonts()
-        self.resize(HOME_COMPACT_WIDTH, HOME_HEIGHT)
-        self._page_changed(self.stack.currentIndex())
+        self.setMinimumSize(NAV_WIDTH + 560, 540)
+        self.nav.select("home")
+        self._show_page("home")
 
     def _sync_language_combo(self) -> None:
         saved_language = self._configured_language()
         mapping = {"zh_CN": 0, "en_US": 1, "ja_JP": 2}
-        self.home.language.blockSignals(True)
-        self.home.language.setCurrentIndex(mapping.get(saved_language, 0))
-        self.home.language.blockSignals(False)
+        self.settings_page.language.blockSignals(True)
+        self.settings_page.language.setCurrentIndex(mapping.get(saved_language, 0))
+        self.settings_page.language.blockSignals(False)
 
     def change_language(self, index: int) -> None:
         lang = SUPPORTED_LANGUAGES[index]
@@ -150,11 +194,54 @@ class MainWindow(QMainWindow):
         self.setFont(font_for_language(self.i18n.language))
         self.setWindowTitle(f"{self.i18n.t('app.title')} ({self.metadata.display_version})")
         self.version_label.setText(self.metadata.display_version)
-        self.home.retranslate()
-        self.home.set_server_running(self.server.is_running())
+        self.nav.set_item_text("home", self.i18n.t("nav.home"))
+        self.nav.set_item_text("tools", self.i18n.t("nav.tools"))
+        self.nav.set_item_text("subtitle", self.i18n.t("nav.subtitle"))
+        self.nav.set_item_text("log", self.i18n.t("nav.log"))
+        self.nav.set_item_text("settings", self.i18n.t("nav.settings"))
+        self.dashboard.retranslate()
+        self.tools.retranslate()
+        self.log_page.retranslate()
+        self.settings_page.retranslate()
         self.offline.retranslate()
         self.two_dvr.retranslate()
+        self.rm.retranslate()
+        self.superres.retranslate()
         self.subtitle.retranslate()
+        self.dashboard.set_server_running(self.server.is_running())
+
+    # ---- navigation ----
+
+    def _nav_selected(self, key: str) -> None:
+        self._show_page(key)
+
+    def _show_page(self, key: str) -> None:
+        page = self._nav_pages.get(key)
+        if page is None:
+            return
+        self.nav.select(key)
+        self.stack.setCurrentWidget(page)
+        if page is self.dashboard:
+            self.dashboard.sync_from_settings()
+        elif page is self.settings_page:
+            self.settings_page.sync_from_settings()
+        self._resize_for(page)
+
+    def _show_sub_page(self, page: QWidget) -> None:
+        self.nav.select("tools")
+        self.stack.setCurrentWidget(page)
+        self._resize_for(page)
+
+    def _resize_for(self, page: QWidget) -> None:
+        if page is self.subtitle:
+            content = QSize(SUBTITLE_PAGE_WIDTH, SUBTITLE_PAGE_HEIGHT)
+        elif page in (self.offline, self.two_dvr, self.rm, self.superres):
+            content = QSize(OFFLINE_PAGE_WIDTH, OFFLINE_PAGE_HEIGHT)
+        elif page is self.settings_page:
+            content = QSize(DASHBOARD_WIDTH, SETTINGS_PAGE_HEIGHT)
+        else:
+            content = QSize(DASHBOARD_WIDTH, DASHBOARD_HEIGHT)
+        self.resize(NAV_WIDTH + content.width(), max(content.height(), 560))
 
     def toggle_server(self) -> None:
         if self._server_action_pending is not None:
@@ -163,7 +250,12 @@ class MainWindow(QMainWindow):
             self._set_server_action_pending("stopping")
             self.server.stop()
             return
-        if self.offline_process.is_running() or self.two_dvr_process.is_running():
+        if (
+            self.offline_process.is_running()
+            or self.two_dvr_process.is_running()
+            or self.rm_process.is_running()
+            or self.superres_process.is_running()
+        ):
             QMessageBox.warning(self, self.i18n.t("dialog.warning"), self.i18n.t("dialog.stop_offline_first"))
             return
         gpu_support = detect_nvidia_gpu_requirement()
@@ -179,7 +271,10 @@ class MainWindow(QMainWindow):
             return
         self.settings.save()
         env = self.settings.server_env()
-        env["PT_DEBUG_LOGS"] = "1" if self.home.debug_toggle.isChecked() else "0"
+        env["PT_DEBUG_LOGS"] = "1" if self.log_page.debug_toggle.isChecked() else "0"
+        # Keep the UI process's own port view (dashboard address, runtime
+        # status poller, live control PUTs) aligned with the server we launch.
+        os.environ["PT_HTTP_PORT"] = env["PT_HTTP_PORT"]
         log_startup_event(
             "server_start_requested",
             status_port=STATUS_DEFAULT_PORT,
@@ -188,7 +283,7 @@ class MainWindow(QMainWindow):
             debug_logs=env.get("PT_DEBUG_LOGS"),
             ui_startup_log=str(UI_STARTUP_LOG_PATH),
         )
-        self.home.clear_log()
+        self.log_page.clear_log()
         self._set_server_action_pending("starting")
         self.server.start(env)
         log_startup_event("server_start_called", server_running=self.server.is_running(), pid=self.server.process.process_id())
@@ -202,39 +297,47 @@ class MainWindow(QMainWindow):
         if self.server.is_running():
             QMessageBox.warning(self, self.i18n.t("dialog.warning"), self.i18n.t("dialog.stop_server_first"))
             return
-        self.stack.setCurrentWidget(self.offline)
+        self.offline.sync_from_settings()
+        self._show_sub_page(self.offline)
 
     def open_two_dvr(self) -> None:
         if self.server.is_running():
             QMessageBox.warning(self, self.i18n.t("dialog.warning"), self.i18n.t("dialog.stop_server_first"))
             return
-        self.stack.setCurrentWidget(self.two_dvr)
+        self.two_dvr.sync_from_settings()
+        self._show_sub_page(self.two_dvr)
 
-    def _page_changed(self, index: int) -> None:
-        if self.stack.widget(index) is self.home:
-            self.home.sync_from_settings()
-            self.home._adjust_window()
+    def open_rm(self) -> None:
+        if not bool(self.settings.data.get("rm_card_visible")):
             return
-        self.setMinimumWidth(0)
-        self.setMaximumWidth(QT_MAX_WIDGET_SIZE)
-        self.setMinimumHeight(0)
-        self.setMaximumHeight(QT_MAX_WIDGET_SIZE)
-        if self.stack.widget(index) is self.subtitle:
-            self.resize(SUBTITLE_PAGE_WIDTH, SUBTITLE_PAGE_HEIGHT)
-        elif self.stack.widget(index) is self.offline:
-            self.offline.sync_from_settings()
-            self.resize(OFFLINE_PAGE_WIDTH, OFFLINE_PAGE_HEIGHT)
-        elif self.stack.widget(index) is self.two_dvr:
-            self.two_dvr.sync_from_settings()
-            self.resize(OFFLINE_PAGE_WIDTH, OFFLINE_PAGE_HEIGHT)
+        if self.server.is_running():
+            QMessageBox.warning(self, self.i18n.t("dialog.warning"), self.i18n.t("dialog.stop_server_first"))
+            return
+        self.rm.sync_from_settings()
+        self._show_sub_page(self.rm)
+
+    def open_superres(self) -> None:
+        if self.server.is_running():
+            QMessageBox.warning(self, self.i18n.t("dialog.warning"), self.i18n.t("dialog.stop_server_first"))
+            return
+        self.superres.sync_from_settings()
+        self._show_sub_page(self.superres)
 
     def _offline_state_changed(self, running: bool) -> None:
         if running:
-            self.stack.setCurrentWidget(self.offline)
+            self._show_sub_page(self.offline)
 
     def _two_dvr_state_changed(self, running: bool) -> None:
         if running:
-            self.stack.setCurrentWidget(self.two_dvr)
+            self._show_sub_page(self.two_dvr)
+
+    def _rm_state_changed(self, running: bool) -> None:
+        if running:
+            self._show_sub_page(self.rm)
+
+    def _superres_state_changed(self, running: bool) -> None:
+        if running:
+            self._show_sub_page(self.superres)
 
     def closeEvent(self, event) -> None:
         self.status_poller.stop()
@@ -243,6 +346,8 @@ class MainWindow(QMainWindow):
         self.server.stop()
         self.offline_process.stop()
         self.two_dvr_process.stop()
+        self.rm_process.stop()
+        self.superres_process.stop()
         super().closeEvent(event)
 
     # ---- Startup overlay glue ----
@@ -399,7 +504,6 @@ class MainWindow(QMainWindow):
         else:
             self.runtime_status_timer.stop()
             self._runtime_status_pending = False
-            self.runtime_status_label.clear()
         if not running:
             self._set_server_action_pending(None)
             self.status_poller.stop()
@@ -434,7 +538,7 @@ class MainWindow(QMainWindow):
 
     def _set_server_action_pending(self, action: str | None) -> None:
         self._server_action_pending = action
-        self.home.server_button.setEnabled(action is None)
+        self.dashboard.server_button.setEnabled(action is None)
 
     def _runtime_status_url(self) -> str:
         port = str(os.environ.get("PT_HTTP_PORT") or "8200").strip() or "8200"
@@ -460,11 +564,8 @@ class MainWindow(QMainWindow):
 
     def _apply_runtime_status(self, status: dict) -> None:
         self._runtime_status_pending = False
-        if not self.server.is_running():
-            self.runtime_status_label.clear()
-            return
-        if not status.get("ok"):
-            self.runtime_status_label.clear()
+        if not self.server.is_running() or not status.get("ok"):
+            self.dashboard.set_runtime_status("")
             return
         used = status.get("vram_used_mib")
         total = status.get("vram_total_mib")
@@ -485,4 +586,4 @@ class MainWindow(QMainWindow):
                 pass
         elif active:
             parts.append(f"{self.i18n.t('status.vram')} --")
-        self.runtime_status_label.setText(" | ".join(parts))
+        self.dashboard.set_runtime_status(" | ".join(parts))

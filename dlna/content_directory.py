@@ -40,6 +40,11 @@ from config import (
     MEDIA_LIBRARY,
     VIDEO_DIR,
     VIDEO_EXTS,
+    RTX_VSR_ENABLED,
+    RTX_VSR_REALTIME_ENABLED,
+    RTX_VSR_INPUT_MIN_HEIGHT,
+    RTX_VSR_INPUT_MAX_HEIGHT,
+    RTX_VSR_TARGET_HEIGHT,
 )
 from dlna.profiles import passthrough_frame_rate
 from media_library import safe_resolve_path
@@ -54,13 +59,15 @@ from utils.offline_outputs import (
     is_offline_passthrough_output_name,
 )
 from utils.runtime_settings import get_rm, get_si_mix
-from utils.subtitles import SubtitleTrack, find_external_subtitles, subtitle_output_enabled
+from utils.subtitles import SubtitleTrack, find_external_subtitles
 from utils.video_metadata import probe_video_metadata, select_backend
+from utils.rtx_vsr import source_exceeds_target_resolution
 from utils.vr_naming import (
     has_vr_filename_marker,
     is_half_equirectangular_source,
     live_passthrough_title,
     source_display_stem,
+    superres_stem,
 )
 
 log = get("cds")
@@ -74,16 +81,19 @@ ALPHA_LIVE_PREFIX = "pla_"
 LEGACY_ALPHA_LIVE_PREFIX = "pla:"
 TWO_DVR_LIVE_PREFIX = "pl3_"
 RM_LIVE_PREFIX = "plr_"
+SUPERRES_LIVE_PREFIX = "plsr_"
 LIVE_ITEM_PREFIX = "lg_"
 ALPHA_LIVE_ITEM_PREFIX = "la_"
 TWO_DVR_LIVE_ITEM_PREFIX = "l3_"
 RM_LIVE_ITEM_PREFIX = "lr_"
+SUPERRES_LIVE_ITEM_PREFIX = "plsr_item_"
 LIVE_TIME_INDEX_PREFIX = "lix_"
 LIVE_TIME_GROUP_PREFIX = "lig_"
 LIVE_TIME_MINUTE_PREFIX = "lim_"
 LIVE_TIME_POINT_PREFIX = "li5_"
 SEEK_ITEM_PREFIX = "sg_"
 ALPHA_SEEK_ITEM_PREFIX = "sa_"
+SUPERRES_SEEK_ITEM_PREFIX = "ssr_"
 IMAGE_ITEM_PREFIX = "img_"
 SI_ITEM_PREFIX = "si_"
 # Realtime SI ([SI]) directory + time-index object ids. The [SI] entry is a
@@ -112,7 +122,7 @@ DLNA_OP_BYTE_AND_TIME_SEEK = "11"
 DIDL_NS = "urn:schemas-upnp-org:metadata-1-0/DIDL-Lite/"
 
 _DIR_ITEMS_CACHE_MAX = 256
-_DIDL_SCHEMA_VERSION = 10
+_DIDL_SCHEMA_VERSION = 11
 _SYSTEM_UPDATE_ID = _DIDL_SCHEMA_VERSION
 _OBJECT_ID_VERSION_PREFIX = f"ptv{_DIDL_SCHEMA_VERSION}_"
 _dir_items_cache: dict[tuple, list[dict]] = {}
@@ -123,7 +133,7 @@ _CDS_CLIENT_DEOVR = "deovr"
 _TIME_INDEX_GROUP_SEC = 10 * 60
 _TIME_INDEX_MINUTE_SEC = 60
 _TIME_INDEX_POINT_SEC = 5
-_LIVE_TIME_MODE_TOKEN_BY_MODE = {"green": "g", "alpha": "a", "two_dvr": "3", "rm": "r"}
+_LIVE_TIME_MODE_TOKEN_BY_MODE = {"green": "g", "alpha": "a", "two_dvr": "3", "rm": "r", "superres": "s"}
 _LIVE_TIME_MODE_BY_TOKEN = {token: mode for mode, token in _LIVE_TIME_MODE_TOKEN_BY_MODE.items()}
 _SELECT_TIME_INDEX_LABELS = {
     "en_US": "Select Time Index",
@@ -238,7 +248,10 @@ def _id_to_dir(object_id: str) -> Path | None:
 def _id_to_live(object_id: str) -> tuple[Path, str] | None:
     mode = "green"
     prefix = LIVE_PREFIX
-    if object_id.startswith(RM_LIVE_ITEM_PREFIX):
+    if object_id.startswith(SUPERRES_LIVE_ITEM_PREFIX):
+        mode = "superres"
+        prefix = SUPERRES_LIVE_ITEM_PREFIX
+    elif object_id.startswith(RM_LIVE_ITEM_PREFIX):
         mode = "rm"
         prefix = RM_LIVE_ITEM_PREFIX
     elif object_id.startswith(TWO_DVR_LIVE_ITEM_PREFIX):
@@ -249,6 +262,9 @@ def _id_to_live(object_id: str) -> tuple[Path, str] | None:
         prefix = ALPHA_LIVE_ITEM_PREFIX
     elif object_id.startswith(LIVE_ITEM_PREFIX):
         prefix = LIVE_ITEM_PREFIX
+    elif object_id.startswith(SUPERRES_LIVE_PREFIX):
+        mode = "superres"
+        prefix = SUPERRES_LIVE_PREFIX
     elif object_id.startswith(RM_LIVE_PREFIX):
         mode = "rm"
         prefix = RM_LIVE_PREFIX
@@ -330,7 +346,10 @@ def _id_to_live_time_index(object_id: str) -> tuple[Path, str, str, int, int] | 
 
 def _id_to_seek(object_id: str) -> tuple[Path, str] | None:
     mode = "green"
-    if object_id.startswith(ALPHA_SEEK_ITEM_PREFIX):
+    if object_id.startswith(SUPERRES_SEEK_ITEM_PREFIX):
+        mode = "superres"
+        prefix = SUPERRES_SEEK_ITEM_PREFIX
+    elif object_id.startswith(ALPHA_SEEK_ITEM_PREFIX):
         mode = "alpha"
         prefix = ALPHA_SEEK_ITEM_PREFIX
     elif object_id.startswith(SEEK_ITEM_PREFIX):
@@ -456,9 +475,13 @@ def _video_item_count(path: Path, child: IndexedChild | None = None) -> int:
         or _hide_passthrough_for_path(path, child)
     ):
         return 1 + si_items
-    passthrough_modes = len(_passthrough_modes())
-    seek_items = passthrough_modes if _seek_passthrough_dlna_enabled() else 0
     width, height = _indexed_video_dimensions(child)
+    passthrough_modes_list = [
+        mode for mode in _passthrough_modes()
+        if mode != "superres" or _superres_dlna_enabled(path, width, height, child)
+    ]
+    passthrough_modes = len(passthrough_modes_list)
+    seek_items = passthrough_modes if _seek_passthrough_dlna_enabled() else 0
     rm_items = 1 if _rm_dlna_enabled(path, width, height) else 0
     return 1 + si_items + rm_items + passthrough_modes + seek_items
 
@@ -482,6 +505,18 @@ def _indexed_video_dimensions(child: IndexedChild | None) -> tuple[int, int]:
     if width <= 0 or height <= 0:
         width, height = _parse_resolution(getattr(video, "resolution", ""))
     return width, height
+
+
+def _indexed_is_10bit(child: IndexedChild | None) -> bool:
+    """Infer >8-bit sources from the indexed pixel format.
+
+    IndexedVideo carries no bit_depth field, so mirror the pix_fmt heuristic
+    used by utils.video_metadata when bits_per_raw_sample is unavailable.
+    """
+    video = child.video if child is not None else None
+    if video is None:
+        return False
+    return "10" in str(getattr(video, "pix_fmt", "") or "")
 
 
 def _live_passthrough_block_reason(path: Path, child: IndexedChild | None) -> str:
@@ -523,7 +558,7 @@ def _passthrough_modes() -> tuple[str, ...]:
         else:
             tokens = (token,)
         for mode in tokens:
-            if mode in {"green", "alpha", "two_dvr"} and mode not in out:
+            if mode in {"green", "alpha", "two_dvr", "superres"} and mode not in out:
                 out.append(mode)
     return tuple(out)
 
@@ -873,6 +908,8 @@ def _passthrough_live_prefix(mode: str) -> str:
         return RM_LIVE_PREFIX
     if mode == "two_dvr":
         return TWO_DVR_LIVE_PREFIX
+    if mode == "superres":
+        return SUPERRES_LIVE_PREFIX
     return ALPHA_LIVE_PREFIX if mode == "alpha" else LIVE_PREFIX
 
 
@@ -881,16 +918,20 @@ def _passthrough_live_item_prefix(mode: str) -> str:
         return RM_LIVE_ITEM_PREFIX
     if mode == "two_dvr":
         return TWO_DVR_LIVE_ITEM_PREFIX
+    if mode == "superres":
+        return SUPERRES_LIVE_ITEM_PREFIX
     return ALPHA_LIVE_ITEM_PREFIX if mode == "alpha" else LIVE_ITEM_PREFIX
 
 
 def _passthrough_seek_item_prefix(mode: str) -> str:
+    if mode == "superres":
+        return SUPERRES_SEEK_ITEM_PREFIX
     return ALPHA_SEEK_ITEM_PREFIX if mode == "alpha" else SEEK_ITEM_PREFIX
 
 
 def _passthrough_live_query(mode: str) -> str:
     version = f"ptv={_DIDL_SCHEMA_VERSION}"
-    if mode in {"green", "alpha", "two_dvr", "rm"}:
+    if mode in {"green", "alpha", "two_dvr", "rm", "superres"}:
         return f"mode={mode}&{version}"
     return version
 
@@ -983,6 +1024,25 @@ def _rm_dlna_enabled(path: Path, width: int = 0, height: int = 0) -> bool:
     """A [RM] live entry is offered for 2D sources when mosaic restoration is on.
     2:1 half-equirectangular VR sources are excluded (handled by _is_two_d_source)."""
     return bool(get_rm().enabled) and _is_two_d_source(path, width, height)
+
+
+def _superres_dlna_enabled(
+    path: Path,
+    width: int = 0,
+    height: int = 0,
+    child: IndexedChild | None = None,
+) -> bool:
+    is_vr = has_vr_filename_marker(path.stem) or is_half_equirectangular_source(width, height)
+    source_shape_allowed = _is_two_d_source(path, width, height) or is_vr
+    input_height_allowed = int(height) >= RTX_VSR_INPUT_MIN_HEIGHT and (is_vr or int(height) <= RTX_VSR_INPUT_MAX_HEIGHT)
+    return bool(
+        RTX_VSR_ENABLED
+        and RTX_VSR_REALTIME_ENABLED
+        and source_shape_allowed
+        and not _indexed_is_10bit(child)
+        and input_height_allowed
+        and not source_exceeds_target_resolution(width, height, RTX_VSR_TARGET_HEIGHT)
+    )
 
 
 def _live_chapter_offsets(duration: float) -> list[int]:
@@ -1171,6 +1231,8 @@ def _video_items_from_index(
     # beside the live entry instead of replacing it, so unknown or blocked
     # clients still have the stable /passthrough_live fallback visible.
     for mode in _passthrough_modes():
+        if mode == "superres" and not _superres_dlna_enabled(path, width, height, child):
+            continue
         if mode == "two_dvr" and (
             not _is_two_d_source(path, width, height)
             or has_offline_two_dvr_output(path, siblings)
@@ -1325,6 +1387,8 @@ def _live_time_index_items(
         return []
     if mode == "rm" and not _rm_dlna_enabled(path, width, height):
         return []
+    if mode == "superres" and not _superres_dlna_enabled(path, width, height):
+        return []
 
     virtual_title = _passthrough_virtual_title(path, mode, width, height)
     force_hours = _live_time_force_hours(duration)
@@ -1468,6 +1532,8 @@ def _live_chapter_items(
         return []
     if mode == "rm" and not _rm_dlna_enabled(path, width, height):
         return []
+    if mode == "superres" and not _superres_dlna_enabled(path, width, height):
+        return []
     pt_bps = _parse_bitrate(PASSTHROUGH_BITRATE)
     if duration > 0:
         _, pt_bps_est, _ = estimate_for_media(path, duration, PYNV_OUTPUT_CODEC)
@@ -1475,7 +1541,7 @@ def _live_chapter_items(
         pt_bps_est = pt_bps
     items: list[dict] = []
     virtual_title = _passthrough_virtual_title(path, mode, width, height)
-    suffix = {"alpha": "a", "two_dvr": "3", "rm": "r"}.get(mode, "g")
+    suffix = {"alpha": "a", "two_dvr": "3", "rm": "r", "superres": "s"}.get(mode, "g")
     live_route_suffix = _live_route_hint_suffix(client_profile)
     live_omit_filelike_attrs = not _is_deovr_cds_client(client_profile)
     items.append(_live_time_index_root_item(path, mode, parent_id, duration, width, height, language))
@@ -1520,7 +1586,6 @@ def _children_for_dir(directory: Path, client_profile: str | None = None) -> lis
         snapshot.key,
         snapshot.signature,
         PASSTHROUGH_OUTPUT_MODE,
-        int(subtitle_output_enabled()),
         int(PASSTHROUGH_LIVE_CHAPTER_MAX_ITEMS),
         int(PASSTHROUGH_LIVE_CHAPTER_MIN_INTERVAL_SEC),
         int(DLNA_IMAGE_ENABLED),

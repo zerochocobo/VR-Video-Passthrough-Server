@@ -48,7 +48,7 @@ from offline.sam3_matanyone2 import (  # noqa: E402
     empty_sam3_mask,
     fill_short_inactive_gaps,
 )
-from offline.decoded_frames import decoded_frame_to_bgr  # noqa: E402
+from offline.decoded_frames import decoded_frame_to_sbs_eye_rgbs, scene_bgr_from_rgb  # noqa: E402
 from offline.matanyone2_engine import MatAnyone2OnnxEngine as SharedMatAnyone2OnnxEngine  # noqa: E402
 
 GPU_CACHE_ENV = configure_gpu_runtime_cache()
@@ -714,17 +714,15 @@ def _precompute_sam3_segment_masks(args, src: Path, dec, source_fps: float, fps:
             masker = make_masker()
         src_idx = min(len(dec) - 1, cfr_source_index(start, source_fps, fps))
         frame = dec.frame_at(src_idx)
-        bgr = decoded_frame_to_bgr(frame)
-        half = frame.width // 2
+        eye_images = decoded_frame_to_sbs_eye_rgbs(frame)
+        del frame
         scene_cut = False
         scene_distance = 0.0
         if scene_detector is not None:
-            scene_cut = scene_detector.step(bgr[:, :half] if half > 0 else bgr)
+            scene_cut = scene_detector.step(
+                scene_bgr_from_rgb(eye_images[0], getattr(scene_detector, "downsample_height", 540))
+            )
             scene_distance = scene_detector.last_distance
-        eye_images = [
-            cv2.cvtColor(bgr[:, :half], cv2.COLOR_BGR2RGB),
-            cv2.cvtColor(bgr[:, half:half * 2], cv2.COLOR_BGR2RGB),
-        ]
         masks = []
         infos = []
         t0 = time.perf_counter()
@@ -733,12 +731,15 @@ def _precompute_sam3_segment_masks(args, src: Path, dec, source_fps: float, fps:
             image_out = masker.encode_prepared(None, sam_image)
             del sam_image
             try:
-                mask, info = masker.decode_encoded(
-                    None,
-                    image_out,
-                    source_size,
-                    out_size=(args._matanyone2_in_w, args._matanyone2_in_h),
-                )
+                try:
+                    mask, info = masker.decode_encoded(
+                        None,
+                        image_out,
+                        source_size,
+                        out_size=(args._matanyone2_in_w, args._matanyone2_in_h),
+                    )
+                finally:
+                    del image_out
             except RuntimeError as exc:
                 message = str(exc)
                 if "SAM3 returned no masks" not in message and "SAM3 returned empty masks" not in message:
@@ -797,6 +798,7 @@ def _precompute_sam3_segment_masks(args, src: Path, dec, source_fps: float, fps:
             + (f" scene_cut=1 dist={scene_distance:.3f}" if scene_cut else "")
             + (f" gpu={gpu_used}/{gpu_total}MiB" if gpu_total else "")
         )
+        del eye_images, masks, infos, mask_tensors
         if release_interval and n % release_interval == 0:
             del masker
             masker = None

@@ -65,13 +65,21 @@ class SIMixTests(unittest.TestCase):
         self.assertIn("[0:a:0]", filt)
         self.assertIn("[1:a:0]", filt)
         self.assertIn("sidechaincompress", filt)
+        self.assertIn("threshold=0.025:ratio=5:attack=30:release=600:makeup=1", filt)
         self.assertIn("[si_track]", filt)
+
+    def test_duck_strength_presets_control_compressor_params(self) -> None:
+        light = build_si_mix_filter("both", 100, 100, 0.0, duck_original=True, duck_preset="light")
+        strong = build_si_mix_filter("both", 100, 100, 0.0, duck_original=True, duck_preset="strong")
+        self.assertIn("threshold=0.03:ratio=2.5:attack=30:release=400:makeup=1", light)
+        self.assertIn("threshold=0.015:ratio=10:attack=30:release=800:makeup=1", strong)
 
     def test_si_defaults_are_enabled_both_channel_and_full_si_volume(self) -> None:
         params = SIMixParams()
         self.assertTrue(params.enabled)
         self.assertEqual(params.mix_channel, "both")
         self.assertEqual(params.si_volume_percent, 100)
+        self.assertEqual(params.duck_preset, "normal")
 
     def test_runtime_params_clamp_supported_choices(self) -> None:
         params = SIMixParams(
@@ -81,6 +89,7 @@ class SIMixTests(unittest.TestCase):
             si_volume_percent=55,
             si_delay_seconds=1.4,
             duck_original="off",
+            duck_preset="bad",
         )
         self.assertTrue(params.enabled)
         self.assertEqual(params.mix_channel, "both")
@@ -88,6 +97,7 @@ class SIMixTests(unittest.TestCase):
         self.assertEqual(params.si_volume_percent, 100)
         self.assertEqual(params.si_delay_seconds, 0.0)
         self.assertFalse(params.duck_original)
+        self.assertEqual(params.duck_preset, "normal")
 
     def test_parse_range_header_is_lenient(self) -> None:
         self.assertEqual(parse_range_header("bytes=1024-2047"), (1024, 2047, True))
@@ -213,6 +223,7 @@ class SIMixTests(unittest.TestCase):
                 "si_volume_percent": 90,
                 "si_delay_seconds": 0.7,
                 "duck_original": False,
+                "duck_preset": "strong",
             },
         )
         self.assertEqual(response.status_code, 200)
@@ -223,6 +234,7 @@ class SIMixTests(unittest.TestCase):
         self.assertEqual(data["original_volume_percent"], 80)
         self.assertEqual(data["si_delay_seconds"], 0.7)
         self.assertFalse(data["duck_original"])
+        self.assertEqual(data["duck_preset"], "strong")
         self.assertGreater(data["version"], before.json()["version"])
 
     def test_settings_server_env_contains_si_mix_values(self) -> None:
@@ -237,6 +249,7 @@ class SIMixTests(unittest.TestCase):
                 self.assertEqual(default_env["PT_SI_MIX_ENABLED"], "1")
                 self.assertEqual(default_env["PT_SI_MIX_CHANNEL"], "both")
                 self.assertEqual(default_env["PT_SI_VOLUME_PERCENT"], "100")
+                self.assertEqual(default_env["PT_SI_DUCK_PRESET"], "normal")
 
                 settings.data["si_enabled"] = True
                 settings.data["si_mix_channel"] = "right"
@@ -244,6 +257,7 @@ class SIMixTests(unittest.TestCase):
                 settings.data["si_volume_percent"] = 90
                 settings.data["si_delay_seconds"] = 0.7
                 settings.data["si_duck_original"] = False
+                settings.data["si_duck_preset"] = "light"
                 env = settings.server_env()
         self.assertEqual(env["PT_SI_MIX_ENABLED"], "1")
         self.assertEqual(env["PT_SI_MIX_CHANNEL"], "right")
@@ -251,6 +265,7 @@ class SIMixTests(unittest.TestCase):
         self.assertEqual(env["PT_SI_VOLUME_PERCENT"], "90")
         self.assertEqual(env["PT_SI_DELAY_SECONDS"], "0.7")
         self.assertEqual(env["PT_SI_DUCK_ORIGINAL"], "0")
+        self.assertEqual(env["PT_SI_DUCK_PRESET"], "light")
 
     def test_media_si_head_uses_virtual_layout_without_opening_legacy_stream(self) -> None:
         class Service:
@@ -374,7 +389,7 @@ class SIMixTests(unittest.TestCase):
         # The [SI] entry is now a realtime directory (chapters + time index),
         # not a single cached item.
         self.assertTrue(items[1].get("container"))
-        self.assertEqual(items[1]["id"], "six_ptv10_movie.mp4")
+        self.assertEqual(items[1]["id"], "six_ptv11_movie.mp4")
         self.assertEqual(items[1]["title"], "[SI]movie_LR_180_SBS")
         # 60s source -> one quick chapter (t=0) + one "Select Time Index" entry.
         self.assertEqual(items[1]["child_count"], 2)
@@ -394,10 +409,10 @@ class SIMixTests(unittest.TestCase):
                 children = cds._si_chapter_items(video)
         # First child is the "Select Time Index" subdirectory.
         self.assertTrue(children[0].get("container"))
-        self.assertEqual(children[0]["id"], "sxi_ptv10_movie.mp4")
+        self.assertEqual(children[0]["id"], "sxi_ptv11_movie.mp4")
         self.assertIn("[SI]movie_LR_180_SBS", children[0]["title"])
         # Then up to N quick-play chapter leaves hitting /si_live.
-        self.assertEqual(children[1]["id"], "sic_ptv10_movie.mp4@0")
+        self.assertEqual(children[1]["id"], "sic_ptv11_movie.mp4@0")
         self.assertIn("/si_live/movie.mp4", children[1]["url"])
         self.assertIn("t=0", children[1]["url"])
         self.assertEqual(children[1]["mime"], "video/MP2T")
@@ -418,10 +433,10 @@ class SIMixTests(unittest.TestCase):
                 minute_items = cds._si_time_index_items(video, "minute", start=0)
         # 60s -> a single 10-min group, so [SI] shows the minute directories directly.
         self.assertTrue(index_items[0].get("container"))
-        self.assertEqual(index_items[0]["id"], "sin_ptv10_movie.mp4@0")
+        self.assertEqual(index_items[0]["id"], "sin_ptv11_movie.mp4@0")
         # Each 5s point is a playable leaf hitting the realtime MPEG-TS route.
         first_leaf = minute_items[0]
-        self.assertEqual(first_leaf["id"], "sit_ptv10_movie.mp4@0")
+        self.assertEqual(first_leaf["id"], "sit_ptv11_movie.mp4@0")
         self.assertIn("/si_live/movie.mp4", first_leaf["url"])
         self.assertIn("t=0", first_leaf["url"])
         self.assertEqual(first_leaf["mime"], "video/MP2T")

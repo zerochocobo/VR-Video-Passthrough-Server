@@ -1,9 +1,11 @@
 ﻿# VR Video Passthrough Server - Project Guide
 
-VR Video Passthrough Server is a local DLNA/UPnP media server for VR video playback.
-It exposes a local video library to DLNA clients and can generate a realtime
-passthrough stream by applying RVM video matting, compositing the foreground over
-a green background, and encoding the result for playback.
+VR Video Passthrough Server v1.2.0 is a Windows-first local DLNA/UPnP media
+server and GPU video-processing desktop application. It exposes local media to
+DLNA clients and provides realtime Green/Alpha passthrough, 2D perspective,
+2D-to-3D / VR, NVIDIA RTX Video Super Resolution, subtitles, light matching,
+and dubbing / simultaneous-interpretation playback, plus dedicated offline
+generation tools.
 
 The current production-oriented path is PyNvVideoCodec + GPU matting + HEVC
 output. The older FFmpeg subprocess pipeline remains available as a fallback and
@@ -31,36 +33,62 @@ launcher unless temporarily overriding values for diagnostics.
 
 - DLNA discovery uses SSDP on UDP/1900.
 - HTTP media/control defaults to port `8200`.
-- The advertised server name defaults to `VR Video Passthrough Server` and can be
+- The advertised server name defaults to `VR Passthrough Server` and can be
   changed with `PT_SERVER_NAME`.
-- The video directory defaults to `G:\Downloads` and can be changed with
+- The video directory defaults to the project `videos/` directory and can be changed with
   `PT_VIDEO_DIR`.
-- Physical folders under `VIDEO_DIR` are exposed as DLNA folders.
-- Each normal video is listed as:
-  - the original media item;
-  - a `*-passthrough-live` item.
+- Multiple local roots are supported with `|` separators. Cloud drives mounted
+  as local paths are supported; UNC network-share roots are rejected.
+- Physical folders are exposed as DLNA folders and original media remains
+  directly playable with HTTP Range support.
 - `PT_PASSTHROUGH_OUTPUT_MODE` controls generated live entries:
-  - `green`: existing green-background chroma-key live entry;
-  - `alpha`: experimental DeoVR alpha-packed fisheye live entry titled
-    `Alpha Passthrough`;
-  - `all`: expose both green and alpha live entries.
+  - `green`: green-background/chroma-key output;
+  - `alpha`: alpha-packed passthrough output;
+  - `two_dvr`: DA3-based realtime 2D-to-SBS 3D/VR output;
+  - `superres`: NVIDIA RTX VSR for eligible 2D and VR sources;
+  - comma-separated combinations are supported; legacy `all` means green + alpha.
+- The desktop UI also exposes independent realtime controls for 2D perspective,
+  hard subtitles, dubbing/SI, and light matching.
+- Realtime and offline SuperRes use isolated real-evaluation preflight, 8-bit
+  source gates, and project resolution policy. The adaptive 4096 target outputs
+  8192x4096 for recognized 2:1 SBS VR and 3840x2160 for ordinary 2D.
+- 2:1 SBS VR is split into left/right eyes before NGX evaluation and rejoined on
+  the GPU. The 8K offline path has no unsupported whole-frame fallback.
+- Same-stem `.si.wav` sidecars create `[SI]` entries. Current DLNA playback uses
+  realtime `/si_live` MPEG-TS with start offsets and configurable channel mix,
+  original-audio ducking, and Light/Normal/Strong duck presets.
+- Same-stem subtitle sidecars are advertised for normal media independently of
+  the realtime hard-subtitle switch.
 - The older pseudo-VOD `/passthrough/{name}` endpoint still exists in HTTP code
   but is hidden from the DLNA catalog for now.
-- `*-passthrough-live` is directly playable for short videos.
-- For longer videos, `*-passthrough-live` is a chapter container. Entering it
-  shows coarse start points backed by `/passthrough_live/{name}?t=<seconds>`.
-- Live chapter rules:
-  - max items: `PT_PASSTHROUGH_LIVE_CHAPTER_MAX_ITEMS`, default `10`;
-  - minimum interval: `PT_PASSTHROUGH_LIVE_CHAPTER_MIN_INTERVAL_SEC`, default
-    `180` seconds;
-  - first item is always `Play from start` at `0` seconds;
-  - titles use `HH:MM`, not seconds;
-  - computed intervals round up to whole minutes;
-  - candidate starts with `<= 60` seconds remaining are omitted.
+- Generated Live/SI directories provide a localized `[Select Time Index]`
+  hierarchy with quick points, 10-minute groups, minute folders, and 5-second
+  playable offsets.
 - Files whose name contains `passthrough` are treated as already-derived media
   and do not get additional passthrough/live virtual entries.
+- Offline output discovery also skips existing generated `_2K`, `_4K`, `_8K`,
+  and passthrough products where applicable.
 - Thumbnails are cached and live/passthrough entries reuse the raw thumbnail to
   avoid loading matting during browsing.
+
+### Desktop UI
+
+The PySide6 v1.2.0 UI uses a fixed navigation rail rather than the previous
+expand/collapse Home layout:
+
+- **Home:** server start/stop, address/status, and feature cards for Alpha,
+  Green, HD Super Resolution, 2D-to-3D / VR, dubbing/SI, hard subtitles, light
+  matching, and 2D perspective.
+- **Offline Tools:** passthrough generation, 2D-to-3D / VR generation, and
+  standalone RTX Super Resolution.
+- **Subtitle Style:** video/frame preview and persisted subtitle appearance.
+- **Logs:** runtime log view, debug-log toggle, clear, and report entry point.
+- **Settings:** media roots, DLNA name/port, language, output quality/FPS/size,
+  and TensorRT cache controls.
+
+Realtime feature switches are locked while the server is running, except for
+controls designed for live updates such as light matching. Configuration dialogs
+remain available where safe.
 
 ## Top-Level Layout
 
@@ -73,12 +101,12 @@ VR Video Passthrough Server/
 |-- PROJECT.md                 This document.
 |-- dlna/                      UPnP/DLNA discovery and ContentDirectory.
 |-- http_app/                  FastAPI app and HTTP routes.
-|-- pipeline/                  Decode, matting, encode, thumbnail pipelines.
+|-- pipeline/                  Decode, matting, VSR, 2DVR, encode, subtitle pipelines.
 |-- ui/                        PySide6 desktop UI, pages, i18n, and process control.
 |-- offline/                   Production offline conversion entry points.
 |-- utils/                     Shared helpers for cache, logs, metadata, etc.
 |-- tools/                     Benchmarks, probes, scans, warmup utilities.
-|-- models/                    ONNX matting models.
+|-- models/                    ONNX models plus packaged RTX VSR native/runtime assets.
 |-- videos/                    Default local input video directory.
 |-- runtime_cache/             Runtime caches, thumbnails, and warmup marker.
 |-- debug_output/              Runtime logs and diagnostic outputs.
@@ -149,10 +177,12 @@ Implements ContentDirectory SOAP Browse logic:
 
 - maps physical subdirectories to DIDL containers (`d:<relative/path>`);
 - emits original video items;
-- emits passthrough-live direct items or chapter containers;
-- generates chapter items with `?t=<seconds>` start offsets;
+- emits enabled `[GREEN]`, `[ALPHA]`, `[2D>3D]`, `[SuperRes]`, and `[SI]`
+  virtual entries after source-policy checks;
+- builds localized time-index trees and `?t=<seconds>` playback offsets;
+- advertises same-stem subtitle sidecars for normal media;
 - estimates sizes/bitrates for virtual resources;
-- skips derived links for filenames containing `passthrough`.
+- skips derived links for already-generated outputs.
 
 ### `dlna/profiles.py`
 
@@ -183,29 +213,36 @@ Media and passthrough routes:
 
 - `GET /media/{name}`: raw source file with HTTP Range support.
 - `GET /thumb/{name}`: cached JPEG thumbnail.
-- `GET /passthrough_live/{name}`: live passthrough stream, normally MPEG-TS.
+- `GET /passthrough_live/{name}`: live Green/Alpha/2DVR/SuperRes stream,
+  normally MPEG-TS, with the selected mode carried in the request.
+- `GET /si_live/{name}`: realtime SI/dubbing MPEG-TS with start offset.
+- `HEAD/GET /media_si/{name}`: progressive SI virtual MP4 fallback.
 - `HEAD/GET /passthrough/{name}`: pseudo-VOD byte/time-seek experiment; still
   implemented but hidden from DLNA listings.
 
-This module also owns passthrough concurrency control. The default server allows
-one active passthrough stream at a time to avoid NVENC/NVDEC and shared-matting
-resource contention.
+This module also owns passthrough concurrency control. The default `auto` policy
+selects a conservative stream count from NVIDIA VRAM; matting modes acquire
+independent `Matter` instances from the lazy pool to avoid recurrent-state
+crosstalk.
 
 ## Pipeline Package
 
 ### `pipeline/pynv_stream.py`
 
-Production PyNv passthrough stream:
+Production multi-mode PyNv stream:
 
 ```text
-PyNv decode -> GPU matting/composite -> PyNv HEVC encode -> FFmpeg mux
+PyNv decode -> selected GPU mode -> PyNv HEVC encode -> FFmpeg MPEG-TS mux
 ```
 
 Responsibilities:
 
 - PyNv preflight and preflight cache;
 - PyNv decoder/encoder lifecycle;
-- GPU stream synchronization before NVENC reads composited NV12;
+- Green/Alpha matting, 2D-to-3D stereo rendering, and RTX VSR mode branches;
+- split-eye VR processing and RGBA-stride-aware VSR output conversion;
+- optional SDR HDR-look after NGX VSR;
+- GPU ring-buffer ownership and synchronization before NVENC reads NV12;
 - FFmpeg muxing to fMP4 or MPEG-TS;
 - stderr draining;
 - reader/worker thread coordination;
@@ -227,7 +264,8 @@ ONNX Runtime matting and compositing:
 - handles SBS splitting and RVM recurrent state;
 - supports CPU/BGR and GPU/NV12 paths;
 - includes CuPy RawKernel preprocess and composite kernels;
-- exposes the shared `Matter` instance through `get_matter()`.
+- exposes a lazy VRAM-aware `Matter` pool for realtime streams while retaining
+  `get_matter()` for startup warmup and single-user utility paths.
 
 ### `pipeline/ffmpeg_io.py`
 
@@ -251,6 +289,44 @@ Thumbnail generation and cache:
 - uses stat-based fingerprints to invalidate stale thumbnails;
 - reuses raw thumbnails for live/passthrough catalog items;
 - has a configurable ffmpeg timeout to avoid browse/shutdown stalls.
+
+### `pipeline/hdr_look.py`
+
+Shared CUDA SDR appearance kernel used after RTX VSR output. User-facing modes
+are Off, Natural, and Vivid. This is an 8-bit BT.709 look adjustment, not NVIDIA
+RTX Video HDR / TrueHDR and not an HDR10 output path.
+
+## Offline Package
+
+- `offline/convert.py`: single/batch passthrough generation and time-segment
+  workflows for RVM/MatAnyone2-based Green/Alpha output.
+- `offline/two_dvr.py` and `offline/two_dvr_pynv.py`: DA3/NVDS-backed offline
+  2D-to-SBS 3D/VR generation with quality-speed, temporal, projection, and
+  skip-existing controls.
+- `offline/superres_offline.py`: standalone UI/CLI entry for RTX VSR.
+- `offline/rtx_vsr_pynv.py`: preferred all-GPU SuperRes pipeline:
+
+```text
+NVDEC/PyNv -> fused NV12-to-eye-RGBA -> NGX VSR -> HDR-look
+            -> RGBA-to-NV12 -> NVENC -> FFmpeg video/audio stream-copy mux
+```
+
+The 8K VR path evaluates two 2048x2048 input eyes into two 4096x4096 output
+eyes, rejoins them as 8192x4096, and caps target bitrate at 120 Mbps. Optional
+stage telemetry is available through `PT_RTX_VSR_STAGE_TIMING=1` and
+`PT_RTX_VSR_NATIVE_TIMING=1`.
+
+## UI Package
+
+- `ui/main_window.py`: navigation, page/subpage routing, server process control,
+  runtime status polling, and page-size management.
+- `ui/pages/dashboard_page.py`: server bar and release feature-card dashboard.
+- `ui/pages/tools_page.py`: production offline tool launchers.
+- `ui/pages/settings_page.py`: media/DLNA/general/performance settings in a
+  scroll area.
+- `ui/dialogs/feature_dialogs.py`: dashboard feature configuration dialogs.
+- `ui/settings.py`: persisted UI values and conversion to `PT_*` server env.
+- `ui/translations/`: UTF-8 BOM Chinese, English, and Japanese dictionaries.
 
 ## Utils Package
 
@@ -351,6 +427,8 @@ Development probes used while building the PyNv path:
 
 - `gpu_video_probe.py`: inspect local GPU/video stack.
 - `ort_cold_probe.py`: isolate ONNX Runtime CUDA cold-start behavior.
+- `rtx_vsr_probe.py`: isolated NVIDIA RTX VSR capability and real-evaluate
+  probe; configures the project CUDA/CuPy caches before importing CuPy.
 
 ## Runtime Data Directories
 
@@ -366,10 +444,10 @@ These directories are generated or environment-specific:
 
 | Variable | Default / Current Intent | Purpose |
 |---|---:|---|
-| `PT_SERVER_NAME` | `VR Video Passthrough Server` | DLNA/SSDP friendly name. |
+| `PT_SERVER_NAME` | `VR Passthrough Server` | DLNA/SSDP friendly name; editable in Settings. |
 | `PT_LAN_IP` | auto-detect | LAN address advertised to DLNA clients. |
-| `PT_HTTP_PORT` | `8200` | HTTP media/control port. |
-| `PT_VIDEO_DIR` | `G:\Downloads` | Media library root. |
+| `PT_HTTP_PORT` | `8200` | HTTP media/control port; editable in Settings and requires server restart. |
+| `PT_VIDEO_DIR` | project `videos/` | One or more `|`-separated local media roots; UNC roots are rejected. |
 | `PT_MODEL_PATH` | RVM MobileNetV3 fp16 | ONNX matting model. |
 | `PT_MATTING_INPUT_SIZE` | RVM `1024`, other models `512` | Matting reference input size. |
 | `PT_MATTING_SPLIT_SBS` | `1` | Split side-by-side VR frames before matting. |
@@ -396,7 +474,16 @@ These directories are generated or environment-specific:
 | `PT_MATANYONE2_ALPHA_SMOOTH` | `0` | Optional per-eye EMA smoothing for MatAnyone2 offline alpha; default off because it can add motion afterimages. |
 | `PT_USE_PYNV` | `1` | Enable PyNv backend for eligible sources. |
 | `PT_PASSTHROUGH_MAX_FPS` | `30` | Output FPS cap. |
-| `PT_PASSTHROUGH_OUTPUT_MODE` | `green` | Generated passthrough layout: `none`, `green`, `alpha`, or `all` to expose both passthrough entries. |
+| `PT_PASSTHROUGH_OUTPUT_MODE` | `green` backend default | `none`, `green`, `alpha`, `two_dvr`, `superres`, or comma-separated combinations; legacy `all` means green + alpha. |
+| `PT_RTX_VSR_REALTIME_ENABLE` | `1` | Enable the realtime SuperRes output when `superres` is selected. |
+| `PT_RTX_VSR_OFFLINE_ENABLE` | `1` | Enable the standalone offline SuperRes page/process. |
+| `PT_RTX_VSR_OFFLINE_PYNV_ENABLE` | `1` | Prefer the all-GPU NVDEC/CUDA/NGX/NVENC offline path. |
+| `PT_RTX_VSR_QUALITY` | backend `2`, desktop `4` | VSR quality enum: 0 Bicubic, 1 Low, 2 Medium, 3 High, 4 Ultra. Dashboard exposes 1-4. |
+| `PT_RTX_VSR_INPUT_MIN_HEIGHT` | `360` | Project policy minimum input height for SuperRes. |
+| `PT_RTX_VSR_INPUT_MAX_HEIGHT` | `1440` | Normal 2D project-policy maximum; eligible recognized VR uses the VR gate. |
+| `PT_RTX_VSR_TARGET_HEIGHT` | `4096` | Adaptive default: 8192x4096 for recognized SBS VR, 3840x2160 for ordinary 2D. |
+| `PT_RTX_VSR_HDR_LOOK` | `natural` | SDR appearance mode: `off`, `natural`, or `vivid`. |
+| `PT_RTX_VSR_EVALUATE_TIMEOUT_SEC` | `45` | Timeout for isolated real NGX evaluation preflight. |
 | `PT_ALPHA_PASSTHROUGH_TITLE` | `Alpha Passthrough` | DLNA virtual item title when alpha output mode is enabled. |
 | `PT_COMPOSITE_BG_RGB` | `808080` | Green-screen/composite background color as RGB hex. UI presets: `808080`, `C8C8C8`, `2BE640`, `0047BB`. |
 | `PT_PASSTHROUGH_SEND_REALTIME_PACING` | `1` | Pace live HTTP delivery to player-safe bitrate. |
@@ -410,9 +497,11 @@ These directories are generated or environment-specific:
 | `PT_PASSTHROUGH_AUDIO_MPEGTS_SLATE` | `1` | Use green-screen slate while first AAC cache is built. Slate video continues while the first real frame is prepared; source audio starts only after the first real video bitstream is written. |
 | `PT_PASSTHROUGH_AUDIO_MPEGTS_SLATE_DIRECT_AFTER` | `1.0` | On cache miss, stop waiting for full AAC cache after this many seconds and feed this playback from direct source demux while the full cache continues. |
 | `PT_PASSTHROUGH_GOP` | `60` | Encoder GOP size. |
-| `PT_PASSTHROUGH_MAX_CONCURRENT` | `1` | Concurrent passthrough stream limit. |
+| `PT_PASSTHROUGH_MAX_CONCURRENT` | `auto` | VRAM-aware concurrent generated-stream limit; can be overridden explicitly. |
 | `PT_PASSTHROUGH_LIVE_CHAPTER_MIN_INTERVAL_SEC` | `180` | Minimum live chapter spacing and short-video threshold. |
 | `PT_PASSTHROUGH_LIVE_CHAPTER_MAX_ITEMS` | `10` | Max live chapter entries. |
+| `PT_SI_MIX_ENABLED` | `1` | Enable same-stem `.si.wav` dubbing/SI entries. |
+| `PT_SI_DUCK_PRESET` | `normal` | Original-audio ducking strength: `light`, `normal`, or `strong`. |
 | `PT_THUMB_FFMPEG_TIMEOUT_SEC` | `3` | Thumbnail extraction timeout. |
 | `PT_STARTUP_GPU_WARMUP` | `1` | Warm CUDA/ORT caches before serving. |
 | `PT_STARTUP_STATUS_PORT` | `8299` | Local status port during warmup. |
@@ -426,19 +515,21 @@ DLNA client
   |
   |-- GET /description.xml ----------> routes_dlna -> descriptions.py
   |-- POST /control/cds Browse ------> routes_dlna -> content_directory.py
-  |                                      returns folders, raw items, live chapter containers/items
+  |                                      returns folders, raw items, enabled generated modes,
+  |                                      subtitle sidecars, and time-index containers
   |
   |-- GET /media/{name} -------------> routes_media -> FileResponse with Range
   |-- GET /thumb/{name} -------------> routes_media -> thumbnail.py -> runtime_cache/thumbs/
   |
-  |-- GET /passthrough_live/{name}?t=seconds
-        -> routes_media
-        -> PyNvPassthroughStream when eligible
-        -> PyNv decode
-        -> Matter GPU matting/composite
-        -> PyNv HEVC encode
-        -> FFmpeg mux
-        -> StreamingResponse
+  |-- GET /passthrough_live/{name}?mode=...&t=seconds
+  |     -> source/preflight gate
+  |     -> PyNv decode
+  |     -> Green/Alpha matting, 2DVR rendering, or RTX VSR
+  |     -> PyNv HEVC encode -> FFmpeg MPEG-TS mux -> StreamingResponse
+  |
+  |-- GET /si_live/{name}?t=seconds
+        -> same-stem .si.wav mix + ducking
+        -> realtime MPEG-TS StreamingResponse
 ```
 
 ## Notes for Future Work
@@ -447,6 +538,13 @@ DLNA client
   hidden from DLNA because several clients probe/seek generated media in ways
   that do not match realtime generation.
 - Live chapter containers are the current coarse seek strategy.
+- 8K VR RTX VSR at Ultra quality is compute-bound on midrange GPUs. On the test
+  RTX 5060 Ti it sustains roughly 23-24 processing FPS; lowering NGX quality or
+  the global output FPS is the supported performance tradeoff. NVENC P1/P4/P7
+  is a separate encoding-speed choice.
+- RTX VSR HDR-look is deliberately documented as SDR BT.709 appearance
+  processing. TrueHDR/HDR10 requires a separate 10-bit P010/Main10 and metadata
+  path and is not a current product feature.
 - Startup GPU warmup is important on systems where ORT CUDA first-run JIT is
   expensive.
 - Direct development diagnostics that need ONNX Runtime CUDA must launch with

@@ -61,6 +61,8 @@ class VrNamingTests(unittest.TestCase):
     def test_live_titles_use_green_base_and_alpha_original_base(self) -> None:
         self.assertEqual(live_passthrough_title("movie", "green", 3840, 1920), "movie_LR_180_SBS_passthrough_live")
         self.assertEqual(live_passthrough_title("movie", "alpha", 3840, 1920), "movie_LR_180_FISHEYE_F180_alpha_live")
+        self.assertEqual(live_passthrough_title("movie", "superres", 3840, 1920), "[SuperRes]movie_LR_180_SBS_live")
+        self.assertEqual(live_passthrough_title("movie_LR_180_FISHEYE", "superres", 3840, 1920), "[SuperRes]movie_LR_180_FISHEYE_live")
 
     def test_alpha_rewrites_fisheye_to_f180(self) -> None:
         self.assertEqual(alpha_passthrough_stem("movie_FISHEYE"), "movie_FISHEYE_LR_180_FISHEYE_F180_alpha")

@@ -1,0 +1,5 @@
+NVIDIA RTX Video SDK 1.1.0
+PT CUDA bridge build: CUDA 12.x runtime compatibility build
+
+Runtime files copied from reference/RTX_Video_SDK_v1.1.0 for application packaging.
+The application must resolve these files from its own runtime directory and must not access reference/ at runtime.

@@ -35,6 +35,32 @@ def _env_any(keys: tuple[str, ...], default):
     return default
 
 
+# ---- NVIDIA RTX Video Super Resolution ----
+# The SDK Programming Guide does not define a 360p-1440p hard limit. These
+# defaults are PTMediaServer's conservative first-release policy and remain
+# configurable while the native capability probe gathers wider evidence.
+RTX_VSR_ENABLED = _env("RTX_VSR_ENABLE", "1") == "1"
+RTX_VSR_REALTIME_ENABLED = _env("RTX_VSR_REALTIME_ENABLE", "1") == "1"
+RTX_VSR_OFFLINE_ENABLED = _env("RTX_VSR_OFFLINE_ENABLE", "1") == "1"
+RTX_VSR_OFFLINE_PYNV_ENABLED = _env("RTX_VSR_OFFLINE_PYNV_ENABLE", "1") == "1"
+# NVIDIA defines 0=Bicubic, 1=Low, 2=Medium, 3=High, 4=Ultra.
+RTX_VSR_QUALITY = max(0, min(4, int(_env("RTX_VSR_QUALITY", 2))))
+RTX_VSR_INPUT_MIN_HEIGHT = max(1, int(_env("RTX_VSR_INPUT_MIN_HEIGHT", 360)))
+RTX_VSR_INPUT_MAX_HEIGHT = max(RTX_VSR_INPUT_MIN_HEIGHT, int(_env("RTX_VSR_INPUT_MAX_HEIGHT", 1440)))
+RTX_VSR_TARGET_HEIGHT = max(2, int(_env("RTX_VSR_TARGET_HEIGHT", 4096)))
+RTX_VSR_HDR_LOOK = str(_env("RTX_VSR_HDR_LOOK", "natural")).strip().lower()
+if RTX_VSR_HDR_LOOK not in {"off", "natural", "vivid"}:
+    RTX_VSR_HDR_LOOK = "natural"
+RTX_VSR_PREFIX = str(_env("RTX_VSR_PREFIX", "[SuperRes]")).strip() or "[SuperRes]"
+RTX_VSR_FALLBACK = str(_env("RTX_VSR_FALLBACK", "passthrough")).strip().lower()
+if RTX_VSR_FALLBACK not in {"passthrough", "error"}:
+    RTX_VSR_FALLBACK = "passthrough"
+# A first NGX EvaluateFeature call may load a model and must never be allowed
+# to stall the media worker indefinitely.  The preflight runs in a child
+# process and is terminated after this timeout.
+RTX_VSR_EVALUATE_TIMEOUT_SEC = max(5, float(_env("RTX_VSR_EVALUATE_TIMEOUT_SEC", 45)))
+
+
 def _rgb_hex(value: str, default: str = "000000") -> tuple[int, int, int]:
     """Parse RRGGBB or #RRGGBB into an RGB tuple."""
     text = str(value or default).strip()
@@ -107,12 +133,15 @@ DEVICE_USN = f"uuid:{DEVICE_UUID}"
 #   named after each physical directory, with numeric suffixes for conflicts.
 from media_library import MediaLibrary, build_media_roots, parse_video_dirs
 from utils.si_filter import (
+    DEFAULT_DUB_MODE,
     DEFAULT_DUCK_ORIGINAL,
+    DEFAULT_DUCK_PRESET,
     DEFAULT_ORIGINAL_VOLUME_PERCENT,
     DEFAULT_SI_DELAY_SECONDS,
     DEFAULT_SI_MIX_CHANNEL,
     DEFAULT_SI_MIX_ENABLED,
     DEFAULT_SI_VOLUME_PERCENT,
+    SI_DUCK_PRESET_CHOICES,
 )
 
 
@@ -967,6 +996,17 @@ SI_DUCK_ORIGINAL = str(_env_any(
     ("SI_DUCK_ORIGINAL", "DLNA_SI_DUCK_ORIGINAL"),
     "1" if DEFAULT_DUCK_ORIGINAL else "0",
 )).lower() in {"1", "true", "yes", "on"}
+SI_DUCK_PRESET = str(_env_any(("SI_DUCK_PRESET", "DLNA_SI_DUCK_PRESET"), DEFAULT_DUCK_PRESET)).strip().lower()
+if SI_DUCK_PRESET not in SI_DUCK_PRESET_CHOICES:
+    SI_DUCK_PRESET = DEFAULT_DUCK_PRESET
+# PT_SI_DUB_MODE:
+#   When a same-stem `.si.duck.wav` sidecar exists, automatically switch the [SI]
+#   stream into dubbing mode (original 100%, dub 120%, no delay, original ducked
+#   across every subtitle span via the duck key). Runtime changes via /control/si_mix.
+SI_DUB_MODE = str(_env_any(
+    ("SI_DUB_MODE", "DLNA_SI_DUB_MODE"),
+    "1" if DEFAULT_DUB_MODE else "0",
+)).lower() in {"1", "true", "yes", "on"}
 SI_MIX_DICT = {
     "enabled": SI_MIX_ENABLED,
     "mix_channel": SI_MIX_CHANNEL,
@@ -974,6 +1014,8 @@ SI_MIX_DICT = {
     "si_volume_percent": SI_VOLUME_PERCENT,
     "si_delay_seconds": SI_DELAY_SECONDS,
     "duck_original": SI_DUCK_ORIGINAL,
+    "duck_preset": SI_DUCK_PRESET,
+    "dub_mode_enabled": SI_DUB_MODE,
 }
 
 # ---- Realtime mosaic restoration (RM) ----

@@ -3,7 +3,7 @@ from PyInstaller.utils.hooks import collect_data_files
 from PyInstaller.utils.hooks import collect_submodules
 from PyInstaller.utils.hooks import collect_all
 
-datas = [('resources', 'resources')]
+datas = [('resources', 'resources'), ('models\\rtx_vsr\\runtime', 'models\\rtx_vsr\\runtime')]
 binaries = []
 hiddenimports = ['offline.convert', 'offline.two_dvr', 'tools.offline_passthrough', 'tools.offline_alpha_passthrough', 'tools.warmup_offline_trt', 'tools.generate_yoloworld_person_txt_feats', 'cupy_backends.cuda._softlink']
 datas += collect_data_files('osam')

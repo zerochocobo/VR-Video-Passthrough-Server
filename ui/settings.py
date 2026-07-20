@@ -4,14 +4,18 @@ import json
 import sys
 from pathlib import Path
 
+from media_library import is_unc_path
 from ui.i18n import system_language
 from utils.si_filter import (
+    DEFAULT_DUB_MODE,
     DEFAULT_DUCK_ORIGINAL,
+    DEFAULT_DUCK_PRESET,
     DEFAULT_ORIGINAL_VOLUME_PERCENT,
     DEFAULT_SI_DELAY_SECONDS,
     DEFAULT_SI_MIX_CHANNEL,
     DEFAULT_SI_MIX_ENABLED,
     DEFAULT_SI_VOLUME_PERCENT,
+    SI_DUCK_PRESET_CHOICES,
 )
 from utils.trt_manifest import TRT_PROVIDER_CHAIN, cache_status
 
@@ -38,12 +42,23 @@ LIGHT_MATCH_PRESETS = {
     "night_cool": {"temp_k": 8000, "tint": 0, "exposure_ev": 0.0, "contrast": 1.0, "gamma": 1.0, "saturation": 1.0},
 }
 
+DEFAULT_HTTP_PORT = 8200
+DEFAULT_SERVER_NAME = "VR Passthrough Server"  # config.py fallback when PT_SERVER_NAME is unset.
+
 DEFAULTS = {
     "language": system_language(),
     "video_dirs": [str(ROOT / "videos")],
+    "server_name": "",
+    "http_port": DEFAULT_HTTP_PORT,
     "mode_green": True,
     "mode_alpha": True,
+    "mode_2d": True,
     "mode_two_dvr": True,
+    "mode_superres": False,
+    "superres_target_height": 4096,
+    "superres_quality": 4,
+    "superres_hdr_look": "natural",
+    "superres_offline_hdr_look": "natural",
     "two_dvr_live_model": "base",
     "two_dvr_live_hole_fill": "soft_shift",
     "two_dvr_live_eye_distance": 65.0,
@@ -81,7 +96,10 @@ DEFAULTS = {
     "si_volume_percent": DEFAULT_SI_VOLUME_PERCENT,
     "si_delay_seconds": DEFAULT_SI_DELAY_SECONDS,
     "si_duck_original": DEFAULT_DUCK_ORIGINAL,
+    "si_duck_preset": DEFAULT_DUCK_PRESET,
+    "si_dub_mode": DEFAULT_DUB_MODE,
     "rm_enabled": False,
+    "rm_card_visible": False,
     "alpha_2d_projection": "fisheye",
     "alpha_2d_distance_m": 4.0,
     "subtitle_enable": True,
@@ -206,9 +224,10 @@ class Settings:
                     if not self._migration_done("20260620_seek_dlna_default_off", loaded):
                         self.data["passthrough_seek_dlna"] = False
                         self._mark_migration_done("20260620_seek_dlna_default_off")
-                    if not self._migration_done("20260624_rm_default_off", loaded):
-                        self.data["rm_enabled"] = False
-                        self._mark_migration_done("20260624_rm_default_off")
+                    if not self._migration_done("20260720_superres_adaptive_8k_default", loaded):
+                        if int(loaded.get("superres_target_height", 2160) or 2160) == 2160:
+                            self.data["superres_target_height"] = 4096
+                        self._mark_migration_done("20260720_superres_adaptive_8k_default")
             except Exception:
                 pass
 
@@ -231,6 +250,8 @@ class Settings:
             modes.append("alpha")
         if bool(self.data.get("mode_two_dvr")):
             modes.append("two_dvr")
+        if bool(self.data.get("mode_superres")):
+            modes.append("superres")
         if modes == ["green", "alpha"]:
             return "all"
         return ",".join(modes) if modes else "none"
@@ -247,10 +268,18 @@ class Settings:
         ).strip().lower()
         if seek_container not in {"mpegts", "mp4"}:
             seek_container = DEFAULTS["passthrough_seek_container"]
+        si_duck_preset = str(self.data.get("si_duck_preset") or DEFAULTS["si_duck_preset"]).strip().lower()
+        if si_duck_preset not in SI_DUCK_PRESET_CHOICES:
+            si_duck_preset = DEFAULTS["si_duck_preset"]
         env = {
             "PT_VIDEO_DIR": "|".join(self.video_dirs()),
+            "PT_HTTP_PORT": str(self.http_port()),
             "PT_UI_LANGUAGE": str(self.data.get("language") or system_language()),
             "PT_PASSTHROUGH_OUTPUT_MODE": self.passthrough_mode(),
+            "PT_RTX_VSR_REALTIME_ENABLE": "1" if self.data.get("mode_superres") else "0",
+            "PT_RTX_VSR_TARGET_HEIGHT": str(_setting_value(self.data, "superres_target_height", DEFAULTS["superres_target_height"])),
+            "PT_RTX_VSR_QUALITY": str(_setting_value(self.data, "superres_quality", DEFAULTS["superres_quality"])),
+            "PT_RTX_VSR_HDR_LOOK": str(self.data.get("superres_hdr_look") or DEFAULTS["superres_hdr_look"]),
             "PT_COMPOSITE_BG_RGB": str(self.data.get("background_color") or "00FF00"),
             "PT_ALPHA_STRIDE": str(_setting_value(self.data, "alpha_stride", 1)),
             "PT_PASSTHROUGH_MAX_FPS": str(passthrough_max_fps),
@@ -277,7 +306,10 @@ class Settings:
             "PT_SI_VOLUME_PERCENT": str(_setting_value(self.data, "si_volume_percent", DEFAULTS["si_volume_percent"])),
             "PT_SI_DELAY_SECONDS": str(_setting_value(self.data, "si_delay_seconds", DEFAULTS["si_delay_seconds"])),
             "PT_SI_DUCK_ORIGINAL": "1" if self.data.get("si_duck_original", DEFAULTS["si_duck_original"]) else "0",
+            "PT_SI_DUCK_PRESET": si_duck_preset,
+            "PT_SI_DUB_MODE": "1" if self.data.get("si_dub_mode", DEFAULTS["si_dub_mode"]) else "0",
             "PT_RM_ENABLED": "1" if self.data.get("rm_enabled", DEFAULTS["rm_enabled"]) else "0",
+            "PT_ALPHA_2D_ENABLE": "1" if self.data.get("mode_2d", DEFAULTS["mode_2d"]) else "0",
             "PT_ALPHA_2D_PROJECTION": str(self.data.get("alpha_2d_projection") or "fisheye"),
             "PT_ALPHA_2D_DISTANCE_M": str(_setting_value(self.data, "alpha_2d_distance_m", 4.0)),
             "PT_TWO_DVR_MODEL": str(DEFAULTS["two_dvr_live_model"]),
@@ -302,6 +334,9 @@ class Settings:
             "PT_ONNX_PROVIDERS": "CUDAExecutionProvider,CPUExecutionProvider",
         }
         env.update(quality_speed_env(self.data.get("quality_speed")))
+        server_name = self.server_name()
+        if server_name:
+            env["PT_SERVER_NAME"] = server_name
         color = str(self.data.get("subtitle_color") or "").strip()
         if color:
             env["PT_SUBTITLE_COLOR"] = color
@@ -315,18 +350,32 @@ class Settings:
                 pass
         return env
 
+    def http_port(self) -> int:
+        try:
+            port = int(self.data.get("http_port") or DEFAULT_HTTP_PORT)
+        except (TypeError, ValueError):
+            return DEFAULT_HTTP_PORT
+        return port if 1 <= port <= 65535 else DEFAULT_HTTP_PORT
+
+    def server_name(self) -> str:
+        return str(self.data.get("server_name") or "").strip()
+
     def video_dirs(self) -> list[str]:
         raw = self.data.get("video_dirs")
         if isinstance(raw, list):
-            values = [str(item).strip() for item in raw if str(item).strip()]
+            values = [str(item).strip() for item in raw if str(item).strip() and not is_unc_path(item)]
         elif isinstance(raw, str):
-            values = [item.strip() for item in raw.split("|") if item.strip()]
+            values = [item.strip() for item in raw.split("|") if item.strip() and not is_unc_path(item)]
         else:
             values = []
         return values or [str(ROOT / "videos")]
 
     def set_video_dirs(self, directories: list[str]) -> None:
-        values = [str(Path(directory).expanduser()) for directory in directories if str(directory).strip()]
+        values = [
+            str(Path(directory).expanduser())
+            for directory in directories
+            if str(directory).strip() and not is_unc_path(directory)
+        ]
         self.data["video_dirs"] = values or [str(ROOT / "videos")]
 
     def restore_default_subtitle_style(self) -> None:

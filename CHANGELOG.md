@@ -4,6 +4,32 @@ This file only keeps version releases, major bug fixes, major UI/UX updates, and
 
 ## English
 
+### 2026-07-20
+
+- **Desktop UI v1.2.0 overhaul:** Replaced the legacy expanding Home layout with a fixed navigation rail, feature-card dashboard, standalone Offline Tools, Subtitle Style, Logs, and scrolling Settings pages. Updated card grouping, naming, lock-state feedback, player-support entry points, and the three localized interfaces.
+- **DLNA/settings update:** Added editable DLNA server name and HTTP port with an explicit Save/restart flow, synchronized the active port across status polling and live controls, and made normal DLNA subtitle-sidecar discovery independent from the realtime hard-subtitle switch.
+- **Remove Mosaic model update:** Integrated the 8-frame recurrent chunk restoration model with batched mosaic regions and cross-chunk state reuse for realtime and offline processing. The release UI now hides the experimental Remove Mosaic cards and the Settings-page Feature debug status block while retaining saved-setting compatibility.
+- **RTX Video Super Resolution:** Added standalone realtime and offline NVIDIA RTX VSR features, isolated evaluation preflight/timeouts, unified source/resolution/bit-depth gates, `[SuperRes]` DLNA routes, time-index/seek handling, and safe rejection instead of silent fallback when a source or runtime is unsupported.
+- **GPU-resident offline SuperRes:** Added the NVDEC/PyNv -> CUDA -> NGX VSR -> HDR-look -> NVENC pipeline, source-audio stream-copy remuxing, progress/ETA reporting, and adaptive `8K VR / 4K 2D` output. SBS VR is processed as two GPU-resident eyes and rejoined at 8192x4096; existing `_2K`, `_4K`, and `_8K` outputs are skipped by batch discovery.
+- **SuperRes quality and appearance controls:** Added Off/Natural/Vivid SDR HDR-look processing, Low/Medium/High/Ultra NGX quality choices on the dashboard, P1/P4/P7 offline NVENC presets, and a prominent localized warning recommending lower quality or global output FPS for 4K-VR-to-8K-VR work on lower-end GPUs.
+- **RTX VSR performance diagnostics:** Added opt-in Python/CUDA and native bridge stage timing, fused NV12 conversion with left/right-eye RGBA preparation, and verified identical output with SSIM 1.0. RTX 5060 Ti testing established that 8K VR Ultra is NGX-compute-bound at roughly 23-24 FPS; whole-frame evaluation, removed synchronizations, async encode, and dual-instance ideas do not provide a safe path to 60 FPS.
+- **SuperRes correctness fixes:** Fixed realtime RGBA stride handling that caused gray/tiled frames, fixed empty DLNA SuperRes directories and stale object IDs, made preflight non-blocking/retryable, fixed realtime target/quality/HDR environment propagation, protected GPU output with ring buffers, drained FFmpeg pipes safely, and preserved audio through the offline HEVC mux flow.
+- **RTX VSR packaging:** Bundled the precompiled CUDA 12.6 bridge, NGX runtime, local CUDA runtime, license, and version metadata into both PyInstaller outputs; added build-time runtime verification and confirmed frozen bridge loading, real NGX evaluation, and the standalone offline SuperRes command.
+
+### 2026-07-01
+
+- **SI ducking strength:** Added Light/Normal/Strong original-audio ducking presets to SI realtime controls, persisted the selected preset through settings/control APIs/server environment, localized the UI, and included the preset in progressive SI audio-cache keys so changes rebuild the mixed sidecar correctly.
+
+### 2026-06-29
+
+- **8K SAM3 prepass memory fix:** Following the June 27 investigation, removed the full-frame OpenCV BGR materialization that could fail late in long 8K SBS SAM3/MatAnyone2 jobs. Prepasses now convert decoded NV12/P016 directly into left/right RGB eyes, downsample before scene-detection BGR conversion, and explicitly release large per-sample tensors and frame temporaries.
+- **Local media-path policy:** Added UNC path rejection across media-library parsing, Settings persistence, environment generation, and the video-folder dialog while continuing to support cloud drives mounted as local drive letters or directories. Local fallback behavior and localized warning text were added.
+
+### 2026-06-24
+
+- **Cloud-drive path compatibility:** Added a shared safe path resolver that falls back to absolute paths when `Path.resolve()` fails on virtual roots such as CloudDrive2 `Y:\`, and applied it consistently across media indexing, DLNA/HTTP playback, subtitles, cache keys, bitrate probing, and PyNv input handling.
+- **Video-folder UX:** Added a localized timeout note to the Manage Video Folders dialog explaining that cloud mounts with many videos can take longer while metadata is read.
+
 ### 2026-06-21
 
 - **SI realtime MPEG-TS transport:** Added the `/si_live/{name}` streaming route for same-stem `.si.wav` sidecars, switching SI playback from full-file progressive virtual MP4 preparation to zero-cache realtime MPEG-TS with `?t=` start offsets.
@@ -246,6 +272,32 @@ This file only keeps version releases, major bug fixes, major UI/UX updates, and
 - **Core update:** Added initial DLNA time-seek metadata, passthrough HEAD support, and `PT_CONTAINER` support for MP4 and MPEG-TS passthrough output.
 
 ## 中文
+
+### 2026-07-20
+
+- **桌面UI v1.2.0重构：** 将旧版首页伸缩配置区替换为固定导航栏、功能卡片首页以及独立的离线工具、字幕样式、日志和可滚动设置页面；同步调整功能分组、名称、服务器运行锁定提示、播放器支持入口和中英日界面。
+- **DLNA与设置更新：** 新增可编辑的DLNA服务器名称和HTTP端口、明确的保存/重启生效流程，并让状态轮询和实时控制始终使用实际端口；普通DLNA外挂字幕发现不再受实时硬字幕开关影响。
+- **马赛克复原模型更新：** 实时与离线处理接入8帧递归chunk复原模型，支持多马赛克区域批处理和跨chunk状态复用。发布界面隐藏实验性的马赛克复原卡片及设置页“功能调试状态”区块，同时保留已保存配置兼容性。
+- **NVIDIA RTX视频超分辨率：** 新增独立的实时和离线RTX VSR功能、隔离子进程Evaluate预检/超时、统一源分辨率/位深门控、`[SuperRes]` DLNA目录、时间索引和seek支持；运行时或视频不支持时明确拒绝，不再静默降级。
+- **全GPU离线超分：** 新增NVDEC/PyNv -> CUDA -> NGX VSR -> HDR观感 -> NVENC链路、源音频无损复用封装、进度/ETA日志和自适应“8K VR / 4K 2D”输出。SBS VR在GPU内拆成左右眼处理并重组为8192x4096，批处理会跳过已有`_2K`、`_4K`和`_8K`成品。
+- **超分质量与观感配置：** 新增关闭/自然/鲜明三种SDR HDR观感，首页目标质量提供低/中/高/超高，离线NVENC提供P1/P4/P7；增加醒目的多语言提示，建议低端显卡进行4K VR转8K VR时降低目标质量或全局输出FPS。
+- **RTX VSR性能诊断：** 新增可选Python/CUDA及Native bridge分阶段计时，融合NV12转换和左右眼RGBA准备，并以SSIM 1.0确认画面完全一致。RTX 5060 Ti实测表明8K VR超高质量受NGX计算限制，约23-24 FPS；整帧调用、删除同步、异步编码及双实例均无法安全实现60 FPS。
+- **SuperRes正确性修复：** 修复实时RGBA步幅错误造成的灰色/重复平铺画面、空DLNA SuperRes目录及旧Object ID缓存；预检改为非阻塞且失败可重试，修复实时目标/质量/HDR环境变量传递，使用环形GPU输出缓冲，安全排空FFmpeg管道，并修复离线HEVC封装丢失音频。
+- **RTX VSR打包：** 两个PyInstaller产物均打包预编译CUDA 12.6 bridge、NGX运行库、本地CUDA runtime、许可证和版本信息；增加构建后资源校验，并验证冻结程序可加载bridge、完成真实NGX Evaluate及运行独立离线超分命令。
+
+### 2026-07-01
+
+- **SI压低强度：** 为实时SI控制新增轻度/正常/强力三档原声音量压低预设，设置、控制API和服务器环境均会保存并传递所选档位；同步中英日界面，并将档位加入渐进式SI音频缓存键，修改强度后会正确重建混音sidecar。
+
+### 2026-06-29
+
+- **8K SAM3预处理内存修复：** 根据6月27日排查结果，移除长时间8K SBS SAM3/MatAnyone2任务中可能在后期触发CPU内存失败的整帧OpenCV BGR物化。预处理现在从NV12/P016直接转换左右眼RGB，在场景检测BGR转换前先缩小图像，并主动释放每个采样点的大型tensor和帧临时对象。
+- **本地媒体路径策略：** 媒体库解析、设置保存、服务器环境和视频目录对话框统一拒绝UNC网络共享路径，同时继续支持映射为本地盘符或本地目录的云盘；增加本地默认回退和多语言警告。
+
+### 2026-06-24
+
+- **云盘路径兼容：** 新增共享安全路径解析器，当CloudDrive2 `Y:\`等虚拟盘根目录的`Path.resolve()`失败时回退到绝对路径，并统一用于媒体索引、DLNA/HTTP播放、字幕、缓存键、码率探测及PyNv输入处理。
+- **视频目录体验：** “管理视频文件夹”对话框新增多语言超时提示，说明云盘挂载目录包含大量视频时，逐个读取元数据可能需要较长时间。
 
 ### 2026-06-21
 

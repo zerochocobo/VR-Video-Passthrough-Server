@@ -6,7 +6,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from media_library import MediaLibrary, build_media_roots, parse_video_dirs, safe_resolve_path
+from media_library import MediaLibrary, build_media_roots, is_unc_path, parse_video_dirs, safe_resolve_path
 from utils.media_index import MediaIndex
 
 
@@ -17,6 +17,25 @@ class MediaLibraryTests(unittest.TestCase):
         self.assertEqual(len(roots), 2)
         self.assertTrue(str(roots[0]).endswith("D:\\VR"))
         self.assertTrue(str(roots[1]).endswith("E:\\VR"))
+
+    def test_unc_path_detection(self) -> None:
+        self.assertTrue(is_unc_path(r"\\nas\VR"))
+        self.assertTrue(is_unc_path("//nas/VR"))
+        self.assertTrue(is_unc_path(r"\\?\UNC\nas\VR"))
+        self.assertFalse(is_unc_path(r"Y:\VR"))
+        self.assertFalse(is_unc_path(r"\\?\C:\VR"))
+
+    def test_parse_skips_unc_video_dirs(self) -> None:
+        roots = parse_video_dirs(r"\\nas\VR|D:\VR|//nas/Movies", Path("videos"))
+
+        self.assertEqual(len(roots), 1)
+        self.assertTrue(str(roots[0]).endswith("D:\\VR"))
+
+    def test_parse_falls_back_when_only_unc_video_dirs_are_provided(self) -> None:
+        roots = parse_video_dirs(r"\\nas\VR|//nas/Movies", Path("videos"))
+
+        self.assertEqual(len(roots), 1)
+        self.assertTrue(str(roots[0]).endswith("videos"))
 
     def test_safe_resolve_falls_back_for_virtual_drive_root(self) -> None:
         original_resolve = Path.resolve

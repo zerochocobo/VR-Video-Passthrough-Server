@@ -106,10 +106,16 @@ class Sam3TextMasker:
                 str(model_dir / "sam3_decoder.onnx"),
                 providers=self.decoder_providers,
             )
+        self.set_prompt(self.prompt)
+
+    def set_prompt(self, prompt: str) -> None:
+        import onnxruntime as ort
+
+        self.prompt = prompt.strip() or "person"
         # Keep SAM3 text encoding on CPU: for short prompts it is faster in
         # local tests and avoids inflating CUDA memory before image decoding.
         language_encoder = ort.InferenceSession(
-            str(model_dir / "sam3_language_encoder.onnx"),
+            str(self.model_dir / "sam3_language_encoder.onnx"),
             providers=["CPUExecutionProvider"],
         )
         self.language_mask, self.language_features, _ = language_encoder.run(

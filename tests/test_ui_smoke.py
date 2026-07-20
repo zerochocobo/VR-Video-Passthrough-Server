@@ -26,6 +26,34 @@ if hasattr(os, "add_dll_directory"):
 
 
 class UiSmokeTests(unittest.TestCase):
+    def test_superres_dashboard_dialog_includes_low_quality_and_performance_note(self) -> None:
+        from types import SimpleNamespace
+
+        from PySide6.QtWidgets import QApplication
+        from ui.dialogs.feature_dialogs import SuperResSettingsDialog
+        from ui.i18n import I18n
+
+        app = QApplication.instance() or QApplication([])
+        i18n = I18n("zh_CN")
+        settings = SimpleNamespace(data={
+            "superres_target_height": 4096,
+            "superres_quality": 1,
+            "superres_hdr_look": "natural",
+        })
+        dialog = SuperResSettingsDialog(i18n, settings)
+        try:
+            self.assertEqual(dialog.quality.count(), 4)
+            self.assertEqual(dialog.quality.currentData(), 1)
+            self.assertEqual(dialog.quality.itemText(0), i18n.t("superres.quality_1"))
+            self.assertEqual(dialog.performance_note.text(), i18n.t("superres.performance_note"))
+            self.assertEqual(dialog.performance_note.font().pointSizeF(), dialog.font().pointSizeF())
+            self.assertEqual(dialog.minimumWidth(), 520)
+            self.assertEqual(dialog.maximumWidth(), 520)
+            self.assertGreaterEqual(dialog.height(), dialog.sizeHint().height())
+        finally:
+            dialog.close()
+            app.processEvents()
+
     def test_video_dirs_dialog_has_mount_timeout_note(self) -> None:
         from PySide6.QtWidgets import QApplication
         from ui.dialogs.video_dirs_dialog import VideoDirsDialog
@@ -47,11 +75,28 @@ class UiSmokeTests(unittest.TestCase):
         finally:
             dialog.deleteLater()
 
+    def test_video_dirs_dialog_filters_unc_entries(self) -> None:
+        from PySide6.QtWidgets import QApplication
+        from ui.dialogs.video_dirs_dialog import VideoDirsDialog
+        from ui.i18n import I18n
+
+        app = QApplication.instance() or QApplication([])
+        i18n = I18n("zh_CN")
+        dialog = VideoDirsDialog(i18n, [r"\\nas\VR", r"Y:\VR", "//nas/Movies"])
+        try:
+            dialog.show()
+            app.processEvents()
+            self.assertEqual(dialog.list_widget.count(), 1)
+            self.assertEqual(dialog.directories(), [r"Y:\VR"])
+        finally:
+            dialog.deleteLater()
+
     def test_main_window_constructs(self) -> None:
         from PySide6.QtWidgets import QApplication
         from ui import settings as settings_module
         from ui.main_window import MainWindow
         from ui.log_limits import UI_LOG_MAX_BLOCKS
+        from ui.widgets.nav_rail import NAV_WIDTH
 
         app = QApplication.instance() or QApplication([])
         settings_root = Path(tempfile.mkdtemp(prefix="pt_ui_smoke_"))
@@ -59,141 +104,119 @@ class UiSmokeTests(unittest.TestCase):
         patch_stack = contextlib.ExitStack()
         patch_stack.enter_context(patch.object(settings_module, "SETTINGS_PATH", settings_root / "ui_settings.json"))
         patch_stack.enter_context(patch.object(settings_module, "SETTINGS_META_PATH", settings_root / "ui_settings_meta.json"))
-        patch_stack.enter_context(patch("ui.pages.home_page.cache_status", return_value="missing"))
+        patch_stack.enter_context(patch("ui.pages.settings_page.cache_status", return_value="missing"))
         patch_stack.enter_context(patch("ui.pages.offline_page.cache_status", return_value="missing"))
         window = MainWindow()
         try:
             self.assertTrue(window.windowTitle())
             self.assertFalse(window.windowIcon().isNull())
-            self.assertNotIn("(v0.1)", window.home.title.text())
             self.assertIn(f"({window.metadata.display_version})", window.windowTitle())
-            self.assertEqual(window.home.title.font().pointSize(), 19)
-            self.assertGreaterEqual(window.home.title.font().weight(), 800)
-            self.assertLessEqual(window.home.subtitle.font().pointSize(), 9)
-            self.assertFalse(window.home.server_button.icon().isNull())
-            self.assertEqual(window.home.server_button.iconSize().width(), 22)
             self.assertEqual(window.version_label.text(), window.metadata.display_version)
-            self.assertEqual(window.home.language.count(), 3)
-            self.assertNotIn("Follow system", [window.home.language.itemText(i) for i in range(3)])
-            self.assertIs(window.home.language.parentWidget(), window.statusBar())
-            self.assertEqual(window.status_left_spacer.width(), 20)
-            self.assertIn("font-size: 9pt", window.home.language.styleSheet())
             self.assertIn("font-size: 9pt", window.version_label.styleSheet())
-            self.assertIn("font-size: 8pt", window.home.log.styleSheet())
-            self.assertEqual(window.home.log.document().maximumBlockCount(), UI_LOG_MAX_BLOCKS)
-            self.assertIn("https://wapok.com", window.home.project_link.text())
-            self.assertIn(window.i18n.t("project.url_label"), window.home.project_link.text())
-            self.assertTrue(window.home.project_link.openExternalLinks() is False)
-            self.assertEqual(window.home.project_link.height(), 28)
-            self.assertEqual(window.home.subtitle_enable.text(), "")
-            self.assertTrue(window.home.subtitle_enable_label.text())
-            self.assertEqual(window.home.log_toggle.text(), "")
-            self.assertTrue(window.home.log_toggle_label.text())
-            self.assertEqual(window.home.debug_toggle.text(), "")
-            self.assertTrue(window.home.debug_toggle_label.text())
-            self.assertTrue(window.home.debug_toggle.isHidden())
-            self.assertTrue(window.home.debug_toggle_label.isHidden())
-            self.assertEqual(window.home.green_mode.text(), "")
-            self.assertEqual(window.home.alpha_mode.text(), "")
-            self.assertTrue(window.home.green_mode_label.text())
-            self.assertTrue(window.home.alpha_mode_label.text())
-            self.assertEqual(window.home.bg_color.itemData(2), "00FF00")
-            self.assertEqual(window.home.bg_color.itemData(3), "0000FF")
-            self.assertEqual(window.home.bg_color.itemText(2), window.i18n.t("bg.soft_green"))
-            self.assertEqual(window.home.bg_color.itemText(3), window.i18n.t("bg.soft_blue"))
-            self.assertFalse(hasattr(window.home, "bg_color_note"))
-            self.assertEqual(window.home.green_mode_label.width(), window.home.alpha_mode_label.width())
-            quick_label_widths = {
-                window.home.video_dirs_title.width(),
-                window.home.green_mode_label.width(),
-                window.home.alpha_mode_label.width(),
-                window.home.subtitle_enable_label.width(),
-                window.home.log_toggle_label.width(),
-                window.home.performance_quality_label.width(),
-                window.home.performance_fps_label.width(),
-                window.home.performance_output_size_label.width(),
-                window.home.trt_enabled_label.width(),
-                window.home.light_match_enabled_label.width(),
-            }
-            self.assertEqual(len(quick_label_widths), 1)
-            self.assertTrue(window.home.config_header.isChecked())
-            self.assertFalse(window.home.performance_header.isChecked())
-            self.assertFalse(window.home.light_match_header.isChecked())
-            self.assertEqual(window.home.performance_header.text(), window.i18n.t("group.performance_config_short"))
-            self.assertNotEqual(window.i18n.t("group.performance_config_short"), window.i18n.t("group.performance_config"))
-            self.assertTrue(window.home.performance_content.isHidden())
-            self.assertTrue(window.home.light_match_content.isHidden())
-            self.assertEqual(window.home.performance_quality.itemData(0), "ultrafast")
-            self.assertEqual(window.home.light_match_preset.itemData(0), "home_warm")
-            self.assertEqual(window.home.light_match_preset.itemData(3), "custom")
-            self.assertEqual(window.home.light_match_preset.currentData(), "daylight")
-            self.assertTrue(window.home.light_match_advanced_button.text())
-            self.assertGreaterEqual(window.home.light_match_header.minimumHeight(), 42)
-            self.assertTrue(window.home.rm_row_widget.isHidden())
+
+            # Nav rail: five entries, home selected at start.
+            self.assertEqual(window.nav.width(), NAV_WIDTH)
+            self.assertEqual(set(window.nav._items), {"home", "tools", "subtitle", "log", "settings"})
+            self.assertEqual(window.nav.current(), "home")
+            for key in ("home", "tools", "subtitle", "log", "settings"):
+                self.assertTrue(window.nav._items[key]._text_label.text())
+            self.assertEqual(window.stack.count(), 9)
+            self.assertIs(window.stack.currentWidget(), window.dashboard)
+
+            # Dashboard: server bar and feature cards.
+            self.assertFalse(window.dashboard.server_button.icon().isNull())
+            self.assertEqual(window.dashboard.server_button.iconSize().width(), 22)
+            self.assertIn("https://wapok.com", window.dashboard.project_link.text())
+            self.assertIn(window.i18n.t("project.url_label"), window.dashboard.project_link.text())
+            self.assertFalse(window.dashboard.project_link.openExternalLinks())
+            self.assertEqual(
+                set(window.dashboard.cards),
+                {"green", "alpha", "alpha2d", "two_dvr", "superres", "rm", "subtitle", "si", "light"},
+            )
+            for key, card in window.dashboard.cards.items():
+                self.assertTrue(card.title_label.text(), key)
+            self.assertTrue(window.dashboard.cards["green"].is_checked())
+            self.assertTrue(window.dashboard.cards["alpha"].is_checked())
+            self.assertTrue(window.dashboard.cards["alpha2d"].is_checked())
+            self.assertTrue(window.dashboard.cards["green"].summary_label.text().startswith("[GREEN]"))
+            self.assertEqual(window.dashboard.cards["alpha"].summary_label.text(), "[ALPHA]最好的透视效果")
+            self.assertFalse(window.dashboard.cards["alpha"].help_button.isHidden())
+            self.assertTrue(window.dashboard.cards["superres"].summary_label.text().startswith("[SuperRes]"))
+            self.assertTrue(window.dashboard.cards["two_dvr"].summary_label.text().startswith("[2D>3D]"))
+            self.assertTrue(window.dashboard.cards["si"].summary_label.text().startswith("[SI]"))
+            self.assertFalse(window.dashboard.cards["superres"].config_button.isHidden())
+            self.assertEqual(window.dashboard._realtime_keys[:3], ["alpha", "green", "superres"])
+            self.assertEqual(window.dashboard._2d_keys, ["two_dvr", "si", "rm"])
+            self.assertEqual(window.dashboard._audio_keys, ["subtitle", "light", "alpha2d"])
+            self.assertFalse(hasattr(window.dashboard, "two_d_group_label"))
+            self.assertFalse(window.dashboard.cards["light"].is_checked())
             self.assertFalse(window.settings.data["rm_enabled"])
-            window.home.light_match_enabled.setChecked(False)
+            # RM card hidden until the settings debug gate enables it.
+            self.assertFalse(window.dashboard.cards["rm"].isVisible())
+            window.dashboard.set_server_running(True)
+            self.assertFalse(window.dashboard.switch_lock_notice.isHidden())
+            for key, card in window.dashboard.cards.items():
+                self.assertEqual(card.switch.isEnabled(), key == "light", key)
+                self.assertEqual(card.lock_label.isHidden(), key == "light", key)
+            window.dashboard.set_server_running(False)
+            self.assertTrue(window.dashboard.switch_lock_notice.isHidden())
+            for card in window.dashboard.cards.values():
+                self.assertTrue(card.switch.isEnabled())
+                self.assertTrue(card.lock_label.isHidden())
+
+            window.show()
             app.processEvents()
-            self.assertTrue(window.home.light_match_preset.isHidden())
-            self.assertTrue(window.home.light_match_advanced_button.isHidden())
-            self.assertFalse(window.home.light_match_help.isHidden())
-            window.home.light_match_enabled.setChecked(True)
-            window.home.light_match_preset.setCurrentIndex(window.home.light_match_preset.findData("home_warm"))
+            base_size = window.size()
+            self.assertEqual(base_size.width(), NAV_WIDTH + 700)
+
+            # Settings page: performance combos + TRT (cache missing => disabled).
+            window._show_page("settings")
             app.processEvents()
-            self.assertEqual(window.settings.data["light_match_temp_k"], 4000)
-            self.assertEqual(window.settings.data["light_match_saturation"], 1.0)
-            self.assertFalse(window.home.light_match_preset.isHidden())
-            self.assertTrue(window.home.light_match_advanced_button.isHidden())
-            window.home.light_match_preset.setCurrentIndex(window.home.light_match_preset.findData("custom"))
-            app.processEvents()
-            self.assertFalse(window.home.light_match_advanced_button.isHidden())
-            self.assertEqual(window.home.performance_fps.itemData(2), 30)
-            self.assertGreaterEqual(window.home.performance_fps.findData(50), 0)
-            self.assertEqual(window.home.performance_output_size.itemData(0), 0)
-            self.assertEqual(window.home.performance_output_size.itemData(1), 4096)
-            self.assertTrue(window.home.trt_enabled_label.text())
-            self.assertTrue(window.home.trt_configure_button.text())
-            self.assertFalse(window.home.trt_enabled.isEnabled())
-            window.home.performance_output_size.setCurrentIndex(0)
+            self.assertIs(window.stack.currentWidget(), window.settings_page)
+            self.assertEqual(window.nav.current(), "settings")
+            page = window.settings_page
+            self.assertEqual(page.language.count(), 3)
+            self.assertNotIn("Follow system", [page.language.itemText(i) for i in range(3)])
+            self.assertEqual(page.performance_quality.itemData(0), "ultrafast")
+            self.assertEqual(page.performance_fps.itemData(2), 30)
+            self.assertGreaterEqual(page.performance_fps.findData(50), 0)
+            self.assertEqual(page.performance_output_size.itemData(0), 0)
+            self.assertEqual(page.performance_output_size.itemData(1), 4096)
+            self.assertTrue(page.trt_enabled_label.text())
+            self.assertTrue(page.trt_configure_button.text())
+            self.assertFalse(page.trt_enabled.isEnabled())
+            page.performance_output_size.setCurrentIndex(0)
             app.processEvents()
             self.assertEqual(window.settings.data["decode_max_side"], 0)
-            window.home.performance_header.setChecked(True)
+
+            # Release UI hides the feature-debug section while retaining its
+            # internal switch wiring for saved settings and diagnostics.
+            self.assertTrue(page.debug_group.isHidden())
+            self.assertTrue(page.rm_card_label.text())
+            page.rm_card_switch.setChecked(True)
             app.processEvents()
-            self.assertFalse(window.home.config_header.isChecked())
-            self.assertFalse(window.home.light_match_header.isChecked())
-            self.assertTrue(window.home.config_content.isHidden())
-            self.assertFalse(window.home.performance_content.isHidden())
-            self.assertTrue(window.home.light_match_content.isHidden())
-            self.assertEqual(window.home.performance_header.text(), window.i18n.t("group.performance_config"))
-            self.assertEqual(window.height(), 560)
-            window.home.light_match_header.setChecked(True)
+            self.assertTrue(window.settings.data["rm_card_visible"])
+            window._show_page("home")
             app.processEvents()
-            self.assertFalse(window.home.config_header.isChecked())
-            self.assertFalse(window.home.performance_header.isChecked())
-            self.assertTrue(window.home.performance_content.isHidden())
-            self.assertFalse(window.home.light_match_content.isHidden())
-            self.assertEqual(window.height(), 560)
-            self.assertEqual(window.stack.count(), 4)
-            base_size = window.size()
-            self.assertEqual(base_size.height(), 560)
-            window.home.log_toggle.setChecked(True)
+            self.assertTrue(window.dashboard.cards["rm"].isVisible())
+            window._show_page("tools")
             app.processEvents()
-            self.assertEqual(window.height(), base_size.height())
-            self.assertGreater(window.width(), base_size.width())
-            self.assertEqual(window.home.width(), window.width())
-            self.assertEqual(window.home.log.x(), 560)
-            self.assertFalse(window.home.debug_toggle.isHidden())
-            self.assertFalse(window.home.debug_toggle_label.isHidden())
-            window.home.debug_toggle.setChecked(True)
-            window.home.log_toggle.setChecked(False)
+            self.assertTrue(window.tools.rm_card.isVisible())
+            page.rm_card_switch.setChecked(False)
             app.processEvents()
-            self.assertTrue(window.home.debug_toggle.isHidden())
-            self.assertFalse(window.home.debug_toggle.isChecked())
-            self.assertEqual(window.height(), base_size.height())
-            self.assertEqual(window.width(), base_size.width())
-            window.stack.setCurrentWidget(window.subtitle)
+            self.assertFalse(window.dashboard.cards["rm"].isVisible())
+            self.assertFalse(window.tools.rm_card.isVisible())
+
+            # Log page basics.
+            window._show_page("log")
             app.processEvents()
-            self.assertGreaterEqual(window.width(), 1100)
-            self.assertEqual(window.height(), 600)
+            self.assertIs(window.stack.currentWidget(), window.log_page)
+            self.assertEqual(window.log_page.log.document().maximumBlockCount(), UI_LOG_MAX_BLOCKS)
+            self.assertFalse(window.log_page.debug_toggle.isChecked())
+
+            window._show_page("subtitle")
+            app.processEvents()
+            self.assertGreaterEqual(window.width(), NAV_WIDTH + 1100)
             self.assertTrue(hasattr(window.subtitle, "original_canvas"))
             self.assertTrue(hasattr(window.subtitle, "preview_canvas"))
             self.assertTrue(window.subtitle.title_label.text())
@@ -212,10 +235,10 @@ class UiSmokeTests(unittest.TestCase):
             self.assertEqual(window.settings.data["subtitle_direction"], "vertical_left")
             self.assertIn(window.i18n.t("subtitle.save_done"), window.subtitle.save_status_label.text())
             self.assertLess(window.subtitle.save_button.geometry().x(), window.subtitle.restore_button.geometry().x())
-            window.stack.setCurrentWidget(window.offline)
+            window._show_sub_page(window.offline)
             app.processEvents()
-            self.assertEqual(window.width(), 600)
-            self.assertEqual(window.height(), 600)
+            self.assertEqual(window.width(), NAV_WIDTH + 600)
+            self.assertEqual(window.nav.current(), "tools")
             self.assertTrue(window.offline.title_label.text())
             self.assertGreaterEqual(window.offline.back_button.width(), window.offline.back_button.sizeHint().width())
             self.assertNotIn("转换", window.offline.tabs.tabText(0))
@@ -262,10 +285,23 @@ class UiSmokeTests(unittest.TestCase):
             self.assertFalse(window.offline.stop_single.isEnabled())
             self.assertTrue(window.offline.batch_recursive.isChecked())
             self.assertTrue(window.offline.batch_recursive.text())
-            window.stack.setCurrentWidget(window.home)
+            window._show_sub_page(window.superres)
+            app.processEvents()
+            self.assertTrue(window.superres.title_label.text())
+            self.assertEqual(window.superres.single_quality.count(), 3)
+            self.assertEqual(window.superres.single_quality.currentData(), 4)
+            self.assertEqual(window.superres.single_target.currentData(), 4096)
+            self.assertEqual(window.superres.single_hdr_look.currentData(), "natural")
+            self.assertEqual(window.superres.batch_hdr_look.currentData(), "natural")
+            self.assertEqual(window.superres.single_quality_speed.currentData(), "medium")
+            self.assertEqual(window.superres.batch_quality_speed.currentData(), "medium")
+            common_args = window.superres._common_args(window.superres.single_target, window.superres.single_quality, window.superres.single_hdr_look)
+            self.assertIn("p4", common_args)
+            self.assertIn("natural", common_args)
+            window._show_page("home")
             app.processEvents()
             self.assertEqual(window.width(), base_size.width())
-            self.assertEqual(window.height(), base_size.height())
+            self.assertEqual(window.nav.current(), "home")
         finally:
             window.close()
             app.processEvents()

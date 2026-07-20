@@ -31,10 +31,10 @@ class SubtitleDiscoveryTests(unittest.TestCase):
         self.assertEqual([track.lang for track in tracks], ["", "zh", "eng"])
         self.assertEqual(tracks[1].mime, "application/x-ass")
 
-    def test_subtitle_discovery_respects_enable_setting(self) -> None:
+    def test_dlna_subtitle_discovery_ignores_realtime_enable_setting(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            video = root / "movie.mp4"
+            video = root / "movie.mkv"
             video.write_bytes(b"video")
             (root / "movie.srt").write_text("one", encoding="utf-8")
             library = MediaLibrary(build_media_roots([root]))
@@ -46,7 +46,7 @@ class SubtitleDiscoveryTests(unittest.TestCase):
             ):
                 tracks = find_external_subtitles(video)
 
-        self.assertEqual(tracks, [])
+        self.assertEqual([track.path.name for track in tracks], ["movie.srt"])
 
     def test_runtime_ui_setting_overrides_startup_config(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

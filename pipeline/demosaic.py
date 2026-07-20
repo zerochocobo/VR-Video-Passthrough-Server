@@ -6,9 +6,10 @@ ultralytics, so YOLO post-processing is implemented here):
   - detector    models/demosaic/vr_mosaic_detection_model_v2_accurate.onnx
                 YOLO11m-seg: input 'images' (1,3,640,640) ->
                 output0 (1, 4+nc+32, 8400), output1 (1, 32, 160, 160) mask protos
-  - restoration models/demosaic/vr_mosaic_restoration_windows_model_v0.1.onnx
-                sliding window: input 'frames' (1,7,3,256,256) RGB 0..1 ->
-                output 'restored' (1,3,256,256) restored CENTER frame
+  - restoration models/demosaic/vr_mosaic_restoration_chunk_model_v0.1.onnx
+                chunk model: input 'lqs' (B,8,3,256,256) RGB 0..1 plus
+                recurrent 'prev_ds'/'states' -> output 'restored'
+                (B,8,3,256,256) and next recurrent state
 
 TensorRT engine caching mirrors the DA3 depth engine (see offline/da3_depth.py):
 the TensorRT EP builds an fp16 engine on first use and caches it under
@@ -16,8 +17,8 @@ runtime_cache/demosaic_trt/{detector,restoration}. The restoration graph contain
 grid_sample (optical-flow warp) which needs TensorRT >= 8.5; if that EP fails to
 build it transparently falls back to CUDA then CPU.
 
-The pipeline (detect on the CENTER frame, crop each region across the temporal
-window, restore, feather-blend back) follows the reference at
+The pipeline (detect on a chunk frame, crop each region across the temporal
+chunk, restore, feather-blend back) follows the reference at
 G:\\GIT\\lada\\realtime_inference_reference.py.
 """
 from __future__ import annotations
@@ -32,14 +33,15 @@ import onnxruntime as ort
 
 import config
 
-WINDOW = 7              # temporal window of the restoration model
-CENTER = WINDOW // 2    # index of the restored frame within the window (== 3)
+WINDOW = 8              # temporal chunk of the restoration model
+CENTER = WINDOW // 2    # representative frame for compatibility helpers
 REST_SIZE = 256         # restoration works on 256x256 region crops
 DET_SIZE = 640          # detector input side (overridden from the ONNX shape)
 PROTO_DIM = 32          # mask prototype channels
 
 _DETECTOR_FILE = "vr_mosaic_detection_model_v2_accurate.onnx"
-_RESTORATION_FILE = "vr_mosaic_restoration_windows_model_v0.1.onnx"
+_RESTORATION_FILE = "vr_mosaic_restoration_chunk_model_v0.1.onnx"
+_RESTORATION_CACHE_NAME = "restoration_chunk"
 
 
 def _models_dir() -> Path:
@@ -63,7 +65,7 @@ def _trt_cache_dir(name: str) -> Path:
 def rm_trt_cached() -> bool:
     """True if TensorRT engines have been built+cached for both RM models."""
     base = config.ROOT / "runtime_cache" / "demosaic_trt"
-    for name in ("detector", "restoration"):
+    for name in ("detector", _RESTORATION_CACHE_NAME):
         cache = base / name
         if not (cache.is_dir() and any(cache.glob("*.engine"))):
             return False
@@ -248,35 +250,101 @@ def segmentation_mask(det: Detection, protos: np.ndarray, frame_hw: tuple[int, i
     return m[..., None]
 
 
+def _initial_prev_ds_np(frames_nchw: np.ndarray) -> np.ndarray:
+    """Build the chunk model's initial low-resolution feedback from frame 0."""
+    batch = int(frames_nchw.shape[0])
+    prev = np.empty((batch, 3, 64, 64), dtype=np.float32)
+    for i in range(batch):
+        first = frames_nchw[i, 0].transpose(1, 2, 0)
+        down = cv2.resize(first, (64, 64), interpolation=cv2.INTER_LINEAR)
+        prev[i] = down.transpose(2, 0, 1)
+    return prev
+
+
+def _zero_states_np(batch: int) -> np.ndarray:
+    return np.zeros((batch, 2, 64, 64, 64), dtype=np.float32)
+
+
+def _box_iou(a: tuple[int, int, int, int], b: tuple[int, int, int, int]) -> float:
+    ax1, ay1, ax2, ay2 = a
+    bx1, by1, bx2, by2 = b
+    ix1, iy1 = max(ax1, bx1), max(ay1, by1)
+    ix2, iy2 = min(ax2, bx2), min(ay2, by2)
+    iw, ih = max(0, ix2 - ix1), max(0, iy2 - iy1)
+    inter = float(iw * ih)
+    if inter <= 0:
+        return 0.0
+    area_a = float(max(0, ax2 - ax1) * max(0, ay2 - ay1))
+    area_b = float(max(0, bx2 - bx1) * max(0, by2 - by1))
+    return inter / max(1e-6, area_a + area_b - inter)
+
+
 class DemosaicRestorer:
-    """Sliding-window restoration generator running on onnxruntime."""
+    """Chunk restoration generator running on onnxruntime."""
 
     def __init__(self, provider: str = "trt"):
-        self.sess = _make_session(restoration_model_path(), provider, "restoration")
-        self.input_name = self.sess.get_inputs()[0].name
-        self.output_name = self.sess.get_outputs()[0].name
+        self.sess = _make_session(restoration_model_path(), provider, _RESTORATION_CACHE_NAME)
+        self.input_names = [i.name for i in self.sess.get_inputs()]
+        self.input_name = "lqs" if "lqs" in self.input_names else self.input_names[0]
+        self.prev_ds_name = "prev_ds" if "prev_ds" in self.input_names else None
+        self.states_name = "states" if "states" in self.input_names else None
+        self.output_names = [o.name for o in self.sess.get_outputs()]
+        self.output_name = "restored" if "restored" in self.output_names else self.output_names[0]
+        self.ds_out_name = "ds_out" if "ds_out" in self.output_names else None
+        self.states_out_name = "states_out" if "states_out" in self.output_names else None
 
     @property
     def providers(self) -> list:
         return self.sess.get_providers()
 
     def restore(self, window_crops_rgb: Sequence[np.ndarray]) -> np.ndarray:
-        """window_crops_rgb: WINDOW RGB uint8 crops (any HxW). Returns the
-        restored CENTER crop as RGB uint8 at REST_SIZE x REST_SIZE."""
+        """window_crops_rgb: WINDOW RGB uint8 crops (any HxW). Returns one
+        representative restored crop as RGB uint8 at REST_SIZE x REST_SIZE."""
         arr = np.stack([
             cv2.resize(c, (REST_SIZE, REST_SIZE), interpolation=cv2.INTER_AREA).astype(np.float32) / 255.0
             for c in window_crops_rgb
-        ])                                          # (7, 256, 256, 3)
-        arr = arr.transpose(0, 3, 1, 2)[None]       # (1, 7, 3, 256, 256)
+        ])                                          # (8, 256, 256, 3)
+        arr = arr.transpose(0, 3, 1, 2)[None]       # (1, 8, 3, 256, 256)
         return self.restore_stack(arr)
 
+    def restore_chunk_stack(
+        self,
+        frames_nchw: np.ndarray,
+        prev_ds: np.ndarray | None = None,
+        states: np.ndarray | None = None,
+    ) -> tuple[np.ndarray, np.ndarray | None, np.ndarray | None]:
+        """Run the 8-frame chunk model.
+
+        frames_nchw: (B,8,3,256,256) float32 0..1. If no recurrent feedback is
+        supplied, ``prev_ds`` is initialized from the first frame and ``states``
+        is initialized to zero, matching the model provider guidance.
+        """
+        frames = np.ascontiguousarray(frames_nchw, dtype=np.float32)
+        batch = int(frames.shape[0])
+        inputs: dict[str, np.ndarray] = {self.input_name: frames}
+        if self.prev_ds_name is not None:
+            inputs[self.prev_ds_name] = np.ascontiguousarray(
+                _initial_prev_ds_np(frames) if prev_ds is None else prev_ds,
+                dtype=np.float32,
+            )
+        if self.states_name is not None:
+            inputs[self.states_name] = np.ascontiguousarray(
+                _zero_states_np(batch) if states is None else states,
+                dtype=np.float32,
+            )
+        raw_outputs = self.sess.run(self.output_names, inputs)
+        outputs = dict(zip(self.output_names, raw_outputs))
+        return (
+            outputs[self.output_name],
+            outputs.get(self.ds_out_name) if self.ds_out_name is not None else None,
+            outputs.get(self.states_out_name) if self.states_out_name is not None else None,
+        )
+
     def restore_stack(self, frames_nchw: np.ndarray) -> np.ndarray:
-        """frames_nchw: (1,7,3,256,256) float32 0..1 (already resized). Returns the
-        restored CENTER crop as RGB uint8 256x256. Lets the GPU path resize the
-        crops itself and skip the host-side cv2.resize loop."""
-        out = self.sess.run([self.output_name],
-                            {self.input_name: np.ascontiguousarray(frames_nchw, dtype=np.float32)})[0]
-        out = np.clip(out[0], 0.0, 1.0).transpose(1, 2, 0)
+        """frames_nchw: (1,8,3,256,256) float32 0..1 (already resized). Returns a
+        representative restored crop as RGB uint8 256x256."""
+        restored, _ds_out, _states_out = self.restore_chunk_stack(frames_nchw)
+        out = np.clip(restored[0, CENTER], 0.0, 1.0).transpose(1, 2, 0)
         return (out * 255.0).astype(np.uint8)
 
 
@@ -284,8 +352,8 @@ def restore_center_frame(window_frames_rgb: Sequence[np.ndarray],
                          detector: DemosaicDetector, restorer: DemosaicRestorer,
                          conf: float = 0.25) -> np.ndarray:
     """Detect mosaics on the CENTER frame and restore each region using the
-    temporal window. window_frames_rgb: WINDOW consecutive RGB uint8 frames.
-    Returns the restored CENTER frame (RGB uint8). Mirrors the reference."""
+    temporal chunk. window_frames_rgb: WINDOW consecutive RGB uint8 frames.
+    Returns a representative restored frame (RGB uint8)."""
     center = window_frames_rgb[CENTER]
     H, W = center.shape[:2]
     out = center.copy()
@@ -351,11 +419,11 @@ extern "C" __global__ void bilinear_resize_u8(
 
 
 class GpuRmProcessor:
-    """GPU-resident RM pipeline: takes a temporal window of cupy RGB frames and
-    returns the restored CENTER frame as a cupy RGB array.
+    """GPU-resident RM pipeline: takes an 8-frame chunk of cupy RGB frames and
+    returns restored frames as cupy RGB arrays.
 
     Crop, resize and blend all run on the GPU; only the small detector blob
-    (size x size) and the restoration crop window (7 x 256 x 256) cross PCIe to
+    (size x size) and the restoration crop chunk (8 x 256 x 256) cross PCIe to
     onnxruntime, instead of downloading every full frame to host as the numpy
     path does. The detector mask is still built on the host (box sized, cheap)
     and uploaded for blending."""
@@ -368,20 +436,20 @@ class GpuRmProcessor:
         self.det_size = engines.detector.size
         self._resize = cp.RawModule(code=_RESIZE_KERNEL_SRC).get_function("bilinear_resize_u8")
         self._block = (16, 16, 1)
-        # Detector frequency reduction: run detection every ``detect_interval``
-        # frames and reuse the cached (box, gpu-mask) pairs in between. Restoration
-        # always runs on the fresh temporal window, so only the box location is
-        # held stale for up to detect_interval-1 frames.
+        # Detector frequency reduction: ``detect_interval`` is configured in
+        # frames, but the chunk model runs every WINDOW frames. Reuse cached
+        # (box, gpu-mask) pairs between detector chunks.
         self.detect_interval = max(1, int(detect_interval))
-        self._frame_count = 0
+        self._detect_chunk_interval = max(1, (self.detect_interval + WINDOW - 1) // WINDOW)
+        self._chunk_count = 0
         self._cached_regions: list[tuple[tuple[int, int, int, int], "cp.ndarray"]] | None = None
+        self._region_states: list[tuple[tuple[int, int, int, int], "cp.ndarray", "cp.ndarray"]] = []
         # ORT IOBinding lets both models read their input straight from GPU memory,
         # so the float32 /255 + transpose runs on the GPU (cupy) and nothing is
         # downloaded to host for preprocessing. The detector outputs still come to
         # host for NMS (small); the restorer output stays on the GPU.
         self._det_io = engines.detector.sess.io_binding()
         self._rest_io = engines.restorer.sess.io_binding()
-        self._rest_out_g = cp.empty((1, 3, REST_SIZE, REST_SIZE), cp.float32)
         self._stream = cp.cuda.get_current_stream()
 
     def _run_detector_gpu(self, canvas_g, scale, pad_x, pad_y, frame_hw, conf):
@@ -400,22 +468,42 @@ class GpuRmProcessor:
         out0, out1 = io.copy_outputs_to_cpu()
         return _postprocess_detections(out0, out1, scale, pad_x, pad_y, frame_hw, conf, 0.5)
 
-    def _run_restore_gpu(self, stack_g):
-        """stack_g: (WINDOW,256,256,3) uint8 cupy. Normalize on GPU, run via
-        IOBinding (input + output on device), return restored (256,256,3) uint8 cupy."""
+    def _run_restore_chunk_gpu(self, stack_g, prev_ds_g, states_g):
+        """Run the chunk model for a batch of regions.
+
+        stack_g: (B,WINDOW,256,256,3) uint8 cupy. Returns
+        restored (B,WINDOW,256,256,3) uint8 plus recurrent feedback tensors.
+        """
         cp = self.cp
         res = self.engines.restorer
         x = cp.ascontiguousarray(
-            (stack_g.astype(cp.float32) / 255.0).transpose(0, 3, 1, 2)[None])  # (1,7,3,256,256)
+            (stack_g.astype(cp.float32) / 255.0).transpose(0, 1, 4, 2, 3))  # (B,8,3,256,256)
+        prev_ds_g = cp.ascontiguousarray(prev_ds_g)
+        states_g = cp.ascontiguousarray(states_g)
+        batch = int(x.shape[0])
+        restored_out_g = cp.empty((batch, WINDOW, 3, REST_SIZE, REST_SIZE), cp.float32)
+        ds_out_g = cp.empty((batch, 3, 64, 64), cp.float32)
+        states_out_g = cp.empty((batch, 2, 64, 64, 64), cp.float32)
         self._stream.synchronize()
         io = self._rest_io
         io.bind_input(res.input_name, "cuda", 0, np.float32, x.shape, int(x.data.ptr))
-        io.bind_output(res.output_name, "cuda", 0, np.float32,
-                       self._rest_out_g.shape, int(self._rest_out_g.data.ptr))
+        if res.prev_ds_name is not None:
+            io.bind_input(res.prev_ds_name, "cuda", 0, np.float32, prev_ds_g.shape, int(prev_ds_g.data.ptr))
+        if res.states_name is not None:
+            io.bind_input(res.states_name, "cuda", 0, np.float32, states_g.shape, int(states_g.data.ptr))
+        for name in res.output_names:
+            if name == res.output_name:
+                io.bind_output(name, "cuda", 0, np.float32, restored_out_g.shape, int(restored_out_g.data.ptr))
+            elif name == res.ds_out_name:
+                io.bind_output(name, "cuda", 0, np.float32, ds_out_g.shape, int(ds_out_g.data.ptr))
+            elif name == res.states_out_name:
+                io.bind_output(name, "cuda", 0, np.float32, states_out_g.shape, int(states_out_g.data.ptr))
+            else:
+                io.bind_output(name)
         res.sess.run_with_iobinding(io)
         self._stream.synchronize()
-        out = cp.clip(self._rest_out_g[0], 0.0, 1.0).transpose(1, 2, 0)        # (256,256,3) f32
-        return (out * 255.0).astype(cp.uint8)
+        restored = cp.clip(restored_out_g, 0.0, 1.0).transpose(0, 1, 3, 4, 2)
+        return (restored * 255.0).astype(cp.uint8), ds_out_g, states_out_g
 
     def _resize_into(self, src_g, dst_g, src_x0: int, src_y0: int, crop_w: int, crop_h: int) -> None:
         cp = self.cp
@@ -452,31 +540,88 @@ class GpuRmProcessor:
             regions.append((det.box, cp.asarray(mask)))
         return regions
 
-    def process(self, window_g, conf: float = 0.25):
+    def _initial_prev_ds_gpu(self, crop_g):
         cp = self.cp
-        center_g = window_g[CENTER]
+        down_g = cp.empty((64, 64, 3), cp.uint8)
+        self._resize_into(crop_g, down_g, 0, 0, REST_SIZE, REST_SIZE)
+        return cp.ascontiguousarray((down_g.astype(cp.float32) / 255.0).transpose(2, 0, 1))
 
-        if self._cached_regions is None or self._frame_count % self.detect_interval == 0:
-            self._cached_regions = self._detect_regions(center_g, conf)
-        self._frame_count += 1
+    def _matched_state(
+        self,
+        box: tuple[int, int, int, int],
+        used: set[int],
+    ) -> tuple[int, "cp.ndarray", "cp.ndarray"] | None:
+        best_idx = -1
+        best_iou = 0.0
+        for idx, (prev_box, prev_ds, states) in enumerate(self._region_states):
+            if idx in used:
+                continue
+            iou = _box_iou(box, prev_box)
+            if iou > best_iou:
+                best_idx = idx
+                best_iou = iou
+        if best_idx >= 0 and best_iou >= 0.30:
+            _prev_box, prev_ds, states = self._region_states[best_idx]
+            return best_idx, prev_ds, states
+        return None
 
-        out_g = center_g.copy()
-        for box, m_g in self._cached_regions:
+    def process_chunk(self, chunk_g, conf: float = 0.25):
+        cp = self.cp
+        if len(chunk_g) != WINDOW:
+            raise ValueError(f"RM chunk requires {WINDOW} frames, got {len(chunk_g)}")
+        detect_frame_g = chunk_g[0]
+
+        if self._cached_regions is None or self._chunk_count % self._detect_chunk_interval == 0:
+            self._cached_regions = self._detect_regions(detect_frame_g, conf)
+        self._chunk_count += 1
+
+        if not self._cached_regions:
+            self._region_states = []
+            return list(chunk_g)
+
+        out_frames = [frame.copy() for frame in chunk_g]
+        regions = self._cached_regions
+        batch = len(regions)
+        stack_g = cp.empty((batch, WINDOW, REST_SIZE, REST_SIZE, 3), cp.uint8)
+        prev_ds_g = cp.empty((batch, 3, 64, 64), cp.float32)
+        states_g = cp.empty((batch, 2, 64, 64, 64), cp.float32)
+        used_states: set[int] = set()
+
+        for b, (box, _m_g) in enumerate(regions):
             x1, y1, x2, y2 = box
             bw, bh = x2 - x1, y2 - y1
-            # crop+resize each window frame to 256 on the GPU; normalize + restore
-            # via IOBinding so nothing leaves the GPU (restored stays on device)
-            stack_g = cp.empty((WINDOW, REST_SIZE, REST_SIZE, 3), cp.uint8)
             for k in range(WINDOW):
-                self._resize_into(window_g[k], stack_g[k], x1, y1, bw, bh)
-            restored_g = self._run_restore_gpu(stack_g)               # (256,256,3) uint8 cupy
+                self._resize_into(chunk_g[k], stack_g[b, k], x1, y1, bw, bh)
+            matched = self._matched_state(box, used_states)
+            if matched is None:
+                prev_ds_g[b] = self._initial_prev_ds_gpu(stack_g[b, 0])
+                states_g[b].fill(0)
+            else:
+                idx, prev_ds, states = matched
+                used_states.add(idx)
+                prev_ds_g[b] = prev_ds
+                states_g[b] = states
 
-            # resize restored crop back to box on GPU, blend with the cached mask
-            resized_g = cp.empty((bh, bw, 3), cp.uint8)
-            self._resize_into(restored_g, resized_g, 0, 0, REST_SIZE, REST_SIZE)
-            region = out_g[y1:y2, x1:x2].astype(cp.float32)
-            out_g[y1:y2, x1:x2] = (region * (1 - m_g) + resized_g.astype(cp.float32) * m_g).astype(cp.uint8)
-        return out_g
+        restored_g, ds_out_g, states_out_g = self._run_restore_chunk_gpu(stack_g, prev_ds_g, states_g)
+
+        next_states: list[tuple[tuple[int, int, int, int], "cp.ndarray", "cp.ndarray"]] = []
+        for b, (box, m_g) in enumerate(regions):
+            x1, y1, x2, y2 = box
+            bw, bh = x2 - x1, y2 - y1
+            for k in range(WINDOW):
+                resized_g = cp.empty((bh, bw, 3), cp.uint8)
+                self._resize_into(restored_g[b, k], resized_g, 0, 0, REST_SIZE, REST_SIZE)
+                region = out_frames[k][y1:y2, x1:x2].astype(cp.float32)
+                out_frames[k][y1:y2, x1:x2] = (
+                    region * (1 - m_g) + resized_g.astype(cp.float32) * m_g
+                ).astype(cp.uint8)
+            next_states.append((box, ds_out_g[b].copy(), states_out_g[b].copy()))
+        self._region_states = next_states
+        return out_frames
+
+    def process(self, window_g, conf: float = 0.25):
+        """Compatibility helper for callers that still expect one output frame."""
+        return self.process_chunk(window_g, conf)[CENTER]
 
 
 def models_available() -> bool:

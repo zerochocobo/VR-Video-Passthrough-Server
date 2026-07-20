@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import unittest
 import shutil
@@ -17,6 +17,7 @@ class ContentDirectoryModeTests(unittest.TestCase):
             "green": ("green",),
             "alpha": ("alpha",),
             "all": ("green", "alpha"),
+            "superres": ("superres",),
         }
         for mode, expected in cases.items():
             with self.subTest(mode=mode), patch.object(cds, "PASSTHROUGH_OUTPUT_MODE", mode):
@@ -60,6 +61,20 @@ class ContentDirectoryModeTests(unittest.TestCase):
             self.assertIn("mode=green", cds._passthrough_live_query("green"))
             self.assertIn("mode=alpha", cds._passthrough_live_query("alpha"))
 
+    def test_superres_live_container_id_round_trips(self) -> None:
+        source = Path("movie.mp4")
+        library = SimpleNamespace(
+            key_to_path=lambda rel: source if rel == "movie.mp4" else None,
+            contains=lambda path: path == source,
+        )
+        with patch.object(cds, "MEDIA_LIBRARY", library), patch.object(Path, "is_file", return_value=True):
+            self.assertEqual(cds._passthrough_live_prefix("superres"), "plsr_")
+            self.assertEqual(cds._passthrough_live_item_prefix("superres"), "plsr_item_")
+            self.assertEqual(cds._passthrough_seek_item_prefix("superres"), "ssr_")
+            self.assertEqual(cds._id_to_live("plsr_ptv11_movie.mp4"), (source, "superres"))
+            self.assertEqual(cds._id_to_live("plsr_item_ptv11_movie.mp4"), (source, "superres"))
+            self.assertEqual(cds._id_to_seek("ssr_ptv11_movie.mp4"), (source, "superres"))
+
     def test_short_live_items_keep_distinct_modes(self) -> None:
         child = SimpleNamespace(
             size=1024,
@@ -81,7 +96,7 @@ class ContentDirectoryModeTests(unittest.TestCase):
             items = cds._video_items_from_index(Path("movie.mp4"), "0", child)
 
         live = [item for item in items if item.get("container") and str(item["id"]).startswith(("pl_", "pla_"))]
-        self.assertEqual([item["id"] for item in live], ["pl_ptv10_movie.mp4", "pla_ptv10_movie.mp4"])
+        self.assertEqual([item["id"] for item in live], ["pl_ptv11_movie.mp4", "pla_ptv11_movie.mp4"])
         self.assertEqual([item["title"] for item in live], ["[GREEN]_movie_passthrough_live", "[ALPHA]_movie_LR_180_FISHEYE_F180_alpha_live"])
         self.assertEqual([item["child_count"] for item in live], [2, 2])
 
@@ -108,7 +123,7 @@ class ContentDirectoryModeTests(unittest.TestCase):
         ):
             items = cds._video_items_from_index(Path("movie.mp4"), "0", child)
 
-        live = [item for item in items if item.get("container") and item["id"] == "pl_ptv10_movie.mp4"]
+        live = [item for item in items if item.get("container") and item["id"] == "pl_ptv11_movie.mp4"]
         self.assertEqual(live[0]["child_count"], 2)
 
     def test_seek_dlna_switch_adds_live_fallback_virtual_entry(self) -> None:
@@ -140,14 +155,14 @@ class ContentDirectoryModeTests(unittest.TestCase):
         seek = next(item for item in items if "/passthrough_seek/" in item.get("url", ""))
         live = next(item for item in items if item.get("container"))
         self.assertFalse(seek.get("container"))
-        self.assertEqual(seek["id"], "sg_ptv10_movie.mp4")
+        self.assertEqual(seek["id"], "sg_ptv11_movie.mp4")
         self.assertIn("/passthrough_seek/movie.mp4.seek.ts", seek["url"])
         self.assertIn("_seek", seek["title"])
         self.assertEqual(seek["protocol_info"].split(";")[1], "DLNA.ORG_OP=11")
         self.assertIn("DLNA.ORG_CI=0", seek["protocol_info"])
         self.assertIn("DLNA.ORG_FLAGS=01F00000000000000000000000000000", seek["protocol_info"])
         self.assertEqual(seek["size"], 14_345_678)
-        self.assertEqual(live["id"], "pl_ptv10_movie.mp4")
+        self.assertEqual(live["id"], "pl_ptv11_movie.mp4")
         self.assertIn("_live", live["title"])
 
     def test_seek_dlna_requires_route_master_switch(self) -> None:
@@ -175,7 +190,7 @@ class ContentDirectoryModeTests(unittest.TestCase):
             items = cds._video_items_from_index(Path("movie.mp4"), "0", child)
 
         self.assertTrue(items[1].get("container"))
-        self.assertEqual(items[1]["id"], "pl_ptv10_movie.mp4")
+        self.assertEqual(items[1]["id"], "pl_ptv11_movie.mp4")
 
     def test_seek_dlna_can_advertise_true_fmp4_experiment(self) -> None:
         child = SimpleNamespace(
@@ -240,7 +255,7 @@ class ContentDirectoryModeTests(unittest.TestCase):
         ):
             didl = cds._metadata_didl_for_live(source, "alpha")
 
-        self.assertIn("pla_ptv10_movie.mp4", didl)
+        self.assertIn("pla_ptv11_movie.mp4", didl)
         self.assertIn("<container", didl)
         self.assertIn('childCount="2"', didl)
         self.assertIn("[ALPHA]_movie_LR_180_FISHEYE_F180_alpha_live", didl)
@@ -415,7 +430,7 @@ class ContentDirectoryModeTests(unittest.TestCase):
             [item["title"] for item in chapters],
             ["00:00_movie_LR_180_FISHEYE_F180_alpha_live", "00:05_movie_LR_180_FISHEYE_F180_alpha_live"],
         )
-        self.assertEqual(items[0]["id"], "lix_a_ptv10_movie.mp4")
+        self.assertEqual(items[0]["id"], "lix_a_ptv11_movie.mp4")
         self.assertEqual(items[0]["title"], "[Select Time Index]_[ALPHA]_movie_LR_180_FISHEYE_F180_alpha_live")
 
     def test_live_time_index_title_uses_requested_language(self) -> None:
@@ -466,7 +481,7 @@ class ContentDirectoryModeTests(unittest.TestCase):
         ):
             items = cds._live_time_index_items(source, "green", "index")
 
-        self.assertEqual([item["id"] for item in items], ["lim_g_ptv10_movie.mp4@0", "lim_g_ptv10_movie.mp4@60"])
+        self.assertEqual([item["id"] for item in items], ["lim_g_ptv11_movie.mp4@0", "lim_g_ptv11_movie.mp4@60"])
         self.assertEqual([item["title"] for item in items], ["00:00_[GREEN]_movie_passthrough_live", "01:00_[GREEN]_movie_passthrough_live"])
 
     def test_live_time_index_uses_hour_format_for_long_videos(self) -> None:
@@ -569,7 +584,7 @@ class ContentDirectoryModeTests(unittest.TestCase):
             items = cds._root_items()
 
         self.assertEqual([item["title"] for item in items], ["VR", "VR2"])
-        self.assertEqual([item["id"] for item in items], ["d_ptv10_VR", "d_ptv10_VR2"])
+        self.assertEqual([item["id"] for item in items], ["d_ptv11_VR", "d_ptv11_VR2"])
 
     def test_didl_namespace_has_trailing_slash(self) -> None:
         didl = cds._didl_for([])
@@ -611,7 +626,7 @@ class ContentDirectoryModeTests(unittest.TestCase):
         self.assertIn("<sec:CaptionInfoEx sec:type=\"srt\">http://127.0.0.1:8200/subs/movie.zh.srt</sec:CaptionInfoEx>", didl)
         self.assertIn("<sec:CaptionInfo sec:type=\"srt\">http://127.0.0.1:8200/subs/movie.zh.srt</sec:CaptionInfo>", didl)
 
-    def test_directory_cache_key_includes_subtitle_toggle(self) -> None:
+    def test_directory_cache_is_independent_of_realtime_subtitle_toggle(self) -> None:
         child = SimpleNamespace(is_dir=False, path=Path("movie.mp4"))
         snapshot = SimpleNamespace(key="root", signature="sig", children=[child])
         video_item = {
@@ -633,16 +648,16 @@ class ContentDirectoryModeTests(unittest.TestCase):
         with (
             patch.object(cds, "get_media_index") as get_index,
             patch.object(cds, "_folder_id", return_value="0"),
-            patch.object(cds, "_video_items_from_index", side_effect=[[dict(video_item, title="off")], [dict(video_item, title="on")]]),
-            patch.object(cds, "subtitle_output_enabled", side_effect=[False, True]),
+            patch.object(cds, "_video_items_from_index", return_value=[dict(video_item, title="normal")]) as build_item,
         ):
             get_index.return_value.list_directory.return_value = snapshot
             cds._dir_items_cache.clear()
-            off_items = cds._children_for_dir(Path("."))
-            on_items = cds._children_for_dir(Path("."))
+            first_items = cds._children_for_dir(Path("."))
+            second_items = cds._children_for_dir(Path("."))
 
-        self.assertEqual(off_items[0]["title"], "off")
-        self.assertEqual(on_items[0]["title"], "on")
+        self.assertEqual(first_items[0]["title"], "normal")
+        self.assertEqual(second_items[0]["title"], "normal")
+        self.assertEqual(build_item.call_count, 1)
         cds._dir_items_cache.clear()
 
     def test_children_for_dir_includes_image_items_when_enabled(self) -> None:
@@ -665,7 +680,7 @@ class ContentDirectoryModeTests(unittest.TestCase):
             items = cds._children_for_dir(Path("."))
 
         self.assertEqual(len(items), 1)
-        self.assertEqual(items[0]["id"], "img_ptv10_photo.jpg")
+        self.assertEqual(items[0]["id"], "img_ptv11_photo.jpg")
         self.assertEqual(items[0]["mime"], "image/jpeg")
         self.assertEqual(items[0]["protocol_info"], "http-get:*:image/jpeg:DLNA.ORG_PN=JPEG_LRG;DLNA.ORG_OP=00;DLNA.ORG_CI=0;DLNA.ORG_FLAGS=01700000000000000000000000000000")
         didl = cds._didl_for(items)

@@ -14,7 +14,7 @@ import numpy as np
 import onnxruntime as ort
 
 import config
-from offline.decoded_frames import decoded_frame_to_bgr
+from offline.decoded_frames import decoded_frame_to_sbs_eye_rgbs, scene_bgr_from_rgb
 from utils.scene_detection import SceneCutDetector
 from utils.subprocess_hidden import hidden_subprocess_kwargs, run_hidden_streaming
 
@@ -767,17 +767,15 @@ def precompute_segment_masks(args, src: Path, dec, source_fps: float, fps: float
     for n, start in enumerate(scan_points, 1):
         src_idx = min(len(dec) - 1, cfr_source_index(start, source_fps, fps))
         frame = dec.frame_at(src_idx)
-        bgr = decoded_frame_to_bgr(frame)
-        half = frame.width // 2
+        eye_images = decoded_frame_to_sbs_eye_rgbs(frame)
+        del frame
         scene_cut = False
         scene_distance = 0.0
         if scene_detector is not None:
-            scene_cut = scene_detector.step(bgr[:, :half] if half > 0 else bgr)
+            scene_cut = scene_detector.step(
+                scene_bgr_from_rgb(eye_images[0], getattr(scene_detector, "downsample_height", 540))
+            )
             scene_distance = scene_detector.last_distance
-        eye_images = [
-            cv2.cvtColor(bgr[:, :half], cv2.COLOR_BGR2RGB),
-            cv2.cvtColor(bgr[:, half:half * 2], cv2.COLOR_BGR2RGB),
-        ]
         masks = []
         infos = []
         t0 = time.perf_counter()
@@ -827,6 +825,7 @@ def precompute_segment_masks(args, src: Path, dec, source_fps: float, fps: float
             + (f" scene_cut=1 dist={scene_distance:.3f}" if scene_cut else ""),
             flush=True,
         )
+        del eye_images, masks, infos
     gap_fill_frames = int(getattr(args, "y26es_gap_fill_frames", max_segment_frames) or 0)
     fill_boundaries = bool(getattr(args, "y26es_fill_boundaries", True))
     scene_aware_fill = bool(getattr(args, "y26es_scene_aware_fill", True))

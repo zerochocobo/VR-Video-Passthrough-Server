@@ -25,6 +25,8 @@ class OfflineConvertTests(unittest.TestCase):
         green_args = SimpleNamespace(command="single", mode="green", engine="rvm_fast", start=300.0, duration=15.0)
         alpha_args = SimpleNamespace(command="single", mode="alpha", engine="matanyone2", start=5.0, duration=300.0)
         all_args = SimpleNamespace(command="single", mode="green", engine="rvm_fast", start=0.0, duration=0.0)
+        vsr_args = SimpleNamespace(command="single", mode="green", engine="rtx_vsr", start=0.0, duration=0.0, rtx_vsr_target_height=2160)
+        vsr_8k_args = SimpleNamespace(command="single", mode="green", engine="rtx_vsr", start=0.0, duration=0.0, rtx_vsr_target_height=4096)
 
         self.assertEqual(
             convert._single_out(src, green_args, 3840, 1920),
@@ -32,6 +34,9 @@ class OfflineConvertTests(unittest.TestCase):
         )
         self.assertEqual(convert._single_out(src, alpha_args), Path("sample_matanyone2_S000005_E000505_5M_LR_180_FISHEYE_F180_alpha.mp4"))
         self.assertEqual(convert._single_out(src, all_args, 1920, 1080), Path("sample_rvm1_S000000_ALL_passthrough.mp4"))
+        self.assertEqual(convert._single_out(src, vsr_args), Path("sample_4K.mp4"))
+        self.assertEqual(convert._single_out(src, vsr_8k_args, 3840, 1920), Path("sample_8K.mp4"))
+        self.assertEqual(convert._single_out(src, vsr_8k_args, 1920, 1080), Path("sample_4K.mp4"))
 
     def test_single_segments_output_name_includes_segment_count_and_range(self) -> None:
         src = Path("sample.mp4")

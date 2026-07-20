@@ -2,7 +2,7 @@
 from PyInstaller.utils.hooks import collect_data_files
 from PyInstaller.utils.hooks import collect_dynamic_libs
 
-datas = [('resources', 'resources'), ('ui\\app_metadata.json', 'ui'), ('ui\\translations', 'ui\\translations'), ('ui\\styles', 'ui\\styles')]
+datas = [('resources', 'resources'), ('models\\rtx_vsr\\runtime', 'models\\rtx_vsr\\runtime'), ('ui\\app_metadata.json', 'ui'), ('ui\\translations', 'ui\\translations'), ('ui\\styles', 'ui\\styles')]
 binaries = []
 datas += collect_data_files('PySide6')
 binaries += collect_dynamic_libs('PySide6')

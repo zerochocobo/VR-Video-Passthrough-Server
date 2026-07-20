@@ -37,6 +37,7 @@ def is_subtitle_path(path: Path) -> bool:
 
 
 def subtitle_output_enabled() -> bool:
+    """Return whether realtime passthrough should burn subtitles into video."""
     settings_path = config.ROOT / "runtime_cache" / "ui_settings.json"
     if settings_path.exists():
         try:
@@ -67,9 +68,12 @@ def _lang_rank(lang: str) -> tuple[int, str]:
 
 
 def find_external_subtitles(video_path: Path) -> list[SubtitleTrack]:
-    if not subtitle_output_enabled():
-        return []
-    if video_path.suffix.lower() not in {".mp4", ".m4v"}:
+    """Find sidecar subtitles advertised for normal DLNA/media playback.
+
+    This discovery is intentionally independent of ``subtitle_output_enabled``:
+    the UI subtitle switch controls realtime burned-in subtitles only.
+    """
+    if video_path.suffix.lower() not in config.VIDEO_EXTS:
         return []
     parent = video_path.parent
     stem = video_path.stem

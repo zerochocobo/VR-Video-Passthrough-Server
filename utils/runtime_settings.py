@@ -6,7 +6,7 @@ import threading
 
 import config
 from pipeline.light_match import LightMatchParams, normalize_light_match_params
-from utils.si_filter import SIMixParams, normalize_si_mix_params
+from utils.si_filter import DEFAULT_DUB_MODE, SIMixParams, normalize_si_mix_params
 
 
 @dataclass(frozen=True)
@@ -45,6 +45,8 @@ class SIMixRuntime:
     si_volume_percent: int
     si_delay_seconds: float
     duck_original: bool
+    duck_preset: str
+    dub_mode_enabled: bool = DEFAULT_DUB_MODE
     version: int = 0
 
     def params(self) -> SIMixParams:
@@ -55,6 +57,8 @@ class SIMixRuntime:
             si_volume_percent=self.si_volume_percent,
             si_delay_seconds=self.si_delay_seconds,
             duck_original=self.duck_original,
+            duck_preset=self.duck_preset,
+            dub_mode_enabled=self.dub_mode_enabled,
         )
 
     def to_dict(self) -> dict:

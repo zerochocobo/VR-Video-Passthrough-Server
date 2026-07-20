@@ -34,6 +34,7 @@ GREEN_LIVE_PASSTHROUGH_SUFFIX = "_passthrough"
 GREEN_OFFLINE_PASSTHROUGH_SUFFIX = "_LR_180_SBS_passthrough"
 ALPHA_PASSTHROUGH_SUFFIX = "_LR_180_FISHEYE_F180_alpha"
 TWO_DVR_SUFFIX = "_3D_LR_Screen"
+SUPERRES_PREFIX = "[SuperRes]"
 _VIDEO_SUFFIXES = {".mp4", ".mkv", ".mov", ".m4v", ".avi", ".webm", ".ts", ".m2ts"}
 
 
@@ -95,6 +96,23 @@ def two_dvr_stem(stem_or_name: str) -> str:
     return f"{stem}{TWO_DVR_SUFFIX}"
 
 
+def superres_stem(stem_or_name: str) -> str:
+    """Return a stable RTX VSR output stem with the SuperRes marker."""
+    stem = _as_stem(stem_or_name)
+    if stem.lower().startswith(SUPERRES_PREFIX.lower()):
+        return stem
+    return f"{SUPERRES_PREFIX}{stem}"
+
+
+def superres_output_stem(stem_or_name: str, target_height: int = 2160) -> str:
+    """Return the offline RTX VSR stem with a user-facing resolution suffix."""
+    stem = _as_stem(stem_or_name)
+    stem = re.sub(r"_(?:2K|4K|8K)$", "", stem, flags=re.IGNORECASE)
+    height = int(target_height or 2160)
+    suffix = "_2K" if height <= 1440 else ("_8K" if height >= 4096 else "_4K")
+    return f"{stem}{suffix}"
+
+
 def live_passthrough_title(stem_or_name: str, mode: str, width: int = 0, height: int = 0) -> str:
     if mode == "alpha":
         return f"{alpha_passthrough_stem(stem_or_name)}_live"
@@ -102,6 +120,8 @@ def live_passthrough_title(stem_or_name: str, mode: str, width: int = 0, height:
         return f"[2D>3D]{two_dvr_stem(stem_or_name)}_live"
     if mode == "rm":
         return f"[RM]{_as_stem(stem_or_name)}_live"
+    if mode == "superres":
+        return f"{superres_stem(source_display_stem(stem_or_name, width, height))}_live"
     return f"{green_passthrough_stem(stem_or_name, width, height)}_live"
 
 

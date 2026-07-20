@@ -30,6 +30,7 @@ from ui.log_sanitizer import clean_log_text
 from ui.page_icons import BACK_ICON_SIZE, back_icon
 from ui.resources import SWITCH_OFF_IMAGE_PATH, SWITCH_ON_IMAGE_PATH
 from ui.settings import quality_speed_preset, quality_speed_value
+from ui.widgets.sam3_preview_dialog import Sam3PreviewDialog
 from ui.widgets.trt_cache_dialog import TensorRTConfigDialog
 from utils.trt_manifest import TRT_MODEL_MATANYONE2, TRT_MODEL_RVM, cache_status, manifest_path
 from utils.video_metadata import probe_video_metadata
@@ -460,6 +461,7 @@ class OfflinePage(QWidget):
         self.single_recognition = self._recognition_combo()
         self.single_matanyone_help = _help_button()
         self.single_sam3_prompt_button = QPushButton()
+        self.single_sam3_preview_button = QPushButton()
         self.single_sam3_prompt_label = QLabel()
         self.single_quality_speed = self._quality_speed_combo()
         self.single_time_mode = self._time_mode_combo()
@@ -473,6 +475,7 @@ class OfflinePage(QWidget):
         self.single_recognition.currentIndexChanged.connect(self._update_recognition_visibility)
         self.single_matanyone_help.clicked.connect(self.show_matanyone_help)
         self.single_sam3_prompt_button.clicked.connect(self.show_sam3_prompt_dialog)
+        self.single_sam3_preview_button.clicked.connect(self.show_sam3_preview_dialog)
         row_video = QHBoxLayout()
         row_video.addWidget(self.single_video)
         row_video.addWidget(browse_video)
@@ -486,7 +489,7 @@ class OfflinePage(QWidget):
         grid = QGridLayout(page)
         grid.setColumnMinimumWidth(0, OFFLINE_LABEL_WIDTH)
         grid.setColumnStretch(1, 1)
-        self.single_labels = {key: _label() for key in ("video", "output", "mode", "engine", "precision", "recognition", "trt", "performance")}
+        self.single_labels = {key: _label() for key in ("video", "output", "mode", "engine", "precision", "recognition", "sam3_prompt", "trt", "performance")}
         grid.addWidget(self.single_labels["video"], 0, 0)
         grid.addLayout(row_video, 0, 1)
         grid.addWidget(self.single_labels["output"], 1, 0)
@@ -504,18 +507,23 @@ class OfflinePage(QWidget):
         single_recognition_row = QHBoxLayout()
         single_recognition_row.addWidget(self.single_recognition)
         single_recognition_row.addWidget(self.single_matanyone_help)
-        single_recognition_row.addWidget(self.single_sam3_prompt_button)
-        single_recognition_row.addWidget(self.single_sam3_prompt_label)
         single_recognition_row.addStretch(1)
         grid.addLayout(single_recognition_row, 5, 1)
-        grid.addWidget(self.single_labels["trt"], 6, 0)
-        grid.addLayout(self._trt_cache_row("single"), 6, 1)
-        grid.addWidget(self.single_labels["performance"], 7, 0)
-        grid.addLayout(self._performance_row(self.single_quality_speed), 7, 1)
-        grid.addWidget(self.single_time_mode, 8, 0, alignment=Qt.AlignRight)
-        grid.addLayout(self._time_row(), 8, 1)
-        grid.addWidget(self.single_skip, 9, 1)
-        grid.addLayout(actions, 10, 1)
+        grid.addWidget(self.single_labels["sam3_prompt"], 6, 0)
+        single_sam3_row = QHBoxLayout()
+        single_sam3_row.addWidget(self.single_sam3_prompt_button)
+        single_sam3_row.addWidget(self.single_sam3_preview_button)
+        single_sam3_row.addWidget(self.single_sam3_prompt_label)
+        single_sam3_row.addStretch(1)
+        grid.addLayout(single_sam3_row, 6, 1)
+        grid.addWidget(self.single_labels["trt"], 7, 0)
+        grid.addLayout(self._trt_cache_row("single"), 7, 1)
+        grid.addWidget(self.single_labels["performance"], 8, 0)
+        grid.addLayout(self._performance_row(self.single_quality_speed), 8, 1)
+        grid.addWidget(self.single_time_mode, 9, 0, alignment=Qt.AlignRight)
+        grid.addLayout(self._time_row(), 9, 1)
+        grid.addWidget(self.single_skip, 10, 1)
+        grid.addLayout(actions, 11, 1)
         self.tabs.addTab(page, "")
         self._update_custom_duration_visibility()
         self._update_time_mode_visibility()
@@ -532,6 +540,7 @@ class OfflinePage(QWidget):
         self.batch_recognition = self._recognition_combo()
         self.batch_matanyone_help = _help_button()
         self.batch_sam3_prompt_button = QPushButton()
+        self.batch_sam3_preview_button = QPushButton()
         self.batch_sam3_prompt_label = QLabel()
         self.batch_quality_speed = self._quality_speed_combo()
         self.batch_recursive = QCheckBox()
@@ -546,6 +555,7 @@ class OfflinePage(QWidget):
         self.batch_recognition.currentIndexChanged.connect(self._update_recognition_visibility)
         self.batch_matanyone_help.clicked.connect(self.show_matanyone_help)
         self.batch_sam3_prompt_button.clicked.connect(self.show_sam3_prompt_dialog)
+        self.batch_sam3_preview_button.clicked.connect(self.show_sam3_preview_dialog)
         row_dir = QHBoxLayout()
         row_dir.addWidget(self.batch_dir)
         row_dir.addWidget(browse_dir)
@@ -556,7 +566,7 @@ class OfflinePage(QWidget):
         grid = QGridLayout(page)
         grid.setColumnMinimumWidth(0, OFFLINE_LABEL_WIDTH)
         grid.setColumnStretch(1, 1)
-        self.batch_labels = {key: _label() for key in ("directory", "mode", "engine", "precision", "recognition", "trt", "performance")}
+        self.batch_labels = {key: _label() for key in ("directory", "mode", "engine", "precision", "recognition", "sam3_prompt", "trt", "performance")}
         grid.addWidget(self.batch_labels["directory"], 0, 0)
         grid.addLayout(row_dir, 0, 1)
         grid.addWidget(self.batch_labels["mode"], 1, 0)
@@ -572,17 +582,22 @@ class OfflinePage(QWidget):
         batch_recognition_row = QHBoxLayout()
         batch_recognition_row.addWidget(self.batch_recognition)
         batch_recognition_row.addWidget(self.batch_matanyone_help)
-        batch_recognition_row.addWidget(self.batch_sam3_prompt_button)
-        batch_recognition_row.addWidget(self.batch_sam3_prompt_label)
         batch_recognition_row.addStretch(1)
         grid.addLayout(batch_recognition_row, 4, 1)
-        grid.addWidget(self.batch_labels["trt"], 5, 0)
-        grid.addLayout(self._trt_cache_row("batch"), 5, 1)
-        grid.addWidget(self.batch_labels["performance"], 6, 0)
-        grid.addLayout(self._performance_row(self.batch_quality_speed), 6, 1)
-        grid.addWidget(self.batch_recursive, 7, 1)
-        grid.addWidget(self.batch_skip, 8, 1)
-        grid.addLayout(actions, 9, 1)
+        grid.addWidget(self.batch_labels["sam3_prompt"], 5, 0)
+        batch_sam3_row = QHBoxLayout()
+        batch_sam3_row.addWidget(self.batch_sam3_prompt_button)
+        batch_sam3_row.addWidget(self.batch_sam3_preview_button)
+        batch_sam3_row.addWidget(self.batch_sam3_prompt_label)
+        batch_sam3_row.addStretch(1)
+        grid.addLayout(batch_sam3_row, 5, 1)
+        grid.addWidget(self.batch_labels["trt"], 6, 0)
+        grid.addLayout(self._trt_cache_row("batch"), 6, 1)
+        grid.addWidget(self.batch_labels["performance"], 7, 0)
+        grid.addLayout(self._performance_row(self.batch_quality_speed), 7, 1)
+        grid.addWidget(self.batch_recursive, 8, 1)
+        grid.addWidget(self.batch_skip, 9, 1)
+        grid.addLayout(actions, 10, 1)
         self.tabs.addTab(page, "")
 
     def _browse_file(self, target: QLineEdit) -> None:
@@ -681,11 +696,15 @@ class OfflinePage(QWidget):
         batch_sam3_visible = batch_visible and str(self.batch_recognition.currentData()) == "sam3"
         self.single_labels["recognition"].setVisible(single_visible)
         self.single_recognition.setVisible(single_visible)
+        self.single_labels["sam3_prompt"].setVisible(single_sam3_visible)
         self.single_sam3_prompt_button.setVisible(single_sam3_visible)
+        self.single_sam3_preview_button.setVisible(single_sam3_visible)
         self.single_sam3_prompt_label.setVisible(single_sam3_visible)
         self.batch_labels["recognition"].setVisible(batch_visible)
         self.batch_recognition.setVisible(batch_visible)
+        self.batch_labels["sam3_prompt"].setVisible(batch_sam3_visible)
         self.batch_sam3_prompt_button.setVisible(batch_sam3_visible)
+        self.batch_sam3_preview_button.setVisible(batch_sam3_visible)
         self.batch_sam3_prompt_label.setVisible(batch_sam3_visible)
         self._update_sam3_prompt_labels()
         self._update_matanyone_help_visibility()
@@ -848,6 +867,21 @@ class OfflinePage(QWidget):
         layout.addWidget(hint)
         layout.addLayout(prompt_row)
         layout.addLayout(buttons)
+        dialog.exec()
+
+    def show_sam3_preview_dialog(self) -> None:
+        video_path = ""
+        if self.tabs.currentIndex() == 0:
+            candidate = self.single_video.text().strip()
+            if candidate and Path(candidate).is_file():
+                video_path = candidate
+        dialog = Sam3PreviewDialog(
+            self.i18n,
+            self.settings,
+            self,
+            video_path=video_path,
+            on_prompt_saved=self._update_sam3_prompt_labels,
+        )
         dialog.exec()
 
     def _save_quality_speed(self) -> None:
@@ -1152,8 +1186,12 @@ class OfflinePage(QWidget):
             combo.setItemText(2, self.i18n.t("recognition.sam3"))
         self._configure_precision_combo(self.single_precision, str(self.single_engine.currentData()))
         self._configure_precision_combo(self.batch_precision, str(self.batch_engine.currentData()))
-        self.single_sam3_prompt_button.setText(self.i18n.t("offline.sam3_prompt_button"))
-        self.batch_sam3_prompt_button.setText(self.i18n.t("offline.sam3_prompt_button"))
+        self.single_labels["sam3_prompt"].setText(self.i18n.t("offline.sam3_prompt_button"))
+        self.batch_labels["sam3_prompt"].setText(self.i18n.t("offline.sam3_prompt_button"))
+        self.single_sam3_prompt_button.setText(self.i18n.t("offline.sam3_prompt_configure"))
+        self.batch_sam3_prompt_button.setText(self.i18n.t("offline.sam3_prompt_configure"))
+        self.single_sam3_preview_button.setText(self.i18n.t("offline.sam3_preview_button"))
+        self.batch_sam3_preview_button.setText(self.i18n.t("offline.sam3_preview_button"))
         self.single_matanyone_help.setToolTip(self.i18n.t("offline.matanyone_help_title"))
         self.batch_matanyone_help.setToolTip(self.i18n.t("offline.matanyone_help_title"))
         self._update_recognition_visibility()

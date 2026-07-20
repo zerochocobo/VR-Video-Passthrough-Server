@@ -30,6 +30,13 @@ def _runtime_dll_candidates(env: dict[str, str]) -> list[Path]:
             if path.exists():
                 candidates.append(path)
     else:
+        # Keep the pip CUDA 12.9 NVRTC ahead of the system CUDA 12.6 bin.
+        # Blackwell/sm_120 requires >=12.8 for native cubin compilation;
+        # allowing CUDA_PATH\bin to shadow this directory causes the very slow
+        # PTX driver-JIT path described in PROJECT.md.
+        nvrtc_bin = config.ROOT / ".venv" / "Lib" / "site-packages" / "nvidia" / "cuda_nvrtc" / "bin"
+        if nvrtc_bin.exists():
+            candidates.append(nvrtc_bin)
         tensorrt_libs = config.ROOT / ".venv" / "Lib" / "site-packages" / "tensorrt_libs"
         if tensorrt_libs.exists():
             candidates.append(tensorrt_libs)

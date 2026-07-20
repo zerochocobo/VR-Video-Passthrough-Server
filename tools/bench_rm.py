@@ -8,7 +8,7 @@ It reports two figures:
                         only restored where a mosaic is found (the realistic
                         cost on clean footage / between mosaic regions).
   * worst-case FPS    - additionally forces ``--force-regions`` restoration calls
-                        per frame (each a 7-frame 256x256 window) to measure the
+                        per frame (each an 8-frame 256x256 chunk) to measure the
                         cost when several mosaic regions are on screen at once.
 
 This isolates inference cost (NVDEC decode + NVENC encode in the live path are

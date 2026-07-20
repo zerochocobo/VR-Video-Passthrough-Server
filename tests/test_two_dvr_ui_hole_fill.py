@@ -26,8 +26,9 @@ if hasattr(os, "add_dll_directory"):
 from PySide6.QtCore import QObject, Signal
 from PySide6.QtWidgets import QApplication, QComboBox
 
+from ui.dialogs.feature_dialogs import TwoDvrSettingsDialog
 from ui.i18n import I18n
-from ui.pages.home_page import HomePage
+from ui.pages.dashboard_page import DashboardPage
 from ui.pages.two_dvr_page import TwoDvrPage
 
 
@@ -105,31 +106,38 @@ class TwoDvrUiHoleFillTests(unittest.TestCase):
         self.assertEqual(env["PT_TWO_DVR_EYE_DISTANCE_MM"], "65.0")
         self.assertEqual(env["PT_TWO_DVR_STRENGTH"], "1.5")
 
-    def test_home_exposes_only_realtime_strength_and_saves_hidden_defaults(self) -> None:
+    def test_dashboard_exposes_only_realtime_strength_and_saves_hidden_defaults(self) -> None:
         app = QApplication.instance() or QApplication([])
         settings = _FakeSettings()
-        with patch.object(HomePage, "_update_trt_state", lambda self: None):
-            page = HomePage(I18n("en_US"), settings)
+        page = DashboardPage(I18n("en_US"), settings)
+        try:
+            for combo in page.findChildren(QComboBox):
+                values = {combo.itemData(index) for index in range(combo.count())}
+                self.assertNotIn("inverse_warp", values)
+                self.assertNotIn("small_hd", values)
+                self.assertNotIn("base_hd", values)
+
+            dialog = TwoDvrSettingsDialog(I18n("en_US"), settings)
             try:
-                self.assertFalse(hasattr(page, "home_two_dvr_config_button"))
-                self.assertTrue(hasattr(page, "home_two_dvr_strength"))
-                for combo in page.findChildren(QComboBox):
+                for combo in dialog.findChildren(QComboBox):
                     values = {combo.itemData(index) for index in range(combo.count())}
                     self.assertNotIn("inverse_warp", values)
                     self.assertNotIn("small_hd", values)
                     self.assertNotIn("base_hd", values)
-
-                index = page.home_two_dvr_strength.findData(1.5)
+                index = dialog.strength.findData(1.5)
                 self.assertGreaterEqual(index, 0)
-                page.home_two_dvr_strength.setCurrentIndex(index)
-
-                self.assertEqual(settings.data["two_dvr_live_model"], "base")
-                self.assertEqual(settings.data["two_dvr_live_hole_fill"], "soft_shift")
-                self.assertEqual(settings.data["two_dvr_live_eye_distance"], 65.0)
-                self.assertEqual(settings.data["two_dvr_live_strength"], 1.5)
+                dialog.strength.setCurrentIndex(index)
+                page.apply_two_dvr_strength(dialog.selected_strength())
             finally:
-                page.close()
-            app.processEvents()
+                dialog.close()
+
+            self.assertEqual(settings.data["two_dvr_live_model"], "base")
+            self.assertEqual(settings.data["two_dvr_live_hole_fill"], "soft_shift")
+            self.assertEqual(settings.data["two_dvr_live_eye_distance"], 65.0)
+            self.assertEqual(settings.data["two_dvr_live_strength"], 1.5)
+        finally:
+            page.close()
+        app.processEvents()
 
     def test_offline_page_hides_hole_fill_choice_and_runs_soft_shift(self) -> None:
         app = QApplication.instance() or QApplication([])

@@ -11,6 +11,18 @@ class MediaRoot:
     path: Path
 
 
+def is_unc_path(path: object) -> bool:
+    text = os.fspath(path) if isinstance(path, os.PathLike) else str(path or "")
+    normalized = text.strip().replace("/", "\\")
+    if not normalized.startswith("\\\\"):
+        return False
+    if normalized.startswith("\\\\?\\") and not normalized.startswith("\\\\?\\UNC\\"):
+        return False
+    if normalized.startswith("\\\\.\\"):
+        return False
+    return True
+
+
 def safe_resolve_path(path: Path) -> Path:
     """Resolve paths without rejecting virtual drives that cannot report volume info."""
     expanded = Path(path).expanduser()
@@ -28,6 +40,8 @@ def parse_video_dirs(raw: object, default: Path) -> list[Path]:
     roots: list[Path] = []
     seen: set[str] = set()
     for part in parts:
+        if is_unc_path(part):
+            continue
         path = safe_resolve_path(Path(part))
         key = str(path).casefold()
         if key in seen:

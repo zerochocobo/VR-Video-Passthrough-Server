@@ -33,6 +33,8 @@ _SI_MIX_KEYS = {
     "si_volume_percent",
     "si_delay_seconds",
     "duck_original",
+    "duck_preset",
+    "dub_mode_enabled",
 }
 
 

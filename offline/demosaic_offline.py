@@ -1,12 +1,12 @@
 """Offline mosaic-restoration (RM) converter.
 
-Sibling of ``offline/two_dvr.py``. Runs the same detector + sliding-window
+Sibling of ``offline/two_dvr.py``. Runs the same detector + chunk
 restoration models used by the realtime [RM] DLNA path, but writes a finished
 file so the restoration result can be reviewed without a DLNA player.
 
 Pipeline (ffmpeg decode -> GPU restore -> ffmpeg encode):
-    ffmpeg (rgb24, optional -ss/-t) -> 7-frame temporal window -> GpuRmProcessor
-    -> ffmpeg libx-encode muxing the source audio for the same window.
+    ffmpeg (rgb24, optional -ss/-t) -> 8-frame temporal chunk -> GpuRmProcessor
+    -> ffmpeg libx-encode muxing the source audio for the same clip.
 
 TensorRT engine cache is built before conversion (``build-trt`` subcommand, or
 automatically on first run) so the offline path never silently falls back to a
@@ -97,7 +97,7 @@ def _run_clip(processor_factory, src: Path, out: Path, start: float, duration: f
     import cupy as cp
     import PyNvVideoCodec as nvc
     from offline.two_dvr_pynv import _NV12_RGB_KERNELS
-    from pipeline.demosaic import WINDOW, CENTER
+    from pipeline.demosaic import WINDOW
     from pipeline.pynv_io import GpuNv12AppFrame, GpuP016Frame, PyNvSimpleDecoder, PyNvThreadedSerialDecoder
     from pipeline.pynv_stream import PYNV_BACKEND_LABEL, _pynv_encoder_kwargs
     from utils.bitrate_estimator import effective_default_bitrate
@@ -121,7 +121,7 @@ def _run_clip(processor_factory, src: Path, out: Path, start: float, duration: f
         end_idx = dec_len
     end_idx = max(start_out + 1, end_idx)
     last_src = dec_len - 1
-    s0 = max(0, start_out - CENTER)
+    s0 = start_out
     log(f"{src.name}: {width}x{height}@{fps:.3f} frames[{start_out},{end_idx}) -> {out.name}")
 
     dec = PyNvThreadedSerialDecoder(
@@ -181,24 +181,27 @@ def _run_clip(processor_factory, src: Path, out: Path, start: float, duration: f
     total = end_idx - start_out
     t0 = time.perf_counter()
     try:
-        for i in range(start_out, end_idx):
-            window = [rgb_at(i - CENTER + k) for k in range(WINDOW)]
-            out_g = processor.process(window, conf)
-            k_to_nv12(grid_out, bx, (out_g, out_nv12, np.int32(width), np.int32(height)))
-            cp.cuda.get_current_stream().synchronize()
-            flags = 0
-            if produced == 0:
-                flags = int(nvc.NV_ENC_PIC_FLAGS.FORCEIDR) | int(nvc.NV_ENC_PIC_FLAGS.OUTPUT_SPSPPS)
-            bitstream = enc.Encode(GpuNv12AppFrame(out_nv12, width, height), flags)
-            if bitstream:
-                mux.stdin.write(bitstream)
-            produced += 1
-            for key in [k for k in cache if k < (i + 1) - CENTER]:
+        for chunk_start in range(start_out, end_idx, WINDOW):
+            actual = min(WINDOW, end_idx - chunk_start)
+            chunk = [rgb_at(chunk_start + k) for k in range(WINDOW)]
+            out_chunk_g = processor.process_chunk(chunk, conf)
+            for j in range(actual):
+                out_g = out_chunk_g[j]
+                k_to_nv12(grid_out, bx, (out_g, out_nv12, np.int32(width), np.int32(height)))
+                cp.cuda.get_current_stream().synchronize()
+                flags = 0
+                if produced == 0:
+                    flags = int(nvc.NV_ENC_PIC_FLAGS.FORCEIDR) | int(nvc.NV_ENC_PIC_FLAGS.OUTPUT_SPSPPS)
+                bitstream = enc.Encode(GpuNv12AppFrame(out_nv12, width, height), flags)
+                if bitstream:
+                    mux.stdin.write(bitstream)
+                produced += 1
+                if produced % 100 == 0:
+                    elapsed = max(1e-3, time.perf_counter() - t0)
+                    pct = produced / total * 100.0 if total > 0 else 0.0
+                    log(f"  {pct:5.1f}%  {produced}/{total} frames ({produced / elapsed:.1f} fps)")
+            for key in [k for k in cache if k < chunk_start + actual]:
                 del cache[key]
-            if produced % 100 == 0:
-                elapsed = max(1e-3, time.perf_counter() - t0)
-                pct = produced / total * 100.0 if total > 0 else 0.0
-                log(f"  {pct:5.1f}%  {produced}/{total} frames ({produced / elapsed:.1f} fps)")
         tail = enc.EndEncode()
         if tail:
             mux.stdin.write(tail)

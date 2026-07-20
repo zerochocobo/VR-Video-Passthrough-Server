@@ -8,7 +8,9 @@ VR Video Passthrough Server aims to make every VR video passthrough-capable, ena
 
 ![VR Video Passthrough Server overview](assets/intro_en_s.png)
 
-It is a Windows-first VR DLNA local media server for desktop control and offline generation workflows. It exposes a local video library over DLNA/UPnP and supports realtime passthrough stream output, with switching between green-screen compositing and Alpha passthrough, as well as realtime subtitle embedding. It also includes realtime/offline 2D-to-3D / VR generation, optional depth stabilization, and simultaneous-interpretation playback from same-stem `.si.wav` sidecars. VR Video Passthrough Server is primarily designed for VR180 half-equirectangular video sources.
+It is a Windows-first VR DLNA local media server with a multilingual desktop UI and dedicated offline tools. It exposes local video libraries over DLNA/UPnP and provides realtime Green-screen and Alpha passthrough, 2D perspective conversion, 2D-to-3D / VR generation, NVIDIA RTX Video Super Resolution, hard subtitles, light matching, and dubbing / simultaneous-interpretation playback from same-stem `.si.wav` sidecars. It is optimized for VR180 half-equirectangular sources while also supporting eligible flat 2D videos.
+
+Current desktop release: **v1.2.0**.
 
 ## Project Origin
 
@@ -27,11 +29,16 @@ This is the miracle of the AI era.
 - Offline passthrough video generation
 - Realtime and offline 2D-to-3D / VR generation for flat 2D videos using DA3 depth and GPU stereo rendering
 - Optional 2D-to-3D depth stabilization, including built-in temporal stabilization and NVDS ONNX stabilization for offline 16:9 jobs
-- Simultaneous interpretation playback with same-stem `.si.wav` sidecars and `[SI]` DLNA entries
+- Realtime and offline NVIDIA RTX Video Super Resolution for eligible 2D and VR sources, including adaptive `8K VR / 4K 2D` output
+- Split-eye GPU processing for 2:1 SBS VR, with 8192x4096 HEVC output available for offline 4K-VR-to-8K-VR conversion
+- Low / Medium / High / Ultra RTX VSR quality controls and Off / Natural / Vivid SDR HDR-look controls
+- Dubbing / simultaneous interpretation playback with same-stem `.si.wav` sidecars, `[SI]` DLNA entries, start-time selection, channel mixing, and Light / Normal / Strong ducking
 - DLNA Live time-index folders for choosing a playback start time, with 10-minute groups, minute folders, and 5-second playback points
 - Multi-root local video library support
-- PySide6 desktop UI with Chinese, English, and Japanese translations
+- PySide6 desktop UI with a navigation rail, feature-card dashboard, Offline Tools, Subtitle Style, Logs, and Settings pages
+- Editable DLNA server name and HTTP port, with Chinese, English, and Japanese translations
 - Subtitle preview and style configuration
+- Realtime light matching with color-temperature, tint, exposure, contrast, gamma, saturation, and presets
 - Aggressive VRAM-aware pipeline tuning aimed at keeping realtime output smooth, including 8K-class source playback targets where the hardware can sustain them
 
 
@@ -50,8 +57,10 @@ This is the miracle of the AI era.
 
 - Windows 10 / 11
 - Python 3.12
-- NVIDIA GPU for the realtime pipeline. Rough recommendation: RTX 20 series or newer. Check your exact model on NVIDIA's official list: <https://developer.nvidia.com/cuda/gpus>. Recommended VRAM: 6 GB or more for the realtime server, RVM offline generation, and normal DA3 2D-to-3D; about 15 GB or more for MatAnyone2 / SAM3 offline workflows. HD/Large DA3 and NVDS temporal stabilization are offline-oriented and can require significantly more VRAM; NVDS is intended for 16 GB+ cards.
+- NVIDIA GPU for GPU processing. Rough recommendation: RTX 20 series or newer; RTX VSR also requires a GPU/driver supported by NVIDIA RTX Video. Check your exact model on NVIDIA's official list: <https://developer.nvidia.com/cuda/gpus>. Recommended VRAM: 6 GB or more for the realtime server, RVM offline generation, and normal DA3 2D-to-3D; about 15 GB or more for MatAnyone2 / SAM3 offline workflows. HD/Large DA3, NVDS, and 8K SuperRes are high-load offline workflows.
 - FFmpeg / FFprobe
+
+Performance note: 4K SBS VR to 8K VR at Ultra quality is extremely GPU-intensive. An RTX 5060 Ti measured about 23-24 processing FPS. Lower-end GPUs should use a lower Target quality or reduce Output FPS in Global Settings; NVENC P1 controls encoding speed and is separate from NGX Target quality.
 
 ## Quick Start
 
@@ -116,11 +125,15 @@ Tested on Meta Quest 3.
 ## Configuration Notes
 
 - `PT_VIDEO_DIR` supports multiple roots separated by `|`
-- `PT_PASSTHROUGH_OUTPUT_MODE` supports `none`, `green`, `alpha`, `two_dvr`, comma-separated combinations such as `green,alpha,two_dvr`, and legacy `all` for green + alpha
+- Media roots must be local paths. Cloud drives mounted as local drive letters/directories are supported; UNC network-share roots are rejected.
+- `PT_PASSTHROUGH_OUTPUT_MODE` supports `none`, `green`, `alpha`, `two_dvr`, `superres`, comma-separated combinations such as `green,alpha,two_dvr,superres`, and legacy `all` for green + alpha
 - `Alpha Passthrough` is the DLNA virtual title used in alpha mode
 - Realtime 2D-to-3D uses `PT_TWO_DVR_MODEL`, `PT_TWO_DVR_STRENGTH`, and related `PT_TWO_DVR_*` settings; offline 2D-to-3D / VR exposes model, quality-speed, temporal stability, and skip-existing controls in the desktop UI.
-- Same-stem `.si.wav` files enable `[SI]` DLNA entries through the progressive virtual MP4 `/media_si` route. The main switches are `PT_SI_MIX_ENABLED`, `PT_SI_PROGRESSIVE_ENABLED`, and `PT_SI_PROGRESSIVE_DLNA`.
-- DLNA Live directories use `[GREEN]` / `[ALPHA]` prefixes for passthrough modes and include a localized `[Select Time Index]` folder for start-time selection.
+- Realtime SuperRes uses `PT_RTX_VSR_TARGET_HEIGHT`, `PT_RTX_VSR_QUALITY`, and `PT_RTX_VSR_HDR_LOOK`. The adaptive 4096 target means 8192x4096 for recognized 2:1 SBS VR and 3840x2160 for ordinary 2D.
+- Same-stem `.si.wav` files enable `[SI]` DLNA entries. Current DLNA playback uses realtime MPEG-TS through `/si_live` with start offsets; the older progressive `/media_si` implementation remains a fallback route.
+- DLNA Live directories use `[GREEN]`, `[ALPHA]`, `[2D>3D]`, `[SuperRes]`, and `[SI]` markers where applicable and include a localized `[Select Time Index]` folder for start-time selection.
+- The desktop Settings page can change the advertised DLNA server name and HTTP port. Restart the server after saving network identity changes.
+- Packaged Windows builds include the validated CUDA 12.6 RTX VSR bridge, NGX runtime, local CUDA runtime, license, and version metadata; end users do not compile the bridge.
 - TensorRT acceleration is controlled from the desktop UI Performance panel. Build the cache first in `TensorRT -> Configure`; the first build can take several minutes. If the cache is missing or stale after a driver/CUDA/TensorRT/model change, the server falls back to CUDA automatically.
 - UI settings are stored separately from backend runtime configuration
 
@@ -148,7 +161,7 @@ VR Video Passthrough Server does not train matting models itself. It consumes up
 | --- | --- | --- |
 | Robust Video Matting (RVM) | Primary realtime matting path, including `rvm_mobilenetv3_fp16.onnx`, `rvm_mobilenetv3_fp32.onnx`, and `rvm_resnet50_fp32.onnx` | [GitHub](https://github.com/PeterL1n/RobustVideoMatting) |
 | MatAnyone2 | Slower, higher-quality matting path for offline conversion and experimental workflows | [GitHub](https://github.com/pq-yang/MatAnyone2) |
-| Segment Anything Model 3 (SAM 3) | Optional helper used by experimental alpha tooling and prepass workflows | [GitHub](https://github.com/facebookresearch/sam3) |
+| Segment Anything Model 3 (SAM 3) | Optional helper used by high-quality offline alpha prepass workflows | [GitHub](https://github.com/facebookresearch/sam3) |
 | Depth Anything 3 (DA3) | Monocular depth model used by realtime and offline 2D-to-3D / VR generation | [GitHub](https://github.com/ByteDance-Seed/Depth-Anything-3) |
 | NVDS | Optional offline 2D-to-3D depth / near-map temporal stabilizer for 16:9 sources | [GitHub](https://github.com/RaymondWang987/NVDS) |
 
@@ -161,12 +174,13 @@ VR Video Passthrough Server does not train matting models itself. It consumes up
 - [CuPy](https://github.com/cupy/cupy)
 - [PyNvVideoCodec](https://github.com/NVIDIA/VideoProcessingFramework)
 - [PyAV](https://github.com/PyAV-Org/PyAV)
+- [NVIDIA RTX Video SDK](https://developer.nvidia.com/rtx-video-sdk)
 
 ## Notes
 
 - The codebase is currently tuned for a local Windows machine rather than a hosted deployment.
-- Alpha passthrough is exposed as a virtual DLNA item named `VR Passthrough Server`.
-- The current pipeline is tuned for VR180 half-equirectangular sources rather than generic 360-degree or flat video workflows.
+- Generated modes are exposed as separate DLNA entries and are processed on demand; original media remains available unchanged.
+- The current pipeline is optimized for VR180 half-equirectangular sources, with additional supported workflows for flat 2D video.
 - See [README.zh-CN.md](README.zh-CN.md) for the Chinese version and [README.ja-JP.md](README.ja-JP.md) for the Japanese version.
 
 ## License

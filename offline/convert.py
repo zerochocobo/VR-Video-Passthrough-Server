@@ -20,22 +20,25 @@ if __package__ in (None, ""):
 
 import config
 from utils.gpu_requirements import detect_nvidia_gpu_requirement, unsupported_gpu_message
+from utils.rtx_vsr import effective_offline_target_height
 from utils.subprocess_hidden import hidden_subprocess_kwargs, run_hidden_streaming
 from utils.trt_manifest import TRT_MODEL_MATANYONE2, TRT_MODEL_RVM, TRT_PROVIDER_CHAIN, cache_dir_for_model, cache_status
 from utils.video_metadata import probe_video_metadata, select_backend
-from utils.vr_naming import offline_passthrough_stem
+from utils.vr_naming import offline_passthrough_stem, superres_output_stem
 
 ROOT = config.ROOT
 VIDEO_EXTS = {".mp4", ".mkv", ".mov", ".m4v"}
 _WARMUP_NOTICE_PRINTED = False
 
 ENGINES = {
+    "rtx_vsr": ("rtx_vsr", None),
     "rvm_fast": ("rvm", ROOT / "models" / "rvm_mobilenetv3_fp32.onnx"),
     "matanyone2_medium": ("matanyone2_onnx", None),
     "matanyone2": ("matanyone2_onnx", None),
 }
 
 ENGINE_TAGS = {
+    "rtx_vsr": "rtxvsr",
     "rvm_fast": "rvm1",
     "matanyone2_medium": "matanyone2m",
     "matanyone2": "matanyone2",
@@ -175,6 +178,13 @@ def _segment_arg(text: str) -> tuple[float, float]:
 
 
 def _single_out(src: Path, args: argparse.Namespace, width: int = 0, height: int = 0) -> Path:
+    if args.engine == "rtx_vsr":
+        requested = int(getattr(args, "rtx_vsr_target_height", config.RTX_VSR_TARGET_HEIGHT) or config.RTX_VSR_TARGET_HEIGHT)
+        target_height = effective_offline_target_height(requested, width, height)
+        if float(args.duration or 0.0) > 0 or float(args.start or 0.0) > 0:
+            base = f"{src.stem}_S{_time_tag(float(args.start or 0.0))}_D{_duration_tag(float(args.duration or 0.0))}"
+            return src.with_name(superres_output_stem(base, target_height) + ".mp4")
+        return src.with_name(superres_output_stem(src.stem, target_height) + ".mp4")
     engine_tag = ENGINE_TAGS[args.engine]
     start_tag = f"S{_time_tag(args.start)}"
     duration_tag = _duration_tag(args.duration)
@@ -193,6 +203,11 @@ def _single_segments_out(
     width: int = 0,
     height: int = 0,
 ) -> Path:
+    if args.engine == "rtx_vsr":
+        base = f"{src.stem}_rtxvsr_SEG{len(segments)}_S{_time_tag(segments[0][0])}_E{_time_tag(segments[-1][1])}"
+        requested = int(getattr(args, "rtx_vsr_target_height", config.RTX_VSR_TARGET_HEIGHT) or config.RTX_VSR_TARGET_HEIGHT)
+        target_height = effective_offline_target_height(requested, width, height)
+        return src.with_name(superres_output_stem(base, target_height) + ".mp4")
     engine_tag = ENGINE_TAGS[args.engine]
     start_tag = f"S{_time_tag(segments[0][0])}"
     end_tag = f"E{_time_tag(segments[-1][1])}"
@@ -206,7 +221,7 @@ def _video_files(root: Path, recursive: bool) -> list[Path]:
     for path in iterator:
         if not path.is_file() or path.suffix.lower() not in VIDEO_EXTS:
             continue
-        if "passthrough" in path.name.lower():
+        if "passthrough" in path.name.lower() or path.stem.lower().startswith("[superres]") or path.stem.lower().endswith(("_2k", "_4k", "_8k")):
             continue
         out.append(path)
     return sorted(out, key=lambda p: str(p).lower())
@@ -312,7 +327,19 @@ def _run_one(args: argparse.Namespace, src: Path) -> int:
         return 4
     width = int(getattr(meta.codec, "width", 0) or 0)
     height = int(getattr(meta.codec, "height", 0) or 0)
+    requested_vsr_target = int(getattr(args, "rtx_vsr_target_height", config.RTX_VSR_TARGET_HEIGHT) or config.RTX_VSR_TARGET_HEIGHT)
+    effective_vsr_target = effective_offline_target_height(requested_vsr_target, width, height)
+    if args.engine == "rtx_vsr" and effective_vsr_target != requested_vsr_target:
+        print(
+            f"[rtx-vsr] 8K is limited to 2:1 SBS VR sources; "
+            f"source={width}x{height} fallback=4K",
+            flush=True,
+        )
     default_out = (
+        _single_out(src, args, width, height)
+        if getattr(args, "command", "") == "single"
+        else src.with_name(superres_output_stem(src.stem, effective_vsr_target) + ".mp4")
+    ) if args.engine == "rtx_vsr" else (
         _single_out(src, args, width, height)
         if getattr(args, "command", "") == "single"
         else _default_out(src, args.mode, width, height)
@@ -325,6 +352,21 @@ def _run_one(args: argparse.Namespace, src: Path) -> int:
         print(f"[offline] skip existing: {out}")
         return 0
     out.parent.mkdir(parents=True, exist_ok=True)
+    if args.engine == "rtx_vsr":
+        from offline.rtx_vsr import run_rtx_vsr
+
+        return run_rtx_vsr(
+            src,
+            out,
+            meta,
+            start=float(getattr(args, "start", 0.0) or 0.0),
+            duration=float(getattr(args, "duration", 0.0) or 0.0),
+            target_height=effective_vsr_target,
+            quality=int(getattr(args, "rtx_vsr_quality", config.RTX_VSR_QUALITY)),
+            preset=str(getattr(args, "preset", config.PASSTHROUGH_PYNV_PRESET) or config.PASSTHROUGH_PYNV_PRESET),
+            hdr_look=str(getattr(args, "rtx_vsr_hdr_look", config.RTX_VSR_HDR_LOOK) or config.RTX_VSR_HDR_LOOK),
+            cq=int(getattr(args, "cq", 19) if int(getattr(args, "cq", -1)) >= 0 else 19),
+        )
     cmd = _base_cmd(args, src, out)
     print("[offline] run: " + subprocess.list2cmdline(cmd), flush=True)
     _print_warmup_notice()
@@ -490,6 +532,9 @@ def main(argv: list[str] | None = None) -> int:
     single.add_argument("--out-dir", default="")
     single.add_argument("--mode", choices=["green", "alpha"], default="green")
     single.add_argument("--engine", choices=sorted(ENGINES), default="rvm_fast")
+    single.add_argument("--rtx-vsr-target-height", type=int, default=config.RTX_VSR_TARGET_HEIGHT)
+    single.add_argument("--rtx-vsr-quality", type=int, choices=[2, 3, 4], default=config.RTX_VSR_QUALITY)
+    single.add_argument("--rtx-vsr-hdr-look", choices=["off", "natural", "vivid"], default=config.RTX_VSR_HDR_LOOK)
     single.add_argument("--start", type=float, default=0.0)
     single.add_argument("--duration", type=float, default=0.0)
     single.add_argument("--segment", dest="segments", type=_segment_arg, action="append", default=[], metavar="START-END")
@@ -509,6 +554,9 @@ def main(argv: list[str] | None = None) -> int:
     batch.add_argument("directory")
     batch.add_argument("--mode", choices=["green", "alpha"], default="green")
     batch.add_argument("--engine", choices=sorted(ENGINES), default="rvm_fast")
+    batch.add_argument("--rtx-vsr-target-height", type=int, default=config.RTX_VSR_TARGET_HEIGHT)
+    batch.add_argument("--rtx-vsr-quality", type=int, choices=[2, 3, 4], default=config.RTX_VSR_QUALITY)
+    batch.add_argument("--rtx-vsr-hdr-look", choices=["off", "natural", "vivid"], default=config.RTX_VSR_HDR_LOOK)
     batch.add_argument("--recursive", action=argparse.BooleanOptionalAction, default=True)
     batch.add_argument("--skip-existing", action="store_true")
     batch.add_argument("--fps", type=float, default=RVM_DEFAULT_ARGS["fps"])

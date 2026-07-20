@@ -209,6 +209,34 @@ extern "C" __global__ void rgb_to_nv12(
         nv12[uvbase+1]=(unsigned char)fminf(fmaxf(V,0.f),255.f);
     }
 }
+
+// Pack RGBA (H,W,4) into NV12. RTX VSR returns RGBA8; taking [:,:,:3]
+// produces a non-contiguous view whose pixel stride remains 4, so it must not
+// be passed to the tightly-packed RGB kernel above.
+extern "C" __global__ void rgba_to_nv12(
+    const unsigned char* rgba, unsigned char* nv12, int W, int H)
+{
+    int x = blockIdx.x*blockDim.x + threadIdx.x;
+    int y = blockIdx.y*blockDim.y + threadIdx.y;
+    if (x>=W || y>=H) return;
+    long i=((long)y*W+x)*4;
+    float R=rgba[i], G=rgba[i+1], B=rgba[i+2];
+    float Yv=16.f + 0.182586f*R + 0.614231f*G + 0.062007f*B;
+    nv12[(long)y*W+x]=(unsigned char)fminf(fmaxf(Yv,0.f),255.f);
+    if ((x&1)==0 && (y&1)==0){
+        float r=0,g=0,b=0; int n=0;
+        for(int dy=0;dy<2;dy++)for(int dx=0;dx<2;dx++){
+            int xx=min(x+dx,W-1), yy=min(y+dy,H-1); long j=((long)yy*W+xx)*4;
+            r+=rgba[j]; g+=rgba[j+1]; b+=rgba[j+2]; n++;
+        }
+        r/=n; g/=n; b/=n;
+        float U=128.f -0.100644f*r -0.338572f*g +0.439216f*b;
+        float V=128.f +0.439216f*r -0.398942f*g -0.040274f*b;
+        long uvbase=(long)W*H + (long)(y>>1)*W + x;
+        nv12[uvbase]=(unsigned char)fminf(fmaxf(U,0.f),255.f);
+        nv12[uvbase+1]=(unsigned char)fminf(fmaxf(V,0.f),255.f);
+    }
+}
 '''
 
 

@@ -13,6 +13,7 @@ from PySide6.QtGui import QIcon
 ROOT = Path(sys.executable).resolve().parent / "_internal" if getattr(sys, "frozen", False) else Path(__file__).resolve().parents[1]
 RESOURCE_DIR = ROOT / "resources"
 APP_ICON_PATH = RESOURCE_DIR / "app.ico"
+LOGO_PATH = RESOURCE_DIR / "logo.png"
 SWITCH_OFF_IMAGE_PATH = RESOURCE_DIR / "switch_off.png"
 SWITCH_ON_IMAGE_PATH = RESOURCE_DIR / "switch_on.png"
 PLAYER_SUPPORT_PATH = RESOURCE_DIR / "player_support.json"

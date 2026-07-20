@@ -42,6 +42,7 @@ from config import (
     PASSTHROUGH_LIVE_VLC_PREROLL_TIMEOUT_SEC,
     PASSTHROUGH_LIVE_VLC_PSEUDO_VOD,
     PASSTHROUGH_OUTPUT_MODE,
+    RTX_VSR_REALTIME_ENABLED,
     PASSTHROUGH_AUDIO_MPEGTS_VLC,
     PASSTHROUGH_FALLBACK_MAX_FPS,
     PASSTHROUGH_GOP,
@@ -1376,21 +1377,25 @@ async def si_live_get(
     path = _safe_si_video_path(name)
     annotate_request(request, media_name=path.name, media_path=str(path), passthrough_route="si_live")
     service = get_si_stream_service()
-    config = service.current_config()
+    config, duck_key = service.resolve_stream(path)
     si_wav = service.has_si_source(path)
     if not config.enabled or si_wav is None:
         raise HTTPException(404, "SI stream not available")
     start_time = max(0.0, float(t or 0.0))
-    log.info("si_live start: path=%s t=%.3f si=%s ua=%r", path, start_time, si_wav, user_agent)
+    log.info(
+        "si_live start: path=%s t=%.3f si=%s duck=%s ua=%r",
+        path, start_time, si_wav, duck_key, user_agent,
+    )
     headers = {
         "Accept-Ranges": "none",
         "X-SI-Enabled": "1",
         "X-SI-Transport": "mpegts-live",
+        "X-SI-Dub-Mode": "1" if duck_key is not None else "0",
         "contentFeatures.dlna.org": _si_live_content_features(),
         "transferMode.dlna.org": "Streaming",
     }
     return StreamingResponse(
-        iter_si_mpegts(path, si_wav, config, start_time, chunk_size=DEFAULT_CHUNK_SIZE),
+        iter_si_mpegts(path, si_wav, config, start_time, duck_key=duck_key, chunk_size=DEFAULT_CHUNK_SIZE),
         status_code=200,
         headers=headers,
         media_type="video/MP2T",
@@ -1966,7 +1971,7 @@ def _configured_passthrough_modes() -> tuple[str, ...]:
         else:
             tokens = (token,)
         for mode in tokens:
-            if mode in {"green", "alpha", "two_dvr"} and mode not in out:
+            if mode in {"green", "alpha", "two_dvr", "superres"} and mode not in out:
                 out.append(mode)
     return tuple(out)
 
@@ -2052,6 +2057,31 @@ def _rm_live_block_reason(path: Path, meta) -> str:
     return ""
 
 
+async def _superres_live_block_reason(path: Path, meta) -> str:
+    if not RTX_VSR_REALTIME_ENABLED:
+        return "RTX VSR realtime is disabled"
+    from utils.rtx_vsr import evaluation_preflight_status, run_evaluation_preflight, source_block_reason
+
+    codec = meta.codec
+    reason = source_block_reason(
+        codec.width,
+        codec.height,
+        is_vr=has_vr_filename_marker(path.stem) or is_half_equirectangular_source(codec.width, codec.height),
+        is_10bit=bool(int(getattr(codec, "bit_depth", 8) or 8) > 8),
+        allow_vr=True,
+    )
+    if reason:
+        return reason
+    preflight = evaluation_preflight_status()
+    if preflight is None or not preflight.get("ok"):
+        # NGX first-run evaluation may take up to the configured timeout. Do
+        # not run subprocess.run() on FastAPI's event-loop thread.
+        preflight = await asyncio.to_thread(run_evaluation_preflight)
+    if preflight is not None and not preflight.get("ok"):
+        return f"evaluate preflight failed: {preflight.get('reason', 'unknown')}"
+    return ""
+
+
 def _probe_live_request_metadata(path: Path):
     info = probe_cached(path)
     live_meta = probe_video_metadata(path)
@@ -2071,7 +2101,7 @@ def _select_passthrough_stream(
     output_mode = (output_mode or PASSTHROUGH_OUTPUT_MODE).lower()
     if output_mode == "all":
         output_mode = "green"
-    elif output_mode not in {"green", "alpha", "two_dvr", "rm"}:
+    elif output_mode not in {"green", "alpha", "two_dvr", "rm", "superres"}:
         output_mode = _select_live_output_mode("")
     fallback_container = "mpegts" if container == "mpegts" else None
     fallback_max_fps = max_fps
@@ -2090,6 +2120,8 @@ def _select_passthrough_stream(
             raise RuntimeError("2D->3D live requires the PyNv NV12 live path")
         if output_mode == "rm":
             raise RuntimeError("RM live requires the PyNv NV12 live path")
+        if output_mode == "superres":
+            raise RuntimeError("RTX VSR live requires the PyNv CUDA path")
         return PassthroughStream(
             path,
             start_sec,
@@ -2281,6 +2313,14 @@ async def passthrough_live_get(
                 rm_block_reason,
             )
             return Response(f"RM live unsupported: {rm_block_reason}", status_code=409)
+    if live_output_mode == "superres":
+        superres_block_reason = await _superres_live_block_reason(path, live_meta)
+        if superres_block_reason:
+            log.info(
+                "passthrough_live[%d] reject unsupported RTX VSR source: %s reason=%s",
+                rid, path.name, superres_block_reason,
+            )
+            return Response(f"RTX VSR live unsupported: {superres_block_reason}", status_code=409)
     live_max_fps = _live_adaptive_max_fps(path, live_meta)
     live_profile = _live_response_profile(user_agent)
     is_nplayer = _is_nplayer_client(user_agent)
@@ -2965,9 +3005,13 @@ async def passthrough_live_get(
 
 def _seek_output_mode(requested_mode: str | None) -> str:
     requested = (requested_mode or "").lower()
-    modes = tuple(mode for mode in _configured_passthrough_modes() if mode in {"green", "alpha"})
+    modes = tuple(mode for mode in _configured_passthrough_modes() if mode in {"green", "alpha", "superres"})
+    if requested in modes:
+        return requested
+    if "superres" in modes and len(modes) == 1:
+        return "superres"
     if "green" in modes and "alpha" in modes:
-        return requested if requested in {"green", "alpha"} else "green"
+        return "green"
     if "alpha" in modes:
         return "alpha"
     return "green"
@@ -3085,6 +3129,14 @@ async def passthrough_seek_head(
         log.info("passthrough_seek[%d] HEAD blocked: reason=%s profile=%s", rid, reason, route_profile)
         return _seek_blocked_response(reason)
     info = probe_cached(path)
+    if output_mode == "superres":
+        try:
+            seek_meta = await asyncio.to_thread(probe_video_metadata, path)
+            superres_reason = await _superres_live_block_reason(path, seek_meta)
+        except Exception as exc:
+            superres_reason = f"metadata probe failed: {exc}"
+        if superres_reason:
+            return Response(f"RTX VSR seek unsupported: {superres_reason}", status_code=409)
     codec = PYNV_OUTPUT_CODEC
     client_host = request.client.host if request.client else ""
     container = route_container or _seek_container()
@@ -3165,6 +3217,14 @@ async def passthrough_seek_get(
         return _seek_blocked_response(reason)
 
     info = probe_cached(path)
+    if output_mode == "superres":
+        try:
+            seek_meta = await asyncio.to_thread(probe_video_metadata, path)
+            superres_reason = await _superres_live_block_reason(path, seek_meta)
+        except Exception as exc:
+            superres_reason = f"metadata probe failed: {exc}"
+        if superres_reason:
+            return Response(f"RTX VSR seek unsupported: {superres_reason}", status_code=409)
     codec = PYNV_OUTPUT_CODEC
     client_host = request.client.host if request.client else ""
     container = route_container or _seek_container()
@@ -3444,6 +3504,17 @@ async def passthrough_head(
     path = _safe_video_path(name)
     annotate_request(request, media_name=path.name, media_path=str(path), passthrough_route="pseudo_vod")
     info = probe_cached(path)
+    # The pseudo-VOD route historically bypassed the live route's mode gate.
+    # Keep it consistent when RTX VSR is selected globally: reject unsupported
+    # sources before advertising a stream that cannot be produced.
+    if _select_live_output_mode("") == "superres":
+        try:
+            _, superres_meta = await asyncio.to_thread(_probe_live_request_metadata, path)
+            superres_reason = await _superres_live_block_reason(path, superres_meta)
+        except Exception as exc:
+            superres_reason = f"metadata probe failed: {exc}"
+        if superres_reason:
+            return Response(f"RTX VSR pseudo-VOD unsupported: {superres_reason}", status_code=409)
     estimate_codec = _passthrough_estimate_codec(path) or info.codec_name
     backend_verdict = _passthrough_backend_verdict(path)
     if PASSTHROUGH_SEEK_MODE == "bytes" and _range_unsatisfiable(range_header, path, info.duration, estimate_codec):
@@ -3493,6 +3564,14 @@ async def passthrough_get(
     path = _safe_video_path(name)
     annotate_request(request, media_name=path.name, media_path=str(path), passthrough_route="pseudo_vod")
     info = probe_cached(path)
+    if _select_live_output_mode("") == "superres":
+        try:
+            _, superres_meta = await asyncio.to_thread(_probe_live_request_metadata, path)
+            superres_reason = await _superres_live_block_reason(path, superres_meta)
+        except Exception as exc:
+            superres_reason = f"metadata probe failed: {exc}"
+        if superres_reason:
+            return Response(f"RTX VSR pseudo-VOD unsupported: {superres_reason}", status_code=409)
     estimate_codec = _passthrough_estimate_codec(path) or info.codec_name
     backend_verdict = _passthrough_backend_verdict(path)
     user_agent = request.headers.get("user-agent", "")
