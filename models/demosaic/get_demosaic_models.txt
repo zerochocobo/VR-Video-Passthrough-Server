@@ -1,0 +1,7 @@
+
+vr_mosaic_detection_model_v2_accurate.onnx
+vr_mosaic_detection_model_v2_accurate_1280.onnx
+vr_mosaic_restoration_chunk_model_v0.2.onnx
+
+Download from
+https://huggingface.co/zelefans/vrmr

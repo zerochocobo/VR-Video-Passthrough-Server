@@ -188,16 +188,13 @@ class SettingsTests(unittest.TestCase):
         env = s.server_env()
         self.assertEqual(env["PT_DECODE_MAX_SIDE"], "0")
 
-    def test_server_env_enables_tensorrt_only_when_cache_ready(self) -> None:
+    def test_server_env_defers_tensorrt_validation_to_server_process(self) -> None:
         s = self._settings()
         s.data["inference_backend"] = "tensorrt"
-        with patch.object(settings_module, "cache_status", return_value="missing"):
-            self.assertEqual(s.server_env()["PT_ONNX_PROVIDERS"], "CUDAExecutionProvider,CPUExecutionProvider")
-        with patch.object(settings_module, "cache_status", return_value="ready"):
-            self.assertEqual(
-                s.server_env()["PT_ONNX_PROVIDERS"],
-                "TensorrtExecutionProvider,CUDAExecutionProvider,CPUExecutionProvider",
-            )
+        self.assertEqual(
+            s.server_env()["PT_ONNX_PROVIDERS"],
+            "TensorrtExecutionProvider,CUDAExecutionProvider,CPUExecutionProvider",
+        )
 
     def test_server_env_disables_tensorrt_explicitly(self) -> None:
         s = self._settings()

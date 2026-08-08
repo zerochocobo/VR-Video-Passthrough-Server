@@ -20,12 +20,14 @@ from urllib.parse import quote, unquote
 from fastapi import APIRouter, HTTPException, Header, Query, Request
 from fastapi.responses import FileResponse, Response, StreamingResponse
 
+import config
 from config import (
     HTTP_PORT,
     DLNA_IMAGE_ENABLED,
     IMAGE_EXTS,
     IMAGE_MIME_BY_EXT,
     LAN_IP,
+    FACE_BEAUTY_LIVE_FIRST_CHUNK_TIMEOUT_SEC,
     PASSTHROUGH_CONTAINER,
     PASSTHROUGH_BUSY_WAIT_SEC,
     PASSTHROUGH_LIVE_ADAPTIVE_FPS,
@@ -770,6 +772,13 @@ async def runtime_status():
     vram = await asyncio.to_thread(_query_vram_mib)
     status = {
         "ok": True,
+        "provider_kind": (
+            "trt"
+            if config.ONNX_PROVIDERS and config.ONNX_PROVIDERS[0] == "TensorrtExecutionProvider"
+            else "cuda"
+            if config.ONNX_PROVIDERS and config.ONNX_PROVIDERS[0] == "CUDAExecutionProvider"
+            else "cpu"
+        ),
         "active": stream_info is not None,
         "source": "",
         "source_name": "",
@@ -2039,15 +2048,18 @@ def _two_dvr_live_block_reason(path: Path, meta) -> str:
 
 
 def _rm_live_block_reason(path: Path, meta) -> str:
-    """RM (realtime mosaic restoration) live runs on the GPU NV12 (PyNv) path and
-    only for 2D source videos (2:1 half-equirectangular VR is excluded)."""
+    """RM (realtime mosaic restoration) live runs on the GPU NV12 (PyNv) path.
+
+    2D and VR are both supported: realtime RM runs the same GpuRmProcessor as
+    offline, which reprojects each VR region to a flat view and back. This gate
+    has to stay in step with ``_rm_dlna_enabled`` in dlna/content_directory.py --
+    when the two disagreed, the [RM] entry was offered for VR sources and then
+    rejected at playback, and SKYBOX answered the 409 by silently re-requesting
+    the same item with no mode and no seek, i.e. alpha from 00:00."""
     from utils.runtime_settings import get_rm
 
     if not get_rm().enabled:
         return "mosaic restoration is disabled"
-    codec = meta.codec
-    if not _is_two_d_source(path, codec.width, codec.height):
-        return "RM live is only available for 2D source videos"
     try:
         decision = select_backend(meta.timing, meta.codec, meta.color)
     except Exception as e:
@@ -2057,16 +2069,40 @@ def _rm_live_block_reason(path: Path, meta) -> str:
     return ""
 
 
+def _face_beauty_live_block_reason(path: Path, meta) -> str:
+    """Keep the FaceBeauty playback gate aligned with its DLNA listing gate."""
+    from utils.runtime_settings import get_face_beauty
+
+    if not get_face_beauty().enabled:
+        return "face beautification is disabled"
+    try:
+        decision = select_backend(meta.timing, meta.codec, meta.color)
+    except Exception as e:
+        return f"face beauty live source probe failed: {e}"
+    if decision.verdict != "pynv_hevc":
+        return f"face beauty live requires the GPU NV12 path (source ineligible: {decision.reason})"
+    return ""
+
+
+def _live_first_chunk_timeout(output_mode: str) -> float:
+    if output_mode == "face_beauty":
+        return FACE_BEAUTY_LIVE_FIRST_CHUNK_TIMEOUT_SEC
+    return _LIVE_FIRST_CHUNK_TIMEOUT_SEC
+
+
 async def _superres_live_block_reason(path: Path, meta) -> str:
     if not RTX_VSR_REALTIME_ENABLED:
         return "RTX VSR realtime is disabled"
     from utils.rtx_vsr import evaluation_preflight_status, run_evaluation_preflight, source_block_reason
 
     codec = meta.codec
+    is_vr = has_vr_filename_marker(path.stem) or is_half_equirectangular_source(codec.width, codec.height)
+    if is_vr and int(codec.width or 0) > 4096:
+        return "8K VR sources are hidden from realtime SuperRes"
     reason = source_block_reason(
         codec.width,
         codec.height,
-        is_vr=has_vr_filename_marker(path.stem) or is_half_equirectangular_source(codec.width, codec.height),
+        is_vr=is_vr,
         is_10bit=bool(int(getattr(codec, "bit_depth", 8) or 8) > 8),
         allow_vr=True,
     )
@@ -2101,7 +2137,7 @@ def _select_passthrough_stream(
     output_mode = (output_mode or PASSTHROUGH_OUTPUT_MODE).lower()
     if output_mode == "all":
         output_mode = "green"
-    elif output_mode not in {"green", "alpha", "two_dvr", "rm", "superres"}:
+    elif output_mode not in {"green", "alpha", "two_dvr", "rm", "superres", "face_beauty"}:
         output_mode = _select_live_output_mode("")
     fallback_container = "mpegts" if container == "mpegts" else None
     fallback_max_fps = max_fps
@@ -2120,6 +2156,8 @@ def _select_passthrough_stream(
             raise RuntimeError("2D->3D live requires the PyNv NV12 live path")
         if output_mode == "rm":
             raise RuntimeError("RM live requires the PyNv NV12 live path")
+        if output_mode == "face_beauty":
+            raise RuntimeError("face beauty live requires the PyNv NV12 live path")
         if output_mode == "superres":
             raise RuntimeError("RTX VSR live requires the PyNv CUDA path")
         return PassthroughStream(
@@ -2256,8 +2294,10 @@ async def passthrough_live_get(
     requested_mode = (mode or "").lower()
     # RM (realtime mosaic restoration) is a runtime-toggled mode independent of
     # the server-configured passthrough modes, so it bypasses _select_live_output_mode.
-    if requested_mode == "rm":
-        live_output_mode = "rm"
+    if requested_mode in {"rm", "face_beauty"}:
+        # Both are runtime-toggled modes independent of the server-configured
+        # passthrough modes, so they bypass _select_live_output_mode.
+        live_output_mode = requested_mode
     else:
         live_output_mode = _select_live_output_mode(requested_mode)
 
@@ -2313,6 +2353,19 @@ async def passthrough_live_get(
                 rm_block_reason,
             )
             return Response(f"RM live unsupported: {rm_block_reason}", status_code=409)
+    if live_output_mode == "face_beauty":
+        face_beauty_block_reason = _face_beauty_live_block_reason(path, live_meta)
+        if face_beauty_block_reason:
+            log.info(
+                "passthrough_live[%d] reject unsupported FaceBeauty live source: %s reason=%s",
+                rid,
+                path.name,
+                face_beauty_block_reason,
+            )
+            return Response(
+                f"FaceBeauty live unsupported: {face_beauty_block_reason}",
+                status_code=409,
+            )
     if live_output_mode == "superres":
         superres_block_reason = await _superres_live_block_reason(path, live_meta)
         if superres_block_reason:
@@ -2534,9 +2587,9 @@ async def passthrough_live_get(
         live_acquire_timeout = max(PASSTHROUGH_BUSY_WAIT_SEC, 1.0)
 
         def build_stream():
-            matter = None if live_output_mode in {"two_dvr", "rm"} else acquire_matter(blocking=True, timeout=live_acquire_timeout)
+            matter = None if live_output_mode in {"two_dvr", "rm", "face_beauty"} else acquire_matter(blocking=True, timeout=live_acquire_timeout)
             if matter is None:
-                if live_output_mode not in {"two_dvr", "rm"}:
+                if live_output_mode not in {"two_dvr", "rm", "face_beauty"}:
                     return None
             try:
                 stream_tuple = _select_passthrough_stream(
@@ -2659,6 +2712,7 @@ async def passthrough_live_get(
         live_send_pacing,
         headers,
     )
+    first_chunk_timeout = _live_first_chunk_timeout(live_output_mode)
 
     if not use_managed_live_session:
         effective_stall_timeout = PASSTHROUGH_LIVE_STALL_TIMEOUT_SEC
@@ -2672,7 +2726,7 @@ async def passthrough_live_get(
             while True:
                 first_live_chunk = await asyncio.wait_for(
                     stream_iter.__anext__(),
-                    timeout=_LIVE_FIRST_CHUNK_TIMEOUT_SEC,
+                    timeout=first_chunk_timeout,
                 )
                 if first_live_chunk:
                     preroll_chunks.append(first_live_chunk)
@@ -2709,7 +2763,7 @@ async def passthrough_live_get(
             log.warning(
                 "passthrough_live[%d] return 504 VLC first chunk timeout after %.1fs",
                 rid,
-                _LIVE_FIRST_CHUNK_TIMEOUT_SEC,
+                first_chunk_timeout,
             )
             return Response("passthrough live first chunk timeout", status_code=504, headers={"Retry-After": "2"})
         except Exception:
@@ -2886,7 +2940,7 @@ async def passthrough_live_get(
         while True:
             first_live_chunk = await asyncio.wait_for(
                 stream_iter.__anext__(),
-                timeout=_LIVE_FIRST_CHUNK_TIMEOUT_SEC,
+                timeout=first_chunk_timeout,
             )
             if first_live_chunk:
                 break
@@ -2904,7 +2958,7 @@ async def passthrough_live_get(
         log.warning(
             "passthrough_live[%d] return 504 first chunk timeout after %.1fs",
             rid,
-            _LIVE_FIRST_CHUNK_TIMEOUT_SEC,
+            first_chunk_timeout,
         )
         return Response("passthrough live first chunk timeout", status_code=504, headers={"Retry-After": "2"})
     except Exception:

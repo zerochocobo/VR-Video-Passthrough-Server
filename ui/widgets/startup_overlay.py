@@ -1,13 +1,13 @@
-"""Non-modal startup overlay shown while the server is warming the GPU.
+"""Non-modal overlay for the complete server startup pipeline.
 
 Goals (driven by the "面向非技术型用户" UX requirement):
   - Friendly language. Avoid words like "JIT", "PTX", "cubin"; use plain
     phrases such as "First-time GPU initialization" so non-technical users
     are not scared away.
   - Set expectations BEFORE the long wait. The overlay shows the predicted
-    duration as soon as the server starts (from predict_warmup_state in the
-    server process). The user knows ahead of time whether to expect 5s or
-    150s, and why.
+    duration as soon as the server publishes its configuration-aware startup
+    plan. The user can see whether time is being spent on media indexing,
+    acceleration models, runtime initialization, or network services.
   - Visible animation. A determinate progress bar and an animated ellipsis
     in the status label reassure the user the program is alive.
   - Easy escape hatch. One-click "Copy hardware report" puts a detailed
@@ -20,6 +20,8 @@ restructuring HomePage's layout. It can be cancelled by the user (which
 should be wired to stop the server process).
 """
 from __future__ import annotations
+
+import math
 
 from PySide6.QtCore import Qt, QTimer, Signal
 from PySide6.QtGui import QGuiApplication
@@ -41,6 +43,12 @@ from PySide6.QtWidgets import (
 # Server-side `step` strings map into these indices; unknown values fall
 # back to the current step_index from /status.
 _STEP_KEYS = (
+    "process_start",
+    "media_index",
+    "gpu_requirement",
+    "trt_rebuild",
+    "trt_validate",
+    "vsr_preflight",
     "predict_probe",
     "predict",
     "warmup_start",
@@ -49,7 +57,10 @@ _STEP_KEYS = (
     "ort_iobinding_runs",
     "composite_jit",
     "reset_state",
+    "da3_trt_warmup",
+    "rm_trt_warmup",
     "nvenc_preflight",
+    "runtime_pool",
     "firewall",
     "ssdp",
     "http_starting",
@@ -73,12 +84,25 @@ _HINT_STYLE_WARN = (
     " border: 2px solid #E59A2F; border-radius: 6px; padding: 8px; }"
 )
 
+_NON_GPU_FAILURE_STEPS = {
+    "process_start",
+    "media_index",
+    "gpu_requirement",
+    "vsr_preflight",
+    "runtime_pool",
+    "firewall",
+    "ssdp",
+    "http_starting",
+    "listening",
+}
+
 
 class StartupOverlay(QDialog):
-    """Friendly progress overlay shown while the server initializes the GPU."""
+    """Friendly progress overlay for server initialization."""
 
     cancelRequested = Signal()
     copyReportRequested = Signal()
+    repairGpuCacheRequested = Signal()
     showDetailsToggled = Signal(bool)
 
     def __init__(self, i18n, parent: QWidget | None = None) -> None:
@@ -137,12 +161,17 @@ class StartupOverlay(QDialog):
         self.copy_report_btn = QPushButton()
         self.copy_report_btn.clicked.connect(self._on_copy_report_clicked)
 
+        self.repair_gpu_cache_btn = QPushButton()
+        self.repair_gpu_cache_btn.clicked.connect(self._on_repair_gpu_cache_clicked)
+        self.repair_gpu_cache_btn.setVisible(False)
+
         self.cancel_btn = QPushButton()
         self.cancel_btn.clicked.connect(self._on_cancel_clicked)
 
         button_row = QHBoxLayout()
         button_row.addWidget(self.toggle_details_btn)
         button_row.addStretch(1)
+        button_row.addWidget(self.repair_gpu_cache_btn)
         button_row.addWidget(self.copy_report_btn)
         button_row.addWidget(self.cancel_btn)
 
@@ -186,6 +215,9 @@ class StartupOverlay(QDialog):
         self.details_text.clear()
         self.toggle_details_btn.setText(self.i18n.t("startup.show_details"))
         self.copy_report_btn.setText(self.i18n.t("startup.copy_report"))
+        self.repair_gpu_cache_btn.setText(self.i18n.t("gpu_repair.failed_button"))
+        self.repair_gpu_cache_btn.setVisible(False)
+        self.repair_gpu_cache_btn.setEnabled(True)
         self.toggle_details_btn.setChecked(False)
         self._ellipsis_timer.start()
 
@@ -194,6 +226,9 @@ class StartupOverlay(QDialog):
         self._last_status = status
         phase = str(status.get("phase") or "")
         step = str(status.get("step") or "")
+        self.repair_gpu_cache_btn.setVisible(
+            phase == "failed" and step not in _NON_GPU_FAILURE_STEPS
+        )
         progress_value = float(status.get("progress") or 0.0)
         step_index = int(status.get("step_index") or 0)
         step_total = int(status.get("step_total") or 0)
@@ -206,6 +241,8 @@ class StartupOverlay(QDialog):
         reason = str(status.get("reason") or "")
         message = str(status.get("message") or "")
         provider_kind = str(status.get("provider_kind") or "")
+        plan_active = bool(status.get("plan_active"))
+        step_elapsed = float(status.get("step_elapsed_sec") or elapsed)
         step_text = self._step_text(step, status)
         step_translated = self._step_has_translation(step, status)
 
@@ -267,7 +304,10 @@ class StartupOverlay(QDialog):
             self.eta_label.setText(
                 self.i18n.t("startup.eta_template").format(
                     elapsed=int(elapsed),
-                    eta=max(0, int(eta - elapsed)) if eta > elapsed else int(eta),
+                    eta=max(
+                        0,
+                        int(round(eta if plan_active else (eta - elapsed if eta > elapsed else eta))),
+                    ),
                 )
             )
         else:
@@ -279,13 +319,13 @@ class StartupOverlay(QDialog):
             if self.progress.minimum() == 0 and self.progress.maximum() == 0:
                 self.progress.setRange(0, 1000)
             self.progress.setValue(self.progress.maximum() or 1000)
-        elif phase in {"warmed", "firewall", "ssdp", "http_starting"}:
+        elif not plan_active and phase in {"warmed", "firewall", "ssdp", "http_starting"}:
             # Warmup is finished but uvicorn hasn't bound the port yet. Show
             # near-full progress with an indeterminate marquee so the user
             # knows the program is still doing something between the GPU
             # readiness signal and the network being live.
             self.progress.setRange(0, 0)
-        elif phase == "warming" and elapsed <= 0.1 and progress_value <= 0.11:
+        elif not plan_active and phase == "warming" and elapsed <= 0.1 and progress_value <= 0.11:
             # The server emits a single update right before the long blocking
             # ORT session load + warmup runs, then goes silent for tens of
             # seconds. A static 30% bar feels frozen to a non-technical user;
@@ -309,7 +349,7 @@ class StartupOverlay(QDialog):
             self.progress.setValue(value)
 
         # ----- Advisory / reassurance -----
-        self._apply_hint(status, phase, cold, known_slow, provider_kind, elapsed)
+        self._apply_hint(status, phase, cold, known_slow, provider_kind, step_elapsed)
 
         # ----- Details panel content (raw status) -----
         if self.details_text.isVisible():
@@ -346,6 +386,7 @@ class StartupOverlay(QDialog):
         self.message_label.setText(self.i18n.t("startup.connecting"))
         self.toggle_details_btn.setText(self.i18n.t("startup.show_details"))
         self.copy_report_btn.setText(self.i18n.t("startup.copy_report"))
+        self.repair_gpu_cache_btn.setText(self.i18n.t("gpu_repair.failed_button"))
         self.cancel_btn.setText(self.i18n.t("startup.cancel"))
 
     def _step_key(self, step: str, status: dict | None = None) -> str:
@@ -392,9 +433,15 @@ class StartupOverlay(QDialog):
             "step",
             "step_index",
             "step_total",
+            "plan_active",
+            "plan_estimate_sec",
             "progress",
             "eta_sec",
             "elapsed_sec",
+            "step_elapsed_sec",
+            "step_estimate_sec",
+            "trt_building",
+            "trt_build_model",
             "cold",
             "is_known_slow",
             "provider_kind",
@@ -422,6 +469,23 @@ class StartupOverlay(QDialog):
     ) -> None:
         if phase == "failed":
             self._set_hint(self.i18n.t("startup.hint_failed"), "warn")
+            return
+        if bool(status.get("trt_building")):
+            try:
+                estimate = max(1.0, float(status.get("step_estimate_sec") or 60.0))
+            except (TypeError, ValueError):
+                estimate = 60.0
+            model_id = str(status.get("trt_build_model") or "generic")
+            model_key = f"startup.trt_model.{model_id}"
+            model = self.i18n.t(model_key)
+            if model == model_key:
+                model = self.i18n.t("startup.trt_model.generic")
+            template = self.i18n.t("startup.hint_trt_building")
+            try:
+                text = template.format(model=model, minutes=max(1, math.ceil(estimate / 60.0)))
+            except Exception:
+                text = template
+            self._set_hint(text, "info")
             return
         if phase != "warming":
             self.hint_label.setVisible(False)
@@ -486,6 +550,10 @@ class StartupOverlay(QDialog):
 
     def _on_copy_report_clicked(self) -> None:
         self.copyReportRequested.emit()
+
+    def _on_repair_gpu_cache_clicked(self) -> None:
+        self.repair_gpu_cache_btn.setEnabled(False)
+        self.repairGpuCacheRequested.emit()
 
     def _on_cancel_clicked(self) -> None:
         self.cancelRequested.emit()

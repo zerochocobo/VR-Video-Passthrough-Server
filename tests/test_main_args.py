@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import subprocess
 import sys
 import types
 import unittest
@@ -11,6 +12,92 @@ import main
 
 
 class MainArgsTests(unittest.TestCase):
+    def test_startup_plan_includes_configured_long_running_steps(self) -> None:
+        with (
+            patch.object(config, "DLNA_ALL_VIDEOS_ENABLED", True),
+            patch.object(config, "GPU_REPAIR_REBUILD_TRT", True),
+            patch.object(config, "ONNX_PROVIDERS", ["TensorrtExecutionProvider", "CUDAExecutionProvider"]),
+            patch.object(config, "RTX_VSR_REALTIME_ENABLED", True),
+            patch.object(config, "PASSTHROUGH_OUTPUT_MODE", "superres,two_dvr"),
+            patch.object(config, "STARTUP_GPU_WARMUP", True),
+            patch.object(config, "WARMUP_COMPOSITE_ENABLE", True),
+            patch.object(config, "USE_PYNV", True),
+            patch.object(config, "NVENC_PREFLIGHT_ENABLE", True),
+            patch.object(main, "_passthrough_mode_enabled", return_value=True),
+            patch("utils.runtime_settings.get_rm", return_value=types.SimpleNamespace(enabled=True)),
+        ):
+            keys = [key for key, _estimate in main._startup_plan_steps(active_provider_kind="trt")]
+
+        for expected in (
+            "media_index",
+            "trt_rebuild",
+            "trt_validate",
+            "vsr_preflight",
+            "static_trt_preload",
+            "da3_trt_warmup",
+            "rm_trt_warmup",
+            "nvenc_preflight",
+            "runtime_pool",
+            "listening",
+        ):
+            self.assertIn(expected, keys)
+        self.assertEqual(keys, list(dict.fromkeys(keys)))
+
+    def test_startup_plan_uses_final_provider_for_runtime_steps(self) -> None:
+        with (
+            patch.object(config, "ONNX_PROVIDERS", ["TensorrtExecutionProvider", "CUDAExecutionProvider"]),
+            patch.object(config, "STARTUP_GPU_WARMUP", True),
+            patch.object(config, "WARMUP_COMPOSITE_ENABLE", False),
+            patch.object(main, "_passthrough_mode_enabled", return_value=False),
+            patch("utils.runtime_settings.get_rm", return_value=types.SimpleNamespace(enabled=False)),
+        ):
+            pending_steps = dict(main._startup_plan_steps(requested_trt=True))
+            trt_steps = dict(main._startup_plan_steps(requested_trt=True, active_provider_kind="trt"))
+            cuda_steps = dict(main._startup_plan_steps(requested_trt=True, active_provider_kind="cuda"))
+
+        self.assertIn("trt_validate", cuda_steps)
+        self.assertNotIn("static_trt_preload", pending_steps)
+        self.assertEqual(pending_steps["ort_iobinding_runs"], 90.0)
+        self.assertIn("static_trt_preload", trt_steps)
+        self.assertNotIn("static_trt_preload", cuda_steps)
+        self.assertEqual(trt_steps["ort_iobinding_runs"], 12.0)
+        self.assertEqual(cuda_steps["ort_iobinding_runs"], 90.0)
+
+    def test_gpu_repair_rebuilds_realtime_trt_in_isolated_process(self) -> None:
+        log = Mock()
+        completed = subprocess.CompletedProcess(["python"], 0, stdout="DONE")
+        with (
+            patch("ui.services.process_helpers.trt_warmup_command", return_value=("python", ["-m", "warmup"])),
+            patch("ui.services.process_helpers.base_environment", return_value={"PT_GPU_REPAIR_REBUILD_TRT": "1"}),
+            patch.object(main.subprocess, "run", return_value=completed) as run,
+            patch.object(main, "set_startup_phase") as set_status,
+            patch.object(main, "start_heartbeat"),
+            patch.object(main, "stop_heartbeat"),
+        ):
+            self.assertTrue(main._rebuild_realtime_trt_cache_isolated(log))
+
+        command = run.call_args.args[0]
+        self.assertIn("--model", command)
+        self.assertIn("rvm", command)
+        self.assertNotIn("PT_GPU_REPAIR_REBUILD_TRT", run.call_args.kwargs["env"])
+        first_status = set_status.call_args_list[0]
+        self.assertTrue(first_status.kwargs["trt_building"])
+        self.assertEqual(first_status.kwargs["trt_build_model"], "rvm")
+        self.assertEqual(first_status.kwargs["minimum_step_estimate_sec"], 300.0)
+
+    def test_gpu_repair_trt_rebuild_failure_allows_cuda_fallback(self) -> None:
+        log = Mock()
+        completed = subprocess.CompletedProcess(["python"], 9, stdout="ERROR:boom")
+        with (
+            patch("ui.services.process_helpers.trt_warmup_command", return_value=("python", [])),
+            patch("ui.services.process_helpers.base_environment", return_value={}),
+            patch.object(main.subprocess, "run", return_value=completed),
+            patch.object(main, "set_startup_phase"),
+            patch.object(main, "start_heartbeat"),
+            patch.object(main, "stop_heartbeat"),
+        ):
+            self.assertFalse(main._rebuild_realtime_trt_cache_isolated(log))
+
     def test_debug_positional_enables_verbose_logs(self) -> None:
         original_env = os.environ.get("PT_DEBUG_LOGS")
         original_config = config.DEBUG_LOGS

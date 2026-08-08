@@ -88,6 +88,11 @@ def download_file(
                         done += len(block)
                         if progress:
                             progress(done, total)
+            # A truncated stream ends cleanly, so without this check the partial
+            # file is promoted to the real name and only surfaces later as
+            # "Protobuf parsing failed" when onnxruntime tries to load it.
+            if total and done != total:
+                raise OSError(f"incomplete download: got {done} of {total} bytes")
             tmp.replace(dest)
             log(f"download: {dest.name} done ({dest.stat().st_size / 1e6:.1f} MB)")
             return dest

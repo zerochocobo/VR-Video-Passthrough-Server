@@ -11,6 +11,7 @@ from utils.rtx_vsr import (
     source_exceeds_target_resolution, target_dimensions, target_resolution,
 )
 from utils.vr_naming import superres_output_stem, superres_stem
+from utils.superres_bitrate import normalize_superres_bitrate_mode, plan_superres_bitrate
 from ui.settings import Settings
 from pipeline.hdr_look import hdr_look_mode_value, normalize_hdr_look
 
@@ -32,6 +33,30 @@ def test_target_dimensions_preserves_aspect_and_even_size():
     assert target_resolution(1440) == (2560, 1440)
     assert source_exceeds_target_resolution(3000, 1200, 1440) is True
     assert source_exceeds_target_resolution(1200, 2000, 1440) is False
+
+
+def test_offline_superres_auto_bitrate_uses_sqrt_pixel_ratio():
+    plan = plan_superres_bitrate(30_000_000, 4096, 2048, 8192, 4096, "auto")
+    assert plan.pixel_ratio == 4.0
+    assert plan.target_bps == 60_000_000
+    assert plan.max_bps == 75_000_000
+    assert plan.buffer_bps == 120_000_000
+
+
+def test_offline_superres_manual_bitrate_modes_use_source_multiplier():
+    plan = plan_superres_bitrate(30_000_000, 3840, 1920, 8192, 4096, "1.5")
+    assert plan.target_bps == 45_000_000
+    assert plan.max_bps == 56_250_000
+    assert plan.buffer_bps == 90_000_000
+    assert normalize_superres_bitrate_mode("2.0x") == "2"
+    assert normalize_superres_bitrate_mode("invalid") == "auto"
+
+
+def test_offline_superres_bitrate_caps_auto_and_manual_modes():
+    auto = plan_superres_bitrate(100_000_000, 3840, 1920, 8192, 4096, "auto")
+    manual = plan_superres_bitrate(100_000_000, 3840, 1920, 8192, 4096, "3")
+    assert auto.target_bps == 80_000_000
+    assert manual.target_bps == 120_000_000
 
 
 def test_offline_8k_target_is_limited_to_sbs_vr():

@@ -485,18 +485,19 @@ def cache_status(
     scope: str | None = None,
 ) -> CacheStatus:
     key = normalized_model_key(model_key)
-    manifest = load_manifest_for_model(key, cache_dir, scope) if manifest is None else manifest
-    if not manifest:
+    if manifest is None:
+        manifest = load_manifest_for_model(key, cache_dir, scope)
+    structural = cache_artifact_status(
+        manifest=manifest,
+        model_key=key,
+        cache_dir=cache_dir,
+        scope=scope,
+    )
+    if structural != "ready":
+        return structural
+    if not isinstance(manifest, dict):
         return "missing"
-    if int(manifest.get("version", 0) or 0) != MANIFEST_VERSION:
-        return "stale"
-    if any(model.get("status") == "failed" for model in manifest.get("models", []) if isinstance(model, dict)):
-        return "failed"
-    if not _manifest_engine_files_exist(manifest, key, cache_dir, scope):
-        return "failed"
     offline_scope = str(scope or "").strip().lower() == "offline"
-    if key == TRT_MODEL_RVM and offline_scope and not _rvm_offline_cache_complete(manifest, cache_dir, scope):
-        return "stale"
     actual = collect_fingerprint(key) if actual_fp is None else actual_fp
     saved = manifest.get("fingerprint")
     if not isinstance(saved, dict):
@@ -509,6 +510,36 @@ def cache_status(
             return "stale"
         return "ready"
     if stale_reasons(saved, actual):
+        return "stale"
+    return "ready"
+
+
+def cache_artifact_status(
+    manifest: dict | None = None,
+    model_key: str | None = None,
+    cache_dir: Path | None = None,
+    scope: str | None = None,
+) -> CacheStatus:
+    """Check manifest/files only, without probing CUDA, NVML, ORT, or TRT.
+
+    UI construction uses this lightweight status.  The server process performs
+    the full fingerprint validation before it enables TensorRT.
+    """
+    key = normalized_model_key(model_key)
+    manifest = load_manifest_for_model(key, cache_dir, scope) if manifest is None else manifest
+    if not manifest:
+        return "missing"
+    if int(manifest.get("version", 0) or 0) != MANIFEST_VERSION:
+        return "stale"
+    if any(model.get("status") == "failed" for model in manifest.get("models", []) if isinstance(model, dict)):
+        return "failed"
+    if not _manifest_engine_files_exist(manifest, key, cache_dir, scope):
+        return "failed"
+    offline_scope = str(scope or "").strip().lower() == "offline"
+    if key == TRT_MODEL_RVM and offline_scope and not _rvm_offline_cache_complete(manifest, cache_dir, scope):
+        return "stale"
+    saved = manifest.get("fingerprint")
+    if not isinstance(saved, dict):
         return "stale"
     return "ready"
 

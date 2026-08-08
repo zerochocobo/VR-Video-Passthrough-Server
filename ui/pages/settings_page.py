@@ -29,10 +29,9 @@ from ui.settings import (
     quality_speed_value,
 )
 from ui.widgets.trt_cache_dialog import TensorRTConfigDialog
-from utils.trt_manifest import cache_status, manifest_path
+from utils.trt_manifest import cache_artifact_status as cache_status, manifest_path
 
 ROW_HEIGHT = 34
-SETTINGS_PAGE_HEIGHT = 640
 
 
 def _int_setting(value, default: int) -> int:
@@ -101,6 +100,8 @@ class SettingsGroup(QFrame):
 
 class SettingsPage(QWidget):
     rm_card_visibility_changed = Signal(bool)
+    face_beauty_card_visibility_changed = Signal(bool)
+    gpu_cache_repair_requested = Signal()
 
     def __init__(self, i18n, settings) -> None:
         super().__init__()
@@ -137,6 +138,8 @@ class SettingsPage(QWidget):
         self.http_port.setRange(1024, 65535)
         self.http_port.setValue(settings.http_port())
         self.http_port.setFixedWidth(110)
+        self.dlna_all_videos_label = QLabel()
+        self.dlna_all_videos = _switch(bool(settings.data.get("dlna_all_videos_enabled")))
         self.dlna_save_button = QPushButton()
         self.dlna_save_button.setEnabled(False)
         self.dlna_saved_label = QLabel()
@@ -148,6 +151,7 @@ class SettingsPage(QWidget):
         self.dlna_group.body.addWidget(self.dlna_note)
         self.dlna_group.add_row(self.server_name_label, self.server_name, None)
         self.dlna_group.add_row(self.http_port_label, self.http_port, None)
+        self.dlna_group.add_row(self.dlna_all_videos_label, self.dlna_all_videos, None)
         self.dlna_group.add_row(self.dlna_save_button, self.dlna_saved_label, None)
 
         # General group: language.
@@ -194,6 +198,7 @@ class SettingsPage(QWidget):
         self.trt_status_label = QLabel()
         self.trt_status_label.setStyleSheet(f"color: {theme.TEXT_MUTED}; background: transparent;")
         self.trt_cache_watcher = QFileSystemWatcher(self)
+        self._runtime_provider_kind = ""
         self.trt_cache_watcher.directoryChanged.connect(lambda _path: self._update_trt_state())
         self.trt_cache_watcher.fileChanged.connect(lambda _path: self._update_trt_state())
 
@@ -204,6 +209,18 @@ class SettingsPage(QWidget):
             self.trt_enabled_label, self.trt_enabled, self.trt_configure_button, self.trt_status_label, None
         )
 
+        # Troubleshooting group: filesystem-only GPU cache repair.  MainWindow
+        # owns process coordination and the confirmation/restart flow.
+        self.repair_group = SettingsGroup()
+        self.gpu_cache_repair_note = QLabel()
+        self.gpu_cache_repair_note.setWordWrap(True)
+        self.gpu_cache_repair_note.setStyleSheet(
+            f"color: {theme.TEXT_FAINT}; background: transparent; font-size: 8.5pt;"
+        )
+        self.gpu_cache_repair_button = QPushButton()
+        self.repair_group.body.addWidget(self.gpu_cache_repair_note)
+        self.repair_group.add_row(self.gpu_cache_repair_button, None)
+
         # Feature debug group.
         self.debug_group = SettingsGroup()
         self.debug_note = QLabel()
@@ -211,8 +228,11 @@ class SettingsPage(QWidget):
         self.debug_note.setStyleSheet(f"color: {theme.TEXT_FAINT}; background: transparent; font-size: 8.5pt;")
         self.rm_card_label = QLabel()
         self.rm_card_switch = _switch(bool(settings.data.get("rm_card_visible")))
+        self.face_beauty_card_label = QLabel()
+        self.face_beauty_card_switch = _switch(bool(settings.data.get("face_beauty_card_visible")))
         self.debug_group.body.addWidget(self.debug_note)
         self.debug_group.add_row(self.rm_card_label, self.rm_card_switch, None)
+        self.debug_group.add_row(self.face_beauty_card_label, self.face_beauty_card_switch, None)
 
         scroll_body = QWidget()
         scroll_body.setStyleSheet("background: transparent;")
@@ -223,10 +243,8 @@ class SettingsPage(QWidget):
         body_layout.addWidget(self.dlna_group)
         body_layout.addWidget(self.general_group)
         body_layout.addWidget(self.performance_group)
+        body_layout.addWidget(self.repair_group)
         body_layout.addWidget(self.debug_group)
-        # Release UI: retain the debug gate wiring for compatibility with
-        # saved settings and internal diagnostics, but do not expose it.
-        self.debug_group.setVisible(False)
         body_layout.addStretch(1)
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
@@ -245,6 +263,7 @@ class SettingsPage(QWidget):
 
         self.server_name.textChanged.connect(self._update_dlna_dirty)
         self.http_port.valueChanged.connect(self._update_dlna_dirty)
+        self.dlna_all_videos.toggled.connect(self._save_dlna_all_videos)
         self.server_name.editingFinished.connect(self._save_dlna)
         self.http_port.editingFinished.connect(self._save_dlna)
         self.dlna_save_button.clicked.connect(self._save_dlna)
@@ -253,7 +272,9 @@ class SettingsPage(QWidget):
         self.performance_output_size.currentIndexChanged.connect(self._save)
         self.trt_enabled.toggled.connect(self._save)
         self.trt_configure_button.clicked.connect(self._show_trt_config)
+        self.gpu_cache_repair_button.clicked.connect(lambda _checked=False: self.gpu_cache_repair_requested.emit())
         self.rm_card_switch.toggled.connect(self._toggle_rm_card)
+        self.face_beauty_card_switch.toggled.connect(self._toggle_face_beauty_card)
 
         self._update_trt_state()
         self.retranslate()
@@ -264,7 +285,8 @@ class SettingsPage(QWidget):
         self.settings.data["quality_speed"] = self.performance_quality.currentData()
         self.settings.data["passthrough_max_fps"] = self.performance_fps.currentData()
         self.settings.data["decode_max_side"] = self.performance_output_size.currentData()
-        self.settings.data["inference_backend"] = "tensorrt" if self.trt_enabled.isChecked() else "cuda"
+        if self.trt_enabled.isEnabled():
+            self.settings.data["inference_backend"] = "tensorrt" if self.trt_enabled.isChecked() else "cuda"
         self.settings.save()
 
     def _dlna_dirty(self) -> bool:
@@ -290,10 +312,21 @@ class SettingsPage(QWidget):
         self.dlna_saved_label.setText(self.i18n.t("settings.dlna_saved"))
         self._dlna_saved_timer.start()
 
+    def _save_dlna_all_videos(self, checked: bool) -> None:
+        self.settings.data["dlna_all_videos_enabled"] = bool(checked)
+        self.settings.save()
+
     def _toggle_rm_card(self, checked: bool) -> None:
         self.settings.data["rm_card_visible"] = bool(checked)
         self.settings.save()
         self.rm_card_visibility_changed.emit(bool(checked))
+
+    def _toggle_face_beauty_card(self, checked: bool) -> None:
+        self.settings.data["face_beauty_card_visible"] = bool(checked)
+        if not checked:
+            self.settings.data["face_beauty_enabled"] = False
+        self.settings.save()
+        self.face_beauty_card_visibility_changed.emit(bool(checked))
 
     def sync_from_settings(self) -> None:
         value = quality_speed_value(self.settings.data.get("quality_speed"))
@@ -353,16 +386,28 @@ class SettingsPage(QWidget):
         self.trt_enabled.setEnabled(ready)
         if not ready:
             self.trt_enabled.setChecked(False)
-            if str(self.settings.data.get("inference_backend") or "cuda").lower() == "tensorrt":
-                self.settings.data["inference_backend"] = "cuda"
-                self.settings.save()
         else:
             self.trt_enabled.setChecked(
                 str(self.settings.data.get("inference_backend") or "cuda").lower() == "tensorrt"
             )
         self.trt_enabled.blockSignals(False)
-        self.trt_status_label.setText(self.i18n.t("trt.status_" + status))
+        status_text = self.i18n.t("trt.status_" + status)
+        if self._runtime_provider_kind:
+            runtime_key = {
+                "trt": "trt.runtime_trt",
+                "cuda": "trt.runtime_cuda",
+                "cpu": "trt.runtime_cpu",
+            }.get(self._runtime_provider_kind, "trt.runtime_cpu")
+            status_text = f"{status_text} · {self.i18n.t(runtime_key)}"
+        self.trt_status_label.setText(status_text)
         self.trt_enabled.setToolTip("" if ready else self.i18n.t("trt.build_first_tooltip"))
+
+    def set_runtime_provider_kind(self, provider_kind: str) -> None:
+        value = str(provider_kind or "").strip().lower()
+        if value == self._runtime_provider_kind:
+            return
+        self._runtime_provider_kind = value
+        self._update_trt_state()
 
     # ---- misc ----
 
@@ -380,6 +425,7 @@ class SettingsPage(QWidget):
         self.dlna_note.setText(self.i18n.t("settings.dlna_note"))
         self.server_name_label.setText(self.i18n.t("settings.server_name"))
         self.http_port_label.setText(self.i18n.t("settings.http_port"))
+        self.dlna_all_videos_label.setText(self.i18n.t("settings.dlna_all_videos"))
         self.dlna_save_button.setText(self.i18n.t("button.save"))
         self.general_group.title_label.setText(self.i18n.t("settings.general"))
         self.language_label.setText(self.i18n.t("settings.language"))
@@ -390,9 +436,13 @@ class SettingsPage(QWidget):
         self.performance_output_size_label.setText(self.i18n.t("performance.output_size"))
         self.trt_enabled_label.setText(self.i18n.t("trt.row_label"))
         self.trt_configure_button.setText(self.i18n.t("trt.configure"))
+        self.repair_group.title_label.setText(self.i18n.t("gpu_repair.group"))
+        self.gpu_cache_repair_note.setText(self.i18n.t("gpu_repair.settings_note"))
+        self.gpu_cache_repair_button.setText(self.i18n.t("gpu_repair.settings_button"))
         self.debug_group.title_label.setText(self.i18n.t("settings.feature_debug"))
         self.debug_note.setText(self.i18n.t("settings.feature_debug_note"))
         self.rm_card_label.setText(self.i18n.t("rm.enabled"))
+        self.face_beauty_card_label.setText(self.i18n.t("beauty.entry_visible"))
         self.performance_fps.setItemText(0, self.i18n.t("performance.output_fps_unlimited"))
         for i, key in enumerate(("quality_speed.ultrafast", "quality_speed.medium")):
             self.performance_quality.setItemText(i, self.i18n.t(key))

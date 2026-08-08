@@ -216,6 +216,25 @@ def _mpegts_tick_for_fps(fps: float) -> int:
     return int((90000.0 / fps) + 0.5) if fps > 0 else 3000
 
 
+def _face_beauty_cfr_plan(timing, info_fps: float, dec_len: int,
+                          start_sec: float, fps_cap: float) -> tuple[float, float, int, int, int]:
+    """Return source/output fps, output start/count and initial source frame.
+
+    FaceBeauty used to bypass the live FPS cap and process every 59.94fps source
+    frame even when DLNA advertised 40fps. Keep the CFR mapping in one testable
+    helper so seek and frame dropping use the same rules as the main live path.
+    """
+    source_fps = float(timing.source_fps or info_fps or 30.0)
+    fps = float(timing.effective_fps(fps_cap))
+    start_out = max(0, int(round(float(start_sec) * fps)))
+    total_out = int(float(timing.duration or 0.0) * fps)
+    max_target = int((max(0, int(dec_len) - 1)) * fps / source_fps) + 1 if source_fps > 0 else int(dec_len)
+    target = max(1, min(max_target, total_out or max_target) - start_out)
+    last_src = max(0, int(dec_len) - 1)
+    initial_src = min(last_src, cfr_source_index(start_out, source_fps, fps))
+    return source_fps, fps, start_out, target, initial_src
+
+
 def _mpegts_video_bsf(timestamp_filter: str | None = None) -> list[str]:
     filters: list[str] = []
     if PYNV_OUTPUT_CODEC == "hevc" and config.PASSTHROUGH_MPEGTS_HEVC_AUD and not timestamp_filter:
@@ -1995,6 +2014,9 @@ class PyNvPassthroughStream:
         if self.output_mode == "rm":
             self._worker_loop_rm()
             return
+        if self.output_mode == "face_beauty":
+            self._worker_loop_face_beauty()
+            return
         pending_nv12_slots: list[object] = []
         slate_stop = threading.Event()
         slate_thread: threading.Thread | None = None
@@ -3123,6 +3145,250 @@ class PyNvPassthroughStream:
                 pass
             self._log_vram("two_dvr_worker_done")
             log.info("[PYNV][%d] 2D->3D worker done frames=%d bytes_emitted=%d reader_started=%s", self.sid, self.frames_produced, self.bytes_emitted, reader_started)
+
+    def _worker_loop_face_beauty(self) -> None:
+        """Realtime face beautification: NVDEC NV12 -> RGB -> detect / restore /
+        retouch -> NVENC, at the source resolution and frame rate.
+
+        Shares GpuFaceBeautyProcessor with the offline tool, so VR sources go
+        through the same gnomonic flat-view path and the look is identical. The
+        restorer is pinned to config.FACE_BEAUTY_MODEL (gpen_bfr_256, 6.1 ms per
+        face against gfpgan_1.4's 38.0 ms) because per-face cost is what decides
+        whether the frame budget is met. Unlike RM there is no temporal chunk, so
+        this is a plain per-frame decode/process/encode loop.
+        """
+        reader_started = False
+        try:
+            import numpy as np
+            import cupy as cp
+            import PyNvVideoCodec as nvc
+            from offline.two_dvr_pynv import _NV12_RGB_KERNELS
+            from offline import face_beauty_engine as fb
+            from offline.face_beauty_gpu import GpuFaceBeautyProcessor
+            from utils.runtime_settings import get_face_beauty
+
+            codec_meta = self.metadata.codec if self.metadata is not None else None
+            bit_depth = int(codec_meta.bit_depth if codec_meta and codec_meta.bit_depth > 0 else 8)
+            shift_bits = int(config.PASSTHROUGH_PYNV_10BIT_SHIFT)
+            meta_dec = PyNvSimpleDecoder(self.src, bit_depth=bit_depth)
+            self._log_vram("face_beauty_decoder_metadata_created")
+            info = meta_dec.info
+            dec_len = len(meta_dec)
+            timing = self.metadata.timing if self.metadata is not None else probe_timing_metadata(self.src)
+            if not timing.is_cfr:
+                meta_dec.stop()
+                raise RuntimeError("face beauty live requires strong CFR source")
+            fps_cap = config.PASSTHROUGH_MAX_FPS if self.max_fps is None else float(self.max_fps)
+            source_fps, fps, start_out, target, s0 = _face_beauty_cfr_plan(
+                timing, float(info.fps or 0.0), dec_len, self.start_sec, fps_cap)
+            self.output_fps = fps
+            producer_pacing = bool(config.PASSTHROUGH_PRODUCER_REALTIME_PACING or fps_cap > 0)
+            width, height = int(info.width), int(info.height)
+            last_src = dec_len - 1
+            meta_dec.stop()
+            self._dec = PyNvThreadedSerialDecoder(
+                self.src,
+                bit_depth=bit_depth,
+                start_frame=s0,
+                batch_size=config.PASSTHROUGH_PYNV_THREADED_BATCH_SIZE,
+                buffer_size=config.PASSTHROUGH_PYNV_THREADED_BUFFER_SIZE,
+                info=info,
+                num_frames=dec_len,
+            )
+            self._log_vram("face_beauty_decoder_created")
+
+            # Strengths come from the live runtime state, so the dashboard dialog
+            # takes effect on the next stream without restarting the server.
+            live = get_face_beauty()
+            options = fb.preset_options(
+                live.preset if live.preset in fb.PRESETS else fb.DEFAULT_PRESET,
+                provider="trt",
+                enhancer=str(config.FACE_BEAUTY_MODEL),
+                detect_interval=int(config.FACE_BEAUTY_DETECT_INTERVAL),
+            )
+            options.landmark_interval = int(config.FACE_BEAUTY_LANDMARK_INTERVAL)
+            options.max_faces = int(
+                config.FACE_BEAUTY_MAX_FACES_VR
+                if width >= 2 * height
+                else config.FACE_BEAUTY_MAX_FACES_2D
+            )
+            for key, value in live.strengths().items():
+                setattr(options, key, max(0.0, min(1.0, int(value) / 100.0)))
+            processor = GpuFaceBeautyProcessor(
+                options, log=lambda m: log.info("[PYNV][%d] fb %s", self.sid, m))
+            self._log_vram("face_beauty_engines_created")
+
+            out_w, out_h = width, height
+            subtitle_renderer: SubtitleRenderer | None = None
+            subtitle_path = find_subtitle_for_video(self.src)
+            if subtitle_path is not None:
+                try:
+                    subtitle_renderer = SubtitleRenderer(subtitle_path, out_w, out_h)
+                    if not subtitle_renderer.enabled:
+                        subtitle_renderer = None
+                except Exception as e:
+                    subtitle_renderer = None
+                    log.warning("[PYNV][%d] face beauty subtitle load failed: %s error=%s",
+                                self.sid, subtitle_path.name, e)
+
+            bitrate_estimate = effective_default_bitrate(self.src, PYNV_BACKEND_LABEL)
+            enc_kwargs = _pynv_encoder_kwargs(bitrate=str(bitrate_estimate.bps), fps=f"{fps:.6f}")
+            self._enc = nvc.CreateEncoder(out_w, out_h, "NV12", False, **enc_kwargs)
+            self._log_vram("face_beauty_encoder_created")
+            log.info(
+                "[PYNV][%d] face beauty live start: %dx%d source_fps=%.3f output_fps=%.3f "
+                "target=%d max_faces=%d container=%s %s",
+                self.sid, width, height, source_fps, fps, target, options.max_faces,
+                self.container, options.retouch_summary(),
+            )
+
+            mux_duration = max(0.0, float(timing.duration or info.duration or 0.0) - self.start_sec)
+            self._mux = self._open_muxer(fps, mux_duration)
+            mux_input = self._video_mux.stdin if self._video_mux is not None else self._mux.stdin
+            assert mux_input is not None
+            self._reader = threading.Thread(target=self._reader_loop, name="pynv-reader", daemon=True)
+            self._stderr_reader = threading.Thread(target=self._stderr_loop, name="pynv-stderr", daemon=True)
+            self._reader.start()
+            self._stderr_reader.start()
+            if self._video_mux is not None:
+                threading.Thread(target=self._video_stderr_loop, name="pynv-video-stderr", daemon=True).start()
+            reader_started = True
+
+            mod = cp.RawModule(code=_NV12_RGB_KERNELS)
+            k_to_rgb = mod.get_function("nv12_to_rgb")
+            k_p016_to_rgb = mod.get_function("p016_to_rgb")
+            k_to_nv12 = mod.get_function("rgb_to_nv12")
+            rgb_g = cp.empty((height, width, 3), cp.uint8)
+            out_nv12 = cp.empty((out_h * 3 // 2, out_w), cp.uint8)
+            bx = (16, 16, 1)
+            grid = ((width + 15) // 16, (height + 15) // 16, 1)
+            grid_out = ((out_w + 15) // 16, (out_h + 15) // 16, 1)
+
+            t_start = time.perf_counter()
+            interval_start = t_start
+            interval_bytes = 0
+            faces_seen = 0
+            sum_decode = sum_infer = sum_encode = sum_mux = 0.0
+            processor.reset()
+            for i in range(target):
+                if self._stop.is_set():
+                    break
+                t0 = time.perf_counter()
+                out_idx = start_out + i
+                idx = max(0, min(last_src, cfr_source_index(out_idx, source_fps, fps)))
+                frame = self._dec.frame_at(idx).owned_copy()
+                if isinstance(frame, GpuP016Frame):
+                    y_g = frame.y.as_cupy(cp.uint16).reshape(height, width)
+                    uv_g = frame.uv.as_cupy(cp.uint16).reshape(height // 2, width)
+                    k_p016_to_rgb(grid, bx, (y_g, uv_g, rgb_g, np.int32(width), np.int32(height),
+                                             np.int32(shift_bits)))
+                else:
+                    y_g = frame.y.as_cupy(cp.uint8).reshape(height, width)
+                    uv_g = frame.uv.as_cupy(cp.uint8).reshape(height // 2, width)
+                    k_to_rgb(grid, bx, (y_g, uv_g, rgb_g, np.int32(width), np.int32(height)))
+                t1 = time.perf_counter()
+                _, stats = processor.process(rgb_g)
+                faces_seen += stats.processed
+                t2 = time.perf_counter()
+                sum_decode += t1 - t0
+                sum_infer += t2 - t1
+
+                if producer_pacing and self.container == "mpegts" and fps > 0:
+                    due = t_start + (i / fps)
+                    now = time.perf_counter()
+                    if due > now:
+                        self._stop.wait(due - now)
+                        if self._stop.is_set():
+                            break
+                t_enc0 = time.perf_counter()
+                k_to_nv12(grid_out, bx, (rgb_g, out_nv12, np.int32(out_w), np.int32(out_h)))
+                self._apply_subtitle_overlay(out_nv12, subtitle_renderer,
+                                             idx / source_fps if source_fps > 0 else 0.0)
+                cp.cuda.get_current_stream().synchronize()
+                flags = 0
+                if i == 0:
+                    flags = int(nvc.NV_ENC_PIC_FLAGS.FORCEIDR) | int(nvc.NV_ENC_PIC_FLAGS.OUTPUT_SPSPPS)
+                with self._encoder_lock:
+                    bitstream = self._enc.Encode(GpuNv12AppFrame(out_nv12, out_w, out_h), flags)
+                t3 = time.perf_counter()
+                if bitstream:
+                    mux_stdin = self._video_mux.stdin if self._video_mux is not None else self._mux.stdin
+                    if self._stop.is_set() or not mux_stdin or mux_stdin.closed:
+                        break
+                    try:
+                        self._mark_first_write()
+                        mux_stdin.write(bitstream)
+                        if not self._real_video_started.is_set():
+                            self._real_video_started.set()
+                            self._log_vram("first_face_beauty_video_bitstream")
+                        interval_bytes += len(bitstream)
+                    except (BrokenPipeError, OSError, ValueError) as e:
+                        log.info("[PYNV][%d] face beauty mux stdin write stopped at frame=%d: %s",
+                                 self.sid, i + 1, e)
+                        break
+                t4 = time.perf_counter()
+                self.frames_produced = i + 1
+                sum_encode += t3 - t_enc0
+                sum_mux += t4 - t3
+                if config.DEBUG_LOGS and self.frames_produced % _DIAG_INTERVAL == 0:
+                    elapsed = max(0.001, time.perf_counter() - t_start)
+                    interval_elapsed = max(0.001, time.perf_counter() - interval_start)
+                    log.info(
+                        "[PYNV][%d] face beauty frame %d/%d fps=%.2f interval_fps=%.2f faces=%d "
+                        "out_bps=%.1fM stage_avg_ms decode=%.2f infer=%.2f encode=%.2f mux=%.2f",
+                        self.sid, self.frames_produced, target,
+                        self.frames_produced / elapsed,
+                        _DIAG_INTERVAL / interval_elapsed,
+                        faces_seen,
+                        (interval_bytes * 8.0 / interval_elapsed) / 1_000_000.0,
+                        (sum_decode / _DIAG_INTERVAL) * 1000.0,
+                        (sum_infer / _DIAG_INTERVAL) * 1000.0,
+                        (sum_encode / _DIAG_INTERVAL) * 1000.0,
+                        (sum_mux / _DIAG_INTERVAL) * 1000.0,
+                    )
+                    interval_start = time.perf_counter()
+                    interval_bytes = 0
+                    sum_decode = sum_infer = sum_encode = sum_mux = 0.0
+            if not self._stop.is_set():
+                log.info("[PYNV][%d] face beauty EndEncode begin frames=%d", self.sid, self.frames_produced)
+                with self._encoder_lock:
+                    tail = self._enc.EndEncode()
+                if tail:
+                    mux_stdin = self._video_mux.stdin if self._video_mux is not None else self._mux.stdin
+                    if mux_stdin:
+                        self._mark_first_write()
+                        mux_stdin.write(tail)
+                log.info("[PYNV][%d] face beauty EndEncode done", self.sid)
+        except Exception as e:
+            if self._stop.is_set():
+                log.info("[PYNV][%d] face beauty worker stopped during close: %s", self.sid, e)
+                return
+            if self.frames_produced == 0 and self.bytes_emitted == 0:
+                self.startup_error = str(e)
+            log.error("[PYNV][%d] face beauty worker exception: %s\n%s",
+                      self.sid, e, traceback.format_exc(limit=8))
+        finally:
+            self._enc = None
+            try:
+                if self._dec is not None:
+                    self._dec.stop()
+            except Exception:
+                pass
+            try:
+                stdin = self._video_mux.stdin if self._video_mux is not None else (self._mux.stdin if self._mux else None)
+                if stdin:
+                    stdin.close()
+            except Exception:
+                pass
+            if not reader_started:
+                self._post_sentinel()
+            try:
+                gc.collect()
+            except Exception:
+                pass
+            self._log_vram("face_beauty_worker_done")
+            log.info("[PYNV][%d] face beauty worker done frames=%d bytes_emitted=%d reader_started=%s",
+                     self.sid, self.frames_produced, self.bytes_emitted, reader_started)
 
     def _worker_loop_rm(self) -> None:
         """Realtime mosaic restoration: NVDEC NV12 -> RGB -> YOLO11-seg detect +

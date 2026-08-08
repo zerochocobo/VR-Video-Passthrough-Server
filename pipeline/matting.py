@@ -46,6 +46,7 @@ from config import (
     ONNX_TRT_ENGINE_CACHE_ENABLE,
     ONNX_TRT_ENGINE_CACHE_PATH,
     ONNX_TRT_FP16_ENABLE,
+    ONNX_TRT_MAX_WORKSPACE_BYTES,
     ONNX_PROVIDERS,
     PASSTHROUGH_RVM_BYPASS_ALPHA,
     PASSTHROUGH_PYNV_SYNC_PROBE,
@@ -1178,6 +1179,11 @@ def _provider_config(providers: list[str]):
                 "trt_fp16_enable": "True" if ONNX_TRT_FP16_ENABLE else "False",
                 "trt_engine_cache_enable": "True" if ONNX_TRT_ENGINE_CACHE_ENABLE else "False",
                 "trt_cuda_graph_enable": "True" if ONNX_TRT_CUDA_GRAPH_ENABLE else "False",
+                # Pin workspace so the engine hash is independent of free VRAM at
+                # build time (see config.ONNX_TRT_MAX_WORKSPACE_BYTES). The main RVM
+                # path uses a static prebuilt engine, but this keeps the dynamic-TRT
+                # fallback stable across realtime/offline too.
+                "trt_max_workspace_size": str(ONNX_TRT_MAX_WORKSPACE_BYTES),
             }
             if ONNX_TRT_ENGINE_CACHE_ENABLE:
                 ONNX_TRT_ENGINE_CACHE_PATH.mkdir(parents=True, exist_ok=True)

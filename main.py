@@ -1,15 +1,16 @@
 ﻿"""Application entry point.
 
 Startup order:
-1. Configure runtime caches and optional GPU warmup.
-2. Start SSDP so DLNA clients can discover the server.
-3. Start FastAPI/uvicorn for device descriptions, SOAP, and media streams.
+1. Index configured media and validate the GPU/acceleration caches.
+2. Load enabled GPU runtimes and optional realtime acceleration models.
+3. Configure media services, SSDP discovery, and FastAPI/uvicorn.
 """
 from __future__ import annotations
 
 import argparse
 import os
 import runpy
+import subprocess
 import threading
 import sys
 import time
@@ -32,14 +33,16 @@ from utils.gpu_runtime_cache import (
 )
 from utils.runtime_dll_paths import apply_runtime_dll_paths
 from utils.gpu_requirements import (
-    MIN_NVIDIA_COMPUTE_CAPABILITY,
-    parse_compute_capability,
+    detect_nvidia_gpu_requirement,
+    resolve_passthrough_max_concurrent,
     unsupported_gpu_message,
-    GpuRequirementResult,
 )
 from utils.logger import get, setup
+from utils.subprocess_hidden import hidden_subprocess_kwargs
 from utils.startup_status import (
+    configure_startup_plan,
     get_startup_state,
+    reconfigure_startup_plan,
     set_startup_phase,
     start_heartbeat,
     stop_heartbeat,
@@ -54,6 +57,7 @@ class _StartupReadySignal:
         self.step_total = step_total
 
     async def __call__(self) -> None:
+        stop_heartbeat()
         set_startup_phase(
             "listening",
             "server ready",
@@ -64,6 +68,69 @@ class _StartupReadySignal:
             eta_sec=0.0,
         )
         self.done.set()
+
+
+def _startup_plan_steps(
+    *,
+    requested_trt: bool | None = None,
+    active_provider_kind: str | None = None,
+) -> list[tuple[str, float]]:
+    """Build the visible startup path from the current server configuration."""
+    requested = {p.strip() for p in config.ONNX_PROVIDERS if p.strip()}
+    if requested_trt is None:
+        requested_trt = "TensorrtExecutionProvider" in requested
+    # Before validation, budget the slower CUDA path. A successful TRT
+    # validation can safely shorten the plan; stale-cache fallback must not
+    # lengthen it and leave the monotonic bar waiting to catch up.
+    runtime_trt = active_provider_kind == "trt"
+    output_modes = {part.strip().lower() for part in str(config.PASSTHROUGH_OUTPUT_MODE or "").split(",")}
+    steps: list[tuple[str, float]] = [("process_start", 0.5)]
+    if config.DLNA_ALL_VIDEOS_ENABLED:
+        steps.append(("media_index", 15.0))
+    steps.append(("gpu_requirement", 1.5))
+    if config.GPU_REPAIR_REBUILD_TRT and requested_trt:
+        steps.append(("trt_rebuild", 300.0))
+    if requested_trt:
+        steps.append(("trt_validate", 2.0))
+    if config.RTX_VSR_REALTIME_ENABLED and "superres" in output_modes:
+        steps.append(("vsr_preflight", 8.0))
+    if config.STARTUP_GPU_WARMUP:
+        steps.extend([
+            ("predict_probe", 2.0),
+            ("predict", 0.5),
+            ("warmup_start", 0.5),
+            ("matter_singleton", 25.0),
+        ])
+        if runtime_trt:
+            steps.append(("static_trt_preload", 12.0))
+        steps.append(("ort_iobinding_runs", 12.0 if runtime_trt else 90.0))
+        if config.WARMUP_COMPOSITE_ENABLE:
+            steps.append(("composite_jit", 12.0))
+        steps.append(("reset_state", 0.5))
+    if _passthrough_mode_enabled("two_dvr"):
+        steps.append(("da3_trt_warmup", 45.0))
+    try:
+        from utils.runtime_settings import get_rm
+
+        rm_enabled = bool(get_rm().enabled)
+    except Exception:
+        rm_enabled = False
+    if rm_enabled:
+        steps.append(("rm_trt_warmup", 60.0))
+    if config.USE_PYNV and config.NVENC_PREFLIGHT_ENABLE:
+        steps.append(("nvenc_preflight", 8.0))
+    steps.extend([
+        ("runtime_pool", 1.0),
+        ("firewall", 1.0),
+        ("ssdp", 1.0),
+        ("http_starting", 2.0),
+        ("listening", 0.5),
+    ])
+    return steps
+
+
+def _startup_plan_estimate_profiles(provider_kind: str) -> dict[str, str]:
+    return {"ort_iobinding_runs": provider_kind or "unknown"}
 
 
 def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -124,6 +191,71 @@ def _validate_tensorrt_provider(log) -> bool:
     return False
 
 
+def _rebuild_realtime_trt_cache_isolated(log) -> bool:
+    """Rebuild repaired realtime RVM TRT artifacts without risking the server."""
+    from ui.services.process_helpers import base_environment, trt_warmup_command
+
+    exe, base_args = trt_warmup_command()
+    args = [
+        *base_args,
+        "--model",
+        "rvm",
+        "--input-size",
+        str(int(config.MATTING_INPUT_SIZE)),
+        "--downsample",
+        str(float(config.RVM_DOWNSAMPLE_RATIO)),
+        "--fp16",
+        "1" if config.ONNX_TRT_FP16_ENABLE else "0",
+        "--cuda-graph",
+        "1" if config.ONNX_TRT_CUDA_GRAPH_ENABLE else "0",
+        "--cache-dir",
+        str(config.ONNX_TRT_ENGINE_CACHE_PATH),
+        "--progress-stdout",
+    ]
+    env = base_environment()
+    env.pop("PT_GPU_REPAIR_REBUILD_TRT", None)
+    set_startup_phase(
+        "warming",
+        "rebuilding TensorRT acceleration cache",
+        step="trt_rebuild",
+        step_index=0,
+        step_total=0,
+        progress=0.03,
+        provider_kind="trt",
+        trt_building=True,
+        trt_build_model="rvm",
+        minimum_step_estimate_sec=300.0,
+        monotonic_progress=True,
+    )
+    start_heartbeat(300.0, baseline_progress=0.03, ceiling_progress=0.18)
+    try:
+        completed = subprocess.run(
+            [exe, *args],
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=1800,
+            check=False,
+            **hidden_subprocess_kwargs(),
+        )
+    except Exception as exc:
+        log.warning("GPU repair TensorRT rebuild process failed: %s", exc, exc_info=True)
+        return False
+    finally:
+        stop_heartbeat()
+    output = str(completed.stdout or "").strip()
+    if output:
+        log.info("GPU repair TensorRT rebuild output:\n%s", output[-16000:])
+    if completed.returncode != 0:
+        log.warning("GPU repair TensorRT rebuild exited rc=%d; continuing with CUDA fallback", completed.returncode)
+        return False
+    log.info("GPU repair TensorRT rebuild completed successfully")
+    return True
+
+
 def _passthrough_mode_enabled(mode: str) -> bool:
     raw = str(config.PASSTHROUGH_OUTPUT_MODE or "none").strip().lower()
     if raw == "all":
@@ -156,6 +288,12 @@ def _warmup_da3_trt_if_needed(log, *, step_total: int, provider_kind: str) -> No
         progress=0.90,
         provider_kind=provider_kind,
         detail=variant,
+        trt_building=not cache_present,
+        trt_build_model="da3",
+        # Loading an existing engine still takes tens of seconds. Keep a floor
+        # here too, otherwise a step previously learned as skipped (0.01s)
+        # would drive the bar and ETA straight to the bottom of the segment.
+        minimum_step_estimate_sec=120.0 if not cache_present else 30.0,
     )
     start_heartbeat(
         eta_sec=30.0 if cache_present else 120.0,
@@ -177,6 +315,9 @@ def _warmup_da3_trt_if_needed(log, *, step_total: int, provider_kind: str) -> No
             progress=0.93,
             provider_kind=provider_kind,
             detail=variant,
+            trt_building=not cache_present,
+            trt_build_model="da3",
+            minimum_step_estimate_sec=120.0 if not cache_present else 30.0,
             monotonic_progress=True,
         )
         log.info(
@@ -252,9 +393,12 @@ def _warmup_rm_trt_if_needed(log, *, step_total: int, provider_kind: str) -> Non
         progress=0.93,
         provider_kind=provider_kind,
         detail="demosaic",
+        trt_building=not cache_present,
+        trt_build_model="rm",
+        minimum_step_estimate_sec=420.0 if not cache_present else 30.0,
     )
     start_heartbeat(
-        eta_sec=30.0 if cache_present else 180.0,
+        eta_sec=30.0 if cache_present else 420.0,
         baseline_progress=0.93,
         ceiling_progress=0.96,
     )
@@ -358,6 +502,11 @@ def main(argv: list[str] | None = None) -> int:
         from offline.superres_offline import main as superres_offline_main
 
         return superres_offline_main(argv[1:])
+    if argv and argv[0] == "face_beauty":
+        _force_line_buffered_stdio()
+        from offline.face_beauty import main as face_beauty_main
+
+        return face_beauty_main(argv[1:])
     if argv and argv[0] == "trt_warmup":
         _force_line_buffered_stdio()
         from ui.services.trt_warmup_process import main as trt_warmup_main
@@ -387,19 +536,73 @@ def main(argv: list[str] | None = None) -> int:
     setup()
     log = get("main")
     start_startup_status_server(config.STARTUP_STATUS_PORT)
-    set_startup_phase("starting", "process started")
+    configure_startup_plan(
+        _startup_plan_steps(),
+        history_path=config.ROOT / "runtime_cache" / "startup_step_timings.json",
+        estimate_profiles=_startup_plan_estimate_profiles(
+            "pending"
+            if "TensorrtExecutionProvider" in {p.strip() for p in config.ONNX_PROVIDERS if p.strip()}
+            else provider_kind_from_config()
+        ),
+    )
+    set_startup_phase("starting", "process started", step="process_start", step_progress=1.0)
     log.info("LAN_IP=%s HTTP_PORT=%d UUID=%s", config.LAN_IP, config.HTTP_PORT, config.DEVICE_UUID)
     log.info("VIDEO_DIRS=%s", "|".join(str(path) for path in config.VIDEO_DIRS))
     log.info("MODEL_PATH=%s (exists=%s)", config.MODEL_PATH, config.MODEL_PATH.exists())
     log.info("ONNX providers requested=%s env=%s", config.ONNX_PROVIDERS, os.environ.get("PT_ONNX_PROVIDERS"))
     log.info("GPU_RUNTIME_CACHE=%s", cache_env)
+    if config.DLNA_ALL_VIDEOS_ENABLED:
+        set_startup_phase("starting", "indexing media library", step="media_index")
+        start_heartbeat(15.0, baseline_progress=0.0, ceiling_progress=0.95)
+        try:
+            from dlna.content_directory import build_all_videos_cache
+
+            indexed_count = build_all_videos_cache()
+            log.info("DLNA All Videos cache built: count=%d language=%s", indexed_count, config.UI_LANGUAGE)
+        except Exception as exc:
+            log.exception("DLNA All Videos cache build failed: %s", exc)
+        finally:
+            stop_heartbeat()
+    set_startup_phase("starting", "checking GPU compatibility", step="gpu_requirement")
+    early_gpu = detect_nvidia_gpu_requirement()
+    if early_gpu.detected and not early_gpu.supported:
+        message = unsupported_gpu_message(early_gpu)
+        set_startup_phase(
+            "failed",
+            message,
+            step="gpu_requirement",
+            progress=0.0,
+            gpu_name=early_gpu.name,
+            compute_capability=early_gpu.compute_capability,
+            reason="unsupported_gpu",
+            detail=message,
+        )
+        log.error(message)
+        time.sleep(0.8)
+        stop_startup_status_server()
+        return 1
+    requested_trt = "TensorrtExecutionProvider" in {p.strip() for p in config.ONNX_PROVIDERS if p.strip()}
+    if config.GPU_REPAIR_REBUILD_TRT and requested_trt:
+        _rebuild_realtime_trt_cache_isolated(log)
+    if requested_trt:
+        set_startup_phase("starting", "validating TensorRT cache", step="trt_validate")
     _validate_tensorrt_provider(log)
+    active_provider_kind = provider_kind_from_config()
+    reconfigure_startup_plan(
+        _startup_plan_steps(
+            requested_trt=requested_trt,
+            active_provider_kind=active_provider_kind,
+        ),
+        estimate_profiles=_startup_plan_estimate_profiles(active_provider_kind),
+    )
     log.info("ONNX providers active_after_validation=%s MODEL_PATH=%s", config.ONNX_PROVIDERS, config.MODEL_PATH)
     # Probe one actual NGX evaluation in an isolated process before exposing
     # realtime SuperRes.  A broken SDK/driver must be reported as unavailable
     # rather than hanging a long-lived PyNv worker on its first frame.
     output_modes = {part.strip().lower() for part in str(config.PASSTHROUGH_OUTPUT_MODE or "").split(",")}
     if config.RTX_VSR_REALTIME_ENABLED and "superres" in output_modes:
+        set_startup_phase("starting", "checking RTX video enhancement", step="vsr_preflight")
+        start_heartbeat(8.0, baseline_progress=0.0, ceiling_progress=0.95)
         try:
             from utils.rtx_vsr import run_evaluation_preflight
 
@@ -410,6 +613,8 @@ def main(argv: list[str] | None = None) -> int:
                 log.warning("RTX VSR evaluate preflight failed; realtime SuperRes will be rejected: %s", preflight)
         except Exception as exc:
             log.warning("RTX VSR evaluate preflight unavailable: %s", exc)
+        finally:
+            stop_heartbeat()
     provider_kind = provider_kind_from_config()
     startup_step_total = startup_warmup_step_total(provider_kind)
     nvenc_step_enabled = bool(config.USE_PYNV and config.NVENC_PREFLIGHT_ENABLE)
@@ -449,6 +654,7 @@ def main(argv: list[str] | None = None) -> int:
                 provider_kind=provider_kind,
                 reason=prediction.reason,
                 detail=prediction.detail,
+                monotonic_progress=True,
             )
             start_heartbeat(
                 prediction.estimate_sec,
@@ -466,39 +672,6 @@ def main(argv: list[str] | None = None) -> int:
                 prediction.compute_capability,
                 prediction.onnxruntime_version,
             )
-            cc = parse_compute_capability(prediction.compute_capability)
-            if cc is not None and cc < MIN_NVIDIA_COMPUTE_CAPABILITY:
-                stop_heartbeat()
-                message = unsupported_gpu_message(
-                    GpuRequirementResult(
-                        detected=True,
-                        supported=False,
-                        name=prediction.gpu_name,
-                        compute_capability=prediction.compute_capability,
-                    )
-                )
-                set_startup_phase(
-                    "failed",
-                    message,
-                    step="gpu_requirement",
-                    step_index=0,
-                    step_total=startup_step_total,
-                    progress=0.0,
-                    eta_sec=0.0,
-                    cold=prediction.cold,
-                    is_known_slow=prediction.is_known_slow,
-                    gpu_name=prediction.gpu_name,
-                    compute_capability=prediction.compute_capability,
-                    driver_version=prediction.driver_version,
-                    onnxruntime_version=prediction.onnxruntime_version,
-                    provider_kind=provider_kind,
-                    reason="unsupported_gpu",
-                    detail=message,
-                )
-                log.error(message)
-                time.sleep(0.8)
-                stop_startup_status_server()
-                return 1
         except Exception as e:
             log.warning("warmup prediction failed (non-fatal): %s", e)
             set_startup_phase(
@@ -609,15 +782,31 @@ def main(argv: list[str] | None = None) -> int:
             progress=0.95,
             provider_kind=provider_kind,
         )
+        start_heartbeat(8.0, baseline_progress=0.0, ceiling_progress=0.95)
         try:
             from pipeline.pynv_stream import PyNvPassthroughStream
 
             PyNvPassthroughStream.startup_preflight()
         except Exception as e:
             log.warning("nvenc startup preflight failed; first request will pay it lazily: %s", e, exc_info=True)
-    from pipeline.matting import configure_matter_pool, matter_device
+        finally:
+            stop_heartbeat()
+    if config.PASSTHROUGH_MAX_CONCURRENT_AUTO:
+        config.PASSTHROUGH_MAX_CONCURRENT = resolve_passthrough_max_concurrent("auto")
+        log.info("auto GPU concurrency resolved in server process: %d", config.PASSTHROUGH_MAX_CONCURRENT)
+    set_startup_phase(
+        "starting",
+        "configuring media runtime",
+        step="runtime_pool",
+        provider_kind=provider_kind,
+    )
+    start_heartbeat(3.0, baseline_progress=0.0, ceiling_progress=0.95)
+    try:
+        from pipeline.matting import configure_matter_pool, matter_device
 
-    configure_matter_pool(config.PASSTHROUGH_MAX_CONCURRENT)
+        configure_matter_pool(config.PASSTHROUGH_MAX_CONCURRENT)
+    finally:
+        stop_heartbeat()
     log.info(
         "PIPELINE: HWACCEL=%s DECODE_MAX_SIDE=%d DECODE_PIX_FMT=%s PASSTHROUGH_MAX_FPS=%.2f "
         "ALPHA_STRIDE=%d "
@@ -656,7 +845,11 @@ def main(argv: list[str] | None = None) -> int:
     )
     from utils.firewall import ensure_rules
 
-    ensure_rules()
+    start_heartbeat(2.0, baseline_progress=0.0, ceiling_progress=0.95)
+    try:
+        ensure_rules()
+    finally:
+        stop_heartbeat()
 
     set_startup_phase(
         "ssdp",
@@ -672,10 +865,6 @@ def main(argv: list[str] | None = None) -> int:
     ssdp = SSDPServer()
     ssdp.start()
 
-    from http_app.server import create_app
-
-    ready_signal = _StartupReadySignal(startup_step_total)
-    app = create_app(startup_hook=ready_signal)
     set_startup_phase(
         "http_starting",
         f"uvicorn starting on 0.0.0.0:{config.HTTP_PORT}",
@@ -685,6 +874,11 @@ def main(argv: list[str] | None = None) -> int:
         progress=0.99,
         provider_kind=provider_kind,
     )
+    start_heartbeat(3.0, baseline_progress=0.0, ceiling_progress=0.95)
+    from http_app.server import create_app
+
+    ready_signal = _StartupReadySignal(startup_step_total)
+    app = create_app(startup_hook=ready_signal)
     try:
         import uvicorn
 

@@ -4,6 +4,49 @@ This file only keeps version releases, major bug fixes, major UI/UX updates, and
 
 ## English
 
+### 2026-08-08
+
+- **VR reprojection quality and performance:** Added adaptive supersampling for equirectangular-to-flat projection to remove near-pole aliasing and moire artifacts in VR mosaic restoration and Face Beauty. Replaced the temporary oversized render/downsample path with a fused CUDA accumulation kernel and cached projection footprints and rotation matrices, improving the measured 8K two-region restoration path from 97.9 to 105.7 FPS with visually equivalent output.
+
+### 2026-08-07
+
+- **Face Beauty release gating:** Added a persisted, default-off debug visibility switch for both the Dashboard realtime card and Offline Tools entry, matching mosaic restoration's release behavior. Disabling the entry also disables the runtime feature, blocks direct navigation, and rebuilds the Dashboard grid without gaps.
+
+### 2026-08-06
+
+- **Offline SuperRes bitrate control:** Replaced linear pixel-ratio bitrate scaling with a square-root pixel-ratio automatic policy capped at 80 Mbps, and added 1.2x/1.5x/2x/3x source-bitrate modes capped at 120 Mbps. Both GPU and FFmpeg fallback pipelines now share VBR planning, while the single/batch UI persists the selected mode and conversion logs report bitrate and estimated video size.
+
+### 2026-08-02
+
+- **Realtime Face Beauty:** Added `[FaceBeauty]` DLNA playback and Dashboard integration on top of the GPU-resident pipeline, including source-FPS-to-output-FPS mapping, alternating-frame landmark refinement, two-face defaults, ROI following, VR flat-view restoration, and a dedicated 90-second cold-start allowance. Measured processing reached 37.3 FPS for 1080p two-face footage and 59.0 FPS for stable-state 8K SBS VR with the default realtime cadence controls.
+- **Face Beauty correctness and safety:** Prevented generated ghost faces on hair, occluded profiles, and back-of-head false detections by parsing the untouched source crop before restoration, using source-derived composition masks, retaining landmark confidence, and gating blind generation when source evidence is weak.
+- **DLNA realtime policy fixes:** Removed the stale 2D-only HTTP gate that made advertised VR `[RM]` entries fall back to Alpha at 00:00, preserved `mode` and selected time offsets through RM/Face Beauty playback, and hid/rejected SuperRes for 8K VR while retaining supported 4K VR sources.
+
+### 2026-08-01
+
+- **Offline Face Beauty:** Added single and batch face beautification with YuNet detection, 2DFAN4 landmarks, selectable GFPGAN/RestoreFormer++/GPEN restoration, BiSeNet-guided retouching, presets, fine tuning, model downloads, TensorRT cache preparation, and localized UI. Face swapping was deliberately excluded because the available model and reference licenses are unsuitable.
+- **GPU-resident Face Beauty pipeline:** Added NVDEC -> CuPy/ORT IOBinding -> NVENC processing, GPU warp/mask/retouch/composite kernels, tiled per-eye 8K detection, and gnomonic VR face reprojection with masked paste-back. The optimized GPEN 256 path measured 50.7 FPS at 720p and found/restored both faces in 8K SBS footage that the original full-frame detector missed.
+- **Face Beauty model/cache hardening:** Kept models at their correct precision and alignment templates, isolated TensorRT engine builds in subprocesses, required verified `build.ok` markers, rejected truncated downloads before promotion, and made runtime sessions fall back to CUDA instead of building or loading incomplete engines inline.
+- **RM TensorRT startup hardening:** Added model-mtime cache validation, a bounded 4 GiB workspace setting, longer first-build timeouts, and build-sized startup estimates for the deeper mid=96 restoration model. Realtime and offline contexts may still create separate stable engines; the update prevents legitimate first builds from being misreported or terminated as short cache loads.
+
+### 2026-07-26
+
+- **One-click GPU cache repair:** Added startup-failure and Settings-page repair actions that quarantine only allowlisted generated GPU caches while preserving settings, models, media-library data, and unrelated caches. Repair can rebuild realtime RVM TensorRT in an isolated child, falls back safely to CUDA, reports the active TensorRT/CUDA/CPU provider, preserves native child exit codes, and cleans successful or abandoned quarantines with bounded retention.
+- **Complete startup progress plan:** Replaced independent warmup percentages with a configuration-aware weighted plan covering media indexing, compatibility checks, TensorRT validation/builds, VSR, RVM/DA3/RM initialization, NVENC, runtime pools, firewall, SSDP, HTTP setup, and listening. Per-step timing history provides adaptive whole-startup ETA, provider-specific estimates, monotonic progress, skipped-step convergence, and explicit localized guidance for long TensorRT builds versus cached loads.
+- **GPU-free desktop startup:** Removed CUDA/ORT/TRT and `nvidia-smi` probing from desktop-window construction and moved authoritative provider validation and automatic VRAM/concurrency resolution into the server child, improving startup isolation after driver or cache failures.
+
+### 2026-07-24
+
+- **VR-to-flat mosaic restoration:** Added default-on gnomonic reprojection for VR180 mosaic regions so distorted equirectangular blocks are restored in a flat 256x256 view and composited back per frame, region, and eye. The shared realtime/offline GPU path includes analytic view selection, zero-copy forward projection, fused feathered inverse blending, wide-view fallback, corrected v360 pitch/roll conventions, and localized realtime/offline controls; measured overhead fell to about 6.6% after optimization.
+
+### 2026-07-23
+
+- **Mosaic restoration hang fix:** Added a bounded dynamic TensorRT batch profile across all recurrent restorer inputs and capped detections to the profiled region count, preventing first-seen region counts from triggering runtime engine rebuilds and VRAM stalls. The previously hanging five-region offline clip completed at 63.2 FPS, and the shared fix also covers realtime `[RM]` playback.
+
+### 2026-07-21
+
+- **DLNA All Videos view:** Added an optional, localized root-level All Videos directory that indexes supported media at startup, groups duplicate names safely through virtual ObjectIDs, and exposes each source's normal and realtime playback entries. The setting is disabled by default, and the Settings page now uses the same window height as the Dashboard.
+
 ### 2026-07-20
 
 - **Desktop UI v1.2.0 overhaul:** Replaced the legacy expanding Home layout with a fixed navigation rail, feature-card dashboard, standalone Offline Tools, Subtitle Style, Logs, and scrolling Settings pages. Updated card grouping, naming, lock-state feedback, player-support entry points, and the three localized interfaces.
@@ -272,6 +315,49 @@ This file only keeps version releases, major bug fixes, major UI/UX updates, and
 - **Core update:** Added initial DLNA time-seek metadata, passthrough HEAD support, and `PT_CONTAINER` support for MP4 and MPEG-TS passthrough output.
 
 ## 中文
+
+### 2026-08-08
+
+- **VR投影画质与性能：** 为等距柱状图转平面投影加入自适应超采样，消除VR马赛克复原和人脸美化在近极区的混叠与摩尔纹；用融合CUDA累加kernel替代“大图临时缓冲+缩小”路径，并缓存投影footprint和旋转矩阵。8K双区域马赛克复原实测由97.9 FPS提升至105.7 FPS，输出视觉等价。
+
+### 2026-08-07
+
+- **人脸美化发布门控：** 新增持久化且默认关闭的调试可见性开关，同时控制首页实时卡片和离线工具入口，与马赛克复原的发布策略一致；隐藏入口时会同步关闭运行功能、阻止直接跳转，并正确重排首页卡片而不留空位。
+
+### 2026-08-06
+
+- **离线超分码率控制：** 默认码率从按像素比线性放大改为按像素比平方根计算并限制为80 Mbps，新增原片码率1.2/1.5/2/3倍档位并限制为120 Mbps。GPU路径与FFmpeg回退路径共用VBR规划，单文件和批量页面会同步保存档位，日志增加目标/最大码率和预计视频流大小。
+
+### 2026-08-02
+
+- **实时人脸美化：** 在GPU常驻链路上新增`[FaceBeauty]` DLNA播放和首页入口，支持源帧率到输出帧率映射、隔帧关键点细化、默认最多两张脸、ROI跟踪、VR平面视图复原及专用90秒冷启动等待。默认实时节奏控制下，1080p双人实测37.3 FPS，8K SBS VR稳定阶段实测59.0 FPS。
+- **人脸美化正确性与安全：** 在生成式复原前解析未修改的源人脸crop，使用源图生成合成mask、保留关键点置信度，并在源证据不足时禁止盲目生成，修复头发、严重遮挡侧脸和后脑误检处被生成“幽灵脸”的问题。
+- **DLNA实时策略修复：** 移除HTTP层残留的RM仅限2D检查，修复已展示的VR `[RM]` 入口回退到00:00 Alpha播放的问题；确保RM/Face Beauty保留`mode`与所选时间偏移，并对8K VR隐藏且拒绝SuperRes，同时保留支持的4K VR源。
+
+### 2026-08-01
+
+- **离线人脸美化：** 新增单文件与批量美化，集成YuNet检测、2DFAN4关键点、可选GFPGAN/RestoreFormer++/GPEN复原、BiSeNet引导润色、预设、精细调节、模型下载、TensorRT缓存准备和多语言界面。因现有模型与参考代码许可证不适合，本功能明确不包含换脸。
+- **GPU常驻人脸美化链路：** 新增NVDEC -> CuPy/ORT IOBinding -> NVENC处理、GPU几何变换/mask/润色/合成kernel、逐眼8K分块检测，以及带mask回贴的VR球面转平面人脸复原。优化后的GPEN 256路径在720p实测50.7 FPS，并能在原整帧检测完全漏检的8K SBS素材中找到并复原双眼人脸。
+- **人脸模型与缓存加固：** 按模型固定正确精度和对齐模板，将TensorRT引擎构建隔离到子进程，缓存必须有推理验证后的`build.ok`标记；下载文件长度不符时不再转正，运行时遇到缺失或不完整引擎会回退CUDA，不再内联构建或加载坏缓存。
+- **RM TensorRT启动加固：** 为更深的mid=96复原模型增加模型mtime缓存校验、4 GiB构建workspace上限、更长的首次构建超时和符合实际的构建ETA。实时与离线上下文仍可能各自生成稳定引擎；本次更新避免把正常首次构建误判为短时缓存加载并提前终止。
+
+### 2026-07-26
+
+- **一键修复GPU缓存：** 在启动失败遮罩和设置页新增修复入口，仅隔离白名单中的生成型GPU缓存，保留设置、模型、媒体库和无关缓存；可在隔离子进程重建实时RVM TensorRT，失败时安全回退CUDA，显示实际TensorRT/CUDA/CPU provider，保留原始子进程退出码，并按成功状态或保留期限清理隔离目录。
+- **完整启动进度计划：** 用按当前配置生成的加权计划替代各组件独立百分比，覆盖媒体索引、兼容性检查、TensorRT验证/构建、VSR、RVM/DA3/RM初始化、NVENC、运行池、防火墙、SSDP、HTTP应用和监听。逐步骤历史耗时可自适应整段ETA，区分provider估时，保证进度单调、跳过步骤快速收敛，并对长时间TensorRT构建和缓存加载显示不同的多语言提示。
+- **桌面UI无GPU探测启动：** 从桌面窗口构造阶段移除CUDA/ORT/TRT和`nvidia-smi`探测，将权威provider校验及显存/并发自动解析移到服务器子进程，提高驱动或缓存异常后的启动隔离性。
+
+### 2026-07-24
+
+- **VR转平面马赛克复原：** 为VR180马赛克区域新增默认开启的球面转平面处理，使等距柱状图中扭曲的马赛克先在256x256平面视图复原，再按帧、区域和左右眼合成回原图。实时与离线共用的GPU路径支持解析式视角计算、零拷贝前向投影、融合羽化反向合成、超宽视角回退、修正后的v360俯仰/滚转约定及两处UI控制；优化后实测额外开销约6.6%。
+
+### 2026-07-23
+
+- **马赛克复原卡死修复：** 为递归复原模型全部输入加入有上限的动态TensorRT batch profile，并把检测区域数限制在profile范围内，避免首次出现新区域数量时运行期重建引擎并因显存压力卡死。此前会卡住的五区域离线片段以63.2 FPS完成，共享修复同时覆盖实时`[RM]`播放。
+
+### 2026-07-21
+
+- **DLNA“全部视频”：** 新增默认关闭、支持多语言的根目录“全部视频”入口，启动时索引支持的媒体，通过虚拟ObjectID安全处理同名文件，并在每个文件下复用普通及实时播放入口；设置页高度同时统一为首页高度。
 
 ### 2026-07-20
 

@@ -366,6 +366,7 @@ def _run_one(args: argparse.Namespace, src: Path) -> int:
             preset=str(getattr(args, "preset", config.PASSTHROUGH_PYNV_PRESET) or config.PASSTHROUGH_PYNV_PRESET),
             hdr_look=str(getattr(args, "rtx_vsr_hdr_look", config.RTX_VSR_HDR_LOOK) or config.RTX_VSR_HDR_LOOK),
             cq=int(getattr(args, "cq", 19) if int(getattr(args, "cq", -1)) >= 0 else 19),
+            bitrate_mode=str(getattr(args, "rtx_vsr_bitrate_mode", "auto") or "auto"),
         )
     cmd = _base_cmd(args, src, out)
     print("[offline] run: " + subprocess.list2cmdline(cmd), flush=True)
@@ -535,6 +536,7 @@ def main(argv: list[str] | None = None) -> int:
     single.add_argument("--rtx-vsr-target-height", type=int, default=config.RTX_VSR_TARGET_HEIGHT)
     single.add_argument("--rtx-vsr-quality", type=int, choices=[2, 3, 4], default=config.RTX_VSR_QUALITY)
     single.add_argument("--rtx-vsr-hdr-look", choices=["off", "natural", "vivid"], default=config.RTX_VSR_HDR_LOOK)
+    single.add_argument("--rtx-vsr-bitrate-mode", choices=["auto", "1.2", "1.5", "2", "3"], default="auto")
     single.add_argument("--start", type=float, default=0.0)
     single.add_argument("--duration", type=float, default=0.0)
     single.add_argument("--segment", dest="segments", type=_segment_arg, action="append", default=[], metavar="START-END")
@@ -557,6 +559,7 @@ def main(argv: list[str] | None = None) -> int:
     batch.add_argument("--rtx-vsr-target-height", type=int, default=config.RTX_VSR_TARGET_HEIGHT)
     batch.add_argument("--rtx-vsr-quality", type=int, choices=[2, 3, 4], default=config.RTX_VSR_QUALITY)
     batch.add_argument("--rtx-vsr-hdr-look", choices=["off", "natural", "vivid"], default=config.RTX_VSR_HDR_LOOK)
+    batch.add_argument("--rtx-vsr-bitrate-mode", choices=["auto", "1.2", "1.5", "2", "3"], default="auto")
     batch.add_argument("--recursive", action=argparse.BooleanOptionalAction, default=True)
     batch.add_argument("--skip-existing", action="store_true")
     batch.add_argument("--fps", type=float, default=RVM_DEFAULT_ARGS["fps"])

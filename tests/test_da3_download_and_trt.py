@@ -106,6 +106,58 @@ class Da3DownloadAndTrtTests(unittest.TestCase):
         engine.assert_called_once_with(variant="base", provider="trt")
         session.run.assert_called_once()
 
+    def test_startup_warmup_budgets_the_step_even_when_the_cache_is_present(self) -> None:
+        """Loading a cached engine still takes tens of seconds.
+
+        Without a floor, a step whose history was learned as skipped (0.01s)
+        would drive the plan bar and ETA straight to the end of its segment.
+        """
+        import onnxruntime as ort
+        import main
+        from offline import da3_depth
+
+        class FakeLog:
+            def info(self, *_args, **_kwargs) -> None:
+                pass
+
+            def warning(self, *_args, **_kwargs) -> None:
+                pass
+
+        for cache_present in (True, False):
+            with self.subTest(cache_present=cache_present), tempfile.TemporaryDirectory() as raw:
+                model_path = Path(raw) / "da3_base.onnx"
+                model_path.write_bytes(b"onnx")
+                session = SimpleNamespace(run=MagicMock(return_value=[None]))
+                fake_engine = SimpleNamespace(
+                    providers=["TensorrtExecutionProvider"],
+                    session=session,
+                    input_name="input",
+                    output_name="output",
+                    folded=True,
+                    size=518,
+                )
+                with (
+                    patch.object(main, "_passthrough_mode_enabled", return_value=True),
+                    patch.object(main.config, "TWO_DVR_MODEL", "base"),
+                    patch.object(ort, "get_available_providers", return_value=["TensorrtExecutionProvider"]),
+                    patch.object(da3_depth, "trt_engine_cached", return_value=cache_present),
+                    patch.object(da3_depth, "default_model_path", return_value=model_path),
+                    patch.object(da3_depth, "_ENGINE_CACHE", {}),
+                    patch.object(da3_depth, "Da3DepthEngine", return_value=fake_engine),
+                    patch.object(main, "set_startup_phase") as phase,
+                    patch.object(main, "start_heartbeat"),
+                    patch.object(main, "stop_heartbeat"),
+                ):
+                    main._warmup_da3_trt_if_needed(FakeLog(), step_total=3, provider_kind="trt")
+
+                minimums = [call.kwargs.get("minimum_step_estimate_sec") for call in phase.call_args_list]
+                self.assertTrue(minimums)
+                for minimum in minimums:
+                    self.assertIsNotNone(minimum)
+                    self.assertGreaterEqual(minimum, 30.0)
+                for call in phase.call_args_list:
+                    self.assertEqual(call.kwargs.get("trt_building"), not cache_present)
+
     def test_startup_da3_warmup_failure_is_nonfatal(self) -> None:
         import main
 

@@ -75,6 +75,11 @@ def onnx_providers(provider: str, variant: str) -> list:
                 "trt_engine_cache_enable": True,
                 "trt_engine_cache_path": str(_trt_cache_dir(variant)),
                 "trt_timing_cache_enable": True,
+                # Pin workspace so the engine hash does not depend on free VRAM at
+                # build time -- otherwise the realtime (post-GPU-warmup) and offline
+                # 2DVR paths build mismatched hashes and rebuild each other's engine
+                # (see config.ONNX_TRT_MAX_WORKSPACE_BYTES).
+                "trt_max_workspace_size": config.ONNX_TRT_MAX_WORKSPACE_BYTES,
             },
         ))
     if provider in ("trt", "cuda") and "CUDAExecutionProvider" in available:

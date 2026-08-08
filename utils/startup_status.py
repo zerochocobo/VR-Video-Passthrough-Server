@@ -13,6 +13,7 @@ import json
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 from typing import Any
 
 from utils.logger import get
@@ -44,6 +45,190 @@ _server: ThreadingHTTPServer | None = None
 _thread: threading.Thread | None = None
 _heartbeat_thread: threading.Thread | None = None
 _heartbeat_stop: threading.Event | None = None
+_plan_steps: list[dict[str, Any]] = []
+_plan_started_at = 0.0
+_plan_current_step = ""
+_plan_step_started_at = 0.0
+_plan_history_path: Path | None = None
+_plan_history: dict[str, float] = {}
+_plan_seen: set[str] = set()
+
+
+def configure_startup_plan(
+    steps: list[tuple[str, float]],
+    *,
+    history_path: Path | None = None,
+    estimate_profiles: dict[str, str] | None = None,
+) -> None:
+    """Install the ordered, weighted plan used by the startup overlay.
+
+    Estimates are seconds, optionally refined with an EWMA from previous
+    successful starts. Callers may keep publishing their existing local
+    progress; this module maps the active step into one monotonic global bar.
+    """
+    global _plan_steps, _plan_started_at, _plan_current_step, _plan_step_started_at
+    global _plan_history_path, _plan_history, _plan_seen
+    stop_heartbeat()
+    history: dict[str, float] = {}
+    if history_path is not None:
+        try:
+            loaded = json.loads(history_path.read_text(encoding="utf-8-sig"))
+            if isinstance(loaded, dict):
+                history = {
+                    str(key): max(0.1, float(value))
+                    for key, value in loaded.items()
+                    if isinstance(value, (int, float))
+                }
+        except (OSError, ValueError, TypeError):
+            history = {}
+    profiles = estimate_profiles or {}
+    normalized = []
+    for key, default_estimate in steps:
+        step_key = str(key)
+        profile = str(profiles.get(step_key) or "").strip()
+        history_key = f"{step_key}@{profile}" if profile else step_key
+        if profile == "pending":
+            # Pending is a conservative pre-validation budget, not a runtime
+            # provider whose duration should be learned. Ignore and remove
+            # values written by older builds with the profile-switch bug.
+            history.pop(history_key, None)
+            estimate = max(0.1, float(default_estimate))
+        else:
+            estimate = history.get(history_key, max(0.1, float(default_estimate)))
+        normalized.append({"key": step_key, "history_key": history_key, "estimate": estimate})
+    now = time.time()
+    with _lock:
+        _plan_steps = normalized
+        _plan_started_at = now
+        _plan_current_step = ""
+        _plan_step_started_at = 0.0
+        _plan_history_path = history_path
+        _plan_history = history
+        _plan_seen = set()
+        _state["plan_active"] = bool(normalized)
+        _state["plan_steps"] = [item["key"] for item in normalized]
+        _state["plan_estimate_sec"] = round(sum(float(item["estimate"]) for item in normalized), 1)
+        _state["step_total"] = len(normalized)
+        _state["step_index"] = 0
+        _state["progress"] = 0.0
+        _state["eta_sec"] = _state["plan_estimate_sec"]
+        _state["elapsed_sec"] = 0.0
+        _state["total_elapsed_sec"] = 0.0
+        _state["step_elapsed_sec"] = 0.0
+
+
+def reconfigure_startup_plan(
+    steps: list[tuple[str, float]],
+    *,
+    estimate_profiles: dict[str, str] | None = None,
+) -> None:
+    """Replace future plan weights without resetting elapsed/progress state."""
+    global _plan_steps
+    now = time.time()
+    with _lock:
+        previous_steps = list(_plan_steps)
+        profiles = estimate_profiles or {}
+        normalized = []
+        for key, default_estimate in steps:
+            step_key = str(key)
+            profile = str(profiles.get(step_key) or "").strip()
+            history_key = f"{step_key}@{profile}" if profile else step_key
+            estimate = _plan_history.get(history_key, max(0.1, float(default_estimate)))
+            normalized.append({"key": step_key, "history_key": history_key, "estimate": estimate})
+        retained_keys = {str(item["key"]) for item in normalized}
+        for item in previous_steps:
+            if str(item["key"]) not in _plan_seen and str(item["key"]) not in retained_keys:
+                _mark_plan_step_skipped_locked(str(item["history_key"]))
+        _plan_steps = normalized
+        _state["plan_active"] = bool(normalized)
+        _state["plan_steps"] = [item["key"] for item in normalized]
+        _state["plan_estimate_sec"] = round(sum(float(item["estimate"]) for item in normalized), 1)
+        _state["step_total"] = len(normalized)
+        if _plan_current_step:
+            current = next((item for item in normalized if item["key"] == _plan_current_step), None)
+            if current is not None:
+                elapsed = max(0.0, now - _plan_step_started_at)
+                local = min(0.95, elapsed / max(0.1, float(current["estimate"])))
+                _apply_plan_locked(_plan_current_step, now, local)
+
+
+def _plan_index(step: str) -> int:
+    for index, item in enumerate(_plan_steps):
+        if item["key"] == step:
+            return index
+    return -1
+
+
+def _complete_plan_step_locked(now: float) -> None:
+    global _plan_current_step, _plan_step_started_at
+    if not _plan_current_step or _plan_step_started_at <= 0:
+        return
+    elapsed = max(0.01, now - _plan_step_started_at)
+    item = next((candidate for candidate in _plan_steps if candidate["key"] == _plan_current_step), None)
+    history_key = str(item["history_key"]) if item is not None else _plan_current_step
+    _update_plan_history_locked(history_key, elapsed)
+    _plan_current_step = ""
+    _plan_step_started_at = 0.0
+
+
+def _update_plan_history_locked(step: str, elapsed: float) -> None:
+    previous = _plan_history.get(step)
+    _plan_history[step] = elapsed if previous is None else previous * 0.7 + elapsed * 0.3
+
+
+def _mark_plan_step_skipped_locked(step: str) -> None:
+    # A skipped step is a deterministic zero-duration observation, not a noisy
+    # timing sample. Collapse it immediately so the next start is not burdened
+    # by a stale duration from an earlier configuration/cache state.
+    _plan_history[step] = 0.01
+
+
+def _save_plan_history_locked() -> None:
+    for item in _plan_steps:
+        key = str(item["key"])
+        if key not in _plan_seen:
+            _mark_plan_step_skipped_locked(str(item["history_key"]))
+    if _plan_history_path is None or not _plan_history:
+        return
+    try:
+        _plan_history_path.parent.mkdir(parents=True, exist_ok=True)
+        _plan_history_path.write_text(
+            json.dumps(_plan_history, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+    except OSError:
+        pass
+
+
+def _apply_plan_locked(step: str, now: float, local_progress: float = 0.0) -> None:
+    global _plan_current_step, _plan_step_started_at
+    index = _plan_index(step)
+    if index < 0:
+        if _plan_current_step and step != _plan_current_step:
+            _complete_plan_step_locked(now)
+        return
+    if step != _plan_current_step:
+        _complete_plan_step_locked(now)
+        _plan_current_step = step
+        _plan_step_started_at = now
+    _plan_seen.add(step)
+    local = max(0.0, min(0.99, float(local_progress)))
+    total_estimate = sum(float(item["estimate"]) for item in _plan_steps) or 1.0
+    completed_estimate = sum(float(item["estimate"]) for item in _plan_steps[:index])
+    current_estimate = float(_plan_steps[index]["estimate"])
+    step_elapsed = max(0.0, now - _plan_step_started_at)
+    progress = (completed_estimate + current_estimate * local) / total_estimate
+    remaining = max(0.0, current_estimate * (1.0 - local)) + sum(
+        float(item["estimate"]) for item in _plan_steps[index + 1 :]
+    )
+    _state["step_index"] = index + 1
+    _state["step_total"] = len(_plan_steps)
+    _state["progress"] = max(float(_state.get("progress") or 0.0), min(0.99, progress))
+    _state["eta_sec"] = round(remaining, 1)
+    _state["elapsed_sec"] = round(max(0.0, now - _plan_started_at), 3)
+    _state["total_elapsed_sec"] = _state["elapsed_sec"]
+    _state["step_elapsed_sec"] = round(step_elapsed, 3)
+    _state["step_estimate_sec"] = round(current_estimate, 1)
 
 
 def set_startup_phase(phase: str, message: str = "", **fields: Any) -> None:
@@ -58,18 +243,53 @@ def set_startup_phase(phase: str, message: str = "", **fields: Any) -> None:
     """
     now = time.time()
     monotonic_progress = bool(fields.pop("monotonic_progress", False))
+    local_progress = fields.pop("step_progress", None)
+    minimum_step_estimate = fields.pop("minimum_step_estimate_sec", None)
     with _lock:
         previous_phase = str(_state.get("phase") or "")
+        previous_step = str(_state.get("step") or "")
         _state["phase"] = phase
         _state["message"] = message
         _state["updated_at"] = now
+        step = str(fields.get("step") or "")
+        if step != previous_step:
+            if "trt_building" not in fields:
+                _state["trt_building"] = False
+            if "trt_build_model" not in fields:
+                _state["trt_build_model"] = ""
+        if _plan_steps and phase != "failed":
+            if minimum_step_estimate is not None:
+                item = next((candidate for candidate in _plan_steps if candidate["key"] == step), None)
+                if item is not None:
+                    item["estimate"] = max(float(item["estimate"]), float(minimum_step_estimate))
+                    _state["plan_estimate_sec"] = round(
+                        sum(float(candidate["estimate"]) for candidate in _plan_steps),
+                        1,
+                    )
+            if local_progress is None:
+                done = fields.get("run_done")
+                total = fields.get("run_total")
+                try:
+                    local_progress = float(done) / float(total) if float(total) > 0 else 0.0
+                except (TypeError, ValueError, ZeroDivisionError):
+                    local_progress = 0.0
+            _apply_plan_locked(step, now, float(local_progress))
         for key, value in fields.items():
+            if _plan_steps and phase != "failed" and key in {"step_index", "step_total", "progress", "eta_sec", "elapsed_sec"}:
+                continue
             if key == "progress" and monotonic_progress and previous_phase == phase:
                 try:
                     value = max(float(value), float(_state.get("progress") or 0.0))
                 except (TypeError, ValueError):
                     pass
             _state[key] = value
+        if phase == "listening":
+            _complete_plan_step_locked(now)
+            _state["progress"] = 1.0
+            _state["eta_sec"] = 0.0
+            _state["elapsed_sec"] = round(max(0.0, now - _plan_started_at), 3) if _plan_started_at else 0.0
+            _state["total_elapsed_sec"] = _state["elapsed_sec"]
+            _save_plan_history_locked()
 
 
 def start_heartbeat(eta_sec: float, baseline_progress: float, ceiling_progress: float = 0.95) -> None:
@@ -78,6 +298,11 @@ def start_heartbeat(eta_sec: float, baseline_progress: float, ceiling_progress: 
     stop_heartbeat()
 
     eta = max(0.1, float(eta_sec or 0.1))
+    with _lock:
+        if _plan_steps and _plan_current_step:
+            current = next((item for item in _plan_steps if item["key"] == _plan_current_step), None)
+            if current is not None:
+                eta = max(0.1, float(current["estimate"]))
     baseline = max(0.0, min(1.0, float(baseline_progress)))
     ceiling = max(baseline, min(1.0, float(ceiling_progress)))
     started_at = time.time()
@@ -89,10 +314,13 @@ def start_heartbeat(eta_sec: float, baseline_progress: float, ceiling_progress: 
             elapsed = max(0.0, now - started_at)
             progress = min(ceiling, baseline + (ceiling - baseline) * min(1.0, elapsed / eta))
             with _lock:
-                _state["elapsed_sec"] = round(elapsed, 3)
                 _state["updated_at"] = now
-                if progress > float(_state.get("progress") or 0.0):
-                    _state["progress"] = progress
+                if _plan_steps and _plan_current_step:
+                    _apply_plan_locked(_plan_current_step, now, min(0.95, elapsed / eta))
+                else:
+                    _state["elapsed_sec"] = round(elapsed, 3)
+                    if progress > float(_state.get("progress") or 0.0):
+                        _state["progress"] = progress
 
     _heartbeat_stop = stop_event
     _heartbeat_thread = threading.Thread(target=_run, name="startup-status-heartbeat", daemon=True)

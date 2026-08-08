@@ -99,6 +99,20 @@ class _FakeHiddenProcess:
 
 
 class ServerProcessStopTests(unittest.TestCase):
+    def test_finished_preserves_exit_code(self) -> None:
+        _app()
+        service = ServerProcess()
+        states: list[bool] = []
+        output: list[str] = []
+        service.state_changed.connect(states.append)
+        service.output.connect(output.append)
+
+        service._finished(-1073741819)
+
+        self.assertEqual(service.last_exit_code, -1073741819)
+        self.assertEqual(states, [False])
+        self.assertIn("code=-1073741819", "".join(output))
+
     def test_stop_waits_after_successful_taskkill(self) -> None:
         _app()
         service = ServerProcess()

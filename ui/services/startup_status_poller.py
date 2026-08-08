@@ -62,7 +62,7 @@ class StartupStatusPoller(QObject):
         port: int = DEFAULT_PORT,
         interval_ms: int = 500,
         timeout_sec: float = 1.0,
-        max_duration_sec: float = 300.0,
+        max_duration_sec: float = 900.0,
         parent: QObject | None = None,
     ) -> None:
         super().__init__(parent)

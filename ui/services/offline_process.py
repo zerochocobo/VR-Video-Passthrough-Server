@@ -7,7 +7,7 @@ from PySide6.QtCore import QObject, Signal
 
 from ui.log_sanitizer import clean_log_text
 from ui.services.hidden_process import HiddenProcess
-from ui.services.process_helpers import ROOT, base_environment, offline_command, rm_offline_command, superres_offline_command, two_dvr_command
+from ui.services.process_helpers import ROOT, base_environment, face_beauty_command, offline_command, rm_offline_command, superres_offline_command, two_dvr_command
 from utils.subprocess_hidden import hidden_subprocess_kwargs
 
 _TERMINATE_WAIT_MS = 3000
@@ -130,3 +130,10 @@ class SuperResProcess(OfflineProcess):
 
     def _command(self) -> tuple[str, list[str]]:
         return superres_offline_command()
+
+
+class FaceBeautyProcess(OfflineProcess):
+    """Offline face-beautification process (offline/face_beauty.py)."""
+
+    def _command(self) -> tuple[str, list[str]]:
+        return face_beauty_command()

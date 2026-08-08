@@ -23,6 +23,7 @@ G:\\GIT\\lada\\realtime_inference_reference.py.
 """
 from __future__ import annotations
 
+import math
 import threading
 from pathlib import Path
 from typing import Sequence
@@ -40,7 +41,8 @@ DET_SIZE = 640          # detector input side (overridden from the ONNX shape)
 PROTO_DIM = 32          # mask prototype channels
 
 _DETECTOR_FILE = "vr_mosaic_detection_model_v2_accurate.onnx"
-_RESTORATION_FILE = "vr_mosaic_restoration_chunk_model_v0.1.onnx"
+_DETECTOR_FILE_1280 = "vr_mosaic_detection_model_v2_accurate_1280.onnx"
+_RESTORATION_FILE = "vr_mosaic_restoration_chunk_model_v0.2.onnx"
 _RESTORATION_CACHE_NAME = "restoration_chunk"
 
 
@@ -50,6 +52,10 @@ def _models_dir() -> Path:
 
 def detector_model_path() -> Path:
     return _models_dir() / _DETECTOR_FILE
+
+
+def detector_1280_model_path() -> Path:
+    return _models_dir() / _DETECTOR_FILE_1280
 
 
 def restoration_model_path() -> Path:
@@ -63,41 +69,162 @@ def _trt_cache_dir(name: str) -> Path:
 
 
 def rm_trt_cached() -> bool:
-    """True if TensorRT engines have been built+cached for both RM models."""
-    base = config.ROOT / "runtime_cache" / "demosaic_trt"
-    for name in ("detector", _RESTORATION_CACHE_NAME):
-        cache = base / name
-        if not (cache.is_dir() and any(cache.glob("*.engine"))):
+    """True if a *current* TensorRT engine is cached for the 640 detector and the
+    restorer. The 1280 detector is built lazily per-clip, so it is not part of
+    this check.
+
+    An engine older than its ONNX means the model was swapped (e.g. a new mid=96
+    restorer): ORT-TRT will rebuild on first use, which is slow. Returning False
+    then lets startup show the "building" phase with a build-sized ETA instead of
+    a 30s "warming" ETA that stalls the progress bar and trips the startup
+    timeout."""
+    for name, model_path in (("detector", detector_model_path()),
+                             (_RESTORATION_CACHE_NAME, restoration_model_path())):
+        ctx = _ctx_model_path(name)
+        if not ctx.exists():
             return False
+        if model_path.is_file() and model_path.stat().st_mtime > ctx.stat().st_mtime:
+            return False   # model newer than the built engine -> will rebuild
     return True
 
 
-def _onnx_providers(provider: str, cache_name: str) -> list:
+def _restorer_trt_profiles(max_batch: int, states_ch: int = 64) -> dict[str, str]:
+    """Explicit TensorRT optimization-profile shapes for the chunk restorer,
+    covering the dynamic ``batch`` (== detected region count) from 1..max_batch.
+
+    Without an explicit profile ORT-TRT locks each engine to the first shape it
+    sees, so every new region count triggers a *runtime* engine rebuild -- which
+    stalls under VRAM pressure and hangs the pipeline (see the batch=5 hang).
+    One profile spanning the whole range builds a single engine, once, up front.
+    All three inputs share the same ``batch`` axis, so all three must be listed.
+    ``states_ch`` is the state channel count (64 for mid=64, 96 for mid=96).
+    """
+    # Optimize for the most common batch: VR SBS is measured at 2 (one region per
+    # eye), 2D at 1. The engine still spans 1..max_batch; opt just tunes for 2.
+    opt_batch = min(2, max_batch)
+
+    def shp(b: int) -> str:
+        return (f"lqs:{b}x{WINDOW}x3x{REST_SIZE}x{REST_SIZE},"
+                f"prev_ds:{b}x3x64x64,"
+                f"states:{b}x2x{states_ch}x64x64")
+
+    return {
+        "trt_profile_min_shapes": shp(1),
+        "trt_profile_opt_shapes": shp(opt_batch),
+        "trt_profile_max_shapes": shp(max_batch),
+    }
+
+
+def _onnx_providers(provider: str, cache_name: str,
+                    trt_profiles: dict[str, str] | None = None,
+                    ep_context_dump: Path | None = None) -> list:
     """Provider chain. ``trt`` puts the TensorRT EP (fp16 + cached engine) in
-    front of CUDA, then CPU. Mirrors offline.da3_depth.onnx_providers."""
+    front of CUDA, then CPU. Mirrors offline.da3_depth.onnx_providers.
+
+    ``trt_profiles`` (restorer only) pins the optimization-profile shape range so
+    a dynamic batch never forces a runtime engine rebuild."""
     available = set(ort.get_available_providers())
     chain: list = []
     if provider == "trt" and "TensorrtExecutionProvider" in available:
-        chain.append((
-            "TensorrtExecutionProvider",
-            {
-                "trt_fp16_enable": True,
-                "trt_engine_cache_enable": True,
-                "trt_engine_cache_path": str(_trt_cache_dir(cache_name)),
-                "trt_timing_cache_enable": True,
-            },
-        ))
+        trt_opts = {
+            "trt_fp16_enable": True,
+            "trt_engine_cache_enable": True,
+            "trt_engine_cache_path": str(_trt_cache_dir(cache_name)),
+            "trt_timing_cache_enable": True,
+            # Pin the workspace so the cached engine's hash does not depend on the
+            # free VRAM at build time (else realtime vs offline builds mismatch and
+            # rebuild; see config.ONNX_TRT_MAX_WORKSPACE_BYTES).
+            "trt_max_workspace_size": config.ONNX_TRT_MAX_WORKSPACE_BYTES,
+        }
+        if trt_profiles:
+            trt_opts.update(trt_profiles)
+        if ep_context_dump is not None:
+            # Compile the engine and embed it in an EPContext onnx. Loading that
+            # onnx later reuses the engine directly (no rebuild), so offline and
+            # realtime share one engine regardless of build-time VRAM state.
+            # Disable the plain engine cache while dumping: with it on, a cached
+            # engine is reused and the build -- hence the ctx dump -- is skipped,
+            # so a swapped model would neither rebuild nor emit a new ctx (and the
+            # stale ctx we just deleted would be gone -> NoSuchFile).
+            trt_opts["trt_engine_cache_enable"] = False
+            trt_opts.pop("trt_engine_cache_path", None)
+            trt_opts.update({
+                "trt_dump_ep_context_model": "True",
+                "trt_ep_context_file_path": str(ep_context_dump),
+                "trt_ep_context_embed_mode": "1",
+            })
+        chain.append(("TensorrtExecutionProvider", trt_opts))
     if provider in ("trt", "cuda") and "CUDAExecutionProvider" in available:
         chain.append("CUDAExecutionProvider")
     chain.append("CPUExecutionProvider")
     return chain
 
 
-def _make_session(model_path: Path, provider: str, cache_name: str) -> ort.InferenceSession:
+def _ctx_model_path(cache_name: str) -> Path:
+    """EPContext onnx (engine embedded) for a cache name. Env-specific, so it
+    lives under runtime_cache, not the repo."""
+    return config.ROOT / "runtime_cache" / "demosaic_trt" / f"{cache_name}_ctx.onnx"
+
+
+def _session_opts() -> "ort.SessionOptions":
     opts = ort.SessionOptions()
     opts.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
-    return ort.InferenceSession(str(model_path), sess_options=opts,
-                                providers=_onnx_providers(provider, cache_name))
+    return opts
+
+
+def _dummy_run(sess: ort.InferenceSession) -> None:
+    """One inference to force ORT-TRT to build (and, if requested, dump) the
+    engine now rather than lazily on first real use."""
+    feeds = {}
+    for i in sess.get_inputs():
+        shape = [d if isinstance(d, int) and d > 0 else 2 for d in i.shape]
+        feeds[i.name] = np.random.rand(*shape).astype(np.float32)
+    sess.run(None, feeds)
+
+
+def _load_ctx_session(ctx_path: Path) -> ort.InferenceSession:
+    """Load an EPContext onnx: the embedded engine is reused as-is (no rebuild),
+    so this is fast and independent of build-time VRAM."""
+    return ort.InferenceSession(
+        str(ctx_path), sess_options=_session_opts(),
+        providers=[("TensorrtExecutionProvider", {"trt_fp16_enable": True}),
+                   "CUDAExecutionProvider", "CPUExecutionProvider"])
+
+
+def _build_ctx(model_path: Path, cache_name: str,
+               trt_profiles: dict[str, str] | None, ctx_path: Path) -> None:
+    ctx_path.parent.mkdir(parents=True, exist_ok=True)
+    sess = ort.InferenceSession(
+        str(model_path), sess_options=_session_opts(),
+        providers=_onnx_providers("trt", cache_name, trt_profiles, ep_context_dump=ctx_path))
+    _dummy_run(sess)   # triggers the engine build + EPContext dump
+    del sess
+
+
+def _make_session(model_path: Path, provider: str, cache_name: str,
+                  trt_profiles: dict[str, str] | None = None) -> ort.InferenceSession:
+    # Non-TRT providers keep the plain path (offline --provider cuda/cpu).
+    if provider != "trt" or "TensorrtExecutionProvider" not in set(ort.get_available_providers()):
+        return ort.InferenceSession(str(model_path), sess_options=_session_opts(),
+                                    providers=_onnx_providers(provider, cache_name, trt_profiles))
+    # TRT: build the engine once into an EPContext onnx, then always load that.
+    # offline and realtime load the same file -> one shared engine.
+    ctx = _ctx_model_path(cache_name)
+    # Rebuild if the ctx is missing OR older than the model: swapping in a new
+    # .onnx must not keep silently running the old embedded engine.
+    stale = (ctx.exists() and model_path.is_file()
+             and model_path.stat().st_mtime > ctx.stat().st_mtime)
+    if not ctx.exists() or stale:
+        ctx.unlink(missing_ok=True)
+        _build_ctx(model_path, cache_name, trt_profiles, ctx)
+    try:
+        return _load_ctx_session(ctx)
+    except Exception:
+        # ctx built for a different GPU/TRT (e.g. driver or hardware change);
+        # rebuild it once for this environment.
+        ctx.unlink(missing_ok=True)
+        _build_ctx(model_path, cache_name, trt_profiles, ctx)
+        return _load_ctx_session(ctx)
 
 
 def _letterbox(img: np.ndarray, size: int) -> tuple[np.ndarray, float, int, int]:
@@ -125,8 +252,9 @@ class Detection:
 class DemosaicDetector:
     """YOLO11m-seg mosaic detector running on onnxruntime."""
 
-    def __init__(self, provider: str = "trt"):
-        self.sess = _make_session(detector_model_path(), provider, "detector")
+    def __init__(self, provider: str = "trt", model_path: Path | None = None,
+                 cache_name: str = "detector"):
+        self.sess = _make_session(model_path or detector_model_path(), provider, cache_name)
         self.input_name = self.sess.get_inputs()[0].name
         shape = self.sess.get_inputs()[0].shape
         try:
@@ -134,6 +262,17 @@ class DemosaicDetector:
         except Exception:
             self.size = DET_SIZE
         self.output_names = [o.name for o in self.sess.get_outputs()]
+        # EPContext can reorder the two outputs, so identify them by rank rather
+        # than position: detections are rank-3 (1, 4+nc+32, N), mask protos are
+        # rank-4 (1, 32, 160, 160).
+        self._det_out = self._proto_out = None
+        for o in self.sess.get_outputs():
+            if len(o.shape) == 4:
+                self._proto_out = o.name
+            else:
+                self._det_out = o.name
+        if self._det_out is None or self._proto_out is None:
+            self._det_out, self._proto_out = self.output_names[0], self.output_names[1]
 
     @property
     def providers(self) -> list:
@@ -159,16 +298,24 @@ class DemosaicDetector:
         square canvas (the GPU path), skipping the host-side cv2 resize of the
         full frame."""
         blob = canvas_u8.astype(np.float32).transpose(2, 0, 1)[None] / 255.0
-        out0, out1 = self.sess.run(self.output_names,
-                                   {self.input_name: np.ascontiguousarray(blob)})
-        return _postprocess_detections(out0, out1, scale, pad_x, pad_y, frame_hw, conf, iou)
+        results = self.sess.run(self.output_names,
+                                {self.input_name: np.ascontiguousarray(blob)})
+        outs = dict(zip(self.output_names, results))
+        return _postprocess_detections(outs[self._det_out], outs[self._proto_out],
+                                       scale, pad_x, pad_y, frame_hw, conf, iou,
+                                       max_det=config.RM_MAX_REGIONS)
 
 
 def _postprocess_detections(out0: np.ndarray, out1: np.ndarray, scale: float,
                             pad_x: int, pad_y: int, frame_hw: tuple[int, int],
-                            conf: float, iou: float) -> tuple[list[Detection], np.ndarray]:
+                            conf: float, iou: float,
+                            max_det: int = 0) -> tuple[list[Detection], np.ndarray]:
     """Decode YOLO11-seg raw outputs to (detections, protos). Shared by the CPU
-    and GPU (IOBinding) detector paths."""
+    and GPU (IOBinding) detector paths.
+
+    ``max_det`` (>0) caps the returned regions to the top-N by score. This bounds
+    the restorer's dynamic batch to the pre-built TensorRT profile max so a rare
+    high-region-count frame can never trigger a stalling runtime engine rebuild."""
     H, W = frame_hw
     preds = out0[0].T                      # (8400, 4+nc+32)
     protos = out1[0]                       # (32, 160, 160)
@@ -188,7 +335,9 @@ def _postprocess_detections(out0: np.ndarray, out1: np.ndarray, scale: float,
     x2 = (cx + bw / 2 - pad_x) / scale
     y2 = (cy + bh / 2 - pad_y) / scale
     boxes_xyxy = np.stack([x1, y1, x2, y2], axis=1)
-    idx = _nms(boxes_xyxy, scores, iou)
+    idx = _nms(boxes_xyxy, scores, iou)   # descending score order
+    if max_det > 0:
+        idx = idx[:max_det]
     dets: list[Detection] = []
     for i in idx:
         bx1 = max(0, int(round(boxes_xyxy[i, 0])))
@@ -261,8 +410,24 @@ def _initial_prev_ds_np(frames_nchw: np.ndarray) -> np.ndarray:
     return prev
 
 
-def _zero_states_np(batch: int) -> np.ndarray:
-    return np.zeros((batch, 2, 64, 64, 64), dtype=np.float32)
+def _zero_states_np(batch: int, states_ch: int = 64) -> np.ndarray:
+    return np.zeros((batch, 2, states_ch, 64, 64), dtype=np.float32)
+
+
+def _restorer_states_channels(model_path: Path) -> int:
+    """State channel count from the restorer ONNX 'states' input (64 for mid=64,
+    96 for mid=96). Read before the session so the TRT profile can be built."""
+    try:
+        import onnx
+        m = onnx.load(str(model_path), load_external_data=False)
+        for i in m.graph.input:
+            if i.name == "states":
+                dims = i.type.tensor_type.shape.dim
+                if len(dims) >= 3 and dims[2].dim_value > 0:
+                    return int(dims[2].dim_value)
+    except Exception:
+        pass
+    return 64
 
 
 def _box_iou(a: tuple[int, int, int, int], b: tuple[int, int, int, int]) -> float:
@@ -283,7 +448,11 @@ class DemosaicRestorer:
     """Chunk restoration generator running on onnxruntime."""
 
     def __init__(self, provider: str = "trt"):
-        self.sess = _make_session(restoration_model_path(), provider, _RESTORATION_CACHE_NAME)
+        self.states_channels = _restorer_states_channels(restoration_model_path())
+        self.sess = _make_session(
+            restoration_model_path(), provider, _RESTORATION_CACHE_NAME,
+            trt_profiles=_restorer_trt_profiles(config.RM_MAX_REGIONS, self.states_channels),
+        )
         self.input_names = [i.name for i in self.sess.get_inputs()]
         self.input_name = "lqs" if "lqs" in self.input_names else self.input_names[0]
         self.prev_ds_name = "prev_ds" if "prev_ds" in self.input_names else None
@@ -329,7 +498,7 @@ class DemosaicRestorer:
             )
         if self.states_name is not None:
             inputs[self.states_name] = np.ascontiguousarray(
-                _zero_states_np(batch) if states is None else states,
+                _zero_states_np(batch, self.states_channels) if states is None else states,
                 dtype=np.float32,
             )
         raw_outputs = self.sess.run(self.output_names, inputs)
@@ -372,15 +541,34 @@ def restore_center_frame(window_frames_rgb: Sequence[np.ndarray],
 
 
 class DemosaicEngines:
-    """Bundle of detector + restorer sharing one provider preference."""
+    """Bundle of detector + restorer sharing one provider preference.
+
+    The 640px detector is always built (it covers 4K and below); the 1280px one
+    is built lazily the first time an 8K-class source needs it (see
+    ``detector_for``), so deployments that never process 8K pay nothing for it."""
 
     def __init__(self, provider: str = "trt"):
+        self._provider = provider
         self.detector = DemosaicDetector(provider)
         self.restorer = DemosaicRestorer(provider)
+        self._detector_1280: DemosaicDetector | None = None
 
     @property
     def providers(self) -> list:
         return self.detector.providers
+
+    def detector_for(self, frame_width: int) -> DemosaicDetector:
+        """Pick the detector by source width: the 1280px model for 8K-class
+        sources (better recall there), the 640px model otherwise."""
+        if frame_width >= config.RM_DETECTOR_1280_MIN_WIDTH and detector_1280_model_path().is_file():
+            if self._detector_1280 is None:
+                print(f"[rm] source width {frame_width} >= {config.RM_DETECTOR_1280_MIN_WIDTH}: "
+                      f"building 1280px detector (first 8K use; slow once)", flush=True)
+                self._detector_1280 = DemosaicDetector(
+                    self._provider, model_path=detector_1280_model_path(),
+                    cache_name="detector_1280")
+            return self._detector_1280
+        return self.detector
 
 
 # --- GPU (cupy) pipeline -----------------------------------------------------
@@ -433,6 +621,9 @@ class GpuRmProcessor:
 
         self.cp = cp
         self.engines = engines
+        # Default to the 640 detector; _select_detector swaps in the 1280 model
+        # for 8K-class frames on the first detect.
+        self._detector = engines.detector
         self.det_size = engines.detector.size
         self._resize = cp.RawModule(code=_RESIZE_KERNEL_SRC).get_function("bilinear_resize_u8")
         self._block = (16, 16, 1)
@@ -451,12 +642,36 @@ class GpuRmProcessor:
         self._det_io = engines.detector.sess.io_binding()
         self._rest_io = engines.restorer.sess.io_binding()
         self._stream = cp.cuda.get_current_stream()
+        # "VR转平面后解码": gnomonic-reproject each region to a flat view before
+        # restoring (SBS/VR sources only). Reprojector kernels are built lazily.
+        self._vr2flat = bool(config.RM_VR2FLAT_DECODE)
+        self._fov_margin = float(config.RM_VR2FLAT_FOV_MARGIN)
+        self._feather = float(config.RM_VR2FLAT_EDGE_FEATHER)
+        self._max_fov = float(config.RM_VR2FLAT_MAX_FOV)
+        self._reproj = None
+
+    def prewarm_for_width(self, frame_width: int) -> None:
+        """Build, bind and warm the width-specific detector up front, so the 1280
+        model's one-time TensorRT build/load happens here instead of stalling the
+        first chunk. The dummy inference forces the engine load now."""
+        self._select_detector(frame_width)
+        dummy = np.zeros((self.det_size, self.det_size, 3), np.uint8)
+        self._detector.detect(dummy, conf=0.99)
+
+    def _select_detector(self, frame_width: int) -> None:
+        """Bind the detector for this source width (640 vs 1280). Cheap after the
+        first call; a processor handles one clip/stream so width is stable."""
+        det = self.engines.detector_for(frame_width)
+        if det is not self._detector:
+            self._detector = det
+            self.det_size = det.size
+            self._det_io = det.sess.io_binding()
 
     def _run_detector_gpu(self, canvas_g, scale, pad_x, pad_y, frame_hw, conf):
         """Normalize the letterbox canvas on the GPU, run the detector via
         IOBinding (input on device), return decoded detections + protos."""
         cp = self.cp
-        det = self.engines.detector
+        det = self._detector
         blob_g = cp.ascontiguousarray(
             (canvas_g.astype(cp.float32) / 255.0).transpose(2, 0, 1)[None])  # (1,3,S,S)
         self._stream.synchronize()
@@ -465,8 +680,12 @@ class GpuRmProcessor:
         for name in det.output_names:
             io.bind_output(name)                       # host outputs (small, for NMS)
         det.sess.run_with_iobinding(io)
-        out0, out1 = io.copy_outputs_to_cpu()
-        return _postprocess_detections(out0, out1, scale, pad_x, pad_y, frame_hw, conf, 0.5)
+        # copy_outputs_to_cpu follows output_names order; map by name so an
+        # EPContext-reordered output list still picks detections vs protos right.
+        outs = dict(zip(det.output_names, io.copy_outputs_to_cpu()))
+        return _postprocess_detections(outs[det._det_out], outs[det._proto_out],
+                                       scale, pad_x, pad_y, frame_hw, conf, 0.5,
+                                       max_det=config.RM_MAX_REGIONS)
 
     def _run_restore_chunk_gpu(self, stack_g, prev_ds_g, states_g):
         """Run the chunk model for a batch of regions.
@@ -483,7 +702,7 @@ class GpuRmProcessor:
         batch = int(x.shape[0])
         restored_out_g = cp.empty((batch, WINDOW, 3, REST_SIZE, REST_SIZE), cp.float32)
         ds_out_g = cp.empty((batch, 3, 64, 64), cp.float32)
-        states_out_g = cp.empty((batch, 2, 64, 64, 64), cp.float32)
+        states_out_g = cp.empty((batch, 2, res.states_channels, 64, 64), cp.float32)
         self._stream.synchronize()
         io = self._rest_io
         io.bind_input(res.input_name, "cuda", 0, np.float32, x.shape, int(x.data.ptr))
@@ -520,6 +739,7 @@ class GpuRmProcessor:
         """Run the detector on the center frame and cache (box, gpu-mask) pairs."""
         cp = self.cp
         H, W = int(center_g.shape[0]), int(center_g.shape[1])
+        self._select_detector(W)
         size = self.det_size
         scale = min(size / W, size / H)
         nw, nh = int(round(W * scale)), int(round(H * scale))
@@ -565,6 +785,53 @@ class GpuRmProcessor:
             return best_idx, prev_ds, states
         return None
 
+    def _reprojector(self):
+        if self._reproj is None:
+            from pipeline.vr_reproject import VrReprojector
+            self._reproj = VrReprojector(self.cp)
+        return self._reproj
+
+    def _region_view(self, box, W: int, H: int):
+        """Map an equirect (whole-frame) box to its eye + view angles.
+
+        hequirect eye spans 180x180 (pixel<->angle linear), so yaw/pitch/fov come
+        straight from the box center/size in eye-local coords."""
+        is_sbs = W >= 2 * H
+        eye_w = W // 2 if is_sbs else W
+        eye_h = H
+        x1, y1, x2, y2 = box
+        cx = (x1 + x2) / 2.0
+        eye_x0 = eye_w if (is_sbs and cx >= eye_w) else 0
+        ex1, ey1, ex2, ey2 = x1 - eye_x0, y1, x2 - eye_x0, y2
+        ecx, ecy = (ex1 + ex2) / 2.0, (ey1 + ey2) / 2.0
+        bw, bh = ex2 - ex1, ey2 - ey1
+        yaw = (ecx / eye_w) * 180.0 - 90.0
+        pitch = 90.0 - (ecy / eye_h) * 180.0
+        # Longitude is compressed by cos(lat): near the poles a physically small
+        # region covers many pixels horizontally, so a linear px->deg reading
+        # wildly overestimates the fov it needs (a bottom-of-frame mosaic band
+        # measured 1189px / 104deg linearly, but only ~30deg of actual arc).
+        # Use the box edge nearest the equator, i.e. the largest cos, so the
+        # estimate stays conservative and never crops the region.
+        lat_near = min(abs(90.0 - (ey1 / eye_h) * 180.0),
+                       abs(90.0 - (ey2 / eye_h) * 180.0))
+        cos_lat = max(0.15, math.cos(math.radians(lat_near)))
+        fov_x = (bw / eye_w) * 180.0 * cos_lat
+        fov_y = (bh / eye_h) * 180.0
+        d_fov = min(160.0, max(fov_x, fov_y) * self._fov_margin)
+        return eye_x0, eye_w, eye_h, (ex1, ey1, ex2, ey2), yaw, pitch, d_fov
+
+    def _eye_crop(self, elocal, eye_w: int, eye_h: int):
+        """Compositing window (eye-local x_off,y_off,cw,ch): the box grown by a
+        margin so the whole reprojected patch (fov > box) lands inside it."""
+        ex1, ey1, ex2, ey2 = elocal
+        mx, my = 0.45 * (ex2 - ex1), 0.45 * (ey2 - ey1)
+        cx0 = max(0, int(math.floor(ex1 - mx)))
+        cy0 = max(0, int(math.floor(ey1 - my)))
+        cx1 = min(eye_w, int(math.ceil(ex2 + mx)))
+        cy1 = min(eye_h, int(math.ceil(ey2 + my)))
+        return cx0, cy0, cx1 - cx0, cy1 - cy0
+
     def process_chunk(self, chunk_g, conf: float = 0.25):
         cp = self.cp
         if len(chunk_g) != WINDOW:
@@ -582,16 +849,37 @@ class GpuRmProcessor:
         out_frames = [frame.copy() for frame in chunk_g]
         regions = self._cached_regions
         batch = len(regions)
+        H, W = int(chunk_g[0].shape[0]), int(chunk_g[0].shape[1])
+        vr = self._vr2flat and (W >= 2 * H)   # SBS VR: reproject to flat first
         stack_g = cp.empty((batch, WINDOW, REST_SIZE, REST_SIZE, 3), cp.uint8)
         prev_ds_g = cp.empty((batch, 3, 64, 64), cp.float32)
-        states_g = cp.empty((batch, 2, 64, 64, 64), cp.float32)
+        states_g = cp.empty((batch, 2, self.engines.restorer.states_channels, 64, 64), cp.float32)
         used_states: set[int] = set()
+        views: list = [None] * batch          # per-region view params when vr
 
         for b, (box, _m_g) in enumerate(regions):
             x1, y1, x2, y2 = box
             bw, bh = x2 - x1, y2 - y1
-            for k in range(WINDOW):
-                self._resize_into(chunk_g[k], stack_g[b, k], x1, y1, bw, bh)
+            # Per region, not per frame: a region whose view would be too wide
+            # falls back to the legacy crop (views[b] stays None), because
+            # gnomonic edge stretch past that point costs more than it gains.
+            view = self._region_view(box, W, H) if vr else None
+            if view is not None and view[6] > self._max_fov:
+                view = None
+            if view is not None:
+                eye_x0, eye_w, eye_h, elocal, yaw, pitch, d_fov = view
+                reproj = self._reprojector()
+                for k in range(WINDOW):
+                    # zero-copy: address the eye inside the full frame, and write
+                    # straight into the restorer batch slot
+                    reproj.to_flat(chunk_g[k], yaw, pitch, d_fov, REST_SIZE, REST_SIZE,
+                                   eye_origin=(eye_x0, 0), eye_size=(eye_w, eye_h),
+                                   out=stack_g[b, k])
+                views[b] = (eye_x0, eye_w, eye_h, yaw, pitch, d_fov,
+                            self._eye_crop(elocal, eye_w, eye_h))
+            else:
+                for k in range(WINDOW):
+                    self._resize_into(chunk_g[k], stack_g[b, k], x1, y1, bw, bh)
             matched = self._matched_state(box, used_states)
             if matched is None:
                 prev_ds_g[b] = self._initial_prev_ds_gpu(stack_g[b, 0])
@@ -608,13 +896,24 @@ class GpuRmProcessor:
         for b, (box, m_g) in enumerate(regions):
             x1, y1, x2, y2 = box
             bw, bh = x2 - x1, y2 - y1
-            for k in range(WINDOW):
-                resized_g = cp.empty((bh, bw, 3), cp.uint8)
-                self._resize_into(restored_g[b, k], resized_g, 0, 0, REST_SIZE, REST_SIZE)
-                region = out_frames[k][y1:y2, x1:x2].astype(cp.float32)
-                out_frames[k][y1:y2, x1:x2] = (
-                    region * (1 - m_g) + resized_g.astype(cp.float32) * m_g
-                ).astype(cp.uint8)
+            if views[b] is not None:
+                eye_x0, eye_w, eye_h, yaw, pitch, d_fov, crop = views[b]
+                reproj = self._reprojector()
+                for k in range(WINDOW):
+                    # fused reproject + feathered alpha blend straight into the
+                    # output frame (no patch/alpha temporaries)
+                    reproj.blend_into(restored_g[b, k], out_frames[k],
+                                      yaw, pitch, d_fov, eye_w, eye_h,
+                                      crop=crop, eye_origin=(eye_x0, 0),
+                                      feather=self._feather)
+            else:
+                for k in range(WINDOW):
+                    resized_g = cp.empty((bh, bw, 3), cp.uint8)
+                    self._resize_into(restored_g[b, k], resized_g, 0, 0, REST_SIZE, REST_SIZE)
+                    region = out_frames[k][y1:y2, x1:x2].astype(cp.float32)
+                    out_frames[k][y1:y2, x1:x2] = (
+                        region * (1 - m_g) + resized_g.astype(cp.float32) * m_g
+                    ).astype(cp.uint8)
             next_states.append((box, ds_out_g[b].copy(), states_out_g[b].copy()))
         self._region_states = next_states
         return out_frames
@@ -630,7 +929,9 @@ def models_available() -> bool:
 
 def warmup_rm_engines(provider: str = "trt", log=print) -> DemosaicEngines:
     """Build/load both engines and run one dummy inference each so the (slow)
-    first-call TensorRT build happens here. Mirrors da3_depth.warmup_depth_engine."""
+    first-call TensorRT build happens here. Mirrors da3_depth.warmup_depth_engine.
+    Only the 640 detector is warmed; the 1280 one is built lazily per-clip (see
+    GpuRmProcessor.prewarm_for_width) since most sources never need it."""
     engines = DemosaicEngines(provider)
     log(f"[rm] detector providers={engines.detector.providers}")
     log(f"[rm] restorer providers={engines.restorer.providers}")

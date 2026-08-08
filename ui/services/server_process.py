@@ -21,6 +21,7 @@ class ServerProcess(QObject):
 
     def __init__(self) -> None:
         super().__init__()
+        self.last_exit_code: int | None = None
         self.process = HiddenProcess(self)
         self.process.stdout.connect(self._read_stdout)
         self.process.stderr.connect(self._read_stderr)
@@ -33,6 +34,7 @@ class ServerProcess(QObject):
     def start(self, env: dict[str, str]) -> None:
         if self.is_running():
             return
+        self.last_exit_code = None
         exe, args = server_command()
         if self.process.start(exe, args, env=base_environment(env)):
             self.state_changed.emit(True)
@@ -78,5 +80,7 @@ class ServerProcess(QObject):
         if not self.is_running():
             self.state_changed.emit(False)
 
-    def _finished(self, _exit_code: int = 0) -> None:
+    def _finished(self, exit_code: int = 0) -> None:
+        self.last_exit_code = int(exit_code)
+        self.output.emit(f"Server process exited: code={self.last_exit_code}\n")
         self.state_changed.emit(False)

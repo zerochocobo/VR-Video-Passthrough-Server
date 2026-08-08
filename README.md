@@ -32,6 +32,8 @@ This is the miracle of the AI era.
 - Realtime and offline NVIDIA RTX Video Super Resolution for eligible 2D and VR sources, including adaptive `8K VR / 4K 2D` output
 - Split-eye GPU processing for 2:1 SBS VR, with 8192x4096 HEVC output available for offline 4K-VR-to-8K-VR conversion
 - Low / Medium / High / Ultra RTX VSR quality controls and Off / Natural / Vivid SDR HDR-look controls
+- Realtime and offline Face Beauty (under development and testing; enable it from Settings)
+- Realtime and offline mosaic removal (under development and testing; enable it from Settings)
 - Dubbing / simultaneous interpretation playback with same-stem `.si.wav` sidecars, `[SI]` DLNA entries, start-time selection, channel mixing, and Light / Normal / Strong ducking
 - DLNA Live time-index folders for choosing a playback start time, with 10-minute groups, minute folders, and 5-second playback points
 - Multi-root local video library support

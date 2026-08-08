@@ -4,9 +4,11 @@ from __future__ import annotations
 from fastapi import APIRouter, HTTPException, Request
 
 from utils.runtime_settings import (
+    get_face_beauty,
     get_light_match,
     get_rm,
     get_si_mix,
+    set_face_beauty,
     set_light_match,
     set_rm,
     set_si_mix,
@@ -110,6 +112,30 @@ async def put_si_mix_control(request: Request):
     result = payload.to_dict()
     result["ok"] = True
     return result
+
+
+@router.get("/control/face_beauty")
+async def get_face_beauty_control(request: Request):
+    if not _is_local_request(request):
+        raise HTTPException(status_code=403, detail="local control only")
+    payload = get_face_beauty().to_dict()
+    payload["ok"] = True
+    return payload
+
+
+@router.put("/control/face_beauty")
+async def put_face_beauty_control(request: Request):
+    if not _is_local_request(request):
+        raise HTTPException(status_code=403, detail="local control only")
+    try:
+        data = await request.json()
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail="invalid json") from exc
+    if not isinstance(data, dict):
+        raise HTTPException(status_code=400, detail="object expected")
+    payload = set_face_beauty(data).to_dict()
+    payload["ok"] = True
+    return payload
 
 
 @router.get("/control/rm")

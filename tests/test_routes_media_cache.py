@@ -1418,6 +1418,59 @@ class LiveSupportTests(unittest.TestCase):
         with patch.object(routes_media, "select_backend", return_value=decision):
             self.assertEqual(routes_media._live_block_reason(Path("movie.mp4"), meta), "codec needs fallback")
 
+    def test_rm_live_accepts_vr_when_enabled_and_pynv_eligible(self) -> None:
+        meta = self._meta(width=8192, height=4096)
+        decision = SimpleNamespace(verdict="pynv_hevc", reason="")
+        runtime = SimpleNamespace(enabled=True)
+        with (
+            patch("utils.runtime_settings.get_rm", return_value=runtime),
+            patch.object(routes_media, "select_backend", return_value=decision),
+        ):
+            self.assertEqual(routes_media._rm_live_block_reason(Path("movie_8k.mp4"), meta), "")
+
+    def test_face_beauty_live_gate_matches_runtime_and_backend(self) -> None:
+        meta = self._meta(width=8192, height=4096)
+        enabled = SimpleNamespace(enabled=True)
+        disabled = SimpleNamespace(enabled=False)
+        pynv = SimpleNamespace(verdict="pynv_hevc", reason="")
+        fallback = SimpleNamespace(verdict="ffmpeg_fallback", reason="unsupported pixel format")
+
+        with patch("utils.runtime_settings.get_face_beauty", return_value=disabled):
+            self.assertEqual(
+                routes_media._face_beauty_live_block_reason(Path("movie_8k.mp4"), meta),
+                "face beautification is disabled",
+            )
+        with (
+            patch("utils.runtime_settings.get_face_beauty", return_value=enabled),
+            patch.object(routes_media, "select_backend", return_value=pynv),
+        ):
+            self.assertEqual(
+                routes_media._face_beauty_live_block_reason(Path("movie_8k.mp4"), meta),
+                "",
+            )
+        with (
+            patch("utils.runtime_settings.get_face_beauty", return_value=enabled),
+            patch.object(routes_media, "select_backend", return_value=fallback),
+        ):
+            self.assertIn(
+                "unsupported pixel format",
+                routes_media._face_beauty_live_block_reason(Path("movie.mp4"), meta),
+            )
+
+    def test_face_beauty_gets_a_mode_specific_cold_start_timeout(self) -> None:
+        with (
+            patch.object(routes_media, "_LIVE_FIRST_CHUNK_TIMEOUT_SEC", 30.0),
+            patch.object(routes_media, "FACE_BEAUTY_LIVE_FIRST_CHUNK_TIMEOUT_SEC", 90.0),
+        ):
+            self.assertEqual(routes_media._live_first_chunk_timeout("rm"), 30.0)
+            self.assertEqual(routes_media._live_first_chunk_timeout("face_beauty"), 90.0)
+
+    def test_superres_live_rejects_8k_vr_before_preflight(self) -> None:
+        meta = self._meta(width=8192, height=4096)
+        meta.codec.bit_depth = 8
+        reason = asyncio.run(routes_media._superres_live_block_reason(Path("movie_8k_vr.mp4"), meta))
+        self.assertEqual(reason, "8K VR sources are hidden from realtime SuperRes")
+
 
 if __name__ == "__main__":
     unittest.main()

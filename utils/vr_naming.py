@@ -35,6 +35,11 @@ GREEN_OFFLINE_PASSTHROUGH_SUFFIX = "_LR_180_SBS_passthrough"
 ALPHA_PASSTHROUGH_SUFFIX = "_LR_180_FISHEYE_F180_alpha"
 TWO_DVR_SUFFIX = "_3D_LR_Screen"
 SUPERRES_PREFIX = "[SuperRes]"
+# Face beautification keeps the source geometry, so the marker is appended after
+# any existing VR markers (which stay matchable, being followed by "_").
+FACE_BEAUTY_SUFFIX = "_beauty"
+# Display prefix for the realtime DLNA entry, alongside [RM] / [2D>3D].
+FACE_BEAUTY_PREFIX = "[FaceBeauty]"
 _VIDEO_SUFFIXES = {".mp4", ".mkv", ".mov", ".m4v", ".avi", ".webm", ".ts", ".m2ts"}
 
 
@@ -120,6 +125,8 @@ def live_passthrough_title(stem_or_name: str, mode: str, width: int = 0, height:
         return f"[2D>3D]{two_dvr_stem(stem_or_name)}_live"
     if mode == "rm":
         return f"[RM]{_as_stem(stem_or_name)}_live"
+    if mode == "face_beauty":
+        return f"{FACE_BEAUTY_PREFIX}{_as_stem(stem_or_name)}_live"
     if mode == "superres":
         return f"{superres_stem(source_display_stem(stem_or_name, width, height))}_live"
     return f"{green_passthrough_stem(stem_or_name, width, height)}_live"

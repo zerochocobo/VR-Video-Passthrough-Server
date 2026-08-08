@@ -16,8 +16,6 @@ import sys
 from pathlib import Path
 from uuid import NAMESPACE_DNS, uuid5
 
-from utils.gpu_requirements import resolve_passthrough_max_concurrent
-
 ROOT = Path(sys.executable).resolve().parent if getattr(sys, "frozen", False) else Path(__file__).parent.resolve()
 
 
@@ -149,6 +147,12 @@ VIDEO_DIRS: list[Path] = parse_video_dirs(_env("VIDEO_DIR", ROOT / "videos"), RO
 MEDIA_ROOTS = build_media_roots(VIDEO_DIRS)
 MEDIA_LIBRARY = MediaLibrary(MEDIA_ROOTS)
 VIDEO_DIR: Path = VIDEO_DIRS[0]
+
+# PT_DLNA_ALL_VIDEOS_ENABLED: expose a startup-cached, flat All Videos view.
+DLNA_ALL_VIDEOS_ENABLED = str(_env("DLNA_ALL_VIDEOS_ENABLED", "0")).lower() in {"1", "true", "yes", "on"}
+# UI language selected by the desktop application, used for server-generated
+# localized virtual-folder titles.
+UI_LANGUAGE = str(_env("PT_UI_LANGUAGE", "en_US"))
 
 # File extensions considered video media during directory scans.
 VIDEO_EXTS = {".mp4", ".mkv", ".mov", ".m4v"}
@@ -737,8 +741,10 @@ STARTUP_GPU_WARMUP = _env("STARTUP_GPU_WARMUP", "1") == "1"
 STARTUP_GPU_WARMUP_FORCE = _env("STARTUP_GPU_WARMUP_FORCE", "0") == "1"
 
 # PT_STARTUP_GPU_WARMUP_TIMEOUT:
-#   Seconds to wait for the global warmup lock before failing startup.
-STARTUP_GPU_WARMUP_TIMEOUT = float(_env("STARTUP_GPU_WARMUP_TIMEOUT", 300))
+#   Seconds to wait for the global warmup lock before failing startup. 900 so a
+#   first-time TensorRT build of the deep mid=96 restorer (>10min) is not cut off;
+#   once the engine is cached, warmup is ~8s and this ceiling is never approached.
+STARTUP_GPU_WARMUP_TIMEOUT = float(_env("STARTUP_GPU_WARMUP_TIMEOUT", 900))
 
 # PT_STARTUP_GPU_WARMUP_RUNS_PER_SHAPE:
 #   Number of warmup runs per configured shape. More runs provide stronger
@@ -773,6 +779,15 @@ ONNX_TRT_FP16_ENABLE = _env("ONNX_TRT_FP16_ENABLE", "0") == "1"
 ONNX_TRT_CUDA_GRAPH_ENABLE = _env("ONNX_TRT_CUDA_GRAPH_ENABLE", "0") == "1"
 ONNX_TRT_DUMP_SUBGRAPHS = _env("ONNX_TRT_DUMP_SUBGRAPHS", "0") == "1"
 ONNX_TRT_DETAILED_BUILD_LOG = _env("ONNX_TRT_DETAILED_BUILD_LOG", "0") == "1"
+# PT_ONNX_TRT_MAX_WORKSPACE_BYTES:
+#   Pin the TensorRT build workspace so the ORT-TRT engine-cache filename hash is
+#   independent of how much VRAM is free at build time. Without this, ORT-TRT
+#   sizes the workspace from currently-free VRAM, so an engine built by the
+#   realtime path (after the GPU warmup grabs VRAM) gets a different hash than one
+#   built by an offline/CLI path on a clean GPU -- whichever runs second rebuilds
+#   (minutes). Applies to every demosaic/DA3/matting/NVDS TRT session. 4 GiB is
+#   ample for these models and coexists with 8K decode/encode on a 16 GiB card.
+ONNX_TRT_MAX_WORKSPACE_BYTES = int(_env("ONNX_TRT_MAX_WORKSPACE_BYTES", 4 << 30))
 
 # PT_PASSTHROUGH_PYNV_SYNC_PROBE:
 #   1 enables extra CUDA synchronizations inside the PyNv green matting path to
@@ -1025,14 +1040,76 @@ SI_MIX_DICT = {
 #   decode path. Default off; runtime changes handled by /control/rm.
 RM_ENABLED = str(_env("RM_ENABLED", "0")).lower() in {"1", "true", "yes", "on"}
 # PT_RM_CONF:
-#   Detector confidence threshold for mosaic regions.
-RM_CONF = float(_env("RM_CONF", "0.25"))
+#   Detector confidence threshold for mosaic regions. Shared by every RM path --
+#   offline and realtime, 2D and VR (they all run the same GpuRmProcessor).
+#   0.2 (lowered from 0.5): the detector's confidence on bottom-of-frame,
+#   near-nadir VR mosaics is low and unstable -- a strongly distorted region
+#   drifting toward the pole dipped to 0.29-0.33 and fell below 0.5, so the
+#   restorer never saw it and the mosaic leaked (same mosaic scored 0.68 in the
+#   other eye). Dropping to 0.2 recovers these marginal detections.
+#   Trade-off: below ~0.5 some boxes were seen grossly oversized or displaced,
+#   which feeds a wrong yaw/pitch to the VR-to-flat reprojection and can rewrite
+#   healthy pixels; the real fix is better detector recall on near-nadir mosaics.
+RM_CONF = float(_env("RM_CONF", "0.2"))
 # PT_RM_DETECT_INTERVAL:
 #   Run the (expensive) mosaic detector every N frames; between detections the
 #   previous frame's boxes + masks are reused while restoration still runs on the
 #   fresh temporal window. 1 = detect every frame. Higher = faster, but a box
-#   lags for up to N-1 frames on fast motion.
+#   lags on fast motion.
+#   Detection is quantized to chunk boundaries: it fires every ceil(N/WINDOW)
+#   chunks, i.e. every ceil(N/8)*8 frames. So N<=8 all mean "every chunk"
+#   (8 frames); 16 would mean "every 2 chunks" (16 frames) -- there is no value
+#   between, it is 8 or 16 frames.
+#   Kept at 2 (every chunk): 16 was tested and rejected. On slow content a
+#   16-frame-old box is fine, but on fast-motion sources the box drifts far
+#   enough that the reused box covered only ~60% of the mosaic (vs ~79% at the
+#   every-chunk baseline), leaking the drifted edge. The detector-halving speedup
+#   is not worth reintroducing leaks; get throughput from decode/encode
+#   pipelining instead.
 RM_DETECT_INTERVAL = max(1, int(_env("RM_DETECT_INTERVAL", "2")))
+# PT_RM_MAX_REGIONS:
+#   Hard cap on mosaic regions restored per frame (top-N by detector score).
+#   The restorer runs with a dynamic batch == region count; this value is also
+#   the TensorRT optimization-profile max batch. Capping keeps the batch inside
+#   the pre-built profile so a never-before-seen region count can never trigger
+#   a runtime TRT engine rebuild (which stalls under VRAM pressure and hangs the
+#   whole offline/realtime RM pipeline). Raise only if you also expect the extra
+#   VRAM cost of a wider profile.
+#   8 matches the restorer model's exported maxShapes (batch=8); going above it
+#   would build a profile the model author did not validate.
+RM_MAX_REGIONS = max(1, int(_env("RM_MAX_REGIONS", "8")))
+# PT_RM_DETECTOR_1280_MIN_WIDTH:
+#   Frame width (px) at/above which the 1280px detector is used instead of the
+#   640px one. Measured: 1280 lifts 8K recall (68->80%, miss 22->17%) for ~11%
+#   FPS, but *hurts* 4K (total-miss 63->87%) -- it behaves like a model tuned for
+#   8K. So gate it to 8K-class sources (8192 SBS / 7680 wide) and keep 640 for 4K
+#   and below. Needs models/demosaic/<detector>_1280.onnx present; falls back to
+#   640 if missing. Set very high (e.g. 999999) to force 640 everywhere.
+RM_DETECTOR_1280_MIN_WIDTH = int(_env("RM_DETECTOR_1280_MIN_WIDTH", "6144"))
+# PT_RM_VR2FLAT_DECODE:
+#   "VR转平面后解码". For VR180 SBS sources, gnomonic-project each detected mosaic
+#   region from the hequirect eye to a flat (rectilinear) view before restoring,
+#   then reproject + alpha-composite back. On equirect the mosaic block is skewed
+#   /stretched; on the flat view it becomes an axis-aligned square the restorer
+#   handles better. Off = restore directly on the equirect crop (legacy path).
+RM_VR2FLAT_DECODE = str(_env("RM_VR2FLAT_DECODE", "1")).lower() in {"1", "true", "yes", "on"}
+# PT_RM_VR2FLAT_FOV_MARGIN:
+#   Enlarge the flat view's FOV vs the region's angular size so the mosaic sits
+#   inside with context/overlap for a clean composite. ~1.4 = 40% margin.
+RM_VR2FLAT_FOV_MARGIN = max(1.0, float(_env("RM_VR2FLAT_FOV_MARGIN", "1.4")))
+# PT_RM_VR2FLAT_EDGE_FEATHER:
+#   Fade the reprojected patch's alpha toward the flat view's border, as a
+#   fraction of its half-extent, so the composite has no hard seam. 0 = hard edge.
+RM_VR2FLAT_EDGE_FEATHER = min(0.5, max(0.0, float(_env("RM_VR2FLAT_EDGE_FEATHER", "0.12"))))
+# PT_RM_VR2FLAT_MAX_FOV:
+#   Upper bound on a region's flat-view d_fov. Gnomonic projection only helps
+#   while the view stays reasonably narrow; past this the edge stretch
+#   (tan(fov/2)) shrinks the mosaic within the flat view and hurts the very
+#   quality this feature exists to improve. The detector does sometimes emit a
+#   confident but huge box (measured: a 1144px-wide box at score 0.60 -> 141 deg),
+#   which no confidence threshold filters out. Regions above this fall back to
+#   the legacy direct-equirect crop, which is safe for large areas.
+RM_VR2FLAT_MAX_FOV = max(20.0, float(_env("RM_VR2FLAT_MAX_FOV", "90")))
 
 
 # ---- Passthrough encoding and DLNA behavior ----
@@ -1048,6 +1125,25 @@ PASSTHROUGH_CONTAINER = _env("CONTAINER", "mp4").lower()
 #   FFmpeg fallback encoder. PyNv production output is always HEVC and does not
 #   use this value for its encoder, but legacy fallback still does.
 #   Common values: h264_nvenc, hevc_nvenc, libx264.
+# PT_FACE_BEAUTY_*:
+# Realtime face beautification ([FaceBeauty] DLNA entry). The realtime path
+# deliberately pins the cheapest restorer -- gpen_bfr_256 measured 6.1 ms per
+# face against gfpgan_1.4's 38.0 ms, which is what keeps a 60 fps budget
+# reachable. Strength defaults track the offline "standard" preset.
+FACE_BEAUTY_ENABLED = str(_env("FACE_BEAUTY_ENABLED", "0")).lower() in {"1", "true", "yes", "on"}
+FACE_BEAUTY_MODEL = _env("FACE_BEAUTY_MODEL", "gpen_bfr_256")
+FACE_BEAUTY_PRESET = _env("FACE_BEAUTY_PRESET", "standard")
+FACE_BEAUTY_DETECT_INTERVAL = max(1, int(_env("FACE_BEAUTY_DETECT_INTERVAL", 2)))
+# The 2DFAN4 landmarker is the dominant realtime cost (~9 ms/face on the
+# reference machine). Reusing its stable 5-point result for one intervening
+# frame preserves alignment while nearly halving that stage's average cost.
+FACE_BEAUTY_LANDMARK_INTERVAL = max(1, int(_env("FACE_BEAUTY_LANDMARK_INTERVAL", 2)))
+# Realtime cost scales linearly with face count. Cap the common case at two so
+# dual-person 2D shots and the two eyes of SBS VR are both preserved. Set 1 for
+# maximum throughput or 0 for unlimited faces. Offline stays unlimited by default.
+FACE_BEAUTY_MAX_FACES_2D = max(0, int(_env("FACE_BEAUTY_MAX_FACES_2D", 2)))
+FACE_BEAUTY_MAX_FACES_VR = max(0, int(_env("FACE_BEAUTY_MAX_FACES_VR", 2)))
+
 PASSTHROUGH_VCODEC = _env("VCODEC", "hevc_nvenc")
 
 # PT_PASSTHROUGH_PRESET or PT_PRESET:
@@ -1537,6 +1633,18 @@ PASSTHROUGH_LIVE_FIRST_CHUNK_TIMEOUT_SEC = max(
     float(_env("PASSTHROUGH_LIVE_FIRST_CHUNK_TIMEOUT_SEC", 30)),
 )
 
+# PT_FACE_BEAUTY_LIVE_FIRST_CHUNK_TIMEOUT_SEC:
+#   FaceBeauty creates four ORT sessions (detector, landmarker, parser and
+#   enhancer) before it can emit its first frame.  Loading cached TensorRT
+#   engines took about 39 seconds on the reference machine, so the generic
+#   30-second live timeout would kill a healthy cold start just as it became
+#   ready.  Keep the normal live timeout for every other mode and give only
+#   FaceBeauty a larger, independently configurable startup allowance.
+FACE_BEAUTY_LIVE_FIRST_CHUNK_TIMEOUT_SEC = max(
+    PASSTHROUGH_LIVE_FIRST_CHUNK_TIMEOUT_SEC,
+    float(_env("FACE_BEAUTY_LIVE_FIRST_CHUNK_TIMEOUT_SEC", 90)),
+)
+
 # PT_PASSTHROUGH_LIVE_VLC_PREROLL_BYTES:
 #   For VLC/LibVLC/MoonVR, buffer this many initial MPEG-TS bytes before
 #   returning the HTTP response. This gives stricter players enough PAT/PMT and
@@ -1664,7 +1772,21 @@ PASSTHROUGH_SEEK_HEADER_BYTES = max(0, int(_env("PASSTHROUGH_SEEK_HEADER_BYTES",
 #   Maximum concurrent passthrough streams. Each concurrent stream needs its own
 #   Matter instance (independent ORT session + RVM recurrent state + GPU buffers),
 #   roughly 1.5-2GB VRAM. Use "auto" to pick a value based on detected VRAM.
-PASSTHROUGH_MAX_CONCURRENT = resolve_passthrough_max_concurrent(_env("PASSTHROUGH_MAX_CONCURRENT", "auto"))
+PASSTHROUGH_MAX_CONCURRENT_RAW = _env("PASSTHROUGH_MAX_CONCURRENT", "auto")
+PASSTHROUGH_MAX_CONCURRENT_AUTO = str(PASSTHROUGH_MAX_CONCURRENT_RAW).strip().lower() in {"", "auto"}
+if PASSTHROUGH_MAX_CONCURRENT_AUTO:
+    # Do not query nvidia-smi while config is imported by the desktop UI.  The
+    # server child resolves the automatic value after it starts.
+    PASSTHROUGH_MAX_CONCURRENT = 1
+else:
+    try:
+        PASSTHROUGH_MAX_CONCURRENT = max(1, int(PASSTHROUGH_MAX_CONCURRENT_RAW))
+    except (TypeError, ValueError):
+        PASSTHROUGH_MAX_CONCURRENT = 1
+
+# One-shot repair restart: rebuild the user's realtime RVM TensorRT cache in an
+# isolated child before the server validates providers and performs warmup.
+GPU_REPAIR_REBUILD_TRT = _env("GPU_REPAIR_REBUILD_TRT", "0") == "1"
 
 # PT_PASSTHROUGH_BUSY_WAIT_SEC:
 #   How long a new passthrough request waits for the active slot before 503.

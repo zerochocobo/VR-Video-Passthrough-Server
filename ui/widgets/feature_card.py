@@ -18,7 +18,10 @@ from ui import theme
 from ui.icons import line_icon, line_pixmap
 from ui.resources import SWITCH_OFF_IMAGE_PATH, SWITCH_ON_IMAGE_PATH
 
-CARD_HEIGHT = 88
+# Content floor is ~72px: 18 margins + 22 top row (icon/switch) + 6 spacing +
+# 26 bottom row (the 26px tool buttons). 76 keeps a little slack while letting
+# the dashboard's 2D row wrap without growing the window much.
+CARD_HEIGHT = 76
 CARD_ICON_SIZE = 20
 CARD_TOOL_ICON = 17
 CARD_LOCK_ICON = 14

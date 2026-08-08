@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import html
 import math
+import os
 import re
 from pathlib import Path
 from urllib.parse import quote
@@ -20,6 +21,7 @@ from xml.etree import ElementTree as ET
 
 from config import (
     HTTP_PORT,
+    DLNA_ALL_VIDEOS_ENABLED,
     DLNA_IMAGE_ENABLED,
     IMAGE_DLNA_PN_BY_EXT,
     IMAGE_EXTS,
@@ -40,6 +42,7 @@ from config import (
     MEDIA_LIBRARY,
     VIDEO_DIR,
     VIDEO_EXTS,
+    UI_LANGUAGE,
     RTX_VSR_ENABLED,
     RTX_VSR_REALTIME_ENABLED,
     RTX_VSR_INPUT_MIN_HEIGHT,
@@ -58,7 +61,7 @@ from utils.offline_outputs import (
     has_offline_two_dvr_output,
     is_offline_passthrough_output_name,
 )
-from utils.runtime_settings import get_rm, get_si_mix
+from utils.runtime_settings import get_face_beauty, get_rm, get_si_mix
 from utils.subtitles import SubtitleTrack, find_external_subtitles
 from utils.video_metadata import probe_video_metadata, select_backend
 from utils.rtx_vsr import source_exceeds_target_resolution
@@ -73,6 +76,8 @@ from utils.vr_naming import (
 log = get("cds")
 
 ROOT_ID = "0"
+ALL_VIDEOS_ID = "all_videos"
+ALL_VIDEO_PREFIX = "all_video_"
 FOLDER_PREFIX = "d_"
 LEGACY_FOLDER_PREFIX = "d:"
 LIVE_PREFIX = "pl_"
@@ -81,11 +86,13 @@ ALPHA_LIVE_PREFIX = "pla_"
 LEGACY_ALPHA_LIVE_PREFIX = "pla:"
 TWO_DVR_LIVE_PREFIX = "pl3_"
 RM_LIVE_PREFIX = "plr_"
+FACE_BEAUTY_LIVE_PREFIX = "plfb_"
 SUPERRES_LIVE_PREFIX = "plsr_"
 LIVE_ITEM_PREFIX = "lg_"
 ALPHA_LIVE_ITEM_PREFIX = "la_"
 TWO_DVR_LIVE_ITEM_PREFIX = "l3_"
 RM_LIVE_ITEM_PREFIX = "lr_"
+FACE_BEAUTY_LIVE_ITEM_PREFIX = "lfb_"
 SUPERRES_LIVE_ITEM_PREFIX = "plsr_item_"
 LIVE_TIME_INDEX_PREFIX = "lix_"
 LIVE_TIME_GROUP_PREFIX = "lig_"
@@ -140,6 +147,12 @@ _SELECT_TIME_INDEX_LABELS = {
     "zh_CN": "选择时间索引",
     "ja_JP": "時間インデックス選択",
 }
+_ALL_VIDEOS_LABELS = {
+    "en_US": "All Videos",
+    "zh_CN": "全部视频",
+    "ja_JP": "すべての動画",
+}
+_all_videos_cache: tuple[Path, ...] = ()
 
 
 def clear_dir_items_cache() -> None:
@@ -202,6 +215,54 @@ def _select_time_index_label(language: str | None = None) -> str:
     return _SELECT_TIME_INDEX_LABELS[_normalise_ui_language(language)]
 
 
+def _all_videos_label() -> str:
+    return _ALL_VIDEOS_LABELS[_normalise_ui_language(UI_LANGUAGE)]
+
+
+def build_all_videos_cache() -> int:
+    """Scan configured media roots once and cache supported videos by name."""
+    global _all_videos_cache
+    if not DLNA_ALL_VIDEOS_ENABLED:
+        _all_videos_cache = ()
+        return 0
+    videos: list[Path] = []
+    seen: set[str] = set()
+    for media_root in MEDIA_LIBRARY.roots:
+        root_path = safe_resolve_path(media_root.path)
+        if not root_path.is_dir():
+            continue
+        for current, dirs, files in os.walk(root_path):
+            dirs.sort(key=str.casefold)
+            for filename in files:
+                if Path(filename).suffix.lower() not in VIDEO_EXTS:
+                    continue
+                path = safe_resolve_path(Path(current) / filename)
+                key = str(path).casefold()
+                if key in seen or not path.is_file() or not MEDIA_LIBRARY.contains(path):
+                    continue
+                seen.add(key)
+                videos.append(path)
+    videos.sort(key=lambda path: (path.name.casefold(), _rel_key(path).casefold()))
+    _all_videos_cache = tuple(videos)
+    clear_dir_items_cache()
+    return len(_all_videos_cache)
+
+
+def _all_video_id(path: Path) -> str:
+    return f"{ALL_VIDEO_PREFIX}{_versioned_rel(_rel_key(path))}"
+
+
+def _id_to_all_video(object_id: str) -> Path | None:
+    if not DLNA_ALL_VIDEOS_ENABLED or not object_id.startswith(ALL_VIDEO_PREFIX):
+        return None
+    rel = _strip_object_id_version(object_id[len(ALL_VIDEO_PREFIX):].replace("\\", "/").strip("/"))
+    path = MEDIA_LIBRARY.key_to_path(rel)
+    if path is None:
+        return None
+    path = safe_resolve_path(path)
+    return path if path in _all_videos_cache and path.is_file() else None
+
+
 def _root() -> Path:
     return safe_resolve_path(VIDEO_DIR)
 
@@ -251,6 +312,9 @@ def _id_to_live(object_id: str) -> tuple[Path, str] | None:
     if object_id.startswith(SUPERRES_LIVE_ITEM_PREFIX):
         mode = "superres"
         prefix = SUPERRES_LIVE_ITEM_PREFIX
+    elif object_id.startswith(FACE_BEAUTY_LIVE_ITEM_PREFIX):
+        mode = "face_beauty"
+        prefix = FACE_BEAUTY_LIVE_ITEM_PREFIX
     elif object_id.startswith(RM_LIVE_ITEM_PREFIX):
         mode = "rm"
         prefix = RM_LIVE_ITEM_PREFIX
@@ -262,6 +326,9 @@ def _id_to_live(object_id: str) -> tuple[Path, str] | None:
         prefix = ALPHA_LIVE_ITEM_PREFIX
     elif object_id.startswith(LIVE_ITEM_PREFIX):
         prefix = LIVE_ITEM_PREFIX
+    elif object_id.startswith(FACE_BEAUTY_LIVE_PREFIX):
+        mode = "face_beauty"
+        prefix = FACE_BEAUTY_LIVE_PREFIX
     elif object_id.startswith(SUPERRES_LIVE_PREFIX):
         mode = "superres"
         prefix = SUPERRES_LIVE_PREFIX
@@ -483,7 +550,8 @@ def _video_item_count(path: Path, child: IndexedChild | None = None) -> int:
     passthrough_modes = len(passthrough_modes_list)
     seek_items = passthrough_modes if _seek_passthrough_dlna_enabled() else 0
     rm_items = 1 if _rm_dlna_enabled(path, width, height) else 0
-    return 1 + si_items + rm_items + passthrough_modes + seek_items
+    face_beauty_items = 1 if _face_beauty_dlna_enabled(path, width, height) else 0
+    return 1 + si_items + rm_items + face_beauty_items + passthrough_modes + seek_items
 
 
 def _marked_original_title(path: Path, child: IndexedChild | None = None) -> str:
@@ -904,6 +972,8 @@ def _passthrough_seek_title(path: Path, mode: str, width: int = 0, height: int =
 
 
 def _passthrough_live_prefix(mode: str) -> str:
+    if mode == "face_beauty":
+        return FACE_BEAUTY_LIVE_PREFIX
     if mode == "rm":
         return RM_LIVE_PREFIX
     if mode == "two_dvr":
@@ -914,6 +984,8 @@ def _passthrough_live_prefix(mode: str) -> str:
 
 
 def _passthrough_live_item_prefix(mode: str) -> str:
+    if mode == "face_beauty":
+        return FACE_BEAUTY_LIVE_ITEM_PREFIX
     if mode == "rm":
         return RM_LIVE_ITEM_PREFIX
     if mode == "two_dvr":
@@ -931,7 +1003,7 @@ def _passthrough_seek_item_prefix(mode: str) -> str:
 
 def _passthrough_live_query(mode: str) -> str:
     version = f"ptv={_DIDL_SCHEMA_VERSION}"
-    if mode in {"green", "alpha", "two_dvr", "rm", "superres"}:
+    if mode in {"green", "alpha", "two_dvr", "rm", "superres", "face_beauty"}:
         return f"mode={mode}&{version}"
     return version
 
@@ -1021,9 +1093,21 @@ def _is_two_d_source(path: Path, width: int = 0, height: int = 0) -> bool:
 
 
 def _rm_dlna_enabled(path: Path, width: int = 0, height: int = 0) -> bool:
-    """A [RM] live entry is offered for 2D sources when mosaic restoration is on.
-    2:1 half-equirectangular VR sources are excluded (handled by _is_two_d_source)."""
-    return bool(get_rm().enabled) and _is_two_d_source(path, width, height)
+    """A [RM] live entry is offered when mosaic restoration is on, for both 2D
+    and VR sources. VR (half-equirect / VR-marked) sources are restored through
+    the VR-to-flat path inside GpuRmProcessor (same processor as offline), so no
+    separate realtime handling is needed. 8K VR is below realtime (~0.8x) and
+    will drop frames; 4K VR and 2D are comfortably realtime."""
+    return bool(get_rm().enabled)
+
+
+def _face_beauty_dlna_enabled(path: Path, width: int = 0, height: int = 0) -> bool:
+    """A [FaceBeauty] live entry is offered whenever realtime beautification is
+    on, for both 2D and VR sources. The realtime worker runs the same
+    GpuFaceBeautyProcessor as offline, which reprojects VR faces through a flat
+    view (W>=2H branch), so VR needs no separate handling. Cost scales with the
+    number of faces, not resolution, so no width cap is applied here."""
+    return bool(get_face_beauty().enabled)
 
 
 def _superres_dlna_enabled(
@@ -1033,6 +1117,11 @@ def _superres_dlna_enabled(
     child: IndexedChild | None = None,
 ) -> bool:
     is_vr = has_vr_filename_marker(path.stem) or is_half_equirectangular_source(width, height)
+    # RTX VSR is useful for lower-resolution VR input, but exposing it for an
+    # already-8K SBS source creates an expensive no-benefit realtime entry.
+    # Keep 4K VR (up to 4096px wide) available and hide only 8K-class VR.
+    if is_vr and int(width or 0) > 4096:
+        return False
     source_shape_allowed = _is_two_d_source(path, width, height) or is_vr
     input_height_allowed = int(height) >= RTX_VSR_INPUT_MIN_HEIGHT and (is_vr or int(height) <= RTX_VSR_INPUT_MAX_HEIGHT)
     return bool(
@@ -1210,6 +1299,17 @@ def _video_items_from_index(
     ):
         return items
 
+    if _face_beauty_dlna_enabled(path, width, height):
+        items.append(
+            {
+                "container": True,
+                "id": f"{FACE_BEAUTY_LIVE_PREFIX}{_versioned_rel(rel)}",
+                "parent_id": parent_id,
+                "title": _prefixed_live_directory_title(path, "face_beauty", width, height),
+                "child_count": len(_live_chapter_offsets(duration)) + 1,
+            }
+        )
+
     if _rm_dlna_enabled(path, width, height):
         items.append(
             {
@@ -1385,6 +1485,8 @@ def _live_time_index_items(
         or width > 4096
     ):
         return []
+    if mode == "face_beauty" and not _face_beauty_dlna_enabled(path, width, height):
+        return None
     if mode == "rm" and not _rm_dlna_enabled(path, width, height):
         return []
     if mode == "superres" and not _superres_dlna_enabled(path, width, height):
@@ -1530,6 +1632,8 @@ def _live_chapter_items(
         or width > 4096
     ):
         return []
+    if mode == "face_beauty" and not _face_beauty_dlna_enabled(path, width, height):
+        return None
     if mode == "rm" and not _rm_dlna_enabled(path, width, height):
         return []
     if mode == "superres" and not _superres_dlna_enabled(path, width, height):
@@ -1626,19 +1730,46 @@ def _children_for_dir(directory: Path, client_profile: str | None = None) -> lis
     return items
 
 
-def _root_items(client_profile: str | None = None) -> list[dict]:
-    if not MEDIA_LIBRARY.multi_root:
-        return _children_for_dir(_root(), client_profile)
+def _all_videos_root_item() -> dict:
+    return {
+        "container": True,
+        "id": ALL_VIDEOS_ID,
+        "parent_id": ROOT_ID,
+        "title": _all_videos_label(),
+        "child_count": len(_all_videos_cache),
+    }
+
+
+def _all_videos_items() -> list[dict]:
     return [
         {
             "container": True,
-            "id": f"{FOLDER_PREFIX}{_versioned_rel(root.label)}",
-            "parent_id": ROOT_ID,
-            "title": root.label,
-            "child_count": _child_count(root.path),
+            "id": _all_video_id(path),
+            "parent_id": ALL_VIDEOS_ID,
+            "title": path.name,
+            "child_count": _video_item_count(path),
         }
-        for root in MEDIA_LIBRARY.roots
+        for path in _all_videos_cache
     ]
+
+
+def _root_items(client_profile: str | None = None) -> list[dict]:
+    if not MEDIA_LIBRARY.multi_root:
+        items = _children_for_dir(_root(), client_profile)
+    else:
+        items = [
+            {
+                "container": True,
+                "id": f"{FOLDER_PREFIX}{_versioned_rel(root.label)}",
+                "parent_id": ROOT_ID,
+                "title": root.label,
+                "child_count": _child_count(root.path),
+            }
+            for root in MEDIA_LIBRARY.roots
+        ]
+    if DLNA_ALL_VIDEOS_ENABLED:
+        items.append(_all_videos_root_item())
+    return items
 
 
 def _items() -> list[dict]:
@@ -1800,16 +1931,18 @@ def _wrap_soap(action: str, body_xml: str) -> bytes:
 
 def _metadata_didl_for_dir(directory: Path) -> str:
     if MEDIA_LIBRARY.multi_root and directory is None:
+        child_count = len(MEDIA_LIBRARY.roots) + (1 if DLNA_ALL_VIDEOS_ENABLED else 0)
         return (
             f'<DIDL-Lite xmlns="{DIDL_NS}" '
             'xmlns:dc="http://purl.org/dc/elements/1.1/" '
             'xmlns:upnp="urn:schemas-upnp-org:metadata-1-0/upnp/">'
-            f'<container id="{ROOT_ID}" parentID="-1" childCount="{len(MEDIA_LIBRARY.roots)}" restricted="1">'
+            f'<container id="{ROOT_ID}" parentID="-1" childCount="{child_count}" restricted="1">'
             "<dc:title>PT Videos</dc:title>"
             "<upnp:class>object.container.storageFolder</upnp:class>"
             "</container></DIDL-Lite>"
         )
     directory = safe_resolve_path(directory or _root())
+    root_child_count = _child_count(directory) + (1 if DLNA_ALL_VIDEOS_ENABLED and directory == _root() else 0)
     title = "PT Videos" if directory == _root() and not MEDIA_LIBRARY.multi_root else _rel_key(directory).split("/", 1)[0] if MEDIA_LIBRARY.multi_root and directory in [root.path for root in MEDIA_LIBRARY.roots] else directory.name
     return (
         f'<DIDL-Lite xmlns="{DIDL_NS}" '
@@ -1817,7 +1950,7 @@ def _metadata_didl_for_dir(directory: Path) -> str:
         'xmlns:upnp="urn:schemas-upnp-org:metadata-1-0/upnp/">'
         f'<container id="{html.escape(_folder_id(directory))}" '
         f'parentID="{html.escape(_parent_id_for_dir(directory))}" '
-        f'childCount="{_child_count(directory)}" restricted="1">'
+        f'childCount="{root_child_count if directory == _root() else _child_count(directory)}" restricted="1">'
         f"<dc:title>{html.escape(title)}</dc:title>"
         "<upnp:class>object.container.storageFolder</upnp:class>"
         "</container></DIDL-Lite>"
@@ -1889,6 +2022,7 @@ def handle_soap(
         si_time = _id_to_si_time_index(object_id)
         si_point = _id_to_si_point(object_id)
         image = _id_to_image(object_id)
+        all_video = _id_to_all_video(object_id)
 
         if time_index is not None:
             index_path, index_mode, index_level, index_start, index_end = time_index
@@ -1909,7 +2043,11 @@ def handle_soap(
         elif live is not None:
             live_path, live_mode = live
             all_items = _live_chapter_items(live_path, live_mode, client_profile, language)
-        elif object_id == ROOT_ID and MEDIA_LIBRARY.multi_root:
+        elif object_id == ALL_VIDEOS_ID and DLNA_ALL_VIDEOS_ENABLED:
+            all_items = _all_videos_items()
+        elif all_video is not None:
+            all_items = _video_items(all_video, object_id, client_profile)
+        elif object_id == ROOT_ID:
             all_items = _root_items(client_profile)
         elif directory is None or not directory.is_dir():
             all_items: list[dict] = []
@@ -1955,6 +2093,18 @@ def handle_soap(
                     if item.get("passthrough_mode") == "si_mix"
                 ]
                 didl = _metadata_didl_for_item(si_items[0]) if si_items else _didl_for([])
+            elif object_id == ALL_VIDEOS_ID and DLNA_ALL_VIDEOS_ENABLED:
+                didl = _metadata_didl_for_item(_all_videos_root_item())
+            elif all_video is not None:
+                didl = _metadata_didl_for_item(
+                    {
+                        "container": True,
+                        "id": object_id,
+                        "parent_id": ALL_VIDEOS_ID,
+                        "title": all_video.name,
+                        "child_count": _video_item_count(all_video),
+                    }
+                )
             else:
                 didl = _metadata_didl_for_dir(directory or _root())
             return _wrap_soap(

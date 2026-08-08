@@ -10,7 +10,7 @@ class DemosaicChunkModelTests(unittest.TestCase):
         self.assertEqual(demosaic.WINDOW, 8)
         self.assertEqual(
             demosaic.restoration_model_path().name,
-            "vr_mosaic_restoration_chunk_model_v0.1.onnx",
+            "vr_mosaic_restoration_chunk_model_v0.2.onnx",
         )
 
 

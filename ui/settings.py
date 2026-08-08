@@ -17,7 +17,7 @@ from utils.si_filter import (
     DEFAULT_SI_VOLUME_PERCENT,
     SI_DUCK_PRESET_CHOICES,
 )
-from utils.trt_manifest import TRT_PROVIDER_CHAIN, cache_status
+from utils.trt_manifest import TRT_PROVIDER_CHAIN
 
 ROOT = Path(sys.executable).resolve().parent if getattr(sys, "frozen", False) else Path(__file__).resolve().parents[1]
 SETTINGS_PATH = ROOT / "runtime_cache" / "ui_settings.json"
@@ -59,6 +59,7 @@ DEFAULTS = {
     "superres_quality": 4,
     "superres_hdr_look": "natural",
     "superres_offline_hdr_look": "natural",
+    "superres_offline_bitrate_mode": "auto",
     "two_dvr_live_model": "base",
     "two_dvr_live_hole_fill": "soft_shift",
     "two_dvr_live_eye_distance": 65.0,
@@ -80,6 +81,7 @@ DEFAULTS = {
     "passthrough_seek_route_policy": "profile",
     "passthrough_seek_container": "mpegts",
     "dlna_image_enabled": False,
+    "dlna_all_videos_enabled": False,
     "decode_max_side": 4096,
     "inference_backend": "cuda",
     "light_match_enabled": False,
@@ -99,6 +101,11 @@ DEFAULTS = {
     "si_duck_preset": DEFAULT_DUCK_PRESET,
     "si_dub_mode": DEFAULT_DUB_MODE,
     "rm_enabled": False,
+    "face_beauty_enabled": False,
+    "face_beauty_card_visible": False,
+    # Realtime strength knobs; empty means "use the offline standard preset".
+    "face_beauty_live": {},
+    "rm_vr2flat_decode": True,
     "rm_card_visible": False,
     "alpha_2d_projection": "fisheye",
     "alpha_2d_distance_m": 4.0,
@@ -289,6 +296,7 @@ class Settings:
             "PT_PASSTHROUGH_SEEK_ROUTE_POLICY": seek_route_policy,
             "PT_PASSTHROUGH_SEEK_CONTAINER": seek_container,
             "PT_DLNA_IMAGE_ENABLED": "1" if self.data.get("dlna_image_enabled") else "0",
+            "PT_DLNA_ALL_VIDEOS_ENABLED": "1" if self.data.get("dlna_all_videos_enabled") else "0",
             "PT_DECODE_MAX_SIDE": str(_setting_value(self.data, "decode_max_side", 4096)),
             "PT_LIGHT_MATCH_ENABLED": "1" if self.data.get("light_match_enabled") else "0",
             "PT_LIGHT_MATCH_TEMP_K": str(_setting_value(self.data, "light_match_temp_k", DEFAULTS["light_match_temp_k"])),
@@ -309,6 +317,11 @@ class Settings:
             "PT_SI_DUCK_PRESET": si_duck_preset,
             "PT_SI_DUB_MODE": "1" if self.data.get("si_dub_mode", DEFAULTS["si_dub_mode"]) else "0",
             "PT_RM_ENABLED": "1" if self.data.get("rm_enabled", DEFAULTS["rm_enabled"]) else "0",
+            "PT_FACE_BEAUTY_ENABLED": "1" if self.data.get(
+                "face_beauty_enabled", DEFAULTS["face_beauty_enabled"]) else "0",
+            "PT_FACE_BEAUTY_PRESET": str(
+                (self.data.get("face_beauty_live") or {}).get("preset") or "standard"),
+            "PT_RM_VR2FLAT_DECODE": "1" if self.data.get("rm_vr2flat_decode", DEFAULTS["rm_vr2flat_decode"]) else "0",
             "PT_ALPHA_2D_ENABLE": "1" if self.data.get("mode_2d", DEFAULTS["mode_2d"]) else "0",
             "PT_ALPHA_2D_PROJECTION": str(self.data.get("alpha_2d_projection") or "fisheye"),
             "PT_ALPHA_2D_DISTANCE_M": str(_setting_value(self.data, "alpha_2d_distance_m", 4.0)),
@@ -343,11 +356,9 @@ class Settings:
         else:
             env.pop("PT_SUBTITLE_COLOR", None)
         if str(self.data.get("inference_backend") or "cuda").lower() == "tensorrt":
-            try:
-                if cache_status() == "ready":
-                    env["PT_ONNX_PROVIDERS"] = TRT_PROVIDER_CHAIN
-            except Exception:
-                pass
+            # The UI stays GPU-runtime-free.  The server process validates the
+            # manifest/fingerprint and falls back to CUDA when TRT is stale.
+            env["PT_ONNX_PROVIDERS"] = TRT_PROVIDER_CHAIN
         return env
 
     def http_port(self) -> int:

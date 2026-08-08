@@ -3,7 +3,9 @@ from __future__ import annotations
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
+import config
 from fastapi.responses import StreamingResponse
 from fastapi.testclient import TestClient
 from starlette.requests import Request
@@ -328,6 +330,23 @@ class RequestHistoryTests(unittest.TestCase):
             self.assertEqual(len(snapshot), 1)
             self.assertEqual(snapshot[0]["path"], "/description.xml")
             self.assertEqual(snapshot[0]["status_code"], 200)
+
+    def test_runtime_status_reads_current_provider_configuration(self) -> None:
+        original = config.ONNX_PROVIDERS
+        try:
+            with TestClient(create_app()) as client, patch("http_app.routes_media._query_vram_mib", return_value=None):
+                for providers, expected in (
+                    (["TensorrtExecutionProvider", "CUDAExecutionProvider"], "trt"),
+                    (["CUDAExecutionProvider", "CPUExecutionProvider"], "cuda"),
+                    (["CPUExecutionProvider"], "cpu"),
+                ):
+                    with self.subTest(expected=expected):
+                        config.ONNX_PROVIDERS = providers
+                        response = client.get("/runtime_status")
+                        self.assertEqual(response.status_code, 200)
+                        self.assertEqual(response.json()["provider_kind"], expected)
+        finally:
+            config.ONNX_PROVIDERS = original
 
     def test_debug_request_history_endpoint_is_localhost_only(self) -> None:
         with TestClient(create_app(), client=("127.0.0.1", 50000)) as client:

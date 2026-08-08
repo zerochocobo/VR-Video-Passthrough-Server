@@ -129,12 +129,26 @@ class TrtManifestTests(unittest.TestCase):
         trt_manifest.shape_inferred_model_path(cache_dir=self.root).write_bytes(b"onnx")
         (self.root / "rvm.engine").write_bytes(b"e" * (1024 * 1024))
         self.assertEqual(trt_manifest.cache_status(actual_fp=actual), "stale")
+        self.assertEqual(trt_manifest.cache_artifact_status(), "ready")
 
     def test_failed_model_status(self) -> None:
         manifest = trt_manifest.build_manifest(self._fingerprint(), [], 0)
         manifest["models"][0]["status"] = "failed"
         trt_manifest.save_manifest(manifest)
         self.assertEqual(trt_manifest.cache_status(actual_fp=self._fingerprint()), "failed")
+
+    def test_cache_status_loads_manifest_once(self) -> None:
+        fp = self._fingerprint()
+        manifest = trt_manifest.build_manifest(
+            fp,
+            [{"shape": "1x3x1024x1024", "size_mb": 1, "built_at": "2026-05-20T00:00:00Z"}],
+            3,
+        )
+        trt_manifest.shape_inferred_model_path(cache_dir=self.root).write_bytes(b"onnx")
+        (self.root / "rvm.engine").write_bytes(b"e" * (1024 * 1024))
+        with patch.object(trt_manifest, "load_manifest_for_model", return_value=manifest) as load:
+            self.assertEqual(trt_manifest.cache_status(actual_fp=fp), "ready")
+        load.assert_called_once()
 
     def test_matanyone2_manifest_uses_separate_cache_dir(self) -> None:
         source_512 = self.root / "matanyone2_512_step_update.onnx"

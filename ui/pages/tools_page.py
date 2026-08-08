@@ -65,6 +65,7 @@ class ToolsPage(QWidget):
     open_two_dvr = Signal()
     open_rm = Signal()
     open_superres = Signal()
+    open_face_beauty = Signal()
 
     def __init__(self, i18n, settings=None) -> None:
         super().__init__()
@@ -84,11 +85,13 @@ class ToolsPage(QWidget):
         self.offline_card = ToolCard("green_screen")
         self.two_dvr_card = ToolCard("two_dvr")
         self.rm_card = ToolCard("rm")
-        self.superres_card = ToolCard("rm")
+        self.superres_card = ToolCard("superres")
+        self.face_beauty_card = ToolCard("face_beauty")
         self.offline_card.open_requested.connect(self.open_offline)
         self.two_dvr_card.open_requested.connect(self.open_two_dvr)
         self.rm_card.open_requested.connect(self.open_rm)
         self.superres_card.open_requested.connect(self.open_superres)
+        self.face_beauty_card.open_requested.connect(self.open_face_beauty)
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(18, 16, 18, 16)
@@ -100,14 +103,20 @@ class ToolsPage(QWidget):
         layout.addWidget(self.two_dvr_card)
         layout.addWidget(self.rm_card)
         layout.addWidget(self.superres_card)
+        layout.addWidget(self.face_beauty_card)
         layout.addStretch(1)
 
         self.set_rm_card_visible(bool(settings and settings.data.get("rm_card_visible")))
+        self.set_face_beauty_card_visible(bool(settings and settings.data.get("face_beauty_card_visible")))
         self.retranslate()
 
     def set_rm_card_visible(self, visible: bool) -> None:
         """Show or hide the offline Remove Mosaic entry from the tools page."""
         self.rm_card.setVisible(bool(visible))
+
+    def set_face_beauty_card_visible(self, visible: bool) -> None:
+        """Show or hide the offline Face Beauty entry from the tools page."""
+        self.face_beauty_card.setVisible(bool(visible))
 
     def retranslate(self) -> None:
         self.title.setText(self.i18n.t("nav.tools"))
@@ -120,5 +129,8 @@ class ToolsPage(QWidget):
         self.rm_card.desc_label.setText(self.i18n.t("tools.rm_desc"))
         self.superres_card.title_label.setText(self.i18n.t("superres.offline_title"))
         self.superres_card.desc_label.setText(self.i18n.t("tools.superres_desc"))
-        for card in (self.offline_card, self.two_dvr_card, self.rm_card, self.superres_card):
+        self.face_beauty_card.title_label.setText(self.i18n.t("beauty.title"))
+        self.face_beauty_card.desc_label.setText(self.i18n.t("tools.face_beauty_desc"))
+        for card in (self.offline_card, self.two_dvr_card, self.rm_card,
+                     self.superres_card, self.face_beauty_card):
             card.open_button.setText(self.i18n.t("tools.open"))

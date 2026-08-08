@@ -32,7 +32,12 @@ from ui.resources import SWITCH_OFF_IMAGE_PATH, SWITCH_ON_IMAGE_PATH
 from ui.settings import quality_speed_preset, quality_speed_value
 from ui.widgets.sam3_preview_dialog import Sam3PreviewDialog
 from ui.widgets.trt_cache_dialog import TensorRTConfigDialog
-from utils.trt_manifest import TRT_MODEL_MATANYONE2, TRT_MODEL_RVM, cache_status, manifest_path
+from utils.trt_manifest import (
+    TRT_MODEL_MATANYONE2,
+    TRT_MODEL_RVM,
+    cache_artifact_status as cache_status,
+    manifest_path,
+)
 from utils.video_metadata import probe_video_metadata
 
 

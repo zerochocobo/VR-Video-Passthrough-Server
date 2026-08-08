@@ -21,9 +21,11 @@ from ui import theme
 from ui.dialogs.feature_dialogs import (
     Alpha2DSettingsDialog,
     BG_COLOR_CHOICES,
+    FaceBeautySettingsDialog,
     GreenScreenSettingsDialog,
     LightMatchSettingsDialog,
     PlayerSupportDialog,
+    RmSettingsDialog,
     SIHelpDialog,
     SISettingsDialog,
     SuperResSettingsDialog,
@@ -33,10 +35,15 @@ from ui.dialogs.feature_dialogs import (
 )
 from ui.services.live_control import send_control
 from ui.settings import DEFAULTS
-from ui.widgets.feature_card import FeatureCard
+from ui.widgets.feature_card import CARD_HEIGHT, FeatureCard
 
 DASHBOARD_WIDTH = 700
-DASHBOARD_HEIGHT = 560
+# Height for the common layout: three single-row card grids. A grid that wraps
+# to a second row adds EXTRA_ROW_HEIGHT, reported by DashboardPage.preferred_height
+# -- the 2D row does exactly that once the [RM] card is visible, and a fixed
+# height there left the "other" group label overlapped by the cards above it.
+DASHBOARD_HEIGHT = 524
+EXTRA_ROW_HEIGHT = CARD_HEIGHT + 8
 SERVER_ICON_SIZE = 22
 GRID_COLUMNS = 3
 PROJECT_URL = "https://wapok.com"
@@ -129,15 +136,16 @@ class DashboardPage(QWidget):
             "green": FeatureCard("green_screen"),
             "alpha": FeatureCard("alpha", configurable=False, with_help=True),
             "alpha2d": FeatureCard("alpha"),
+            "face_beauty": FeatureCard("face_beauty"),
             "two_dvr": FeatureCard("two_dvr"),
-            "superres": FeatureCard("rm", configurable=True),
-            "rm": FeatureCard("rm", configurable=False),
+            "superres": FeatureCard("superres", configurable=True),
+            "rm": FeatureCard("rm", configurable=True),
             "subtitle": FeatureCard("subtitle"),
             "si": FeatureCard("translate", with_help=True),
             "light": FeatureCard("light"),
         }
         self._realtime_keys = ["alpha", "green", "superres"]
-        self._2d_keys = ["two_dvr", "si", "rm"]
+        self._2d_keys = ["face_beauty", "two_dvr", "si", "rm"]
         self._audio_keys = ["subtitle", "light", "alpha2d"]
 
         self.realtime_group_label = QLabel()
@@ -147,6 +155,7 @@ class DashboardPage(QWidget):
                 f"font-size: 9pt; font-weight: 600; color: {theme.TEXT_FAINT}; background: transparent;"
             )
 
+        self._grid_rows: dict[int, int] = {}
         self._realtime_grid = QGridLayout()
         self._realtime_grid.setSpacing(8)
         self._2d_grid = QGridLayout()
@@ -195,6 +204,7 @@ class DashboardPage(QWidget):
         self.cards["two_dvr"].toggled.connect(lambda checked: self._save_flag("mode_two_dvr", checked))
         self.cards["superres"].toggled.connect(lambda checked: self._save_flag("mode_superres", checked))
         self.cards["subtitle"].toggled.connect(lambda checked: self._save_flag("subtitle_enable", checked))
+        self.cards["face_beauty"].toggled.connect(self._toggle_face_beauty)
         self.cards["rm"].toggled.connect(self._toggle_rm)
         self.cards["si"].toggled.connect(self._toggle_si)
         self.cards["light"].toggled.connect(self._toggle_light_match)
@@ -204,9 +214,16 @@ class DashboardPage(QWidget):
         self.cards["superres"].configure_requested.connect(self._configure_superres)
         self.cards["two_dvr"].configure_requested.connect(self._configure_two_dvr)
         self.cards["subtitle"].configure_requested.connect(self.open_subtitle_page)
+        self.cards["face_beauty"].configure_requested.connect(self._configure_face_beauty)
+        self.cards["rm"].configure_requested.connect(self._configure_rm)
         self.cards["si"].configure_requested.connect(self._configure_si)
         self.cards["si"].help_requested.connect(lambda: SIHelpDialog(self.i18n, self).exec())
         self.cards["light"].configure_requested.connect(self._configure_light_match)
+
+    def preferred_height(self) -> int:
+        """Window height this layout needs, growing when a card grid wraps."""
+        extra = sum(max(0, rows - 1) for rows in self._grid_rows.values())
+        return DASHBOARD_HEIGHT + extra * EXTRA_ROW_HEIGHT
 
     def _rebuild_grids(self) -> None:
         for grid, keys in (
@@ -219,7 +236,11 @@ class DashboardPage(QWidget):
                 widget = item.widget()
                 if widget is not None:
                     widget.setParent(None)
-            visible_keys = [key for key in keys if key != "rm" or self._rm_card_enabled()]
+            visible_keys = [
+                key for key in keys
+                if (key != "rm" or self._rm_card_enabled())
+                and (key != "face_beauty" or self._face_beauty_card_enabled())
+            ]
             for index, key in enumerate(visible_keys):
                 card = self.cards[key]
                 card.setVisible(True)
@@ -227,15 +248,20 @@ class DashboardPage(QWidget):
             for column in range(GRID_COLUMNS):
                 grid.setColumnStretch(column, 1)
             rows = max(1, (len(visible_keys) + GRID_COLUMNS - 1) // GRID_COLUMNS)
+            self._grid_rows[id(grid)] = rows
             filled = rows * GRID_COLUMNS
             for pad_index in range(len(visible_keys), filled):
                 spacer = QWidget()
                 spacer.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
                 grid.addWidget(spacer, pad_index // GRID_COLUMNS, pad_index % GRID_COLUMNS)
         self.cards["rm"].setVisible(self._rm_card_enabled())
+        self.cards["face_beauty"].setVisible(self._face_beauty_card_enabled())
 
     def _rm_card_enabled(self) -> bool:
         return bool(self.settings.data.get("rm_card_visible"))
+
+    def _face_beauty_card_enabled(self) -> bool:
+        return bool(self.settings.data.get("face_beauty_card_visible"))
 
     def set_rm_card_visible(self, visible: bool) -> None:
         self._rebuild_grids()
@@ -243,11 +269,31 @@ class DashboardPage(QWidget):
             self.cards["rm"].set_checked(False)
             self._toggle_rm(False)
 
+    def set_face_beauty_card_visible(self, visible: bool) -> None:
+        self._rebuild_grids()
+        if not visible and self.cards["face_beauty"].is_checked():
+            self.cards["face_beauty"].set_checked(False)
+            self._toggle_face_beauty(False)
+
     # ---- toggle handlers ----
 
     def _save_flag(self, key: str, checked: bool) -> None:
         self.settings.data[key] = bool(checked)
         self.settings.save()
+        self._update_summaries()
+
+    def _face_beauty_payload(self) -> dict:
+        stored = self.settings.data.get("face_beauty_live") or {}
+        if not isinstance(stored, dict):
+            stored = {}
+        payload = dict(stored)
+        payload["enabled"] = bool(self.settings.data.get("face_beauty_enabled"))
+        return payload
+
+    def _toggle_face_beauty(self, checked: bool) -> None:
+        self.settings.data["face_beauty_enabled"] = bool(checked)
+        self.settings.save()
+        send_control("face_beauty", self._face_beauty_payload())
         self._update_summaries()
 
     def _toggle_rm(self, checked: bool) -> None:
@@ -310,6 +356,24 @@ class DashboardPage(QWidget):
         self.settings.data["two_dvr_live_hole_fill"] = DEFAULTS["two_dvr_live_hole_fill"]
         self.settings.data["two_dvr_live_eye_distance"] = DEFAULTS["two_dvr_live_eye_distance"]
         self.settings.data["two_dvr_live_strength"] = float(strength)
+        self.settings.save()
+        self._update_summaries()
+
+    def _configure_face_beauty(self) -> None:
+        dialog = FaceBeautySettingsDialog(self.i18n, self.settings, self)
+        if dialog.exec() != FaceBeautySettingsDialog.DialogCode.Accepted:
+            return
+        self.settings.data["face_beauty_live"] = dialog.payload()
+        self.settings.save()
+        send_control("face_beauty", self._face_beauty_payload())
+        self._update_summaries()
+
+    def _configure_rm(self) -> None:
+        dialog = RmSettingsDialog(self.i18n, self.settings, self)
+        if dialog.exec() != RmSettingsDialog.DialogCode.Accepted:
+            return
+        payload = dialog.payload()
+        self.settings.data["rm_vr2flat_decode"] = payload["vr2flat_decode"]
         self.settings.save()
         self._update_summaries()
 
@@ -389,6 +453,12 @@ class DashboardPage(QWidget):
         self.cards["two_dvr"].set_checked(bool(data.get("mode_two_dvr")))
         self.cards["superres"].set_checked(bool(data.get("mode_superres")))
         self.cards["rm"].set_checked(bool(data.get("rm_enabled", DEFAULTS["rm_enabled"])))
+        face_beauty_visible = self._face_beauty_card_enabled()
+        face_beauty_enabled = bool(data.get("face_beauty_enabled", DEFAULTS["face_beauty_enabled"]))
+        self.cards["face_beauty"].set_checked(face_beauty_enabled if face_beauty_visible else False)
+        if not face_beauty_visible and face_beauty_enabled:
+            self.settings.data["face_beauty_enabled"] = False
+            self.settings.save()
         self.cards["subtitle"].set_checked(bool(data.get("subtitle_enable")))
         self.cards["si"].set_checked(bool(data.get("si_enabled")))
         self.cards["light"].set_checked(bool(data.get("light_match_enabled")))
@@ -420,6 +490,8 @@ class DashboardPage(QWidget):
         self.cards["superres"].set_summary(f"[SuperRes] · {self.i18n.t(target_key)} · {self.i18n.t(quality_key)} · {self.i18n.t(f'superres.hdr_look_{hdr_mode}')}")
 
         self.cards["rm"].set_summary(f"[RM] · {self.i18n.t('dashboard.rm_summary')}")
+        self.cards["face_beauty"].set_summary(
+            f"[FaceBeauty] · {self.i18n.t('home.face_beauty_summary')}")
         self.cards["subtitle"].set_summary(self.i18n.t("dashboard.subtitle_summary"))
 
         if bool(data.get("si_dub_mode", DEFAULTS["si_dub_mode"])):
@@ -482,6 +554,7 @@ class DashboardPage(QWidget):
         self.cards["two_dvr"].set_title(self.i18n.t("home.two_dvr_toggle"))
         self.cards["superres"].set_title(self.i18n.t("superres.realtime_title"))
         self.cards["rm"].set_title(self.i18n.t("rm.enabled"))
+        self.cards["face_beauty"].set_title(self.i18n.t("home.face_beauty_toggle"))
         self.cards["subtitle"].set_title(self.i18n.t("subtitle.enable"))
         self.cards["si"].set_title(self.i18n.t("si.enabled"))
         self.cards["light"].set_title(self.i18n.t("light_match.enabled"))

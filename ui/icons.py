@@ -105,6 +105,34 @@ def _draw_rm(p: QPainter, s: float) -> None:
     p.drawLine(QPointF(s * 0.84, s * 0.16), QPointF(s * 0.84, s * 0.34))
 
 
+def _sparkle(p: QPainter, cx: float, cy: float, r: float) -> None:
+    """Four-point star: two crossing strokes, the shorter pair at 45 degrees."""
+    p.drawLine(QPointF(cx, cy - r), QPointF(cx, cy + r))
+    p.drawLine(QPointF(cx - r, cy), QPointF(cx + r, cy))
+    d = r * 0.42
+    p.drawLine(QPointF(cx - d, cy - d), QPointF(cx + d, cy + d))
+    p.drawLine(QPointF(cx - d, cy + d), QPointF(cx + d, cy - d))
+
+
+def _draw_face_beauty(p: QPainter, s: float) -> None:
+    # Magic wand: a diagonal shaft with a banded grip, trailing sparkles.
+    p.drawLine(QPointF(s * 0.2, s * 0.82), QPointF(s * 0.62, s * 0.4))
+    p.drawLine(QPointF(s * 0.29, s * 0.65), QPointF(s * 0.37, s * 0.73))
+    _sparkle(p, s * 0.7, s * 0.29, s * 0.16)
+    _sparkle(p, s * 0.86, s * 0.56, s * 0.09)
+    _sparkle(p, s * 0.5, s * 0.16, s * 0.08)
+
+
+def _draw_superres(p: QPainter, s: float) -> None:
+    # Upscale: a small frame growing into a large one, arrow pointing out.
+    p.drawRoundedRect(QRectF(s * 0.12, s * 0.52, s * 0.36, s * 0.36), s * 0.06, s * 0.06)
+    p.drawRoundedRect(QRectF(s * 0.34, s * 0.12, s * 0.54, s * 0.54), s * 0.07, s * 0.07)
+    p.drawLine(QPointF(s * 0.5, s * 0.5), QPointF(s * 0.76, s * 0.24))
+    p.drawPolyline([
+        QPointF(s * 0.58, s * 0.24), QPointF(s * 0.76, s * 0.24), QPointF(s * 0.76, s * 0.42),
+    ])
+
+
 def _draw_translate(p: QPainter, s: float) -> None:
     font = QFont()
     font.setPointSizeF(max(6.0, s * 0.34))
@@ -178,6 +206,8 @@ _DRAWERS = {
     "alpha": _draw_alpha,
     "two_dvr": _draw_two_dvr,
     "rm": _draw_rm,
+    "superres": _draw_superres,
+    "face_beauty": _draw_face_beauty,
     "translate": _draw_translate,
     "light": _draw_light,
     "folder": _draw_folder,

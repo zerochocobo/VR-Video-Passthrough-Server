@@ -19,6 +19,7 @@ slow provider.
 from __future__ import annotations
 
 import argparse
+import queue
 import shutil
 import subprocess
 import sys
@@ -124,6 +125,11 @@ def _run_clip(processor_factory, src: Path, out: Path, start: float, duration: f
     s0 = start_out
     log(f"{src.name}: {width}x{height}@{fps:.3f} frames[{start_out},{end_idx}) -> {out.name}")
 
+    # Build the width-specific detector (1280 for 8K) up front so its one-time
+    # TensorRT build/load happens here rather than stalling the first chunk.
+    processor = processor_factory()
+    processor.prewarm_for_width(width)
+
     dec = PyNvThreadedSerialDecoder(
         src, bit_depth=bit_depth, start_frame=s0,
         batch_size=config.PASSTHROUGH_PYNV_THREADED_BATCH_SIZE,
@@ -147,13 +153,11 @@ def _run_clip(processor_factory, src: Path, out: Path, start: float, duration: f
 
     stderr_thread = threading.Thread(target=_drain_stderr, name="rm-mux-stderr", daemon=True)
     stderr_thread.start()
-    processor = processor_factory()
 
     mod = cp.RawModule(code=_NV12_RGB_KERNELS)
     k_to_rgb = mod.get_function("nv12_to_rgb")
     k_p016_to_rgb = mod.get_function("p016_to_rgb")
     k_to_nv12 = mod.get_function("rgb_to_nv12")
-    out_nv12 = cp.empty((height * 3 // 2, width), cp.uint8)
     bx = (16, 16, 1)
     grid = ((width + 15) // 16, (height + 15) // 16, 1)
     grid_out = ((width + 15) // 16, (height + 15) // 16, 1)
@@ -177,34 +181,75 @@ def _run_clip(processor_factory, src: Path, out: Path, start: float, duration: f
             cache[idx] = cached
         return cached
 
-    produced = 0
     total = end_idx - start_out
     t0 = time.perf_counter()
+
+    # NVENC + pipe I/O run on their own thread so they overlap the next chunk's
+    # decode + restore (NVENC is a separate HW engine from the CUDA cores). The
+    # main thread only launches the RGB->NV12 conversion and hands over a ready
+    # GPU buffer guarded by a CUDA event; the FIFO queue preserves frame order,
+    # so recurrent state and mux output stay identical to the serial path.
+    enc_q: "queue.Queue" = queue.Queue(maxsize=WINDOW)
+    enc_state = {"produced": 0}
+    enc_error: list[BaseException] = []
+
+    def _encode_worker() -> None:
+        cp.cuda.Device().use()
+        try:
+            while True:
+                item = enc_q.get()
+                if item is None:
+                    break
+                nv12_g, ev = item
+                ev.synchronize()                 # conversion done before NVENC reads
+                flags = 0
+                if enc_state["produced"] == 0:
+                    flags = int(nvc.NV_ENC_PIC_FLAGS.FORCEIDR) | int(nvc.NV_ENC_PIC_FLAGS.OUTPUT_SPSPPS)
+                bitstream = enc.Encode(GpuNv12AppFrame(nv12_g, width, height), flags)
+                if bitstream:
+                    mux.stdin.write(bitstream)
+                enc_state["produced"] += 1
+                p = enc_state["produced"]
+                if p % 100 == 0:
+                    elapsed = max(1e-3, time.perf_counter() - t0)
+                    pct = p / total * 100.0 if total > 0 else 0.0
+                    log(f"  {pct:5.1f}%  {p}/{total} frames ({p / elapsed:.1f} fps)")
+            tail = enc.EndEncode()
+            if tail:
+                mux.stdin.write(tail)
+        except BaseException as e:               # surface to main; never hang the pipe
+            enc_error.append(e)
+
+    enc_thread = threading.Thread(target=_encode_worker, name="rm-encode", daemon=True)
+    enc_thread.start()
+
+    def _submit(item) -> None:
+        while True:
+            if enc_error:
+                raise enc_error[0]
+            try:
+                enc_q.put(item, timeout=0.5)
+                return
+            except queue.Full:
+                continue
+
     try:
         for chunk_start in range(start_out, end_idx, WINDOW):
             actual = min(WINDOW, end_idx - chunk_start)
             chunk = [rgb_at(chunk_start + k) for k in range(WINDOW)]
             out_chunk_g = processor.process_chunk(chunk, conf)
             for j in range(actual):
-                out_g = out_chunk_g[j]
-                k_to_nv12(grid_out, bx, (out_g, out_nv12, np.int32(width), np.int32(height)))
-                cp.cuda.get_current_stream().synchronize()
-                flags = 0
-                if produced == 0:
-                    flags = int(nvc.NV_ENC_PIC_FLAGS.FORCEIDR) | int(nvc.NV_ENC_PIC_FLAGS.OUTPUT_SPSPPS)
-                bitstream = enc.Encode(GpuNv12AppFrame(out_nv12, width, height), flags)
-                if bitstream:
-                    mux.stdin.write(bitstream)
-                produced += 1
-                if produced % 100 == 0:
-                    elapsed = max(1e-3, time.perf_counter() - t0)
-                    pct = produced / total * 100.0 if total > 0 else 0.0
-                    log(f"  {pct:5.1f}%  {produced}/{total} frames ({produced / elapsed:.1f} fps)")
+                nv12_g = cp.empty((height * 3 // 2, width), cp.uint8)
+                k_to_nv12(grid_out, bx, (out_chunk_g[j], nv12_g, np.int32(width), np.int32(height)))
+                ev = cp.cuda.Event()
+                ev.record()
+                _submit((nv12_g, ev))
             for key in [k for k in cache if k < chunk_start + actual]:
                 del cache[key]
-        tail = enc.EndEncode()
-        if tail:
-            mux.stdin.write(tail)
+        _submit(None)                            # sentinel: flush tail + EndEncode
+        enc_thread.join()
+        if enc_error:
+            raise enc_error[0]
         try:
             mux.stdin.close()
         except Exception:
@@ -215,6 +260,12 @@ def _run_clip(processor_factory, src: Path, out: Path, start: float, duration: f
             dec.stop()
         except Exception:
             pass
+        if enc_thread.is_alive():
+            try:
+                enc_q.put_nowait(None)           # unblock a worker parked on the queue
+            except Exception:
+                pass
+            enc_thread.join(timeout=5)
         if mux.poll() is None:
             mux.kill()
     stderr_thread.join(timeout=5)
@@ -222,6 +273,7 @@ def _run_clip(processor_factory, src: Path, out: Path, start: float, duration: f
     if mux.returncode not in (0, None) or not out.is_file():
         log(f"mux failed rc={mux.returncode}: {mux_err[:800]}")
         return 1
+    produced = enc_state["produced"]
     elapsed = max(1e-3, time.perf_counter() - t0)
     log(f"done: {out} ({produced} frames, {produced / elapsed:.1f} fps avg)")
     return 0

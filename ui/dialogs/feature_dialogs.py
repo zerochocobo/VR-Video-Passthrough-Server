@@ -23,6 +23,8 @@ from PySide6.QtWidgets import (
     QSlider,
     QTableWidget,
     QTableWidgetItem,
+    QGridLayout,
+    QWidget,
     QVBoxLayout,
 )
 
@@ -354,6 +356,181 @@ class TwoDvrSettingsDialog(QDialog):
 
     def selected_strength(self) -> float:
         return float(self.strength.currentData() or DEFAULTS["two_dvr_live_strength"])
+
+
+class RmSettingsDialog(QDialog):
+    """Mosaic-restoration settings opened from the [RM] card's gear button."""
+
+    def __init__(self, i18n, settings, parent=None) -> None:
+        super().__init__(parent)
+        self.i18n = i18n
+        self.setModal(True)
+        self.setWindowTitle(self.i18n.t("rm.dialog_title"))
+
+        self.vr2flat = QCheckBox(self.i18n.t("rm.vr2flat_decode"))
+        self.vr2flat.setChecked(bool(settings.data.get(
+            "rm_vr2flat_decode", DEFAULTS["rm_vr2flat_decode"])))
+        self.vr2flat.setToolTip(self.i18n.t("rm.vr2flat_decode_hint"))
+        hint = QLabel(self.i18n.t("rm.vr2flat_decode_hint"))
+        hint.setWordWrap(True)
+        hint.setStyleSheet("color: #6b7280; font-size: 8.5pt;")
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel)
+        buttons.button(QDialogButtonBox.StandardButton.Save).setText(self.i18n.t("button.save"))
+        buttons.button(QDialogButtonBox.StandardButton.Cancel).setText(self.i18n.t("button.cancel"))
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(16, 14, 16, 14)
+        layout.setSpacing(10)
+        layout.addWidget(self.vr2flat)
+        layout.addWidget(hint)
+        layout.addWidget(buttons)
+        self.resize(380, 150)
+
+    def payload(self) -> dict:
+        return {"vr2flat_decode": self.vr2flat.isChecked()}
+
+
+class FaceBeautySettingsDialog(QDialog):
+    """Realtime beautification settings, opened from the [FaceBeauty] card.
+
+    Only strength is configurable here: the realtime path pins the cheapest
+    restorer and its detection/mask settings so the frame budget is predictable,
+    while the offline page keeps the full option set. The presets and their
+    values come from offline.face_beauty_engine, so the two cannot drift."""
+
+    STRENGTH_KEYS = (
+        ("enhancer_blend", "beauty.enhancer_blend"),
+        ("skin_smooth", "beauty.skin_smooth"),
+        ("skin_brighten", "beauty.skin_brighten"),
+        ("skin_even", "beauty.skin_even"),
+        ("eye_brighten", "beauty.eye_brighten"),
+        ("teeth_white", "beauty.teeth_white"),
+        ("lip_vivid", "beauty.lip_vivid"),
+        ("sharpen", "beauty.sharpen"),
+    )
+    PRESETS = ("restore", "natural", "standard", "strong")
+    PRESET_LABEL_KEYS = {
+        "restore": "beauty.preset_restore",
+        "natural": "beauty.preset_natural",
+        "standard": "beauty.preset_standard",
+        "strong": "beauty.preset_strong",
+        "custom": "beauty.preset_custom",
+    }
+
+    def __init__(self, i18n, settings, parent=None) -> None:
+        super().__init__(parent)
+        self.i18n = i18n
+        self.settings = settings
+        self.setModal(True)
+        self.setWindowTitle(self.i18n.t("home.face_beauty_toggle"))
+
+        stored = settings.data.get("face_beauty_live") or {}
+        if not isinstance(stored, dict):
+            stored = {}
+
+        self.preset = QComboBox()
+        for name in (*self.PRESETS, "custom"):
+            self.preset.addItem(self.i18n.t(self.PRESET_LABEL_KEYS[name]), name)
+        self.preset.currentIndexChanged.connect(self._preset_changed)
+
+        self.sliders: dict[str, QSlider] = {}
+        self.value_labels: dict[str, QLabel] = {}
+        form = QWidget()
+        grid = QGridLayout(form)
+        grid.setContentsMargins(0, 0, 0, 0)
+        for row, (key, label_key) in enumerate(self.STRENGTH_KEYS):
+            slider = QSlider(Qt.Orientation.Horizontal)
+            slider.setRange(0, 100)
+            slider.setValue(int(stored.get(key, self._preset_values("standard").get(key, 0))))
+            value_label = QLabel(f"{slider.value()}%")
+            value_label.setFixedWidth(42)
+            value_label.setStyleSheet("color: #5f6368;")
+            slider.valueChanged.connect(
+                lambda v, lbl=value_label: lbl.setText(f"{v}%"))
+            slider.valueChanged.connect(self._mark_custom)
+            self.sliders[key] = slider
+            self.value_labels[key] = value_label
+            grid.addWidget(QLabel(self.i18n.t(label_key)), row, 0)
+            grid.addWidget(slider, row, 1)
+            grid.addWidget(value_label, row, 2)
+        self.form = form
+
+        preset_row = QHBoxLayout()
+        preset_row.addWidget(QLabel(self.i18n.t("beauty.settings")))
+        preset_row.addWidget(self.preset, 1)
+
+        note = QLabel(self.i18n.t("beauty.live_note"))
+        note.setWordWrap(True)
+        note.setStyleSheet("color: #6b7280; font-size: 8.5pt;")
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel)
+        buttons.button(QDialogButtonBox.StandardButton.Save).setText(self.i18n.t("button.save"))
+        buttons.button(QDialogButtonBox.StandardButton.Cancel).setText(self.i18n.t("button.cancel"))
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(16, 14, 16, 14)
+        layout.setSpacing(10)
+        layout.addLayout(preset_row)
+        layout.addWidget(form)
+        layout.addWidget(note)
+        layout.addWidget(buttons)
+        self.resize(430, 380)
+
+        self._syncing = False
+        stored_preset = str(stored.get("preset") or "standard")
+        index = self.preset.findData(stored_preset if stored_preset in
+                                     (*self.PRESETS, "custom") else "standard")
+        self.preset.setCurrentIndex(max(0, index))
+        self._update_form_visibility()
+
+    # -- preset plumbing -----------------------------------------------------
+
+    @staticmethod
+    def _preset_values(name: str) -> dict:
+        try:
+            from offline.face_beauty_engine import preset_percentages
+
+            return preset_percentages(name)
+        except Exception:
+            return {}
+
+    def _preset_changed(self) -> None:
+        name = str(self.preset.currentData() or "standard")
+        if name != "custom":
+            values = self._preset_values(name)
+            self._syncing = True
+            for key, slider in self.sliders.items():
+                if key in values:
+                    slider.setValue(int(values[key]))
+            self._syncing = False
+        self._update_form_visibility()
+
+    def _mark_custom(self) -> None:
+        """Touching a slider is what makes the configuration custom."""
+        if self._syncing:
+            return
+        index = self.preset.findData("custom")
+        if index >= 0 and self.preset.currentIndex() != index:
+            self.preset.blockSignals(True)
+            self.preset.setCurrentIndex(index)
+            self.preset.blockSignals(False)
+            self._update_form_visibility()
+
+    def _update_form_visibility(self) -> None:
+        self.form.setVisible(str(self.preset.currentData() or "") == "custom")
+        self.adjustSize()
+
+    def payload(self) -> dict:
+        data = {"preset": str(self.preset.currentData() or "standard")}
+        data.update({key: int(slider.value()) for key, slider in self.sliders.items()})
+        return data
 
 
 class SISettingsDialog(QDialog):

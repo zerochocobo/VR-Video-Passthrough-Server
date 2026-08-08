@@ -40,7 +40,7 @@ from ui.pages.offline_page import (
     _resolve_time_range,
     _format_time_seconds,
 )
-from ui.settings import quality_speed_preset, quality_speed_value
+from ui.settings import DEFAULTS, quality_speed_preset, quality_speed_value
 from utils.video_metadata import probe_video_metadata
 
 
@@ -142,6 +142,16 @@ class RmPage(QWidget):
         row.addStretch(1)
         return row
 
+    def _vr2flat_checkbox(self) -> QCheckBox:
+        """A checkbox bound to rm_vr2flat_decode. One lives in each tab; both
+        stay in step via _save_vr2flat, and share the setting with the realtime
+        [RM] card. It reaches the offline process through server_env()."""
+        cb = QCheckBox()
+        cb.setChecked(bool(self.settings.data.get(
+            "rm_vr2flat_decode", DEFAULTS["rm_vr2flat_decode"])))
+        cb.toggled.connect(self._save_vr2flat)
+        return cb
+
     def _single_tab(self) -> None:
         page = QWidget()
         self.single_video = QLineEdit()
@@ -151,6 +161,7 @@ class RmPage(QWidget):
         browse_out = QPushButton("...")
         browse_out.clicked.connect(lambda: self._browse_dir(self.single_out_dir))
         self.single_quality_speed = self._quality_speed_combo()
+        self.single_vr2flat = self._vr2flat_checkbox()
         self.single_skip = QCheckBox()
         self.single_skip.setChecked(True)
         self.start_single.clicked.connect(self.run_single)
@@ -178,8 +189,9 @@ class RmPage(QWidget):
         grid.addWidget(self.single_quality_speed, 2, 1, alignment=Qt.AlignLeft)
         grid.addWidget(self.single_labels["time"], 3, 0, alignment=Qt.AlignRight)
         grid.addLayout(self._time_row(), 3, 1)
-        grid.addWidget(self.single_skip, 4, 1)
-        grid.addLayout(actions, 5, 1)
+        grid.addWidget(self.single_vr2flat, 4, 1)
+        grid.addWidget(self.single_skip, 5, 1)
+        grid.addLayout(actions, 6, 1)
         self.tabs.addTab(page, "")
         self._update_custom_duration_visibility()
 
@@ -189,6 +201,7 @@ class RmPage(QWidget):
         browse_dir = QPushButton("...")
         browse_dir.clicked.connect(lambda: self._browse_dir(self.batch_dir))
         self.batch_quality_speed = self._quality_speed_combo()
+        self.batch_vr2flat = self._vr2flat_checkbox()
         self.batch_recursive = QCheckBox()
         self.batch_recursive.setChecked(True)
         self.batch_skip = QCheckBox()
@@ -211,9 +224,10 @@ class RmPage(QWidget):
         grid.addLayout(row_dir, 0, 1)
         grid.addWidget(self.batch_labels["performance"], 1, 0)
         grid.addWidget(self.batch_quality_speed, 1, 1, alignment=Qt.AlignLeft)
-        grid.addWidget(self.batch_recursive, 2, 1)
-        grid.addWidget(self.batch_skip, 3, 1)
-        grid.addLayout(actions, 4, 1)
+        grid.addWidget(self.batch_vr2flat, 2, 1)
+        grid.addWidget(self.batch_recursive, 3, 1)
+        grid.addWidget(self.batch_skip, 4, 1)
+        grid.addLayout(actions, 5, 1)
         self.tabs.addTab(page, "")
 
     # -- browsing ------------------------------------------------------------
@@ -325,6 +339,13 @@ class RmPage(QWidget):
         self.log.moveCursor(self.log.textCursor().MoveOperation.End)
 
     def sync_from_settings(self) -> None:
+        # keep in step when the realtime [RM] card's dialog changes the setting
+        wanted = bool(self.settings.data.get("rm_vr2flat_decode", DEFAULTS["rm_vr2flat_decode"]))
+        for cb in (self.single_vr2flat, self.batch_vr2flat):
+            if cb.isChecked() != wanted:
+                cb.blockSignals(True)
+                cb.setChecked(wanted)
+                cb.blockSignals(False)
         value = quality_speed_value(self.settings.data.get("offline_quality_speed"), "medium")
         for combo in (getattr(self, "single_quality_speed", None), getattr(self, "batch_quality_speed", None)):
             if isinstance(combo, QComboBox):
@@ -333,6 +354,17 @@ class RmPage(QWidget):
                     combo.blockSignals(True)
                     combo.setCurrentIndex(idx)
                     combo.blockSignals(False)
+
+    def _save_vr2flat(self, checked: bool) -> None:
+        checked = bool(checked)
+        self.settings.data["rm_vr2flat_decode"] = checked
+        sender = self.sender()
+        for cb in (getattr(self, "single_vr2flat", None), getattr(self, "batch_vr2flat", None)):
+            if isinstance(cb, QCheckBox) and cb is not sender and cb.isChecked() != checked:
+                cb.blockSignals(True)
+                cb.setChecked(checked)
+                cb.blockSignals(False)
+        self.settings.save()
 
     def _save_quality_speed(self) -> None:
         sender = self.sender()
@@ -359,6 +391,9 @@ class RmPage(QWidget):
             button.setText(self.i18n.t("button.start"))
         for button in (self.stop_single, self.stop_batch):
             button.setText(self.i18n.t("button.stop"))
+        for cb in (self.single_vr2flat, self.batch_vr2flat):
+            cb.setText(self.i18n.t("rm.vr2flat_decode"))
+            cb.setToolTip(self.i18n.t("rm.vr2flat_decode_hint"))
         self.single_skip.setText(self.i18n.t("offline.skip_existing"))
         self.batch_recursive.setText(self.i18n.t("offline.recursive"))
         self.batch_skip.setText(self.i18n.t("offline.skip_existing"))

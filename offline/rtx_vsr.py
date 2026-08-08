@@ -24,6 +24,7 @@ from utils.rtx_vsr import (
     source_block_reason, target_dimensions, target_resolution,
 )
 from utils.subprocess_hidden import hidden_subprocess_kwargs
+from utils.superres_bitrate import plan_superres_bitrate
 from utils.vr_naming import has_vr_filename_marker, is_half_equirectangular_source, superres_output_stem
 from utils.video_metadata import VideoProbeMetadata
 
@@ -53,6 +54,12 @@ def _progress_message(frames: int, total_frames: int, elapsed: float) -> str:
     )
 
 
+def _format_size(size_bytes: float) -> str:
+    if size_bytes >= 1_000_000_000:
+        return f"{size_bytes / 1_000_000_000:.2f}GB"
+    return f"{size_bytes / 1_000_000:.1f}MB"
+
+
 def run_rtx_vsr(
     src: Path,
     out: Path,
@@ -65,6 +72,7 @@ def run_rtx_vsr(
     preset: str | None = None,
     hdr_look: str | None = None,
     cq: int = 19,
+    bitrate_mode: str = "auto",
 ) -> int:
     width = int(meta.codec.width)
     height = int(meta.codec.height)
@@ -98,6 +106,27 @@ def run_rtx_vsr(
     if not config.RTX_VSR_OFFLINE_ENABLED:
         print("[rtx-vsr] disabled by PT_RTX_VSR_OFFLINE_ENABLE", flush=True)
         return 2
+    fps = meta.timing.source_fps if meta.timing.source_fps > 0 else 30.0
+    out_w, out_h = target_dimensions(width, height, target_height)
+    from utils.bitrate_estimator import source_video_bitrate
+
+    bitrate_plan = plan_superres_bitrate(
+        source_video_bitrate(src), width, height, out_w, out_h, bitrate_mode,
+    )
+    source_duration = max(0.0, float(getattr(meta.timing, "duration", 0.0) or 0.0))
+    available_duration = max(0.0, source_duration - max(0.0, float(start or 0.0)))
+    requested_duration = max(0.0, float(duration or 0.0))
+    work_duration = min(requested_duration, available_duration) if requested_duration > 0 and available_duration > 0 else (requested_duration or available_duration)
+    estimated_size = _format_size(bitrate_plan.target_bps * work_duration / 8.0) if work_duration > 0 else "unknown"
+    print(
+        f"[rtx-vsr] bitrate_mode={bitrate_plan.mode} "
+        f"source_bitrate={bitrate_plan.source_bps / 1_000_000:.2f}Mbps "
+        f"pixel_ratio={bitrate_plan.pixel_ratio:.3f} "
+        f"target_bitrate={bitrate_plan.target_bps / 1_000_000:.2f}Mbps "
+        f"max_bitrate={bitrate_plan.max_bps / 1_000_000:.2f}Mbps "
+        f"estimated_video_size={estimated_size}",
+        flush=True,
+    )
     # Fail before opening FFmpeg pipes if the SDK/driver cannot complete one
     # real evaluation.  The preflight itself is isolated and time-limited;
     # this prevents a partially written output file on known-bad systems.
@@ -124,6 +153,9 @@ def run_rtx_vsr(
                 preset=str(preset or config.PASSTHROUGH_PYNV_PRESET or "p4"),
                 cq=int(cq),
                 hdr_look=str(hdr_look or config.RTX_VSR_HDR_LOOK),
+                target_bitrate=bitrate_plan.target_bps,
+                max_bitrate=bitrate_plan.max_bps,
+                buffer_bitrate=bitrate_plan.buffer_bps,
             )
         except Exception as exc:
             if int(target_height or 0) >= 4096:
@@ -142,8 +174,6 @@ def run_rtx_vsr(
                     flush=True,
                 )
                 return 3
-    fps = meta.timing.source_fps if meta.timing.source_fps > 0 else 30.0
-    out_w, out_h = target_dimensions(width, height, target_height)
     ffmpeg = shutil.which("ffmpeg") or "ffmpeg"
     decode_cmd = [ffmpeg, "-hide_banner", "-loglevel", "error"]
     if start > 0:
@@ -163,7 +193,14 @@ def run_rtx_vsr(
     effective_preset = str(preset or config.PASSTHROUGH_PYNV_PRESET or "P1").strip().lower()
     if effective_preset not in {"p1", "p4", "p7"}:
         effective_preset = "p4"
-    encode_cmd += ["-i", str(src), "-map", "0:v:0", "-map", "1:a?", "-c:v", "hevc_nvenc", "-preset", effective_preset, "-cq", str(int(cq)), "-c:a", "copy", "-shortest", *meta.color.ffmpeg_args(), str(out)]
+    encode_cmd += [
+        "-i", str(src), "-map", "0:v:0", "-map", "1:a?",
+        "-c:v", "hevc_nvenc", "-preset", effective_preset,
+        "-rc", "vbr", "-b:v", str(bitrate_plan.target_bps),
+        "-maxrate", str(bitrate_plan.max_bps), "-bufsize", str(bitrate_plan.buffer_bps),
+        "-cq", str(int(cq)), "-c:a", "copy", "-shortest",
+        *meta.color.ffmpeg_args(), str(out),
+    ]
     effective_quality = config.RTX_VSR_QUALITY if quality is None else quality
     from pipeline.hdr_look import apply_hdr_look, create_hdr_look_kernel, normalize_hdr_look
     effective_hdr_look = normalize_hdr_look(hdr_look or config.RTX_VSR_HDR_LOOK)
@@ -204,10 +241,6 @@ def run_rtx_vsr(
     encoder_stderr_thread.start()
     frame_bytes = width * height * 4
     frames = 0
-    source_duration = max(0.0, float(getattr(meta.timing, "duration", 0.0) or 0.0))
-    available_duration = max(0.0, source_duration - max(0.0, float(start or 0.0)))
-    requested_duration = max(0.0, float(duration or 0.0))
-    work_duration = min(requested_duration, available_duration) if requested_duration > 0 and available_duration > 0 else (requested_duration or available_duration)
     total_frames = max(0, int(round(work_duration * fps)))
     progress_started = time.monotonic()
     next_progress_at = progress_started + 5.0

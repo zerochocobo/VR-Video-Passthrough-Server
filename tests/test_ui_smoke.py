@@ -26,6 +26,73 @@ if hasattr(os, "add_dll_directory"):
 
 
 class UiSmokeTests(unittest.TestCase):
+    def test_startup_overlay_offers_gpu_repair_for_warmup_failure_only(self) -> None:
+        from PySide6.QtWidgets import QApplication
+        from ui.i18n import I18n
+        from ui.widgets.startup_overlay import StartupOverlay
+
+        app = QApplication.instance() or QApplication([])
+        overlay = StartupOverlay(I18n("zh_CN"))
+        try:
+            overlay.apply_status({"phase": "failed", "step": "ort_iobinding_runs"})
+            self.assertFalse(overlay.repair_gpu_cache_btn.isHidden())
+            overlay.apply_status({"phase": "failed", "step": "firewall"})
+            self.assertTrue(overlay.repair_gpu_cache_btn.isHidden())
+            overlay.apply_status({
+                "phase": "starting",
+                "step": "media_index",
+                "step_index": 2,
+                "step_total": 12,
+                "progress": 0.2,
+                "eta_sec": 30.0,
+                "elapsed_sec": 5.0,
+                "plan_active": True,
+            })
+            self.assertEqual(overlay.progress.maximum(), 1000)
+            self.assertEqual(overlay.progress.value(), 200)
+            self.assertIn("2/12", overlay.step_label.text())
+            self.assertIn("30", overlay.eta_label.text())
+            overlay.apply_status({
+                "phase": "warming",
+                "step": "ort_iobinding_runs",
+                "progress": 0.4,
+                "eta_sec": 60.0,
+                "elapsed_sec": 20.0,
+                "plan_active": False,
+            })
+            self.assertIn("40", overlay.eta_label.text())
+            overlay.apply_status({
+                "phase": "warming",
+                "step": "ort_iobinding_runs",
+                "progress": 0.4,
+                "eta_sec": 60.0,
+                "elapsed_sec": 100.0,
+                "step_elapsed_sec": 5.0,
+                "plan_active": True,
+                "provider_kind": "cuda",
+            })
+            self.assertTrue(overlay.hint_label.isHidden())
+            overlay.apply_status({
+                "phase": "warming",
+                "step": "da3_trt_warmup",
+                "progress": 0.4,
+                "eta_sec": 150.0,
+                "elapsed_sec": 10.0,
+                "step_elapsed_sec": 10.0,
+                "step_estimate_sec": 120.0,
+                "plan_active": True,
+                "provider_kind": "trt",
+                "trt_building": True,
+                "trt_build_model": "da3",
+            })
+            self.assertFalse(overlay.hint_label.isHidden())
+            self.assertIn("2D 转 3D", overlay.hint_label.text())
+            self.assertIn("2 分钟", overlay.hint_label.text())
+            self.assertIn("之后启动会明显更快", overlay.hint_label.text())
+        finally:
+            overlay.close()
+            app.processEvents()
+
     def test_superres_dashboard_dialog_includes_low_quality_and_performance_note(self) -> None:
         from types import SimpleNamespace
 
@@ -104,6 +171,7 @@ class UiSmokeTests(unittest.TestCase):
         patch_stack = contextlib.ExitStack()
         patch_stack.enter_context(patch.object(settings_module, "SETTINGS_PATH", settings_root / "ui_settings.json"))
         patch_stack.enter_context(patch.object(settings_module, "SETTINGS_META_PATH", settings_root / "ui_settings_meta.json"))
+        patch_stack.enter_context(patch("ui.main_window.cleanup_old_quarantines", return_value=()))
         patch_stack.enter_context(patch("ui.pages.settings_page.cache_status", return_value="missing"))
         patch_stack.enter_context(patch("ui.pages.offline_page.cache_status", return_value="missing"))
         window = MainWindow()
@@ -120,7 +188,7 @@ class UiSmokeTests(unittest.TestCase):
             self.assertEqual(window.nav.current(), "home")
             for key in ("home", "tools", "subtitle", "log", "settings"):
                 self.assertTrue(window.nav._items[key]._text_label.text())
-            self.assertEqual(window.stack.count(), 9)
+            self.assertEqual(window.stack.count(), 10)
             self.assertIs(window.stack.currentWidget(), window.dashboard)
 
             # Dashboard: server bar and feature cards.
@@ -131,7 +199,8 @@ class UiSmokeTests(unittest.TestCase):
             self.assertFalse(window.dashboard.project_link.openExternalLinks())
             self.assertEqual(
                 set(window.dashboard.cards),
-                {"green", "alpha", "alpha2d", "two_dvr", "superres", "rm", "subtitle", "si", "light"},
+                {"green", "alpha", "alpha2d", "face_beauty", "two_dvr", "superres", "rm",
+                 "subtitle", "si", "light"},
             )
             for key, card in window.dashboard.cards.items():
                 self.assertTrue(card.title_label.text(), key)
@@ -146,7 +215,7 @@ class UiSmokeTests(unittest.TestCase):
             self.assertTrue(window.dashboard.cards["si"].summary_label.text().startswith("[SI]"))
             self.assertFalse(window.dashboard.cards["superres"].config_button.isHidden())
             self.assertEqual(window.dashboard._realtime_keys[:3], ["alpha", "green", "superres"])
-            self.assertEqual(window.dashboard._2d_keys, ["two_dvr", "si", "rm"])
+            self.assertEqual(window.dashboard._2d_keys, ["face_beauty", "two_dvr", "si", "rm"])
             self.assertEqual(window.dashboard._audio_keys, ["subtitle", "light", "alpha2d"])
             self.assertFalse(hasattr(window.dashboard, "two_d_group_label"))
             self.assertFalse(window.dashboard.cards["light"].is_checked())
@@ -185,13 +254,24 @@ class UiSmokeTests(unittest.TestCase):
             self.assertTrue(page.trt_enabled_label.text())
             self.assertTrue(page.trt_configure_button.text())
             self.assertFalse(page.trt_enabled.isEnabled())
+            self.assertTrue(page.gpu_cache_repair_button.text())
+            self.assertTrue(page.gpu_cache_repair_note.text())
+            window.settings.data["inference_backend"] = "tensorrt"
+            page._update_trt_state()
+            self.assertEqual(window.settings.data["inference_backend"], "tensorrt")
+            page.set_runtime_provider_kind("cuda")
+            self.assertIn(window.i18n.t("trt.runtime_cuda"), page.trt_status_label.text())
             page.performance_output_size.setCurrentIndex(0)
             app.processEvents()
             self.assertEqual(window.settings.data["decode_max_side"], 0)
+            self.assertEqual(window.settings.data["inference_backend"], "tensorrt")
+            page.set_runtime_provider_kind("cpu")
+            self.assertIn(window.i18n.t("trt.runtime_cpu"), page.trt_status_label.text())
 
-            # Release UI hides the feature-debug section while retaining its
-            # internal switch wiring for saved settings and diagnostics.
-            self.assertTrue(page.debug_group.isHidden())
+            # The feature-debug section is exposed, so the mosaic-restoration
+            # card can be shown or hidden from the settings page.
+            self.assertFalse(page.debug_group.isHidden())
+            self.assertTrue(page.debug_group.title_label.text())
             self.assertTrue(page.rm_card_label.text())
             page.rm_card_switch.setChecked(True)
             app.processEvents()
@@ -293,15 +373,27 @@ class UiSmokeTests(unittest.TestCase):
             self.assertEqual(window.superres.single_target.currentData(), 4096)
             self.assertEqual(window.superres.single_hdr_look.currentData(), "natural")
             self.assertEqual(window.superres.batch_hdr_look.currentData(), "natural")
+            self.assertEqual(window.superres.single_bitrate.currentData(), "auto")
+            self.assertEqual(window.superres.batch_bitrate.currentData(), "auto")
             self.assertEqual(window.superres.single_quality_speed.currentData(), "medium")
             self.assertEqual(window.superres.batch_quality_speed.currentData(), "medium")
-            common_args = window.superres._common_args(window.superres.single_target, window.superres.single_quality, window.superres.single_hdr_look)
+            common_args = window.superres._common_args(window.superres.single_target, window.superres.single_quality, window.superres.single_hdr_look, window.superres.single_bitrate)
             self.assertIn("p4", common_args)
             self.assertIn("natural", common_args)
+            self.assertIn("--rtx-vsr-bitrate-mode", common_args)
+            self.assertIn("auto", common_args)
             window._show_page("home")
             app.processEvents()
             self.assertEqual(window.width(), base_size.width())
             self.assertEqual(window.nav.current(), "home")
+
+            window._gpu_repair_pending = True
+            window._gpu_repair_rebuild_trt = True
+            window._gpu_repair_trt_requested = True
+            window._cancel_startup()
+            self.assertFalse(window._gpu_repair_pending)
+            self.assertFalse(window._gpu_repair_rebuild_trt)
+            self.assertFalse(window._gpu_repair_trt_requested)
         finally:
             window.close()
             app.processEvents()

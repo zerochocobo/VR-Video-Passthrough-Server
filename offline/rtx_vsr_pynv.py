@@ -50,14 +50,6 @@ def _format_time(seconds: float) -> str:
     return f"{h:02d}:{m:02d}:{s:02d}"
 
 
-def _target_bitrate(src: Path, in_w: int, in_h: int, out_w: int, out_h: int) -> int:
-    from utils.bitrate_estimator import source_video_bitrate
-
-    source = int(source_video_bitrate(src) or 20_000_000)
-    ratio = (out_w * out_h) / max(1.0, float(in_w * in_h))
-    return max(20_000_000, min(120_000_000, int(source * max(1.0, ratio) * 1.15)))
-
-
 def _open_video_muxer(out: Path, fps: float, color_args: list[str]):
     cmd = [
         FFMPEG, "-hide_banner", "-loglevel", "error", "-y", "-fflags", "+genpts",
@@ -96,6 +88,9 @@ def run_rtx_vsr_pynv(
     preset: str,
     cq: int,
     hdr_look: str,
+    target_bitrate: int,
+    max_bitrate: int,
+    buffer_bitrate: int,
 ) -> int:
     import cupy as cp
     import numpy as np
@@ -140,7 +135,7 @@ def run_rtx_vsr_pynv(
     if not bridge.initialize_cupy(cp):
         raise RuntimeError("RTX VSR bridge failed to initialize on the PyNv CUDA context")
 
-    bitrate = _target_bitrate(src, width, height, out_w, out_h)
+    bitrate = max(1, int(target_bitrate))
     effective_preset = str(preset or "p4").strip().upper()
     if effective_preset not in {"P1", "P4", "P7"}:
         effective_preset = "P4"
@@ -148,8 +143,8 @@ def run_rtx_vsr_pynv(
         "codec": "hevc",
         "fps": f"{fps:.9f}",
         "bitrate": str(bitrate),
-        "maxbitrate": str(int(bitrate * 1.25)),
-        "vbvbufsize": str(int(bitrate * 2.0)),
+        "maxbitrate": str(max(1, int(max_bitrate))),
+        "vbvbufsize": str(max(1, int(buffer_bitrate))),
         "rc": "vbr",
         "cq": str(max(0, int(cq))),
         "preset": effective_preset,

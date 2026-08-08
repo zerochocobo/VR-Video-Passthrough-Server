@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import logging
+import time
 import unittest
 from dataclasses import asdict
 from io import StringIO
@@ -17,9 +18,13 @@ from unittest.mock import MagicMock, patch
 
 from utils import gpu_runtime_cache as grc
 from utils.startup_status import (
+    configure_startup_plan,
     get_startup_state,
+    reconfigure_startup_plan,
     reset_startup_progress,
     set_startup_phase,
+    start_heartbeat,
+    stop_heartbeat,
 )
 from utils.logger import warmup_event
 
@@ -182,6 +187,147 @@ class CompositeWarmupTests(unittest.TestCase):
 
 
 class StartupStatusTests(unittest.TestCase):
+    def test_trt_build_minimum_replaces_skipped_history_budget(self) -> None:
+        with TemporaryDirectory() as tmp:
+            history_path = Path(tmp) / "startup_timings.json"
+            history_path.write_text(json.dumps({"da3_trt_warmup": 0.01}), encoding="utf-8")
+            try:
+                configure_startup_plan([("da3_trt_warmup", 45.0)], history_path=history_path)
+                set_startup_phase(
+                    "warming",
+                    step="da3_trt_warmup",
+                    trt_building=True,
+                    trt_build_model="da3",
+                    minimum_step_estimate_sec=120.0,
+                )
+                state = get_startup_state()
+                self.assertEqual(state["step_estimate_sec"], 120.0)
+                self.assertEqual(state["plan_estimate_sec"], 120.0)
+                self.assertGreaterEqual(state["eta_sec"], 119.0)
+            finally:
+                configure_startup_plan([])
+
+    def test_heartbeat_uses_learned_plan_estimate_instead_of_callsite_constant(self) -> None:
+        with TemporaryDirectory() as tmp:
+            history_path = Path(tmp) / "startup_timings.json"
+            history_path.write_text(json.dumps({"media_index": 2.0}), encoding="utf-8")
+            try:
+                configure_startup_plan([("media_index", 15.0)], history_path=history_path)
+                set_startup_phase("starting", step="media_index")
+                start_heartbeat(0.1, baseline_progress=0.0, ceiling_progress=0.95)
+                time.sleep(0.7)
+                state = get_startup_state()
+                self.assertGreater(state["progress"], 0.1)
+                self.assertLess(state["progress"], 0.6)
+                self.assertGreater(state["eta_sec"], 0.5)
+            finally:
+                stop_heartbeat()
+                configure_startup_plan([])
+
+    def test_reconfigure_switches_ort_estimate_from_trt_to_cuda_without_progress_reset(self) -> None:
+        with TemporaryDirectory() as tmp:
+            history_path = Path(tmp) / "startup_timings.json"
+            history_path.write_text(json.dumps({"ort_iobinding_runs@trt": 12.0}), encoding="utf-8")
+            try:
+                configure_startup_plan(
+                    [("trt_validate", 2.0), ("static_trt_preload", 12.0), ("ort_iobinding_runs", 12.0), ("listening", 0.5)],
+                    history_path=history_path,
+                    estimate_profiles={"ort_iobinding_runs": "trt"},
+                )
+                set_startup_phase("starting", step="trt_validate", step_progress=0.5)
+                before = get_startup_state()
+                reconfigure_startup_plan(
+                    [("trt_validate", 2.0), ("ort_iobinding_runs", 90.0), ("listening", 0.5)],
+                    estimate_profiles={"ort_iobinding_runs": "cuda"},
+                )
+                after = get_startup_state()
+                self.assertNotIn("static_trt_preload", after["plan_steps"])
+                self.assertGreater(after["plan_estimate_sec"], 90.0)
+                self.assertGreaterEqual(after["progress"], before["progress"])
+            finally:
+                configure_startup_plan([])
+
+    def test_reconfigure_profile_switch_does_not_persist_pending_as_skipped(self) -> None:
+        with TemporaryDirectory() as tmp:
+            history_path = Path(tmp) / "startup_timings.json"
+            steps = [("trt_validate", 2.0), ("ort_iobinding_runs", 90.0), ("listening", 0.5)]
+            history_path.write_text(json.dumps({
+                "ort_iobinding_runs@pending": 0.01,
+                "ort_iobinding_runs@cuda": 85.0,
+            }), encoding="utf-8")
+            try:
+                configure_startup_plan(
+                    steps,
+                    history_path=history_path,
+                    estimate_profiles={"ort_iobinding_runs": "pending"},
+                )
+                self.assertGreater(get_startup_state()["plan_estimate_sec"], 90.0)
+                set_startup_phase("starting", step="trt_validate", step_progress=1.0)
+                reconfigure_startup_plan(
+                    steps,
+                    estimate_profiles={"ort_iobinding_runs": "cuda"},
+                )
+                self.assertGreater(get_startup_state()["plan_estimate_sec"], 85.0)
+                set_startup_phase("warming", step="ort_iobinding_runs", step_progress=1.0)
+                set_startup_phase("listening", step="listening", step_progress=1.0)
+                saved = json.loads(history_path.read_text(encoding="utf-8-sig"))
+                self.assertNotIn("ort_iobinding_runs@pending", saved)
+                self.assertIn("ort_iobinding_runs@cuda", saved)
+            finally:
+                configure_startup_plan([])
+
+    def test_unseen_plan_steps_are_learned_as_skipped(self) -> None:
+        with TemporaryDirectory() as tmp:
+            history_path = Path(tmp) / "startup_timings.json"
+            steps = [("a", 1.0), ("static_trt_preload", 12.0), ("da3_trt_warmup", 45.0), ("rm_trt_warmup", 60.0), ("b", 1.0), ("listening", 0.5)]
+            history_path.write_text(json.dumps({
+                "static_trt_preload": 12.0,
+                "da3_trt_warmup": 45.0,
+                "rm_trt_warmup": 60.0,
+            }), encoding="utf-8")
+            try:
+                configure_startup_plan(steps, history_path=history_path)
+                set_startup_phase("starting", step="a", step_progress=1.0)
+                set_startup_phase("starting", step="b", step_progress=1.0)
+                set_startup_phase("listening", step="listening", step_progress=1.0)
+                saved = json.loads(history_path.read_text(encoding="utf-8-sig"))
+                self.assertAlmostEqual(saved["static_trt_preload"], 0.01)
+                self.assertAlmostEqual(saved["da3_trt_warmup"], 0.01)
+                self.assertAlmostEqual(saved["rm_trt_warmup"], 0.01)
+
+                configure_startup_plan(steps, history_path=history_path)
+                learned = get_startup_state()
+                self.assertLess(learned["plan_estimate_sec"], 3.0)
+            finally:
+                configure_startup_plan([])
+
+    def test_plan_maps_local_steps_to_global_progress_and_remaining_eta(self) -> None:
+        with TemporaryDirectory() as tmp:
+            history_path = Path(tmp) / "startup_timings.json"
+            try:
+                configure_startup_plan([("media_index", 10.0), ("gpu_warmup", 20.0)], history_path=history_path)
+                set_startup_phase("starting", step="media_index", step_progress=0.5)
+                first = get_startup_state()
+                self.assertTrue(first["plan_active"])
+                self.assertEqual(first["step_index"], 1)
+                self.assertEqual(first["step_total"], 2)
+                self.assertAlmostEqual(first["progress"], 1.0 / 6.0, places=3)
+                self.assertAlmostEqual(first["eta_sec"], 25.0)
+
+                set_startup_phase("warming", step="gpu_warmup")
+                second = get_startup_state()
+                self.assertEqual(second["step_index"], 2)
+                self.assertAlmostEqual(second["progress"], 1.0 / 3.0, places=3)
+                self.assertAlmostEqual(second["eta_sec"], 20.0)
+
+                set_startup_phase("listening", step="gpu_warmup", step_progress=1.0)
+                complete = get_startup_state()
+                self.assertEqual(complete["progress"], 1.0)
+                self.assertEqual(complete["eta_sec"], 0.0)
+                self.assertTrue(history_path.is_file())
+            finally:
+                configure_startup_plan([])
+
     def test_only_true_terminal_startup_phases_stop_polling(self) -> None:
         poller_source = Path("ui/services/startup_status_poller.py").read_text(encoding="utf-8")
         namespace: dict[str, object] = {}
@@ -220,6 +366,11 @@ class StartupStatusTests(unittest.TestCase):
         self.assertTrue(state["cold"])
         self.assertTrue(state["is_known_slow"])
         self.assertEqual(state["gpu_name"], "RTX 5090")
+
+    def test_step_progress_is_not_exposed_without_a_plan(self) -> None:
+        configure_startup_plan([])
+        set_startup_phase("warming", step="legacy", step_progress=0.5)
+        self.assertNotIn("step_progress", get_startup_state())
 
     def test_reset_clears_progress_fields(self) -> None:
         set_startup_phase(

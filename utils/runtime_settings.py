@@ -76,6 +76,49 @@ class RmRuntime:
         return asdict(self)
 
 
+@dataclass(frozen=True)
+class FaceBeautyRuntime:
+    """Realtime face-beautification state. ``enabled`` gates the [FaceBeauty]
+    DLNA entry; the rest are the strength knobs the dashboard dialog edits, kept
+    as 0-100 percentages so they match the offline UI and CLI one to one.
+    ``version`` bumps on every change so DLNA's SystemUpdateID refreshes."""
+    enabled: bool
+    preset: str = "standard"
+    enhancer_blend: int = 80
+    skin_smooth: int = 40
+    skin_brighten: int = 15
+    skin_even: int = 20
+    eye_brighten: int = 20
+    teeth_white: int = 20
+    lip_vivid: int = 10
+    sharpen: int = 15
+    version: int = 0
+
+    def to_dict(self) -> dict:
+        return asdict(self)
+
+    def strengths(self) -> dict:
+        return {k: getattr(self, k) for k in FACE_BEAUTY_STRENGTH_KEYS}
+
+
+FACE_BEAUTY_STRENGTH_KEYS = (
+    "enhancer_blend", "skin_smooth", "skin_brighten", "skin_even",
+    "eye_brighten", "teeth_white", "lip_vivid", "sharpen",
+)
+
+
+def _face_beauty_defaults() -> dict:
+    """Preset percentages from the offline engine, so realtime and offline
+    cannot drift apart. Falls back to the dataclass defaults if the offline
+    module is unavailable (it pulls in cv2/onnxruntime)."""
+    try:
+        from offline.face_beauty_engine import preset_percentages
+
+        return preset_percentages(config.FACE_BEAUTY_PRESET)
+    except Exception:
+        return {}
+
+
 _lock = threading.RLock()
 _light_match_state = LightMatchRuntime(
     **normalize_light_match_params(config.LIGHT_MATCH_DICT).__dict__,
@@ -160,3 +203,51 @@ def set_rm(data: dict | bool) -> RmRuntime:
             return _rm_state
         _rm_state = RmRuntime(enabled=enabled, version=_rm_state.version + 1)
         return _rm_state
+
+
+def reset_face_beauty_for_test(enabled: bool | None = None) -> FaceBeautyRuntime:
+    global _face_beauty_state
+    with _lock:
+        _face_beauty_state = FaceBeautyRuntime(
+            enabled=bool(config.FACE_BEAUTY_ENABLED if enabled is None else enabled),
+            preset=str(config.FACE_BEAUTY_PRESET),
+            version=0,
+            **_face_beauty_defaults(),
+        )
+        return _face_beauty_state
+
+
+def get_face_beauty() -> FaceBeautyRuntime:
+    with _lock:
+        return _face_beauty_state
+
+
+def set_face_beauty(data: dict | bool) -> FaceBeautyRuntime:
+    global _face_beauty_state
+    with _lock:
+        current = _face_beauty_state
+        if isinstance(data, dict):
+            values = {
+                "enabled": bool(data.get("enabled", current.enabled)),
+                "preset": str(data.get("preset", current.preset)),
+            }
+            for key in FACE_BEAUTY_STRENGTH_KEYS:
+                raw = data.get(key, getattr(current, key))
+                try:
+                    values[key] = max(0, min(100, int(raw)))
+                except (TypeError, ValueError):
+                    values[key] = getattr(current, key)
+        else:
+            values = {"enabled": bool(data), "preset": current.preset,
+                      **current.strengths()}
+        if all(getattr(current, k) == v for k, v in values.items()):
+            return current
+        _face_beauty_state = FaceBeautyRuntime(version=current.version + 1, **values)
+        return _face_beauty_state
+
+
+_face_beauty_state = FaceBeautyRuntime(
+    enabled=bool(config.FACE_BEAUTY_ENABLED),
+    preset=str(config.FACE_BEAUTY_PRESET),
+    **_face_beauty_defaults(),
+)

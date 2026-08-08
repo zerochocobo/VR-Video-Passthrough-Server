@@ -75,6 +75,17 @@ class ContentDirectoryModeTests(unittest.TestCase):
             self.assertEqual(cds._id_to_live("plsr_item_ptv11_movie.mp4"), (source, "superres"))
             self.assertEqual(cds._id_to_seek("ssr_ptv11_movie.mp4"), (source, "superres"))
 
+    def test_superres_dlna_hides_8k_vr_but_keeps_4k_vr(self) -> None:
+        child = SimpleNamespace(video=SimpleNamespace(bit_depth=8))
+        with (
+            patch.object(cds, "RTX_VSR_ENABLED", True),
+            patch.object(cds, "RTX_VSR_REALTIME_ENABLED", True),
+            patch.object(cds, "source_exceeds_target_resolution", return_value=False),
+        ):
+            self.assertTrue(cds._superres_dlna_enabled(Path("movie_vr.mp4"), 4096, 2048, child))
+            self.assertFalse(cds._superres_dlna_enabled(Path("movie_8k_vr.mp4"), 7680, 3840, child))
+            self.assertFalse(cds._superres_dlna_enabled(Path("movie_8k_vr.mp4"), 8192, 4096, child))
+
     def test_short_live_items_keep_distinct_modes(self) -> None:
         child = SimpleNamespace(
             size=1024,
@@ -470,6 +481,26 @@ class ContentDirectoryModeTests(unittest.TestCase):
             ["11:00_movie_passthrough_live", "11:05_movie_passthrough_live", "11:10_movie_passthrough_live"],
         )
         self.assertIn("/passthrough_live/movie.mp4.ts?t=660&mode=green", points[0]["url"])
+
+    def test_rm_and_face_beauty_time_links_preserve_mode_and_seek(self) -> None:
+        source = Path("movie_8k.mp4")
+        info = SimpleNamespace(duration=3330.0, width=8192, height=4096, fps=60.0)
+        enabled = SimpleNamespace(enabled=True)
+        with (
+            patch.object(cds, "_rel_key", return_value="movie_8k.mp4"),
+            patch.object(cds, "probe_cached", return_value=info),
+            patch.object(cds, "estimate_for_media", return_value=(0, 100_000_000, None)),
+            patch.object(cds, "get_rm", return_value=enabled),
+            patch.object(cds, "get_face_beauty", return_value=enabled),
+        ):
+            rm_points = cds._live_time_index_items(source, "rm", "minute", 660)
+            fb_points = cds._live_time_index_items(source, "face_beauty", "minute", 660)
+
+        self.assertIn("/passthrough_live/movie_8k.mp4.ts?t=660&mode=rm", rm_points[0]["url"])
+        self.assertIn(
+            "/passthrough_live/movie_8k.mp4.ts?t=660&mode=face_beauty",
+            fb_points[0]["url"],
+        )
 
     def test_live_time_index_single_group_skips_group_layer(self) -> None:
         source = Path("movie.mp4")

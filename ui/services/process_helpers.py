@@ -54,6 +54,13 @@ def superres_offline_command() -> tuple[str, list[str]]:
     return python_executable(), [str(ROOT / "offline" / "superres_offline.py")]
 
 
+def face_beauty_command() -> tuple[str, list[str]]:
+    if getattr(sys, "frozen", False):
+        server, args = server_command()
+        return server, [*args, "face_beauty"]
+    return python_executable(), [str(ROOT / "offline" / "face_beauty.py")]
+
+
 def trt_warmup_command() -> tuple[str, list[str]]:
     if getattr(sys, "frozen", False):
         server, args = server_command()

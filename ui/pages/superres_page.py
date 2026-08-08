@@ -103,6 +103,16 @@ class SuperResPage(QWidget):
         combo.currentIndexChanged.connect(self._save_hdr_look)
         return combo
 
+    def _bitrate_combo(self) -> QComboBox:
+        combo = _fit_combo(QComboBox())
+        for mode in ("auto", "1.2", "1.5", "2", "3"):
+            combo.addItem("", mode)
+        current = str(self.settings.data.get("superres_offline_bitrate_mode") or "auto")
+        idx = combo.findData(current if current in {"auto", "1.2", "1.5", "2", "3"} else "auto")
+        combo.setCurrentIndex(max(0, idx))
+        combo.currentIndexChanged.connect(self._save_bitrate_mode)
+        return combo
+
     @staticmethod
     def _duration_combo() -> QComboBox:
         combo = _fit_combo(QComboBox())
@@ -119,6 +129,7 @@ class SuperResPage(QWidget):
         self.single_target, self.single_quality = self._target_combo(), self._quality_combo()
         self.single_quality_speed = self._quality_speed_combo()
         self.single_hdr_look = self._hdr_look_combo()
+        self.single_bitrate = self._bitrate_combo()
         self.single_start = QLineEdit("00:00:00")
         self.single_start.setFixedWidth(90)
         self.single_duration = self._duration_combo()
@@ -139,15 +150,16 @@ class SuperResPage(QWidget):
         time_row.addStretch(1)
         actions.addWidget(self.start_single); actions.addWidget(self.stop_single); actions.addStretch(1)
         grid = QGridLayout(page); grid.setColumnMinimumWidth(0, OFFLINE_LABEL_WIDTH); grid.setColumnStretch(1, 1)
-        self.single_labels = {k: _label() for k in ("video", "output", "target", "quality", "hdr_look", "performance", "time")}
+        self.single_labels = {k: _label() for k in ("video", "output", "target", "quality", "hdr_look", "bitrate", "performance", "time")}
         rows = [("video", video_row), ("output", out_row)]
         for row, (key, value) in enumerate(rows): grid.addWidget(self.single_labels[key], row, 0); grid.addLayout(value, row, 1)
         grid.addWidget(self.single_labels["target"], 2, 0); grid.addWidget(self.single_target, 2, 1, alignment=Qt.AlignLeft)
         grid.addWidget(self.single_labels["quality"], 3, 0); grid.addWidget(self.single_quality, 3, 1, alignment=Qt.AlignLeft)
         grid.addWidget(self.single_labels["hdr_look"], 4, 0); grid.addWidget(self.single_hdr_look, 4, 1, alignment=Qt.AlignLeft)
-        grid.addWidget(self.single_labels["performance"], 5, 0); grid.addWidget(self.single_quality_speed, 5, 1, alignment=Qt.AlignLeft)
-        grid.addWidget(self.single_labels["time"], 6, 0); grid.addLayout(time_row, 6, 1)
-        grid.addWidget(self.single_skip, 7, 1); grid.addLayout(actions, 8, 1)
+        grid.addWidget(self.single_labels["bitrate"], 5, 0); grid.addWidget(self.single_bitrate, 5, 1, alignment=Qt.AlignLeft)
+        grid.addWidget(self.single_labels["performance"], 6, 0); grid.addWidget(self.single_quality_speed, 6, 1, alignment=Qt.AlignLeft)
+        grid.addWidget(self.single_labels["time"], 7, 0); grid.addLayout(time_row, 7, 1)
+        grid.addWidget(self.single_skip, 8, 1); grid.addLayout(actions, 9, 1)
         self.tabs.addTab(page, "")
         self._update_custom_visibility()
 
@@ -158,6 +170,7 @@ class SuperResPage(QWidget):
         self.batch_target, self.batch_quality = self._target_combo(), self._quality_combo()
         self.batch_quality_speed = self._quality_speed_combo()
         self.batch_hdr_look = self._hdr_look_combo()
+        self.batch_bitrate = self._bitrate_combo()
         self.batch_recursive = QCheckBox(); self.batch_recursive.setChecked(True)
         self.batch_skip = QCheckBox(); self.batch_skip.setChecked(True)
         self.start_batch.clicked.connect(self.run_batch)
@@ -165,13 +178,14 @@ class SuperResPage(QWidget):
         dir_row.addWidget(self.batch_dir); dir_row.addWidget(browse)
         actions.addWidget(self.start_batch); actions.addWidget(self.stop_batch); actions.addStretch(1)
         grid = QGridLayout(page); grid.setColumnMinimumWidth(0, OFFLINE_LABEL_WIDTH); grid.setColumnStretch(1, 1)
-        self.batch_labels = {k: _label() for k in ("directory", "target", "quality", "hdr_look", "performance")}
+        self.batch_labels = {k: _label() for k in ("directory", "target", "quality", "hdr_look", "bitrate", "performance")}
         grid.addWidget(self.batch_labels["directory"], 0, 0); grid.addLayout(dir_row, 0, 1)
         grid.addWidget(self.batch_labels["target"], 1, 0); grid.addWidget(self.batch_target, 1, 1, alignment=Qt.AlignLeft)
         grid.addWidget(self.batch_labels["quality"], 2, 0); grid.addWidget(self.batch_quality, 2, 1, alignment=Qt.AlignLeft)
         grid.addWidget(self.batch_labels["hdr_look"], 3, 0); grid.addWidget(self.batch_hdr_look, 3, 1, alignment=Qt.AlignLeft)
-        grid.addWidget(self.batch_labels["performance"], 4, 0); grid.addWidget(self.batch_quality_speed, 4, 1, alignment=Qt.AlignLeft)
-        grid.addWidget(self.batch_recursive, 5, 1); grid.addWidget(self.batch_skip, 6, 1); grid.addLayout(actions, 7, 1)
+        grid.addWidget(self.batch_labels["bitrate"], 4, 0); grid.addWidget(self.batch_bitrate, 4, 1, alignment=Qt.AlignLeft)
+        grid.addWidget(self.batch_labels["performance"], 5, 0); grid.addWidget(self.batch_quality_speed, 5, 1, alignment=Qt.AlignLeft)
+        grid.addWidget(self.batch_recursive, 6, 1); grid.addWidget(self.batch_skip, 7, 1); grid.addLayout(actions, 8, 1)
         self.tabs.addTab(page, "")
 
     def _browse_video(self) -> None:
@@ -202,14 +216,14 @@ class SuperResPage(QWidget):
             QMessageBox.warning(self, self.i18n.t("offline.time_error_title"), self.i18n.t(error).format(duration=_format_time_seconds(duration), row=0)); return None
         return start, length
 
-    def _common_args(self, target: QComboBox, quality: QComboBox, hdr_look: QComboBox) -> list[str]:
-        return ["--rtx-vsr-target-height", str(target.currentData()), "--rtx-vsr-quality", str(quality.currentData()), "--rtx-vsr-hdr-look", str(hdr_look.currentData()), "--preset", quality_speed_preset(self.settings.data.get("offline_quality_speed"), "medium").lower()]
+    def _common_args(self, target: QComboBox, quality: QComboBox, hdr_look: QComboBox, bitrate: QComboBox) -> list[str]:
+        return ["--rtx-vsr-target-height", str(target.currentData()), "--rtx-vsr-quality", str(quality.currentData()), "--rtx-vsr-hdr-look", str(hdr_look.currentData()), "--rtx-vsr-bitrate-mode", str(bitrate.currentData()), "--preset", quality_speed_preset(self.settings.data.get("offline_quality_speed"), "medium").lower()]
 
     def run_single(self) -> None:
         time_range = self._time_range()
         if time_range is None: return
         start, duration = time_range
-        args = ["single", self.single_video.text().strip(), "--start", str(start), "--duration", str(duration), *self._common_args(self.single_target, self.single_quality, self.single_hdr_look)]
+        args = ["single", self.single_video.text().strip(), "--start", str(start), "--duration", str(duration), *self._common_args(self.single_target, self.single_quality, self.single_hdr_look, self.single_bitrate)]
         if self.single_out_dir.text().strip(): args += ["--out-dir", self.single_out_dir.text().strip()]
         if self.single_skip.isChecked(): args.append("--skip-existing")
         self.process.start(args, self.settings.server_env())
@@ -218,7 +232,7 @@ class SuperResPage(QWidget):
         directory = self.batch_dir.text().strip()
         if not Path(directory).is_dir():
             QMessageBox.warning(self, self.i18n.t("dialog.warning"), self.i18n.t("offline.time_error_video_missing")); return
-        args = ["batch", directory, *self._common_args(self.batch_target, self.batch_quality, self.batch_hdr_look), "--recursive" if self.batch_recursive.isChecked() else "--no-recursive"]
+        args = ["batch", directory, *self._common_args(self.batch_target, self.batch_quality, self.batch_hdr_look, self.batch_bitrate), "--recursive" if self.batch_recursive.isChecked() else "--no-recursive"]
         if self.batch_skip.isChecked(): args.append("--skip-existing")
         self.process.start(args, self.settings.server_env())
 
@@ -241,6 +255,13 @@ class SuperResPage(QWidget):
             hdr_mode = "natural"
         for combo in (self.single_hdr_look, self.batch_hdr_look):
             idx = combo.findData(hdr_mode)
+            if idx >= 0 and combo.currentIndex() != idx:
+                combo.blockSignals(True); combo.setCurrentIndex(idx); combo.blockSignals(False)
+        bitrate_mode = str(self.settings.data.get("superres_offline_bitrate_mode") or "auto")
+        if bitrate_mode not in {"auto", "1.2", "1.5", "2", "3"}:
+            bitrate_mode = "auto"
+        for combo in (self.single_bitrate, self.batch_bitrate):
+            idx = combo.findData(bitrate_mode)
             if idx >= 0 and combo.currentIndex() != idx:
                 combo.blockSignals(True); combo.setCurrentIndex(idx); combo.blockSignals(False)
 
@@ -272,18 +293,36 @@ class SuperResPage(QWidget):
                     combo.blockSignals(True); combo.setCurrentIndex(idx); combo.blockSignals(False)
         self.settings.save()
 
+    def _save_bitrate_mode(self) -> None:
+        sender = self.sender()
+        if not isinstance(sender, QComboBox):
+            return
+        value = str(sender.currentData() or "auto")
+        if value not in {"auto", "1.2", "1.5", "2", "3"}:
+            value = "auto"
+        self.settings.data["superres_offline_bitrate_mode"] = value
+        for combo in (self.single_bitrate, self.batch_bitrate):
+            if combo is not sender:
+                idx = combo.findData(value)
+                if idx >= 0 and combo.currentIndex() != idx:
+                    combo.blockSignals(True); combo.setCurrentIndex(idx); combo.blockSignals(False)
+        self.settings.save()
+
     def retranslate(self) -> None:
         self.title_label.setText(self.i18n.t("superres.offline_title")); self.back_button.setText(self.i18n.t("button.back"))
         self.tabs.setTabText(0, self.i18n.t("offline.single_tab")); self.tabs.setTabText(1, self.i18n.t("offline.batch_tab"))
         for b in (self.start_single, self.start_batch): b.setText(self.i18n.t("button.start"))
         for b in (self.stop_single, self.stop_batch): b.setText(self.i18n.t("button.stop"))
         self.single_labels["video"].setText(self.i18n.t("offline.video")); self.single_labels["output"].setText(self.i18n.t("offline.output"))
-        self.single_labels["target"].setText(self.i18n.t("superres.target")); self.single_labels["quality"].setText(self.i18n.t("superres.quality")); self.single_labels["hdr_look"].setText(self.i18n.t("superres.hdr_look")); self.single_labels["performance"].setText(self.i18n.t("performance.quality_speed")); self.single_labels["time"].setText(self.i18n.t("offline.time_mode_range"))
-        self.batch_labels["directory"].setText(self.i18n.t("offline.directory")); self.batch_labels["target"].setText(self.i18n.t("superres.target")); self.batch_labels["quality"].setText(self.i18n.t("superres.quality")); self.batch_labels["hdr_look"].setText(self.i18n.t("superres.hdr_look")); self.batch_labels["performance"].setText(self.i18n.t("performance.quality_speed"))
+        self.single_labels["target"].setText(self.i18n.t("superres.target")); self.single_labels["quality"].setText(self.i18n.t("superres.quality")); self.single_labels["hdr_look"].setText(self.i18n.t("superres.hdr_look")); self.single_labels["bitrate"].setText(self.i18n.t("superres.output_bitrate")); self.single_labels["performance"].setText(self.i18n.t("performance.quality_speed")); self.single_labels["time"].setText(self.i18n.t("offline.time_mode_range"))
+        self.batch_labels["directory"].setText(self.i18n.t("offline.directory")); self.batch_labels["target"].setText(self.i18n.t("superres.target")); self.batch_labels["quality"].setText(self.i18n.t("superres.quality")); self.batch_labels["hdr_look"].setText(self.i18n.t("superres.hdr_look")); self.batch_labels["bitrate"].setText(self.i18n.t("superres.output_bitrate")); self.batch_labels["performance"].setText(self.i18n.t("performance.quality_speed"))
         for combo in (self.single_hdr_look, self.batch_hdr_look):
             for i, key in enumerate(("superres.hdr_look_off", "superres.hdr_look_natural", "superres.hdr_look_vivid")): combo.setItemText(i, self.i18n.t(key))
         for combo in (self.single_quality_speed, self.batch_quality_speed):
             for i, key in enumerate(("quality_speed.ultrafast", "quality_speed.medium", "quality_speed.veryslow")): combo.setItemText(i, self.i18n.t(key))
+        bitrate_keys = ("superres.bitrate_auto", "superres.bitrate_1_2", "superres.bitrate_1_5", "superres.bitrate_2", "superres.bitrate_3")
+        for combo in (self.single_bitrate, self.batch_bitrate):
+            for i, key in enumerate(bitrate_keys): combo.setItemText(i, self.i18n.t(key))
         target_keys = ("superres.target_2k", "superres.target_4k", "superres.target_8k_vr")
         for combo in (self.single_target, self.batch_target):
             for i, key in enumerate(target_keys): combo.setItemText(i, self.i18n.t(key))
