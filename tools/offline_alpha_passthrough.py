@@ -26,6 +26,11 @@ import numpy as np  # noqa: E402
 import config  # noqa: E402
 from utils.bitrate_estimator import effective_default_bitrate, parse_bitrate, source_video_bitrate  # noqa: E402
 from utils.gpu_runtime_cache import configure_gpu_runtime_cache  # noqa: E402
+from utils.offline_outputs import (  # noqa: E402
+    discard_pending_output,
+    pending_output_path,
+    publish_pending_output,
+)
 from utils.subprocess_hidden import hidden_subprocess_kwargs, run_hidden_streaming  # noqa: E402
 from utils.scene_detection import SceneCutDetector  # noqa: E402
 from utils.trt_manifest import (  # noqa: E402
@@ -40,7 +45,7 @@ from utils.trt_manifest import (  # noqa: E402
     original_rvm_model_path,
 )
 from utils.video_metadata import cfr_source_index, probe_color_metadata, probe_timing_metadata, probe_video_metadata, select_backend  # noqa: E402
-from utils.vr_naming import offline_passthrough_stem  # noqa: E402
+from utils.vr_naming import offline_passthrough_stem, parse_fisheye_fov  # noqa: E402
 from offline.sam3_matanyone2 import (  # noqa: E402
     Sam3TextMasker,
     apply_sam3_stereo_guard,
@@ -206,7 +211,7 @@ def _resolve_video(value: str) -> Path:
 
 
 def _default_out(src: Path) -> Path:
-    return src.with_name(f"{offline_passthrough_stem(src.stem, 'alpha_passthrough.mp4')}.mp4")
+    return src.with_name(f"{offline_passthrough_stem(src.stem, 'alpha')}.mp4")
 
 
 def _open_muxer(out: Path, fps: float, src: Path, codec: str):
@@ -479,6 +484,7 @@ def _alpha_packer_from_args(matter, args) -> "AlphaPacker":
         blocks_x=args.alpha_pack_blocks_x,
         blocks_y=args.alpha_pack_blocks_y,
         radius_scale=args.fisheye_radius_scale,
+        src_fisheye_fov=float(getattr(args, "src_fisheye_fov", 0.0) or 0.0),
     )
 
 
@@ -1147,6 +1153,14 @@ def main() -> int:
     parser.add_argument("--alpha-stride", type=int, default=1, help="override PT_ALPHA_STRIDE before loading Matter")
     parser.add_argument("--sbs-batch", action=argparse.BooleanOptionalAction, default=False,
                         help="run left/right SBS eyes as a batch when the RVM model supports batch2")
+    parser.add_argument("--src-fisheye-fov", type=float, default=-1.0,
+                        help="source lens FOV in degrees; -1 reads it from the filename "
+                             "(_fisheye190 / MKX200 / VRCA220 / RF52 / _f180), 0 forces "
+                             "the half-equirect path")
+    parser.add_argument("--src-fit", default="", choices=["", "fit", "crop"],
+                        help="fisheye source wider than 180 deg: fit keeps the whole circle "
+                             "(angles compressed at the rim), crop keeps angles exact and "
+                             "drops the ring beyond 180. Default follows PT_ALPHA_SRC_FIT")
     parser.add_argument("--fisheye-radius-scale", type=float, default=1.0,
                         help="fisheye circle radius relative to half the per-eye output size")
     parser.add_argument("--alpha-pack-scale", type=float, default=0.4,
@@ -1184,15 +1198,25 @@ def main() -> int:
     )
 
     src = _resolve_video(args.video)
+    if args.src_fit:
+        config.ALPHA_SRC_FIT = args.src_fit
+    # Offline picks the source projection up automatically: the filename marker
+    # is the only place the lens FOV is recorded.
+    args.src_fisheye_fov = (
+        parse_fisheye_fov(src.stem) if float(args.src_fisheye_fov) < 0.0 else max(0.0, float(args.src_fisheye_fov))
+    )
     out = Path(args.out) if args.out else _default_out(src)
     if not out.is_absolute():
         out = (config.ROOT / out).resolve()
     out.parent.mkdir(parents=True, exist_ok=True)
     final_out = out
-    video_only_out = out
     if args.audio != "off":
         suffix = "".join(out.suffixes[-1:]) or ".mp4"
         video_only_out = out.with_name(f"{out.stem}._video_only{suffix}")
+    else:
+        # Without an audio mux the encode itself produces the deliverable, so it
+        # still writes beside the final name and is renamed only once complete.
+        video_only_out = pending_output_path(out)
 
     meta = probe_video_metadata(src)
     print(
@@ -1316,7 +1340,9 @@ def main() -> int:
         engine = _make_engine(args)
     enc_w, enc_h = alpha_output_size(info.width, info.height)
     bitrate_kwargs, target_bps, max_bps, buf_bps = _encoder_bitrate_kwargs(args, src, info.width, info.height, enc_w, enc_h)
-    projection_mode = AlphaPacker.projection_mode_static(info.width, info.height)
+    projection_mode = AlphaPacker.projection_mode_static(
+        info.width, info.height, float(getattr(args, "src_fisheye_fov", 0.0) or 0.0)
+    )
     if isinstance(engine, SharedMatAnyone2OnnxEngine):
         engine.set_segment_plan(segment_starts)
         for segment_start, masks in sam3_masks.items():
@@ -1342,7 +1368,16 @@ def main() -> int:
         f"source_fps={source_fps:.6f} output_fps={fps:.6f} target={target} audio={args.audio} "
         f"bitrate={target_bps} maxbitrate={max_bps} vbvbufsize={buf_bps} rc={args.rc} cq={args.cq} preset={args.preset}"
     )
-    if projection_mode == "flat2d_fisheye":
+    if projection_mode == "fisheye_src":
+        from pipeline.alpha_packer import fisheye_src_radial_scale
+
+        print(
+            f"[offline-alpha] projection=fisheye_src -> fisheye sbs kept as fisheye "
+            f"src_fov={args.src_fisheye_fov:g} fit={config.ALPHA_SRC_FIT} "
+            f"src_radial={fisheye_src_radial_scale(args.src_fisheye_fov, args.fisheye_radius_scale):.4f} "
+            f"radius_scale={args.fisheye_radius_scale:g}"
+        )
+    elif projection_mode == "flat2d_fisheye":
         alpha_2d_disparity = alpha_2d_disparity_px(enc_w)
         print(
             f"[offline-alpha] projection=flat2d_fisheye -> stereo fisheye sbs "
@@ -1469,11 +1504,18 @@ def main() -> int:
         print("[ffmpeg stderr]")
         print(stderr.strip()[-2000:])
     audio_mux_elapsed = 0.0
+    if rc == 0 and args.audio == "off":
+        if publish_pending_output(video_only_out, final_out):
+            video_only_out = final_out
+        else:
+            print(f"[offline-alpha] could not rename {video_only_out.name} to {final_out.name}")
+            rc = 1
     if rc == 0 and args.audio != "off":
         ta0 = time.perf_counter()
+        pending_out = pending_output_path(final_out)
         audio_cmd, audio_proc = _mux_audio_after(
             video_only_out,
-            final_out,
+            pending_out,
             src,
             args.audio,
             max(0.0, float(args.start or 0.0)),
@@ -1489,6 +1531,11 @@ def main() -> int:
             print(audio_stderr.strip()[-2000:])
         if audio_proc.returncode != 0:
             rc = audio_proc.returncode
+            discard_pending_output(pending_out)
+        elif not publish_pending_output(pending_out, final_out):
+            print(f"[offline-alpha] could not rename {pending_out.name} to {final_out.name}")
+            discard_pending_output(pending_out)
+            rc = 1
         else:
             try:
                 video_only_out.unlink(missing_ok=True)

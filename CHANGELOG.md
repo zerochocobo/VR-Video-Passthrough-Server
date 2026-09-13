@@ -4,6 +4,24 @@ This file only keeps version releases, major bug fixes, major UI/UX updates, and
 
 ## English
 
+### 2026-09-13
+
+- **DLSS 5 Neural Rendering (hidden):** Added realtime `[DLSS5]` playback and offline DLSS5 conversion. It did not beat RTX VSR 1x on VR sources, so its entries are hidden by default (`dlss5_card_visible` in `ui_settings.json`).
+- **Adaptive Dashboard columns:** The card grid switches between three and four columns with the visible cards, without gaps.
+
+### 2026-09-11
+
+- **SuperRes Native mode:** Added a Native target that enhances with RTX VSR at 1x without enlarging, now the realtime default. In Native mode realtime SuperRes supports draggable virtual-file playback, and 4K 2D and 2160p vertical sources are accepted.
+- **SuperRes 6K VR target:** Added a 6K VR target between 4K and 8K.
+- **Offline SuperRes TrueHDR:** Added RTX Video TrueHDR output as HDR10 with adjustable contrast, saturation, middle gray and peak brightness.
+- **Alpha passthrough for native fisheye videos:** Added Alpha passthrough for original 180/190-degree and other fisheye videos, detected from the filename (such as `_fisheye190`, `MKX200`, `VRCA220`), in realtime and offline.
+- **Faster virtual-file start:** Removed a stall of about 3.5 s when starting or seeking to a position that has not been encoded yet.
+
+### 2026-09-10
+
+- **Draggable virtual-file playback:** Realtime Green and Alpha can play as a seekable virtual MP4 with source audio, selectable against the live stream in their settings (default virtual file).
+- **Virtual-file fixes and performance:** Fixed skipping to the next video after dragging, empty mid-title seeks and unsupported titles on mounted drives; fixed 8K mosaic and made generation 2.5x faster.
+
 ### 2026-08-08
 
 - **VR reprojection quality and performance:** Added adaptive supersampling for equirectangular-to-flat projection to remove near-pole aliasing and moire artifacts in VR mosaic restoration and Face Beauty. Replaced the temporary oversized render/downsample path with a fused CUDA accumulation kernel and cached projection footprints and rotation matrices, improving the measured 8K two-region restoration path from 97.9 to 105.7 FPS with visually equivalent output.
@@ -315,6 +333,24 @@ This file only keeps version releases, major bug fixes, major UI/UX updates, and
 - **Core update:** Added initial DLNA time-seek metadata, passthrough HEAD support, and `PT_CONTAINER` support for MP4 and MPEG-TS passthrough output.
 
 ## 中文
+
+### 2026-09-13
+
+- **DLSS 5神经渲染（已隐藏）：** 新增实时`[DLSS5]`播放和离线DLSS5转换。VR片源上效果不如RTX VSR 1x，入口默认隐藏（`ui_settings.json`中的`dlss5_card_visible`）。
+- **首页自适应列数：** 卡片网格随可见卡片在3列和4列之间切换，不留空位。
+
+### 2026-09-11
+
+- **超分新增原生档：** 原生档以RTX VSR 1x增强画质、不放大分辨率，并成为实时默认档。原生档下实时超分支持可拖动进度条的虚拟文件播放，并可处理4K 2D和2160p竖屏素材。
+- **超分新增6K VR档：** 在4K与8K之间新增6K VR目标档。
+- **离线超分TrueHDR：** 新增RTX Video TrueHDR输出HDR10，可调对比度、饱和度、中灰和峰值亮度。
+- **鱼眼视频Alpha透视：** 新增原始180°、190°等鱼眼视频的Alpha透视，根据文件名识别（如`_fisheye190`、`MKX200`、`VRCA220`），实时与离线均支持。
+- **虚拟文件起播加快：** 修复起播或拖到尚未编码的位置时约3.5秒无响应的问题。
+
+### 2026-09-10
+
+- **可拖动进度条的虚拟文件播放：** 实时绿幕和Alpha支持以可seek的虚拟MP4播放并带原片音频，可在设置中与直播流切换（默认虚拟文件）。
+- **虚拟文件修复与性能：** 修复拖动后跳到下一个视频、片中seek无数据、挂载盘片子提示不支持的问题；修复8K马赛克，生成速度提升2.5倍。
 
 ### 2026-08-08
 

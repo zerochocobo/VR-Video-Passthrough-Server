@@ -55,11 +55,39 @@ DEFAULTS = {
     "mode_2d": True,
     "mode_two_dvr": True,
     "mode_superres": False,
-    "superres_target_height": 4096,
+    # Native 1x: the target that can also be played as a virtual file.
+    "superres_target_height": 0,
     "superres_quality": 4,
     "superres_hdr_look": "natural",
     "superres_offline_hdr_look": "natural",
     "superres_offline_bitrate_mode": "auto",
+    # NGX TrueHDR controls; ranges come from the RTX Video SDK headers.
+    "superres_truehdr_contrast": 100,
+    "superres_truehdr_saturation": 100,
+    "superres_truehdr_middle_gray": 50,
+    "superres_truehdr_max_nits": 1000,
+    "mode_dlss5": False,
+    # DLSS5 is parked: the pipeline, the offline tool and the probe all stay,
+    # but on this library NR did not beat RTX VSR 1x, so nothing of it is shown.
+    # While this is False the dashboard card, the offline tools card and the
+    # [DLSS5] DLNA entries are all absent, whatever mode_dlss5 says. There is
+    # deliberately no switch in the settings page; set it in ui_settings.json.
+    "dlss5_card_visible": False,
+    # Neural Rendering controls. The neutral value of each is what the runtime
+    # treats as "no adjustment", which is 1.0 for most of them and -1.0 for skin
+    # structure; see config.DLSS5_* and utils.dlss5.DLSS5_RANGES.
+    "dlss5_style": 0,
+    "dlss5_intensity": 1.0,
+    "dlss5_nr_passes": 1,
+    "dlss5_shimmer_suppression": 0.7,
+    "dlss5_local_tone": 1.0,
+    "dlss5_local_structure": 1.0,
+    "dlss5_skin_structure": -1.0,
+    "dlss5_color_strength": 1.0,
+    "dlss5_tone_preservation": 0.0,
+    "dlss5_face_skin_protection": 0.0,
+    "dlss5_grain_preservation": 0.0,
+    "dlss5_auto_mask": False,
     "two_dvr_live_model": "base",
     "two_dvr_live_hole_fill": "soft_shift",
     "two_dvr_live_eye_distance": 65.0,
@@ -76,10 +104,19 @@ DEFAULTS = {
     "offline_batch_trt_rvm_enabled": True,
     "offline_batch_trt_matanyone2_enabled": True,
     "passthrough_max_fps": 30,
+    # How a passthrough mode is offered to the player. "virtual" advertises the
+    # draggable virtual-MP4 entry (seek), "live" the chapter/live entry. One or
+    # the other, never both - see PT_PASSTHROUGH_SEEK_DLNA.
+    "passthrough_playback_mode": "virtual",
     "passthrough_seek_enabled": False,
     "passthrough_seek_dlna": False,
     "passthrough_seek_route_policy": "profile",
-    "passthrough_seek_container": "mpegts",
+    "passthrough_seek_container": "mp4",
+    "passthrough_seek_vmp4": True,
+    "passthrough_seek_vmp4_backend": "slot_frames",
+    "passthrough_seek_vmp4_slot_ready_only": True,
+    "passthrough_seek_vmp4_build_missing": True,
+    "passthrough_seek_vmp4_build_max_active": 1,
     "dlna_image_enabled": False,
     "dlna_all_videos_enabled": False,
     "decode_max_side": 4096,
@@ -179,6 +216,8 @@ class Settings:
             migrations.append(name)
 
     def load(self) -> None:
+        if not SETTINGS_PATH.exists():
+            return
         if SETTINGS_PATH.exists():
             try:
                 loaded = json.loads(SETTINGS_PATH.read_text(encoding="utf-8-sig"))
@@ -228,9 +267,22 @@ class Settings:
                         self.data["two_dvr_live_hole_fill"] = DEFAULTS["two_dvr_live_hole_fill"]
                         self.data["two_dvr_live_eye_distance"] = DEFAULTS["two_dvr_live_eye_distance"]
                         self._mark_migration_done("20260616_two_dvr_strength")
+                    if not self._migration_done("20260620_seek_vmp4_frames_default", loaded):
+                        # Move the superseded one-fps "slot" backend onto the
+                        # real-fps "slot_frames" backend; leave explicit
+                        # cache_file choices untouched.
+                        if str(self.data.get("passthrough_seek_vmp4_backend") or "").lower() == "slot":
+                            self.data["passthrough_seek_vmp4_backend"] = "slot_frames"
+                        self._mark_migration_done("20260620_seek_vmp4_frames_default")
                     if not self._migration_done("20260620_seek_dlna_default_off", loaded):
                         self.data["passthrough_seek_dlna"] = False
                         self._mark_migration_done("20260620_seek_dlna_default_off")
+                    if not self._migration_done("20260910_playback_mode", loaded):
+                        # The virtual-file entry is the default way a passthrough
+                        # mode is offered now; the dialog on each mode's card
+                        # switches an install back to the live entry.
+                        self.data["passthrough_playback_mode"] = DEFAULTS["passthrough_playback_mode"]
+                        self._mark_migration_done("20260910_playback_mode")
                     if not self._migration_done("20260720_superres_adaptive_8k_default", loaded):
                         if int(loaded.get("superres_target_height", 2160) or 2160) == 2160:
                             self.data["superres_target_height"] = 4096
@@ -249,6 +301,11 @@ class Settings:
             encoding="utf-8",
         )
 
+    def dlss5_enabled(self) -> bool:
+        """mode_dlss5, unless DLSS5 is hidden - a switch left on from before
+        must not keep a [DLSS5] entry in the player's list."""
+        return bool(self.data.get("dlss5_card_visible")) and bool(self.data.get("mode_dlss5"))
+
     def passthrough_mode(self) -> str:
         modes: list[str] = []
         if bool(self.data.get("mode_green")):
@@ -259,6 +316,8 @@ class Settings:
             modes.append("two_dvr")
         if bool(self.data.get("mode_superres")):
             modes.append("superres")
+        if self.dlss5_enabled():
+            modes.append("dlss5")
         if modes == ["green", "alpha"]:
             return "all"
         return ",".join(modes) if modes else "none"
@@ -278,6 +337,14 @@ class Settings:
         si_duck_preset = str(self.data.get("si_duck_preset") or DEFAULTS["si_duck_preset"]).strip().lower()
         if si_duck_preset not in SI_DUCK_PRESET_CHOICES:
             si_duck_preset = DEFAULTS["si_duck_preset"]
+        seek_vmp4_backend = str(
+            self.data.get("passthrough_seek_vmp4_backend") or DEFAULTS["passthrough_seek_vmp4_backend"]
+        ).strip().lower().replace("-", "_")
+        if seek_vmp4_backend not in {"cache_file", "slot", "slot_frames"}:
+            seek_vmp4_backend = DEFAULTS["passthrough_seek_vmp4_backend"]
+        playback_virtual = str(
+            self.data.get("passthrough_playback_mode") or DEFAULTS["passthrough_playback_mode"]
+        ).strip().lower() != "live"
         env = {
             "PT_VIDEO_DIR": "|".join(self.video_dirs()),
             "PT_HTTP_PORT": str(self.http_port()),
@@ -287,14 +354,52 @@ class Settings:
             "PT_RTX_VSR_TARGET_HEIGHT": str(_setting_value(self.data, "superres_target_height", DEFAULTS["superres_target_height"])),
             "PT_RTX_VSR_QUALITY": str(_setting_value(self.data, "superres_quality", DEFAULTS["superres_quality"])),
             "PT_RTX_VSR_HDR_LOOK": str(self.data.get("superres_hdr_look") or DEFAULTS["superres_hdr_look"]),
+            "PT_DLSS5_REALTIME_ENABLE": "1" if self.dlss5_enabled() else "0",
+            "PT_DLSS5_STYLE": str(_setting_value(self.data, "dlss5_style", DEFAULTS["dlss5_style"])),
+            "PT_DLSS5_INTENSITY": str(_setting_value(self.data, "dlss5_intensity", DEFAULTS["dlss5_intensity"])),
+            "PT_DLSS5_NR_PASSES": str(_setting_value(self.data, "dlss5_nr_passes", DEFAULTS["dlss5_nr_passes"])),
+            "PT_DLSS5_SHIMMER_SUPPRESSION": str(
+                _setting_value(self.data, "dlss5_shimmer_suppression", DEFAULTS["dlss5_shimmer_suppression"])
+            ),
+            "PT_DLSS5_LOCAL_TONE": str(_setting_value(self.data, "dlss5_local_tone", DEFAULTS["dlss5_local_tone"])),
+            "PT_DLSS5_LOCAL_STRUCTURE": str(
+                _setting_value(self.data, "dlss5_local_structure", DEFAULTS["dlss5_local_structure"])
+            ),
+            "PT_DLSS5_SKIN_STRUCTURE": str(
+                _setting_value(self.data, "dlss5_skin_structure", DEFAULTS["dlss5_skin_structure"])
+            ),
+            "PT_DLSS5_COLOR_STRENGTH": str(
+                _setting_value(self.data, "dlss5_color_strength", DEFAULTS["dlss5_color_strength"])
+            ),
+            "PT_DLSS5_TONE_PRESERVATION": str(
+                _setting_value(self.data, "dlss5_tone_preservation", DEFAULTS["dlss5_tone_preservation"])
+            ),
+            "PT_DLSS5_FACE_SKIN_PROTECTION": str(
+                _setting_value(self.data, "dlss5_face_skin_protection", DEFAULTS["dlss5_face_skin_protection"])
+            ),
+            "PT_DLSS5_GRAIN_PRESERVATION": str(
+                _setting_value(self.data, "dlss5_grain_preservation", DEFAULTS["dlss5_grain_preservation"])
+            ),
+            "PT_DLSS5_AUTO_MASK": "1" if self.data.get("dlss5_auto_mask") else "0",
             "PT_COMPOSITE_BG_RGB": str(self.data.get("background_color") or "00FF00"),
             "PT_ALPHA_STRIDE": str(_setting_value(self.data, "alpha_stride", 1)),
             "PT_PASSTHROUGH_MAX_FPS": str(passthrough_max_fps),
             "PT_PASSTHROUGH_PRODUCER_REALTIME_PACING": "1",
-            "PT_PASSTHROUGH_SEEK_ENABLED": "1" if self.data.get("passthrough_seek_enabled") else "0",
-            "PT_PASSTHROUGH_SEEK_DLNA": "1" if self.data.get("passthrough_seek_dlna") else "0",
+            # Both come from one choice: the route and the advertisement have to
+            # agree, and a user who picks "virtual file" in the dialog means both.
+            "PT_PASSTHROUGH_SEEK_ENABLED": "1" if playback_virtual else "0",
+            "PT_PASSTHROUGH_SEEK_DLNA": "1" if playback_virtual else "0",
             "PT_PASSTHROUGH_SEEK_ROUTE_POLICY": seek_route_policy,
             "PT_PASSTHROUGH_SEEK_CONTAINER": seek_container,
+            "PT_PASSTHROUGH_SEEK_VMP4": "1" if self.data.get("passthrough_seek_vmp4") else "0",
+            "PT_PASSTHROUGH_SEEK_VMP4_BACKEND": seek_vmp4_backend,
+            "PT_PASSTHROUGH_SEEK_VMP4_SLOT_READY_ONLY": (
+                "1" if self.data.get("passthrough_seek_vmp4_slot_ready_only", True) else "0"
+            ),
+            "PT_PASSTHROUGH_SEEK_VMP4_BUILD_MISSING": "1" if self.data.get("passthrough_seek_vmp4_build_missing") else "0",
+            "PT_PASSTHROUGH_SEEK_VMP4_BUILD_MAX_ACTIVE": str(
+                max(1, int(_setting_value(self.data, "passthrough_seek_vmp4_build_max_active", 1) or 1))
+            ),
             "PT_DLNA_IMAGE_ENABLED": "1" if self.data.get("dlna_image_enabled") else "0",
             "PT_DLNA_ALL_VIDEOS_ENABLED": "1" if self.data.get("dlna_all_videos_enabled") else "0",
             "PT_DECODE_MAX_SIDE": str(_setting_value(self.data, "decode_max_side", 4096)),

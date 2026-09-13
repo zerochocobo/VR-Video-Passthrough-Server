@@ -31,7 +31,8 @@ This is the miracle of the AI era.
 - Optional 2D-to-3D depth stabilization, including built-in temporal stabilization and NVDS ONNX stabilization for offline 16:9 jobs
 - Realtime and offline NVIDIA RTX Video Super Resolution for eligible 2D and VR sources, including adaptive `8K VR / 4K 2D` output
 - Split-eye GPU processing for 2:1 SBS VR, with 8192x4096 HEVC output available for offline 4K-VR-to-8K-VR conversion
-- Low / Medium / High / Ultra RTX VSR quality controls and Off / Natural / Vivid SDR HDR-look controls
+- Native 1x / 2K / 4K / 6K VR / 8K VR SuperRes targets, where native 1x enhances at the source resolution without enlarging
+- Low / Medium / High / Ultra RTX VSR quality controls, Off / Natural / Vivid SDR HDR-look controls, and offline-only NVIDIA TrueHDR for real HDR10 output with adjustable contrast, saturation, middle gray and peak nits
 - Realtime and offline Face Beauty (under development and testing; enable it from Settings)
 - Realtime and offline mosaic removal (under development and testing; enable it from Settings)
 - Dubbing / simultaneous interpretation playback with same-stem `.si.wav` sidecars, `[SI]` DLNA entries, start-time selection, channel mixing, and Light / Normal / Strong ducking
@@ -131,7 +132,7 @@ Tested on Meta Quest 3.
 - `PT_PASSTHROUGH_OUTPUT_MODE` supports `none`, `green`, `alpha`, `two_dvr`, `superres`, comma-separated combinations such as `green,alpha,two_dvr,superres`, and legacy `all` for green + alpha
 - `Alpha Passthrough` is the DLNA virtual title used in alpha mode
 - Realtime 2D-to-3D uses `PT_TWO_DVR_MODEL`, `PT_TWO_DVR_STRENGTH`, and related `PT_TWO_DVR_*` settings; offline 2D-to-3D / VR exposes model, quality-speed, temporal stability, and skip-existing controls in the desktop UI.
-- Realtime SuperRes uses `PT_RTX_VSR_TARGET_HEIGHT`, `PT_RTX_VSR_QUALITY`, and `PT_RTX_VSR_HDR_LOOK`. The adaptive 4096 target means 8192x4096 for recognized 2:1 SBS VR and 3840x2160 for ordinary 2D.
+- Realtime SuperRes uses `PT_RTX_VSR_TARGET_HEIGHT`, `PT_RTX_VSR_QUALITY`, and `PT_RTX_VSR_HDR_LOOK`. The adaptive 4096 target means 8192x4096 for recognized 2:1 SBS VR and 3840x2160 for ordinary 2D. Setting the HDR look to `truehdr` only affects offline jobs; realtime keeps the SDR look.
 - Same-stem `.si.wav` files enable `[SI]` DLNA entries. Current DLNA playback uses realtime MPEG-TS through `/si_live` with start offsets; the older progressive `/media_si` implementation remains a fallback route.
 - DLNA Live directories use `[GREEN]`, `[ALPHA]`, `[2D>3D]`, `[SuperRes]`, and `[SI]` markers where applicable and include a localized `[Select Time Index]` folder for start-time selection.
 - The desktop Settings page can change the advertised DLNA server name and HTTP port. Restart the server after saving network identity changes.

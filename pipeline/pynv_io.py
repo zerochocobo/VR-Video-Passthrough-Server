@@ -511,3 +511,46 @@ class GpuNv12AppFrame:
 
     def cuda(self):
         return [self.y, self.uv]
+
+
+class _RawCudaPlaneView:
+    """Minimal CUDA Array Interface producer with an explicit layout.
+
+    PyNvVideoCodec rejects CuPy's own descriptor for 16-bit planes: it only
+    accepts the ``|u2`` typestr and the plane strides its own samples use.
+    """
+
+    def __init__(self, shape: tuple[int, ...], strides: tuple[int, ...], typestr: str, ptr: int):
+        self.__cuda_array_interface__ = {
+            "shape": tuple(int(v) for v in shape),
+            "strides": tuple(int(v) for v in strides),
+            "data": (int(ptr), False),
+            "typestr": typestr,
+            "version": 3,
+        }
+
+
+class GpuP010AppFrame:
+    """AppFrame wrapper accepted by PyNvVideoCodec for GPU P010 input.
+
+    The buffer has the same plane layout as the NV12 one, but each sample is
+    a uint16 holding its 10-bit value in the high bits.  Strides match the
+    SDK's own P010 sample layout.
+    """
+
+    def __init__(self, p010_dev: Any, width: int, height: int):
+        self.p010_dev = p010_dev
+        self.width = int(width)
+        self.height = int(height)
+        base = int(p010_dev.data.ptr)
+        row_bytes = self.width * 2
+        self.y = _RawCudaPlaneView((self.height, self.width, 1), (row_bytes, 2, 1), "|u2", base)
+        self.uv = _RawCudaPlaneView(
+            (self.height // 2, self.width // 2, 2),
+            (row_bytes, 2, 1),
+            "|u2",
+            base + row_bytes * self.height,
+        )
+
+    def cuda(self):
+        return [self.y, self.uv]

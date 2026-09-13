@@ -9,6 +9,7 @@ from PySide6.QtCore import QSize, Qt, QUrl
 from PySide6.QtGui import QDesktopServices, QIcon
 from PySide6.QtWidgets import (
     QAbstractItemView,
+    QFrame,
     QButtonGroup,
     QCheckBox,
     QComboBox,
@@ -28,9 +29,13 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
 )
 
+from ui import theme
 from ui.icons import question_icon
 from ui.player_support import load_player_support
 from ui.settings import DEFAULTS, LIGHT_MATCH_PRESETS
+from ui.superres_targets import REALTIME_DEFAULT_TARGET, TARGET_CHOICES, target_i18n_key
+from utils.dlss5 import DLSS5_NR_PASSES_RANGE, DLSS5_RANGES
+from utils.rtx_vsr import NATIVE_TARGET_HEIGHT
 from utils.si_filter import (
     ORIGINAL_VOLUME_CHOICES,
     SI_DELAY_SECONDS_CHOICES,
@@ -155,6 +160,67 @@ class PlayerSupportDialog(QDialog):
         return self.i18n.t("player_support.supported") if supported else "-"
 
 
+class PlaybackModeChooser(QWidget):
+    """How a passthrough mode is handed to the player: virtual file or live stream.
+
+    A two-way, mutually exclusive choice where the consequence of each option is
+    not obvious from its name, so it reads as two radio rows with a line of plain
+    explanation under each rather than a combo box (which hides the alternative)
+    or a switch (which cannot label both sides). The closing note points at the
+    fallback, because the virtual file is the one that can fail on an unusual
+    player and the user needs to know there is somewhere to go.
+    """
+
+    def __init__(self, i18n, settings, parent=None) -> None:
+        super().__init__(parent)
+        self.i18n = i18n
+        mode = str(
+            settings.data.get("passthrough_playback_mode")
+            or DEFAULTS["passthrough_playback_mode"]
+        ).strip().lower()
+
+        self.virtual_radio = QRadioButton(self.i18n.t("playback.virtual"))
+        self.live_radio = QRadioButton(self.i18n.t("playback.live"))
+        self.group = QButtonGroup(self)
+        self.group.addButton(self.virtual_radio)
+        self.group.addButton(self.live_radio)
+        self.live_radio.setChecked(mode == "live")
+        self.virtual_radio.setChecked(mode != "live")
+
+        title = QLabel(self.i18n.t("playback.title"))
+        title.setStyleSheet("font-weight: 600; background: transparent;")
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(4)
+        layout.addWidget(title)
+        for radio, hint_key in (
+            (self.virtual_radio, "playback.virtual_hint"),
+            (self.live_radio, "playback.live_hint"),
+        ):
+            radio.setCursor(Qt.CursorShape.PointingHandCursor)
+            hint = QLabel(self.i18n.t(hint_key))
+            hint.setWordWrap(True)
+            hint.setStyleSheet(
+                f"font-size: 8.5pt; color: {theme.TEXT_MUTED}; background: transparent;"
+            )
+            hint.setContentsMargins(22, 0, 0, 0)
+            layout.addWidget(radio)
+            layout.addWidget(hint)
+            layout.addSpacing(2)
+
+        note = QLabel(self.i18n.t("playback.note"))
+        note.setWordWrap(True)
+        note.setStyleSheet(
+            f"font-size: 8.5pt; color: {theme.TEXT_MUTED}; background: {theme.BLUE_SOFT};"
+            " border-radius: 6px; padding: 7px 9px;"
+        )
+        layout.addWidget(note)
+
+    def selected_mode(self) -> str:
+        return "live" if self.live_radio.isChecked() else "virtual"
+
+
 class GreenScreenSettingsDialog(QDialog):
     def __init__(self, i18n, settings, parent=None) -> None:
         super().__init__(parent)
@@ -179,15 +245,51 @@ class GreenScreenSettingsDialog(QDialog):
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
 
+        self.playback = PlaybackModeChooser(self.i18n, settings, self)
+
         layout = QVBoxLayout(self)
         layout.setContentsMargins(16, 14, 16, 14)
         layout.setSpacing(12)
         layout.addLayout(color_row)
+        layout.addWidget(self.playback)
         layout.addWidget(buttons)
-        self.resize(360, 130)
+        self.resize(420, 300)
 
     def selected_color(self) -> str:
         return str(self.bg_color.currentData() or DEFAULTS["background_color"])
+
+    def selected_playback_mode(self) -> str:
+        return self.playback.selected_mode()
+
+
+class AlphaPassthroughSettingsDialog(QDialog):
+    """Alpha passthrough options. Only the playback mode for now."""
+
+    def __init__(self, i18n, settings, parent=None) -> None:
+        super().__init__(parent)
+        self.i18n = i18n
+        self.setModal(True)
+        self.setWindowTitle(self.i18n.t("mode.alpha"))
+
+        self.playback = PlaybackModeChooser(self.i18n, settings, self)
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.button(QDialogButtonBox.StandardButton.Save).setText(self.i18n.t("button.save"))
+        buttons.button(QDialogButtonBox.StandardButton.Cancel).setText(self.i18n.t("button.cancel"))
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(16, 14, 16, 14)
+        layout.setSpacing(12)
+        layout.addWidget(self.playback)
+        layout.addWidget(buttons)
+        self.resize(420, 260)
+
+    def selected_playback_mode(self) -> str:
+        return self.playback.selected_mode()
 
 
 class Alpha2DSettingsDialog(QDialog):
@@ -272,10 +374,9 @@ class SuperResSettingsDialog(QDialog):
         self.setModal(True)
         self.setWindowTitle(self.i18n.t("superres.realtime_title"))
         self.target = QComboBox()
-        self.target.addItem(self.i18n.t("superres.target_2k"), 1440)
-        self.target.addItem(self.i18n.t("superres.target_4k"), 2160)
-        self.target.addItem(self.i18n.t("superres.target_8k_vr"), 4096)
-        current_target = int_setting(settings.data.get("superres_target_height"), 4096)
+        for target in TARGET_CHOICES:
+            self.target.addItem(self.i18n.t(target_i18n_key(target)), target)
+        current_target = int_setting(settings.data.get("superres_target_height"), REALTIME_DEFAULT_TARGET)
         self.target.setCurrentIndex(max(0, self.target.findData(current_target)))
         self.quality = QComboBox()
         for quality in (1, 2, 3, 4):
@@ -295,17 +396,43 @@ class SuperResSettingsDialog(QDialog):
         self.performance_note = QLabel(self.i18n.t("superres.performance_note"))
         self.performance_note.setWordWrap(True)
         self.performance_note.setStyleSheet("color: #626975; background: transparent;")
+        # Only the native 1x target can be served as a virtual file: enlarging
+        # runs at 25-27 FPS and needs about 173 Mbps, which a player pulling at
+        # playback speed cannot ride. So the choice appears exactly when it
+        # applies, and the note says why it is missing otherwise.
+        self.playback = PlaybackModeChooser(self.i18n, settings, self)
+        self.playback_note = QLabel(self.i18n.t("superres.playback_native_only"))
+        self.playback_note.setWordWrap(True)
+        self.playback_note.setStyleSheet("color: #626975; background: transparent;")
+        self.target.currentIndexChanged.connect(self._update_playback_visibility)
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel)
         buttons.button(QDialogButtonBox.StandardButton.Save).setText(self.i18n.t("button.save"))
         buttons.button(QDialogButtonBox.StandardButton.Cancel).setText(self.i18n.t("button.cancel"))
         buttons.accepted.connect(self.accept); buttons.rejected.connect(self.reject)
         layout = QVBoxLayout(self); layout.setContentsMargins(16, 14, 16, 14); layout.setSpacing(12)
-        layout.addLayout(target_row); layout.addLayout(quality_row); layout.addLayout(hdr_row); layout.addWidget(self.performance_note); layout.addWidget(buttons)
+        layout.addLayout(target_row); layout.addLayout(quality_row); layout.addLayout(hdr_row)
+        layout.addWidget(self.performance_note); layout.addWidget(self.playback); layout.addWidget(self.playback_note)
+        layout.addWidget(buttons)
         self.quality_keys = ("superres.quality_1", "superres.quality_2", "superres.quality_3", "superres.quality_4")
         for i, key in enumerate(self.quality_keys): self.quality.setItemText(i, self.i18n.t(key))
         self.setMinimumWidth(520)
         self.setMaximumWidth(520)
+        self._update_playback_visibility()
         self.adjustSize()
+
+    def _update_playback_visibility(self) -> None:
+        # The note stays visible at every target: it is the rule that decides
+        # whether the chooser above it exists, so the user should read it
+        # before picking a target, not only after losing the choice.
+        native = int(self.target.currentData() or 0) <= NATIVE_TARGET_HEIGHT
+        self.playback.setVisible(native)
+        self.adjustSize()
+
+    def selected_playback_mode(self) -> str:
+        """The shared passthrough playback mode, unchanged unless 1x is chosen."""
+        if int(self.target.currentData() or 0) > NATIVE_TARGET_HEIGHT:
+            return ""
+        return self.playback.selected_mode()
 
     def selected_target_height(self) -> int:
         return int(self.target.currentData())
@@ -315,6 +442,170 @@ class SuperResSettingsDialog(QDialog):
 
     def selected_hdr_look(self) -> str:
         return str(self.hdr_look.currentData() or "natural")
+
+
+class DLSS5SettingsDialog(QDialog):
+    """Realtime DLSS 5 Neural Rendering settings, from the [DLSS5] card.
+
+    Neural Rendering has thirteen controls and most of them refine one another.
+    The ones that change what a viewer notices lead; the rest sit behind a
+    disclosure, because a dialog that opens onto thirteen sliders is a dialog
+    nobody adjusts.
+
+    Every slider's range comes from utils.dlss5.DLSS5_RANGES, so the UI cannot
+    offer a value the runtime then rejects. They are integer sliders over
+    hundredths - Qt has no float slider - and the label beside each one shows
+    the real value.
+    """
+
+    #: (settings key, label key, range key). Order is the order on screen.
+    MAIN_SLIDERS = (
+        ("dlss5_intensity", "dlss5.intensity", "intensity"),
+        ("dlss5_shimmer_suppression", "dlss5.shimmer_suppression", "shimmer_suppression"),
+    )
+    ADVANCED_SLIDERS = (
+        ("dlss5_local_tone", "dlss5.local_tone", "local_tone"),
+        ("dlss5_local_structure", "dlss5.local_structure", "local_structure"),
+        ("dlss5_skin_structure", "dlss5.skin_structure", "skin_structure"),
+        ("dlss5_color_strength", "dlss5.color_strength", "color_strength"),
+        ("dlss5_tone_preservation", "dlss5.tone_preservation", "tone_preservation"),
+        ("dlss5_face_skin_protection", "dlss5.face_skin_protection", "face_skin_protection"),
+        ("dlss5_grain_preservation", "dlss5.grain_preservation", "grain_preservation"),
+    )
+    STYLE_KEYS = ("dlss5.style_default", "dlss5.style_natural", "dlss5.style_cinematic")
+
+    def __init__(self, i18n, settings, parent=None, *, offline: bool = False) -> None:
+        super().__init__(parent)
+        self.i18n = i18n
+        self.offline = bool(offline)
+        self.setModal(True)
+        self.setWindowTitle(self.i18n.t("dlss5.offline_title" if offline else "dlss5.realtime_title"))
+
+        self.style = QComboBox()
+        for index, key in enumerate(self.STYLE_KEYS):
+            self.style.addItem(self.i18n.t(key), index)
+        self.style.setCurrentIndex(
+            max(0, min(
+                len(self.STYLE_KEYS) - 1,
+                int_setting(settings.data.get("dlss5_style"), DEFAULTS["dlss5_style"]),
+            ))
+        )
+        self.nr_passes = QComboBox()
+        for passes in range(DLSS5_NR_PASSES_RANGE[0], DLSS5_NR_PASSES_RANGE[1] + 1):
+            self.nr_passes.addItem(str(passes), passes)
+        self.nr_passes.setCurrentIndex(
+            max(0, self.nr_passes.findData(
+                int_setting(settings.data.get("dlss5_nr_passes"), DEFAULTS["dlss5_nr_passes"])
+            ))
+        )
+
+        self.sliders: dict[str, QSlider] = {}
+        self.value_labels: dict[str, QLabel] = {}
+
+        style_row = QHBoxLayout()
+        style_row.addWidget(QLabel(self.i18n.t("dlss5.style")))
+        style_row.addWidget(self.style)
+        style_row.addStretch(1)
+        style_row.addWidget(QLabel(self.i18n.t("dlss5.nr_passes")))
+        style_row.addWidget(self.nr_passes)
+
+        main_form = self._slider_form(settings, self.MAIN_SLIDERS)
+        self.advanced = self._slider_form(settings, self.ADVANCED_SLIDERS)
+        self.auto_mask = QCheckBox(self.i18n.t("dlss5.auto_mask"))
+        self.auto_mask.setChecked(bool(settings.data.get("dlss5_auto_mask", DEFAULTS["dlss5_auto_mask"])))
+        advanced_box = QVBoxLayout()
+        advanced_box.setContentsMargins(0, 0, 0, 0)
+        advanced_box.setSpacing(8)
+        advanced_box.addWidget(self.advanced)
+        advanced_box.addWidget(self.auto_mask)
+        self.advanced_panel = QFrame()
+        self.advanced_panel.setLayout(advanced_box)
+        self.advanced_panel.setVisible(False)
+        self.advanced_toggle = QPushButton()
+        self.advanced_toggle.setCheckable(True)
+        self.advanced_toggle.setFlat(True)
+        self.advanced_toggle.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.advanced_toggle.setStyleSheet(
+            "QPushButton { text-align: left; border: none; background: transparent;"
+            f" color: {theme.BLUE_DARK}; }}"
+        )
+        self.advanced_toggle.toggled.connect(self._toggle_advanced)
+        self._toggle_advanced(False)
+
+        # NR is 1x, so there is no target that cannot be served as a virtual
+        # file: the chooser is always meaningful and always shown, unlike the
+        # SuperRes dialog where it appears only at the native target. Offline
+        # has no playback channel at all, so there it is absent.
+        self.playback = None if self.offline else PlaybackModeChooser(self.i18n, settings, self)
+        self.performance_note = QLabel(
+            self.i18n.t("dlss5.offline_note" if self.offline else "dlss5.performance_note")
+        )
+        self.performance_note.setWordWrap(True)
+        self.performance_note.setStyleSheet(f"color: {theme.TEXT_MUTED}; background: transparent;")
+
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel)
+        buttons.button(QDialogButtonBox.StandardButton.Save).setText(self.i18n.t("button.save"))
+        buttons.button(QDialogButtonBox.StandardButton.Cancel).setText(self.i18n.t("button.cancel"))
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(16, 14, 16, 14)
+        layout.setSpacing(10)
+        layout.addLayout(style_row)
+        layout.addWidget(main_form)
+        layout.addWidget(self.advanced_toggle)
+        layout.addWidget(self.advanced_panel)
+        layout.addWidget(self.performance_note)
+        if self.playback is not None:
+            layout.addWidget(self.playback)
+        layout.addWidget(buttons)
+        self.setMinimumWidth(520)
+        self.setMaximumWidth(520)
+        self.adjustSize()
+
+    def _slider_form(self, settings, rows) -> QWidget:
+        form = QWidget()
+        grid = QGridLayout(form)
+        grid.setContentsMargins(0, 0, 0, 0)
+        for row, (key, label_key, range_key) in enumerate(rows):
+            low, high = DLSS5_RANGES[range_key]
+            slider = QSlider(Qt.Orientation.Horizontal)
+            slider.setRange(int(round(low * 100)), int(round(high * 100)))
+            value = float_setting(settings.data.get(key), DEFAULTS[key])
+            slider.setValue(int(round(max(low, min(high, value)) * 100)))
+            value_label = QLabel(f"{slider.value() / 100:.2f}")
+            value_label.setFixedWidth(42)
+            value_label.setStyleSheet(f"color: {theme.TEXT_MUTED}; background: transparent;")
+            slider.valueChanged.connect(lambda v, lbl=value_label: lbl.setText(f"{v / 100:.2f}"))
+            self.sliders[key] = slider
+            self.value_labels[key] = value_label
+            grid.addWidget(QLabel(self.i18n.t(label_key)), row, 0)
+            grid.addWidget(slider, row, 1)
+            grid.addWidget(value_label, row, 2)
+        grid.setColumnStretch(1, 1)
+        return form
+
+    def _toggle_advanced(self, checked: bool) -> None:
+        self.advanced_panel.setVisible(bool(checked))
+        arrow = "\u25be" if checked else "\u25b8"
+        self.advanced_toggle.setText(f"{arrow} {self.i18n.t('dlss5.advanced')}")
+        self.adjustSize()
+
+    def selected_playback_mode(self) -> str:
+        """The shared passthrough choice, or "" when this dialog is offline."""
+        return "" if self.playback is None else self.playback.selected_mode()
+
+    def payload(self) -> dict:
+        """Every DLSS5 setting this dialog owns, ready for settings.data."""
+        values: dict = {
+            "dlss5_style": int(self.style.currentData() or 0),
+            "dlss5_nr_passes": int(self.nr_passes.currentData() or 1),
+            "dlss5_auto_mask": self.auto_mask.isChecked(),
+        }
+        for key, slider in self.sliders.items():
+            values[key] = round(slider.value() / 100.0, 2)
+        return values
 
 
 class TwoDvrSettingsDialog(QDialog):

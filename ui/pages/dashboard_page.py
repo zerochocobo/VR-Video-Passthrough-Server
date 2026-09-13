@@ -20,6 +20,7 @@ from PySide6.QtWidgets import (
 from ui import theme
 from ui.dialogs.feature_dialogs import (
     Alpha2DSettingsDialog,
+    AlphaPassthroughSettingsDialog,
     BG_COLOR_CHOICES,
     FaceBeautySettingsDialog,
     GreenScreenSettingsDialog,
@@ -28,6 +29,7 @@ from ui.dialogs.feature_dialogs import (
     RmSettingsDialog,
     SIHelpDialog,
     SISettingsDialog,
+    DLSS5SettingsDialog,
     SuperResSettingsDialog,
     TwoDvrSettingsDialog,
     float_setting,
@@ -35,17 +37,26 @@ from ui.dialogs.feature_dialogs import (
 )
 from ui.services.live_control import send_control
 from ui.settings import DEFAULTS
+from ui.superres_targets import target_i18n_key
 from ui.widgets.feature_card import CARD_HEIGHT, FeatureCard
 
-DASHBOARD_WIDTH = 700
+# The column count follows the fullest VISIBLE group, and the width follows the
+# column count. Three is what a default install shows (alpha/green/superres,
+# subtitle/light/2D alpha); a fourth card appears only when a debug entry (RM,
+# face beauty) or DLSS5 is revealed. A fixed three let that fourth card wrap onto
+# a row of its own above the next group; a fixed four left a hole in every row
+# once DLSS5 was hidden. Never fewer than three, so one short group does not
+# stretch its cards across the page.
+MIN_GRID_COLUMNS = 3
+MAX_GRID_COLUMNS = 4
+DASHBOARD_WIDTHS = {3: 700, 4: 860}
+DASHBOARD_WIDTH = DASHBOARD_WIDTHS[MIN_GRID_COLUMNS]
 # Height for the common layout: three single-row card grids. A grid that wraps
-# to a second row adds EXTRA_ROW_HEIGHT, reported by DashboardPage.preferred_height
-# -- the 2D row does exactly that once the [RM] card is visible, and a fixed
-# height there left the "other" group label overlapped by the cards above it.
+# to a second row adds EXTRA_ROW_HEIGHT, reported by DashboardPage.preferred_height,
+# so a wrapped row cannot overlap the group label below it.
 DASHBOARD_HEIGHT = 524
 EXTRA_ROW_HEIGHT = CARD_HEIGHT + 8
 SERVER_ICON_SIZE = 22
-GRID_COLUMNS = 3
 PROJECT_URL = "https://wapok.com"
 
 
@@ -134,17 +145,18 @@ class DashboardPage(QWidget):
 
         self.cards: dict[str, FeatureCard] = {
             "green": FeatureCard("green_screen"),
-            "alpha": FeatureCard("alpha", configurable=False, with_help=True),
+            "alpha": FeatureCard("alpha", configurable=True, with_help=True),
             "alpha2d": FeatureCard("alpha"),
             "face_beauty": FeatureCard("face_beauty"),
             "two_dvr": FeatureCard("two_dvr"),
             "superres": FeatureCard("superres", configurable=True),
+            "dlss5": FeatureCard("dlss5", configurable=True),
             "rm": FeatureCard("rm", configurable=True),
             "subtitle": FeatureCard("subtitle"),
             "si": FeatureCard("translate", with_help=True),
             "light": FeatureCard("light"),
         }
-        self._realtime_keys = ["alpha", "green", "superres"]
+        self._realtime_keys = ["alpha", "green", "superres", "dlss5"]
         self._2d_keys = ["face_beauty", "two_dvr", "si", "rm"]
         self._audio_keys = ["subtitle", "light", "alpha2d"]
 
@@ -203,15 +215,18 @@ class DashboardPage(QWidget):
         self.cards["alpha2d"].toggled.connect(lambda checked: self._save_flag("mode_2d", checked))
         self.cards["two_dvr"].toggled.connect(lambda checked: self._save_flag("mode_two_dvr", checked))
         self.cards["superres"].toggled.connect(lambda checked: self._save_flag("mode_superres", checked))
+        self.cards["dlss5"].toggled.connect(lambda checked: self._save_flag("mode_dlss5", checked))
         self.cards["subtitle"].toggled.connect(lambda checked: self._save_flag("subtitle_enable", checked))
         self.cards["face_beauty"].toggled.connect(self._toggle_face_beauty)
         self.cards["rm"].toggled.connect(self._toggle_rm)
         self.cards["si"].toggled.connect(self._toggle_si)
         self.cards["light"].toggled.connect(self._toggle_light_match)
         self.cards["green"].configure_requested.connect(self._configure_green)
+        self.cards["alpha"].configure_requested.connect(self._configure_alpha_passthrough)
         self.cards["alpha"].help_requested.connect(lambda: PlayerSupportDialog(self.i18n, self).exec())
         self.cards["alpha2d"].configure_requested.connect(self._configure_alpha)
         self.cards["superres"].configure_requested.connect(self._configure_superres)
+        self.cards["dlss5"].configure_requested.connect(self._configure_dlss5)
         self.cards["two_dvr"].configure_requested.connect(self._configure_two_dvr)
         self.cards["subtitle"].configure_requested.connect(self.open_subtitle_page)
         self.cards["face_beauty"].configure_requested.connect(self._configure_face_beauty)
@@ -225,37 +240,64 @@ class DashboardPage(QWidget):
         extra = sum(max(0, rows - 1) for rows in self._grid_rows.values())
         return DASHBOARD_HEIGHT + extra * EXTRA_ROW_HEIGHT
 
+    def preferred_width(self) -> int:
+        """Window width this layout needs: one step per column in use."""
+        return DASHBOARD_WIDTHS[self.grid_columns]
+
+    def _visible_keys(self, keys: list[str]) -> list[str]:
+        return [
+            key for key in keys
+            if (key != "rm" or self._rm_card_enabled())
+            and (key != "face_beauty" or self._face_beauty_card_enabled())
+            and (key != "dlss5" or self._dlss5_card_enabled())
+        ]
+
     def _rebuild_grids(self) -> None:
-        for grid, keys in (
-            (self._realtime_grid, self._realtime_keys),
-            (self._2d_grid, self._2d_keys),
-            (self._audio_grid, self._audio_keys),
-        ):
+        groups = [
+            (self._realtime_grid, self._visible_keys(self._realtime_keys)),
+            (self._2d_grid, self._visible_keys(self._2d_keys)),
+            (self._audio_grid, self._visible_keys(self._audio_keys)),
+        ]
+        columns = max(MIN_GRID_COLUMNS, min(MAX_GRID_COLUMNS, max(len(keys) for _, keys in groups)))
+        self.grid_columns = columns
+        for grid, visible_keys in groups:
             while grid.count():
                 item = grid.takeAt(0)
                 widget = item.widget()
                 if widget is not None:
                     widget.setParent(None)
-            visible_keys = [
-                key for key in keys
-                if (key != "rm" or self._rm_card_enabled())
-                and (key != "face_beauty" or self._face_beauty_card_enabled())
-            ]
             for index, key in enumerate(visible_keys):
                 card = self.cards[key]
+                card.setParent(self)
                 card.setVisible(True)
-                grid.addWidget(card, index // GRID_COLUMNS, index % GRID_COLUMNS)
-            for column in range(GRID_COLUMNS):
-                grid.setColumnStretch(column, 1)
-            rows = max(1, (len(visible_keys) + GRID_COLUMNS - 1) // GRID_COLUMNS)
+                grid.addWidget(card, index // columns, index % columns)
+            # A column that was in use before this rebuild keeps its stretch
+            # unless it is cleared, and an empty stretched column is a hole.
+            for column in range(MAX_GRID_COLUMNS):
+                grid.setColumnStretch(column, 1 if column < columns else 0)
+            rows = max(1, (len(visible_keys) + columns - 1) // columns)
             self._grid_rows[id(grid)] = rows
-            filled = rows * GRID_COLUMNS
+            filled = rows * columns
             for pad_index in range(len(visible_keys), filled):
                 spacer = QWidget()
                 spacer.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
-                grid.addWidget(spacer, pad_index // GRID_COLUMNS, pad_index % GRID_COLUMNS)
+                grid.addWidget(spacer, pad_index // columns, pad_index % columns)
+        # Cards taken out of the grid above must not stay visible on their own.
         self.cards["rm"].setVisible(self._rm_card_enabled())
         self.cards["face_beauty"].setVisible(self._face_beauty_card_enabled())
+        self.cards["dlss5"].setVisible(self._dlss5_card_enabled())
+
+    def _dlss5_card_enabled(self) -> bool:
+        """The DLSS5 runtime is gitignored and optional.
+
+        A clean clone has no runtime/ at all, and a card that is only ever
+        greyed out is a card that asks the user to go looking for something
+        this build does not have. So it is absent rather than disabled.
+        """
+        from utils.dlss5 import is_dlss5_available
+
+        # Parked behind a settings flag as well: see "dlss5_card_visible".
+        return bool(self.settings.data.get("dlss5_card_visible")) and bool(is_dlss5_available())
 
     def _rm_card_enabled(self) -> bool:
         return bool(self.settings.data.get("rm_card_visible"))
@@ -321,6 +363,15 @@ class DashboardPage(QWidget):
         if dialog.exec() != GreenScreenSettingsDialog.DialogCode.Accepted:
             return
         self.settings.data["background_color"] = dialog.selected_color()
+        self.settings.data["passthrough_playback_mode"] = dialog.selected_playback_mode()
+        self.settings.save()
+        self._update_summaries()
+
+    def _configure_alpha_passthrough(self) -> None:
+        dialog = AlphaPassthroughSettingsDialog(self.i18n, self.settings, self)
+        if dialog.exec() != AlphaPassthroughSettingsDialog.DialogCode.Accepted:
+            return
+        self.settings.data["passthrough_playback_mode"] = dialog.selected_playback_mode()
         self.settings.save()
         self._update_summaries()
 
@@ -346,6 +397,22 @@ class DashboardPage(QWidget):
         self.settings.data["superres_target_height"] = dialog.selected_target_height()
         self.settings.data["superres_quality"] = dialog.selected_quality()
         self.settings.data["superres_hdr_look"] = dialog.selected_hdr_look()
+        # The playback mode is the shared passthrough choice and is only offered
+        # for the native 1x target; an enlarging target leaves it untouched.
+        playback = dialog.selected_playback_mode()
+        if playback:
+            self.settings.data["passthrough_playback_mode"] = playback
+        self.settings.save()
+        self._update_summaries()
+
+    def _configure_dlss5(self) -> None:
+        dialog = DLSS5SettingsDialog(self.i18n, self.settings, self)
+        if dialog.exec() != DLSS5SettingsDialog.DialogCode.Accepted:
+            return
+        self.settings.data.update(dialog.payload())
+        # Virtual file vs live is the shared passthrough choice; NR is 1x, so
+        # unlike SuperRes it is offered at every setting and always applies.
+        self.settings.data["passthrough_playback_mode"] = dialog.selected_playback_mode()
         self.settings.save()
         self._update_summaries()
 
@@ -452,6 +519,12 @@ class DashboardPage(QWidget):
         self.cards["alpha2d"].set_checked(bool(data.get("mode_2d", DEFAULTS["mode_2d"])))
         self.cards["two_dvr"].set_checked(bool(data.get("mode_two_dvr")))
         self.cards["superres"].set_checked(bool(data.get("mode_superres")))
+        dlss5_visible = self._dlss5_card_enabled()
+        dlss5_enabled = bool(data.get("mode_dlss5", DEFAULTS["mode_dlss5"]))
+        self.cards["dlss5"].set_checked(dlss5_enabled if dlss5_visible else False)
+        if not dlss5_visible and dlss5_enabled:
+            self.settings.data["mode_dlss5"] = False
+            self.settings.save()
         self.cards["rm"].set_checked(bool(data.get("rm_enabled", DEFAULTS["rm_enabled"])))
         face_beauty_visible = self._face_beauty_card_enabled()
         face_beauty_enabled = bool(data.get("face_beauty_enabled", DEFAULTS["face_beauty_enabled"]))
@@ -470,12 +543,20 @@ class DashboardPage(QWidget):
         bg_value = str(data.get("background_color") or DEFAULTS["background_color"])
         bg_key = next((key for key, value in BG_COLOR_CHOICES if value == bg_value), None)
         bg_name = self.i18n.t(bg_key) if bg_key else f"#{bg_value}"
-        self.cards["green"].set_summary(f"[GREEN] · {self.i18n.t('dashboard.green_bg_color')} {bg_name}")
+        # The playback mode decides what the player is even offered, so it belongs
+        # on the card rather than only inside the dialog.
+        playback = str(
+            data.get("passthrough_playback_mode") or DEFAULTS["passthrough_playback_mode"]
+        ).strip().lower()
+        playback_name = self.i18n.t("playback.live" if playback == "live" else "playback.virtual")
+        self.cards["green"].set_summary(
+            f"[GREEN] · {self.i18n.t('dashboard.green_bg_color')} {bg_name} · {playback_name}"
+        )
 
         projection = str(data.get("alpha_2d_projection") or "fisheye").lower()
         projection_key = "alpha2d.projection_flat3d" if projection == "flat3d" else "alpha2d.projection_fisheye"
         distance = int(round(float_setting(data.get("alpha_2d_distance_m"), 4.0)))
-        self.cards["alpha"].set_summary("[ALPHA]最好的透视效果")
+        self.cards["alpha"].set_summary(f"[ALPHA]最好的透视效果 · {playback_name}")
         self.cards["alpha2d"].set_summary(f"{self.i18n.t(projection_key)} · {distance}m")
 
         strength = float_setting(data.get("two_dvr_live_strength"), DEFAULTS["two_dvr_live_strength"])
@@ -483,11 +564,22 @@ class DashboardPage(QWidget):
         target = int_setting(data.get("superres_target_height"), DEFAULTS["superres_target_height"])
         quality = max(1, min(4, int_setting(data.get("superres_quality"), DEFAULTS["superres_quality"])))
         quality_key = f"superres.quality_{quality}"
-        target_key = "superres.target_2k" if target <= 1440 else ("superres.target_8k_vr" if target >= 4096 else "superres.target_4k")
+        target_key = target_i18n_key(target)
         hdr_mode = str(data.get("superres_hdr_look") or DEFAULTS["superres_hdr_look"])
         if hdr_mode not in {"off", "natural", "vivid"}:
             hdr_mode = "natural"
         self.cards["superres"].set_summary(f"[SuperRes] · {self.i18n.t(target_key)} · {self.i18n.t(quality_key)} · {self.i18n.t(f'superres.hdr_look_{hdr_mode}')}")
+
+        style_key = DLSS5SettingsDialog.STYLE_KEYS[
+            max(0, min(len(DLSS5SettingsDialog.STYLE_KEYS) - 1, int_setting(data.get("dlss5_style"), DEFAULTS["dlss5_style"])))
+        ]
+        intensity = float_setting(data.get("dlss5_intensity"), DEFAULTS["dlss5_intensity"])
+        passes = int_setting(data.get("dlss5_nr_passes"), DEFAULTS["dlss5_nr_passes"])
+        # A card line is ~200px wide, so the summary names the three settings
+        # that change the picture and leaves the rest to the dialog.
+        self.cards["dlss5"].set_summary(
+            f"[DLSS5] · {self.i18n.t(style_key)} · {intensity:.2f} · x{passes} · {playback_name}"
+        )
 
         self.cards["rm"].set_summary(f"[RM] · {self.i18n.t('dashboard.rm_summary')}")
         self.cards["face_beauty"].set_summary(
@@ -553,6 +645,7 @@ class DashboardPage(QWidget):
         self.cards["alpha2d"].set_title(self.i18n.t("alpha2d.button"))
         self.cards["two_dvr"].set_title(self.i18n.t("home.two_dvr_toggle"))
         self.cards["superres"].set_title(self.i18n.t("superres.realtime_title"))
+        self.cards["dlss5"].set_title(self.i18n.t("dlss5.realtime_title"))
         self.cards["rm"].set_title(self.i18n.t("rm.enabled"))
         self.cards["face_beauty"].set_title(self.i18n.t("home.face_beauty_toggle"))
         self.cards["subtitle"].set_title(self.i18n.t("subtitle.enable"))

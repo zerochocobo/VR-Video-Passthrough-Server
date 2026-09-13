@@ -7,7 +7,7 @@ from pathlib import Path
 from PySide6.QtCore import QSize, Qt
 from PySide6.QtWidgets import (
     QCheckBox, QComboBox, QFileDialog, QGridLayout, QHBoxLayout, QLabel,
-    QLineEdit, QMessageBox, QPushButton, QSizePolicy, QTabWidget, QTextEdit,
+    QLineEdit, QMessageBox, QPushButton, QSizePolicy, QSpinBox, QTabWidget, QTextEdit,
     QVBoxLayout, QWidget,
 )
 
@@ -19,7 +19,20 @@ from ui.pages.offline_page import (
     _label, _resolve_time_range,
 )
 from utils.video_metadata import probe_video_metadata
-from ui.settings import quality_speed_preset, quality_speed_value
+from ui.settings import DEFAULTS, quality_speed_preset, quality_speed_value
+# "truehdr" runs the NGX TrueHDR feature and is offline-only: it needs the
+# GPU pipeline's P010/HDR10 output path.
+from pipeline.hdr_look import HDR_LOOK_MODES
+from ui.superres_targets import OFFLINE_DEFAULT_TARGET, TARGET_CHOICES, target_i18n_key
+
+# NGX TrueHDR controls: (name, settings key, minimum, maximum, step).
+# Ranges are the ones the RTX Video SDK documents.
+TRUE_HDR_CONTROLS = (
+    ("contrast", "superres_truehdr_contrast", 0, 200, 5),
+    ("saturation", "superres_truehdr_saturation", 0, 200, 5),
+    ("middle_gray", "superres_truehdr_middle_gray", 10, 100, 5),
+    ("max_nits", "superres_truehdr_max_nits", 400, 2000, 100),
+)
 
 
 class SuperResPage(QWidget):
@@ -70,10 +83,9 @@ class SuperResPage(QWidget):
     @staticmethod
     def _target_combo() -> QComboBox:
         combo = _fit_combo(QComboBox())
-        combo.addItem("", 1440)
-        combo.addItem("", 2160)
-        combo.addItem("", 4096)
-        combo.setCurrentIndex(2)
+        for target in TARGET_CHOICES:
+            combo.addItem("", target)
+        combo.setCurrentIndex(max(0, combo.findData(OFFLINE_DEFAULT_TARGET)))
         return combo
 
     @staticmethod
@@ -95,13 +107,68 @@ class SuperResPage(QWidget):
 
     def _hdr_look_combo(self) -> QComboBox:
         combo = _fit_combo(QComboBox())
-        for mode in ("off", "natural", "vivid"):
+        for mode in HDR_LOOK_MODES:
             combo.addItem("", mode)
         current = str(self.settings.data.get("superres_offline_hdr_look") or "natural").strip().lower()
-        idx = combo.findData(current if current in {"off", "natural", "vivid"} else "natural")
+        idx = combo.findData(current if current in HDR_LOOK_MODES else "natural")
         combo.setCurrentIndex(max(0, idx))
         combo.currentIndexChanged.connect(self._save_hdr_look)
         return combo
+
+    def _true_hdr_row(self) -> tuple[QWidget, dict[str, QSpinBox], dict[str, QLabel]]:
+        """Build the shared NGX TrueHDR controls for one tab.
+
+        The controls live in their own container so hiding them collapses the
+        grid row instead of leaving an empty gap.
+        """
+        container = QWidget()
+        row = QHBoxLayout(container)
+        row.setContentsMargins(0, 0, 0, 0)
+        boxes: dict[str, QSpinBox] = {}
+        labels: dict[str, QLabel] = {}
+        for name, key, minimum, maximum, step in TRUE_HDR_CONTROLS:
+            # Inline captions, not the fixed-width column labels used in row 0.
+            caption = QLabel()
+            box = QSpinBox()
+            box.setRange(minimum, maximum)
+            box.setSingleStep(step)
+            box.setFixedWidth(72)
+            box.setValue(self._true_hdr_value(name))
+            box.valueChanged.connect(lambda value, control=name: self._save_true_hdr(control, value))
+            row.addWidget(caption)
+            row.addWidget(box)
+            boxes[name] = box
+            labels[name] = caption
+        row.addStretch(1)
+        return container, boxes, labels
+
+    def _true_hdr_value(self, name: str) -> int:
+        for control, key, minimum, maximum, _step in TRUE_HDR_CONTROLS:
+            if control != name:
+                continue
+            try:
+                value = int(self.settings.data.get(key, DEFAULTS[key]))
+            except (TypeError, ValueError):
+                value = int(DEFAULTS[key])
+            return max(minimum, min(maximum, value))
+        raise KeyError(name)
+
+    def _save_true_hdr(self, name: str, value: int) -> None:
+        key = next(k for control, k, *_rest in TRUE_HDR_CONTROLS if control == name)
+        self.settings.data[key] = int(value)
+        for boxes in (self.single_true_hdr, self.batch_true_hdr):
+            box = boxes.get(name)
+            if box is not None and box.value() != int(value):
+                box.blockSignals(True); box.setValue(int(value)); box.blockSignals(False)
+        self.settings.save()
+
+    def _update_true_hdr_visibility(self) -> None:
+        """The NGX TrueHDR controls only exist for the TrueHDR grade."""
+        show = str(self.settings.data.get("superres_offline_hdr_look") or "").strip().lower() == "truehdr"
+        for container, labels in ((self.single_true_hdr_box, self.single_labels),
+                                  (self.batch_true_hdr_box, self.batch_labels)):
+            container.setVisible(show)
+            labels["truehdr"].setVisible(show)
 
     def _bitrate_combo(self) -> QComboBox:
         combo = _fit_combo(QComboBox())
@@ -129,6 +196,7 @@ class SuperResPage(QWidget):
         self.single_target, self.single_quality = self._target_combo(), self._quality_combo()
         self.single_quality_speed = self._quality_speed_combo()
         self.single_hdr_look = self._hdr_look_combo()
+        self.single_true_hdr_box, self.single_true_hdr, self.single_true_hdr_labels = self._true_hdr_row()
         self.single_bitrate = self._bitrate_combo()
         self.single_start = QLineEdit("00:00:00")
         self.single_start.setFixedWidth(90)
@@ -150,16 +218,17 @@ class SuperResPage(QWidget):
         time_row.addStretch(1)
         actions.addWidget(self.start_single); actions.addWidget(self.stop_single); actions.addStretch(1)
         grid = QGridLayout(page); grid.setColumnMinimumWidth(0, OFFLINE_LABEL_WIDTH); grid.setColumnStretch(1, 1)
-        self.single_labels = {k: _label() for k in ("video", "output", "target", "quality", "hdr_look", "bitrate", "performance", "time")}
+        self.single_labels = {k: _label() for k in ("video", "output", "target", "quality", "hdr_look", "truehdr", "bitrate", "performance", "time")}
         rows = [("video", video_row), ("output", out_row)]
         for row, (key, value) in enumerate(rows): grid.addWidget(self.single_labels[key], row, 0); grid.addLayout(value, row, 1)
         grid.addWidget(self.single_labels["target"], 2, 0); grid.addWidget(self.single_target, 2, 1, alignment=Qt.AlignLeft)
         grid.addWidget(self.single_labels["quality"], 3, 0); grid.addWidget(self.single_quality, 3, 1, alignment=Qt.AlignLeft)
         grid.addWidget(self.single_labels["hdr_look"], 4, 0); grid.addWidget(self.single_hdr_look, 4, 1, alignment=Qt.AlignLeft)
-        grid.addWidget(self.single_labels["bitrate"], 5, 0); grid.addWidget(self.single_bitrate, 5, 1, alignment=Qt.AlignLeft)
-        grid.addWidget(self.single_labels["performance"], 6, 0); grid.addWidget(self.single_quality_speed, 6, 1, alignment=Qt.AlignLeft)
-        grid.addWidget(self.single_labels["time"], 7, 0); grid.addLayout(time_row, 7, 1)
-        grid.addWidget(self.single_skip, 8, 1); grid.addLayout(actions, 9, 1)
+        grid.addWidget(self.single_labels["truehdr"], 5, 0); grid.addWidget(self.single_true_hdr_box, 5, 1)
+        grid.addWidget(self.single_labels["bitrate"], 6, 0); grid.addWidget(self.single_bitrate, 6, 1, alignment=Qt.AlignLeft)
+        grid.addWidget(self.single_labels["performance"], 7, 0); grid.addWidget(self.single_quality_speed, 7, 1, alignment=Qt.AlignLeft)
+        grid.addWidget(self.single_labels["time"], 8, 0); grid.addLayout(time_row, 8, 1)
+        grid.addWidget(self.single_skip, 9, 1); grid.addLayout(actions, 10, 1)
         self.tabs.addTab(page, "")
         self._update_custom_visibility()
 
@@ -170,6 +239,7 @@ class SuperResPage(QWidget):
         self.batch_target, self.batch_quality = self._target_combo(), self._quality_combo()
         self.batch_quality_speed = self._quality_speed_combo()
         self.batch_hdr_look = self._hdr_look_combo()
+        self.batch_true_hdr_box, self.batch_true_hdr, self.batch_true_hdr_labels = self._true_hdr_row()
         self.batch_bitrate = self._bitrate_combo()
         self.batch_recursive = QCheckBox(); self.batch_recursive.setChecked(True)
         self.batch_skip = QCheckBox(); self.batch_skip.setChecked(True)
@@ -178,15 +248,17 @@ class SuperResPage(QWidget):
         dir_row.addWidget(self.batch_dir); dir_row.addWidget(browse)
         actions.addWidget(self.start_batch); actions.addWidget(self.stop_batch); actions.addStretch(1)
         grid = QGridLayout(page); grid.setColumnMinimumWidth(0, OFFLINE_LABEL_WIDTH); grid.setColumnStretch(1, 1)
-        self.batch_labels = {k: _label() for k in ("directory", "target", "quality", "hdr_look", "bitrate", "performance")}
+        self.batch_labels = {k: _label() for k in ("directory", "target", "quality", "hdr_look", "truehdr", "bitrate", "performance")}
         grid.addWidget(self.batch_labels["directory"], 0, 0); grid.addLayout(dir_row, 0, 1)
         grid.addWidget(self.batch_labels["target"], 1, 0); grid.addWidget(self.batch_target, 1, 1, alignment=Qt.AlignLeft)
         grid.addWidget(self.batch_labels["quality"], 2, 0); grid.addWidget(self.batch_quality, 2, 1, alignment=Qt.AlignLeft)
         grid.addWidget(self.batch_labels["hdr_look"], 3, 0); grid.addWidget(self.batch_hdr_look, 3, 1, alignment=Qt.AlignLeft)
-        grid.addWidget(self.batch_labels["bitrate"], 4, 0); grid.addWidget(self.batch_bitrate, 4, 1, alignment=Qt.AlignLeft)
-        grid.addWidget(self.batch_labels["performance"], 5, 0); grid.addWidget(self.batch_quality_speed, 5, 1, alignment=Qt.AlignLeft)
-        grid.addWidget(self.batch_recursive, 6, 1); grid.addWidget(self.batch_skip, 7, 1); grid.addLayout(actions, 8, 1)
+        grid.addWidget(self.batch_labels["truehdr"], 4, 0); grid.addWidget(self.batch_true_hdr_box, 4, 1)
+        grid.addWidget(self.batch_labels["bitrate"], 5, 0); grid.addWidget(self.batch_bitrate, 5, 1, alignment=Qt.AlignLeft)
+        grid.addWidget(self.batch_labels["performance"], 6, 0); grid.addWidget(self.batch_quality_speed, 6, 1, alignment=Qt.AlignLeft)
+        grid.addWidget(self.batch_recursive, 7, 1); grid.addWidget(self.batch_skip, 8, 1); grid.addLayout(actions, 9, 1)
         self.tabs.addTab(page, "")
+        self._update_true_hdr_visibility()
 
     def _browse_video(self) -> None:
         path, _ = QFileDialog.getOpenFileName(self, self.i18n.t("file.select_video"), "", "Videos (*.mp4 *.mkv *.mov *.m4v)")
@@ -217,7 +289,11 @@ class SuperResPage(QWidget):
         return start, length
 
     def _common_args(self, target: QComboBox, quality: QComboBox, hdr_look: QComboBox, bitrate: QComboBox) -> list[str]:
-        return ["--rtx-vsr-target-height", str(target.currentData()), "--rtx-vsr-quality", str(quality.currentData()), "--rtx-vsr-hdr-look", str(hdr_look.currentData()), "--rtx-vsr-bitrate-mode", str(bitrate.currentData()), "--preset", quality_speed_preset(self.settings.data.get("offline_quality_speed"), "medium").lower()]
+        args = ["--rtx-vsr-target-height", str(target.currentData()), "--rtx-vsr-quality", str(quality.currentData()), "--rtx-vsr-hdr-look", str(hdr_look.currentData()), "--rtx-vsr-bitrate-mode", str(bitrate.currentData()), "--preset", quality_speed_preset(self.settings.data.get("offline_quality_speed"), "medium").lower()]
+        if str(hdr_look.currentData() or "") == "truehdr":
+            for name, _key, *_rest in TRUE_HDR_CONTROLS:
+                args += [f"--rtx-vsr-truehdr-{name.replace('_', '-')}", str(self._true_hdr_value(name))]
+        return args
 
     def run_single(self) -> None:
         time_range = self._time_range()
@@ -251,12 +327,19 @@ class SuperResPage(QWidget):
             if idx >= 0 and combo.currentIndex() != idx:
                 combo.blockSignals(True); combo.setCurrentIndex(idx); combo.blockSignals(False)
         hdr_mode = str(self.settings.data.get("superres_offline_hdr_look") or "natural").strip().lower()
-        if hdr_mode not in {"off", "natural", "vivid"}:
+        if hdr_mode not in HDR_LOOK_MODES:
             hdr_mode = "natural"
         for combo in (self.single_hdr_look, self.batch_hdr_look):
             idx = combo.findData(hdr_mode)
             if idx >= 0 and combo.currentIndex() != idx:
                 combo.blockSignals(True); combo.setCurrentIndex(idx); combo.blockSignals(False)
+        for name, *_rest in TRUE_HDR_CONTROLS:
+            value = self._true_hdr_value(name)
+            for boxes in (self.single_true_hdr, self.batch_true_hdr):
+                box = boxes[name]
+                if box.value() != value:
+                    box.blockSignals(True); box.setValue(value); box.blockSignals(False)
+        self._update_true_hdr_visibility()
         bitrate_mode = str(self.settings.data.get("superres_offline_bitrate_mode") or "auto")
         if bitrate_mode not in {"auto", "1.2", "1.5", "2", "3"}:
             bitrate_mode = "auto"
@@ -283,7 +366,7 @@ class SuperResPage(QWidget):
         if not isinstance(sender, QComboBox):
             return
         value = str(sender.currentData() or "natural")
-        if value not in {"off", "natural", "vivid"}:
+        if value not in HDR_LOOK_MODES:
             value = "natural"
         self.settings.data["superres_offline_hdr_look"] = value
         for combo in (self.single_hdr_look, self.batch_hdr_look):
@@ -291,6 +374,7 @@ class SuperResPage(QWidget):
                 idx = combo.findData(value)
                 if idx >= 0 and combo.currentIndex() != idx:
                     combo.blockSignals(True); combo.setCurrentIndex(idx); combo.blockSignals(False)
+        self._update_true_hdr_visibility()
         self.settings.save()
 
     def _save_bitrate_mode(self) -> None:
@@ -317,15 +401,18 @@ class SuperResPage(QWidget):
         self.single_labels["target"].setText(self.i18n.t("superres.target")); self.single_labels["quality"].setText(self.i18n.t("superres.quality")); self.single_labels["hdr_look"].setText(self.i18n.t("superres.hdr_look")); self.single_labels["bitrate"].setText(self.i18n.t("superres.output_bitrate")); self.single_labels["performance"].setText(self.i18n.t("performance.quality_speed")); self.single_labels["time"].setText(self.i18n.t("offline.time_mode_range"))
         self.batch_labels["directory"].setText(self.i18n.t("offline.directory")); self.batch_labels["target"].setText(self.i18n.t("superres.target")); self.batch_labels["quality"].setText(self.i18n.t("superres.quality")); self.batch_labels["hdr_look"].setText(self.i18n.t("superres.hdr_look")); self.batch_labels["bitrate"].setText(self.i18n.t("superres.output_bitrate")); self.batch_labels["performance"].setText(self.i18n.t("performance.quality_speed"))
         for combo in (self.single_hdr_look, self.batch_hdr_look):
-            for i, key in enumerate(("superres.hdr_look_off", "superres.hdr_look_natural", "superres.hdr_look_vivid")): combo.setItemText(i, self.i18n.t(key))
+            for i, mode in enumerate(HDR_LOOK_MODES): combo.setItemText(i, self.i18n.t(f"superres.hdr_look_{mode}"))
+        for labels in (self.single_labels, self.batch_labels):
+            labels["truehdr"].setText(self.i18n.t("superres.truehdr_params"))
+        for captions in (self.single_true_hdr_labels, self.batch_true_hdr_labels):
+            for name, caption in captions.items(): caption.setText(self.i18n.t(f"superres.truehdr_{name}"))
         for combo in (self.single_quality_speed, self.batch_quality_speed):
             for i, key in enumerate(("quality_speed.ultrafast", "quality_speed.medium", "quality_speed.veryslow")): combo.setItemText(i, self.i18n.t(key))
         bitrate_keys = ("superres.bitrate_auto", "superres.bitrate_1_2", "superres.bitrate_1_5", "superres.bitrate_2", "superres.bitrate_3")
         for combo in (self.single_bitrate, self.batch_bitrate):
             for i, key in enumerate(bitrate_keys): combo.setItemText(i, self.i18n.t(key))
-        target_keys = ("superres.target_2k", "superres.target_4k", "superres.target_8k_vr")
         for combo in (self.single_target, self.batch_target):
-            for i, key in enumerate(target_keys): combo.setItemText(i, self.i18n.t(key))
+            for i, target in enumerate(TARGET_CHOICES): combo.setItemText(i, self.i18n.t(target_i18n_key(target)))
         quality_keys = ("superres.quality_2", "superres.quality_3", "superres.quality_4")
         for combo in (self.single_quality, self.batch_quality):
             for i, key in enumerate(quality_keys): combo.setItemText(i, self.i18n.t(key))

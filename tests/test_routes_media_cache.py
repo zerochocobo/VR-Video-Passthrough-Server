@@ -7,8 +7,24 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import config
 import http_app.routes_media as routes_media
 from pipeline.pynv_stream import _drain_async_queue_nowait
+
+
+_ORIGINAL_VMP4_BACKEND = routes_media.PASSTHROUGH_SEEK_VMP4_BACKEND
+
+
+def setUpModule() -> None:
+    routes_media.PASSTHROUGH_SEEK_VMP4_BACKEND = "cache_file"
+
+
+def tearDownModule() -> None:
+    routes_media.PASSTHROUGH_SEEK_VMP4_BACKEND = _ORIGINAL_VMP4_BACKEND
+
+
+_MP4_FASTSTART = b"\x00\x00\x00\x08ftyp\x00\x00\x00\x08moov\x00\x00\x00\x08mdat"
+_MP4_MOOV_AFTER_MDAT = b"\x00\x00\x00\x08ftyp\x00\x00\x00\x08mdat\x00\x00\x00\x08moov"
 
 
 class ProbeCacheTests(unittest.TestCase):
@@ -123,6 +139,14 @@ class ExistingPassthroughStrategyCharacterizationTests(unittest.TestCase):
         self.assertEqual(blocked_reason, "profile_avpro_blocked")
         self.assertEqual(blocked_profile, "avpro")
 
+    def test_seek_output_mode_excludes_two_dvr(self) -> None:
+        # two_dvr has no seek backend; it must fall back to a supported mode
+        # instead of handing out an endpoint that can only fail.
+        with patch.object(routes_media, "PASSTHROUGH_OUTPUT_MODE", "alpha,two_dvr"):
+            self.assertEqual(routes_media._seek_output_mode("two_dvr"), "alpha")
+            self.assertEqual(routes_media._seek_output_mode("alpha"), "alpha")
+            self.assertEqual(routes_media._seek_output_mode(None), "alpha")
+
     def test_seek_declared_size_is_cached_per_client(self) -> None:
         source = Path("movie.mp4")
         original_cache = dict(routes_media._seek_declared_size_cache)
@@ -143,6 +167,547 @@ class ExistingPassthroughStrategyCharacterizationTests(unittest.TestCase):
         finally:
             routes_media._seek_declared_size_cache.clear()
             routes_media._seek_declared_size_cache.update(original_cache)
+
+    def test_vmp4_seek_declares_source_size_and_forces_mp4_container(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            source = Path(tmp) / "movie.mp4"
+            source.write_bytes(b"x" * 1234)
+
+            with (
+                patch.object(routes_media, "PASSTHROUGH_SEEK_VMP4", True),
+                patch.object(routes_media, "PASSTHROUGH_SEEK_CONTAINER", "mpegts"),
+                patch.object(routes_media, "_estimated_seek_passthrough_size", side_effect=AssertionError("estimate should not be used")),
+            ):
+                self.assertEqual(routes_media._seek_container(), "mp4")
+                self.assertEqual(routes_media._seek_declared_total(source, 60.0, "hevc", "client", None), 1234)
+                self.assertEqual(routes_media._seek_media_type(), "video/mp4")
+
+    def test_vmp4_seek_head_uses_source_size_and_diag_headers(self) -> None:
+        request = SimpleNamespace(
+            headers={"user-agent": "VLC/3.0"},
+            client=SimpleNamespace(host="client"),
+        )
+        info = SimpleNamespace(duration=60.0, fps=30.0)
+        estimate = SimpleNamespace(source="test")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "movie.mp4"
+            path.write_bytes(b"x" * 4321)
+            cache_path = Path(tmp) / "movie_passthrough.mp4"
+            cache_path.write_bytes(_MP4_FASTSTART)
+
+            with (
+                patch.object(routes_media, "PASSTHROUGH_SEEK_VMP4", True),
+                patch.object(routes_media, "PASSTHROUGH_SEEK_CONTAINER", "mpegts"),
+                patch.object(routes_media, "_safe_seek_video_path", return_value=(path, None, None)),
+                patch.object(routes_media, "_seek_route_allowed", return_value=(True, "profile_allowed", "vlc")),
+                patch.object(routes_media, "annotate_request", return_value=None),
+                patch.object(routes_media, "probe_cached", return_value=info),
+                patch.object(routes_media, "estimate_for_media", return_value=(1000, 2000, estimate)),
+                patch.object(routes_media, "_vmp4_mode_candidate", return_value=cache_path),
+            ):
+                response = asyncio.run(
+                    routes_media.passthrough_seek_head(
+                        request,
+                        "movie.mp4",
+                        mode=None,
+                        range_header=None,
+                        time_seek_range=None,
+                        get_content_features=None,
+                        transfer_mode=None,
+                    )
+                )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.headers["content-type"], "video/mp4")
+        self.assertEqual(response.headers["content-length"], "4321")
+        self.assertEqual(response.headers["x-passthrough-vmp4"], "1")
+        self.assertEqual(response.headers["x-passthrough-vmp4-phase"], "cache-file")
+        self.assertEqual(response.headers["x-passthrough-vmp4-layout-size"], "4321")
+        self.assertEqual(response.headers["x-passthrough-vmp4-cache"], "movie_passthrough.mp4")
+        self.assertEqual(response.headers["x-passthrough-mode"], "seek-vmp4-mp4-green")
+
+    def test_vmp4_seek_get_serves_cache_with_virtual_source_size_padding(self) -> None:
+        class _FakeRequest:
+            headers = {"user-agent": "VLC/3.0", "accept": "*/*"}
+            client = SimpleNamespace(host="client")
+
+            async def is_disconnected(self) -> bool:
+                return False
+
+        request = _FakeRequest()
+        info = SimpleNamespace(duration=60.0, fps=30.0, width=3840, height=2160)
+        estimate = SimpleNamespace(source="test")
+
+        async def run() -> tuple[int, dict[str, str], bytes]:
+            response = await routes_media.passthrough_seek_get(
+                request,
+                "movie.mp4",
+                mode=None,
+                range_header="bytes=24-33",
+                time_seek_range=None,
+                get_content_features=None,
+                transfer_mode=None,
+            )
+            body = bytearray()
+            async for chunk in response.body_iterator:
+                body.extend(chunk)
+            return response.status_code, dict(response.headers), bytes(body)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "movie.mp4"
+            path.write_bytes(b"x" * 34)
+            cache_path = Path(tmp) / "movie_passthrough.mp4"
+            cache_path.write_bytes(_MP4_FASTSTART)
+
+            with (
+                patch.object(routes_media, "PASSTHROUGH_SEEK_VMP4", True),
+                patch.object(routes_media, "_safe_seek_video_path", return_value=(path, None, None)),
+                patch.object(routes_media, "_seek_route_allowed", return_value=(True, "profile_allowed", "vlc")),
+                patch.object(routes_media, "annotate_request", return_value=None),
+                patch.object(routes_media, "probe_cached", return_value=info),
+                patch.object(routes_media, "estimate_for_media", return_value=(1000, 2000, estimate)),
+                patch.object(routes_media, "_vmp4_mode_candidate", return_value=cache_path),
+            ):
+                status_code, headers, body = asyncio.run(run())
+
+        self.assertEqual(status_code, 206)
+        self.assertEqual(headers["content-type"], "video/mp4")
+        self.assertEqual(headers["content-range"], "bytes 24-33/34")
+        self.assertEqual(headers["content-length"], "10")
+        self.assertEqual(headers["x-passthrough-vmp4-phase"], "cache-file")
+        self.assertEqual(headers["x-passthrough-vmp4-pad"], "free")
+        self.assertEqual(headers["x-passthrough-vmp4-pad-bytes"], "10")
+        self.assertEqual(body, b"\x00\x00\x00\x0afree\x00\x00")
+
+    def test_vmp4_seek_get_zero_open_range_keeps_startup_200(self) -> None:
+        class _FakeRequest:
+            headers = {"user-agent": "VLC/3.0", "accept": "*/*"}
+            client = SimpleNamespace(host="client")
+
+            async def is_disconnected(self) -> bool:
+                return False
+
+        request = _FakeRequest()
+        info = SimpleNamespace(duration=60.0, fps=30.0, width=3840, height=2160)
+        estimate = SimpleNamespace(source="test")
+
+        async def run() -> tuple[int, dict[str, str], bytes]:
+            response = await routes_media.passthrough_seek_get(
+                request,
+                "movie.mp4",
+                mode=None,
+                range_header="bytes=0-",
+                time_seek_range=None,
+                get_content_features=None,
+                transfer_mode=None,
+            )
+            body = bytearray()
+            async for chunk in response.body_iterator:
+                body.extend(chunk)
+            return response.status_code, dict(response.headers), bytes(body)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "movie.mp4"
+            path.write_bytes(b"x" * 34)
+            cache_path = Path(tmp) / "movie_passthrough.mp4"
+            cache_path.write_bytes(_MP4_FASTSTART)
+
+            with (
+                patch.object(routes_media, "PASSTHROUGH_SEEK_VMP4", True),
+                patch.object(routes_media, "_safe_seek_video_path", return_value=(path, None, None)),
+                patch.object(routes_media, "_seek_route_allowed", return_value=(True, "profile_allowed", "vlc")),
+                patch.object(routes_media, "annotate_request", return_value=None),
+                patch.object(routes_media, "probe_cached", return_value=info),
+                patch.object(routes_media, "estimate_for_media", return_value=(1000, 2000, estimate)),
+                patch.object(routes_media, "_vmp4_mode_candidate", return_value=cache_path),
+            ):
+                status_code, headers, body = asyncio.run(run())
+
+        self.assertEqual(status_code, 200)
+        self.assertEqual(headers["content-type"], "video/mp4")
+        self.assertNotIn("content-range", headers)
+        self.assertEqual(headers["content-length"], "34")
+        self.assertEqual(body, _MP4_FASTSTART + b"\x00\x00\x00\x0afree\x00\x00")
+
+    def test_vmp4_seek_get_rejects_too_small_free_padding_gap(self) -> None:
+        class _FakeRequest:
+            headers = {"user-agent": "VLC/3.0", "accept": "*/*"}
+            client = SimpleNamespace(host="client")
+
+        request = _FakeRequest()
+        info = SimpleNamespace(duration=60.0, fps=30.0, width=3840, height=2160)
+        estimate = SimpleNamespace(source="test")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "movie.mp4"
+            path.write_bytes(b"x" * 30)
+            cache_path = Path(tmp) / "movie_passthrough.mp4"
+            cache_path.write_bytes(_MP4_FASTSTART)
+
+            with (
+                patch.object(routes_media, "PASSTHROUGH_SEEK_VMP4", True),
+                patch.object(routes_media, "_safe_seek_video_path", return_value=(path, None, None)),
+                patch.object(routes_media, "_seek_route_allowed", return_value=(True, "profile_allowed", "vlc")),
+                patch.object(routes_media, "annotate_request", return_value=None),
+                patch.object(routes_media, "probe_cached", return_value=info),
+                patch.object(routes_media, "estimate_for_media", return_value=(1000, 2000, estimate)),
+                patch.object(routes_media, "_vmp4_mode_candidate", return_value=cache_path),
+            ):
+                response = asyncio.run(
+                    routes_media.passthrough_seek_get(
+                        request,
+                        "movie.mp4",
+                        mode=None,
+                        range_header=None,
+                        time_seek_range=None,
+                        get_content_features=None,
+                        transfer_mode=None,
+                    )
+                )
+
+        self.assertEqual(response.status_code, 409)
+        self.assertEqual(response.body, b"VMP4 cache leaves too little room for MP4 free padding")
+        self.assertEqual(response.headers["x-passthrough-vmp4-phase"], "cache-pad-too-small")
+        self.assertNotEqual(response.headers.get("content-length"), "30")
+
+    def test_vmp4_seek_get_range_416_keeps_vmp4_diagnostics(self) -> None:
+        class _FakeRequest:
+            headers = {"user-agent": "VLC/3.0", "accept": "*/*"}
+            client = SimpleNamespace(host="client")
+
+        request = _FakeRequest()
+        info = SimpleNamespace(duration=60.0, fps=30.0, width=3840, height=2160)
+        estimate = SimpleNamespace(source="test")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "movie.mp4"
+            path.write_bytes(b"x" * 12)
+
+            with (
+                patch.object(routes_media, "PASSTHROUGH_SEEK_VMP4", True),
+                patch.object(routes_media, "_safe_seek_video_path", return_value=(path, None, None)),
+                patch.object(routes_media, "_seek_route_allowed", return_value=(True, "profile_allowed", "vlc")),
+                patch.object(routes_media, "annotate_request", return_value=None),
+                patch.object(routes_media, "probe_cached", return_value=info),
+                patch.object(routes_media, "estimate_for_media", return_value=(1000, 2000, estimate)),
+                patch.object(routes_media, "_vmp4_mode_candidate", side_effect=AssertionError("cache lookup not needed")),
+            ):
+                response = asyncio.run(
+                    routes_media.passthrough_seek_get(
+                        request,
+                        "movie.mp4",
+                        mode=None,
+                        range_header="bytes=99-",
+                        time_seek_range=None,
+                        get_content_features=None,
+                        transfer_mode=None,
+                    )
+                )
+
+        self.assertEqual(response.status_code, 416)
+        self.assertEqual(response.headers["content-range"], "bytes */12")
+        self.assertEqual(response.headers["x-passthrough-vmp4"], "1")
+        self.assertEqual(response.headers["x-passthrough-vmp4-phase"], "range-unsatisfiable")
+
+    def test_vmp4_seek_get_rejects_cache_duration_mismatch(self) -> None:
+        class _FakeRequest:
+            headers = {"user-agent": "VLC/3.0", "accept": "*/*"}
+            client = SimpleNamespace(host="client")
+
+        request = _FakeRequest()
+        source_info = SimpleNamespace(duration=60.0, fps=30.0, width=3840, height=2160)
+        cache_info = SimpleNamespace(duration=30.0, fps=30.0, width=3840, height=2160)
+        estimate = SimpleNamespace(source="test")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "movie.mp4"
+            path.write_bytes(b"x" * 34)
+            cache_path = Path(tmp) / "movie_passthrough.mp4"
+            cache_path.write_bytes(_MP4_FASTSTART)
+
+            with (
+                patch.object(routes_media, "PASSTHROUGH_SEEK_VMP4", True),
+                patch.object(routes_media, "_safe_seek_video_path", return_value=(path, None, None)),
+                patch.object(routes_media, "_seek_route_allowed", return_value=(True, "profile_allowed", "vlc")),
+                patch.object(routes_media, "annotate_request", return_value=None),
+                patch.object(routes_media, "probe_cached", side_effect=[source_info, cache_info]),
+                patch.object(routes_media, "estimate_for_media", return_value=(1000, 2000, estimate)),
+                patch.object(routes_media, "_vmp4_mode_candidate", return_value=cache_path),
+            ):
+                response = asyncio.run(
+                    routes_media.passthrough_seek_get(
+                        request,
+                        "movie.mp4",
+                        mode=None,
+                        range_header=None,
+                        time_seek_range=None,
+                        get_content_features=None,
+                        transfer_mode=None,
+                    )
+                )
+
+        self.assertEqual(response.status_code, 409)
+        self.assertEqual(response.body, b"VMP4 cache duration does not match source")
+        self.assertEqual(response.headers["x-passthrough-vmp4-phase"], "cache-duration-mismatch")
+        self.assertEqual(response.headers["x-passthrough-vmp4-cache-duration"], "30.000")
+        self.assertEqual(response.headers["x-passthrough-vmp4-duration-delta"], "30.000")
+
+    def test_vmp4_seek_get_rejects_cache_moov_after_mdat(self) -> None:
+        class _FakeRequest:
+            headers = {"user-agent": "VLC/3.0", "accept": "*/*"}
+            client = SimpleNamespace(host="client")
+
+        request = _FakeRequest()
+        info = SimpleNamespace(duration=60.0, fps=30.0, width=3840, height=2160)
+        estimate = SimpleNamespace(source="test")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "movie.mp4"
+            path.write_bytes(b"x" * 34)
+            cache_path = Path(tmp) / "movie_passthrough.mp4"
+            cache_path.write_bytes(_MP4_MOOV_AFTER_MDAT)
+
+            with (
+                patch.object(routes_media, "PASSTHROUGH_SEEK_VMP4", True),
+                patch.object(routes_media, "_safe_seek_video_path", return_value=(path, None, None)),
+                patch.object(routes_media, "_seek_route_allowed", return_value=(True, "profile_allowed", "vlc")),
+                patch.object(routes_media, "annotate_request", return_value=None),
+                patch.object(routes_media, "probe_cached", return_value=info),
+                patch.object(routes_media, "estimate_for_media", return_value=(1000, 2000, estimate)),
+                patch.object(routes_media, "_vmp4_mode_candidate", return_value=cache_path),
+            ):
+                response = asyncio.run(
+                    routes_media.passthrough_seek_get(
+                        request,
+                        "movie.mp4",
+                        mode=None,
+                        range_header=None,
+                        time_seek_range=None,
+                        get_content_features=None,
+                        transfer_mode=None,
+                    )
+                )
+
+        self.assertEqual(response.status_code, 409)
+        self.assertEqual(response.body, b"VMP4 cache must be faststart with moov before mdat")
+        self.assertEqual(response.headers["x-passthrough-vmp4-phase"], "cache-moov-after-mdat")
+        self.assertEqual(response.headers["x-passthrough-vmp4-mdat-offset"], "8")
+        self.assertEqual(response.headers["x-passthrough-vmp4-moov-offset"], "16")
+
+    def test_vmp4_seek_get_oversize_cache_queues_budget_rebuild(self) -> None:
+        class _FakeRequest:
+            headers = {"user-agent": "VLC/3.0", "accept": "*/*"}
+            client = SimpleNamespace(host="client")
+
+        request = _FakeRequest()
+        info = SimpleNamespace(duration=60.0, fps=30.0, width=3840, height=2160)
+        estimate = SimpleNamespace(source="test")
+        original_builds = dict(routes_media._vmp4_builds)
+        original_active = routes_media._vmp4_active_builds
+        started: list[object] = []
+
+        def fake_start(build) -> None:
+            build.state = "starting"
+            started.append(build)
+
+        try:
+            routes_media._vmp4_builds.clear()
+            routes_media._vmp4_active_builds = 0
+            with tempfile.TemporaryDirectory() as tmp:
+                path = Path(tmp) / "movie.mp4"
+                path.write_bytes(b"x" * 20)
+                cache_path = Path(tmp) / "movie_passthrough.mp4"
+                cache_path.write_bytes(_MP4_FASTSTART)
+
+                with (
+                    patch.object(routes_media, "PASSTHROUGH_SEEK_VMP4", True),
+                    patch.object(routes_media, "PASSTHROUGH_SEEK_VMP4_BUILD_MISSING", True),
+                    patch.object(routes_media, "PASSTHROUGH_SEEK_VMP4_BUILD_BITRATE", "budget"),
+                    patch.object(routes_media, "_safe_seek_video_path", return_value=(path, None, None)),
+                    patch.object(routes_media, "_seek_route_allowed", return_value=(True, "profile_allowed", "vlc")),
+                    patch.object(routes_media, "annotate_request", return_value=None),
+                    patch.object(routes_media, "probe_cached", return_value=info),
+                    patch.object(routes_media, "estimate_for_media", return_value=(1000, 2000, estimate)),
+                    patch.object(routes_media, "_vmp4_mode_candidate", return_value=cache_path),
+                    patch.object(routes_media, "_vmp4_start_build_locked", side_effect=fake_start),
+                ):
+                    response = asyncio.run(
+                        routes_media.passthrough_seek_get(
+                            request,
+                            "movie.mp4",
+                            mode=None,
+                            range_header=None,
+                            time_seek_range=None,
+                            get_content_features=None,
+                            transfer_mode=None,
+                        )
+                    )
+
+            self.assertEqual(response.status_code, 503)
+            self.assertEqual(response.body, b"VMP4 cache rebuilding")
+            self.assertEqual(response.headers["x-passthrough-vmp4-phase"], "cache-oversize")
+            self.assertEqual(response.headers["x-passthrough-vmp4-build"], "starting")
+            self.assertEqual(response.headers["x-passthrough-vmp4-build-target"], "movie_passthrough.mp4")
+            self.assertEqual(len(started), 1)
+            self.assertIn("--bitrate", started[0].cmd)
+            self.assertNotIn("source", started[0].cmd)
+            self.assertIn("cache-oversize", started[0].key)
+        finally:
+            routes_media._vmp4_builds.clear()
+            routes_media._vmp4_builds.update(original_builds)
+            routes_media._vmp4_active_builds = original_active
+
+    def test_vmp4_seek_get_returns_cache_missing_without_large_content_length(self) -> None:
+        class _FakeRequest:
+            headers = {"user-agent": "VLC/3.0", "accept": "*/*"}
+            client = SimpleNamespace(host="client")
+
+        request = _FakeRequest()
+        info = SimpleNamespace(duration=60.0, fps=30.0, width=3840, height=2160)
+        estimate = SimpleNamespace(source="test")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "movie.mp4"
+            path.write_bytes(b"x" * 12)
+
+            with (
+                patch.object(routes_media, "PASSTHROUGH_SEEK_VMP4", True),
+                patch.object(routes_media, "_safe_seek_video_path", return_value=(path, None, None)),
+                patch.object(routes_media, "_seek_route_allowed", return_value=(True, "profile_allowed", "vlc")),
+                patch.object(routes_media, "annotate_request", return_value=None),
+                patch.object(routes_media, "probe_cached", return_value=info),
+                patch.object(routes_media, "estimate_for_media", return_value=(1000, 2000, estimate)),
+                patch.object(routes_media, "_vmp4_mode_candidate", return_value=None),
+                patch.object(routes_media, "PASSTHROUGH_SEEK_VMP4_BUILD_MISSING", False),
+                patch.object(routes_media, "_vmp4_start_build_locked", side_effect=AssertionError("build should stay disabled")),
+            ):
+                response = asyncio.run(
+                    routes_media.passthrough_seek_get(
+                        request,
+                        "movie.mp4",
+                        mode=None,
+                        range_header=None,
+                        time_seek_range=None,
+                        get_content_features=None,
+                        transfer_mode=None,
+                    )
+                )
+
+        self.assertEqual(response.status_code, 503)
+        self.assertEqual(response.body, b"VMP4 cache not ready")
+        self.assertEqual(response.headers["x-passthrough-vmp4-phase"], "cache-missing")
+        self.assertEqual(response.headers["x-passthrough-vmp4-expected-cache"], "movie_passthrough.mp4")
+        self.assertEqual(response.headers["x-passthrough-vmp4-build"], "disabled")
+        self.assertEqual(response.headers["x-passthrough-vmp4-build-reason"], "build-disabled")
+        self.assertNotEqual(response.headers.get("content-length"), "12")
+        self.assertEqual(response.headers["retry-after"], "2")
+
+    def test_vmp4_seek_cache_missing_queues_background_build_once(self) -> None:
+        class _FakeRequest:
+            headers = {"user-agent": "VLC/3.0", "accept": "*/*"}
+            client = SimpleNamespace(host="client")
+
+        request = _FakeRequest()
+        info = SimpleNamespace(duration=60.0, fps=30.0, width=3840, height=2160)
+        estimate = SimpleNamespace(source="test")
+        original_builds = dict(routes_media._vmp4_builds)
+        original_active = routes_media._vmp4_active_builds
+        started: list[object] = []
+
+        def fake_start(build) -> None:
+            build.state = "starting"
+            build.pid = 1234
+            started.append(build)
+
+        async def run_once() -> object:
+            return await routes_media.passthrough_seek_get(
+                request,
+                "movie.mp4",
+                mode="alpha",
+                range_header=None,
+                time_seek_range=None,
+                get_content_features=None,
+                transfer_mode=None,
+            )
+
+        try:
+            routes_media._vmp4_builds.clear()
+            routes_media._vmp4_active_builds = 0
+            with tempfile.TemporaryDirectory() as tmp:
+                path = Path(tmp) / "movie.mp4"
+                path.write_bytes(b"x" * 12)
+
+                with (
+                    patch.object(routes_media, "PASSTHROUGH_SEEK_VMP4", True),
+                    patch.object(routes_media, "PASSTHROUGH_OUTPUT_MODE", "alpha,two_dvr"),
+                    patch.object(routes_media, "PASSTHROUGH_SEEK_VMP4_BUILD_MISSING", True),
+                    patch.object(routes_media, "PASSTHROUGH_SEEK_VMP4_BUILD_MODES", ("green", "alpha", "two_dvr")),
+                    patch.object(routes_media, "_safe_seek_video_path", return_value=(path, None, None)),
+                    patch.object(routes_media, "_seek_route_allowed", return_value=(True, "profile_allowed", "vlc")),
+                    patch.object(routes_media, "annotate_request", return_value=None),
+                    patch.object(routes_media, "probe_cached", return_value=info),
+                    patch.object(routes_media, "estimate_for_media", return_value=(1000, 2000, estimate)),
+                    patch.object(routes_media, "_vmp4_mode_candidate", return_value=None),
+                    patch.object(routes_media, "_vmp4_start_build_locked", side_effect=fake_start),
+                ):
+                    first = asyncio.run(run_once())
+                    second = asyncio.run(run_once())
+
+            self.assertEqual(first.status_code, 503)
+            self.assertEqual(second.status_code, 503)
+            self.assertEqual(first.headers["x-passthrough-vmp4-build"], "starting")
+            self.assertEqual(first.headers["x-passthrough-vmp4-build-pid"], "1234")
+            self.assertIn("movie_LR_180_FISHEYE_F180_alpha.mp4", first.headers["x-passthrough-vmp4-expected-cache"])
+            self.assertEqual(first.headers["x-passthrough-vmp4-build-target"], "movie_LR_180_FISHEYE_F180_alpha.mp4")
+            self.assertEqual(len(started), 1)
+            self.assertEqual(started[0].mode, "alpha")
+            self.assertIn("--mode", started[0].cmd)
+            self.assertIn("alpha", started[0].cmd)
+            self.assertEqual(len(routes_media._vmp4_builds), 1)
+        finally:
+            routes_media._vmp4_builds.clear()
+            routes_media._vmp4_builds.update(original_builds)
+            routes_media._vmp4_active_builds = original_active
+
+    def test_vmp4_seek_head_percent_encodes_non_ascii_cache_header(self) -> None:
+        request = SimpleNamespace(
+            headers={"user-agent": "VLC/3.0"},
+            client=SimpleNamespace(host="client"),
+        )
+        info = SimpleNamespace(duration=60.0, fps=30.0, width=3840, height=2160)
+        estimate = SimpleNamespace(source="test")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "电影.mp4"
+            path.write_bytes(b"x" * 34)
+            cache_path = Path(tmp) / "电影_passthrough.mp4"
+            cache_path.write_bytes(_MP4_FASTSTART)
+
+            with (
+                patch.object(routes_media, "PASSTHROUGH_SEEK_VMP4", True),
+                patch.object(routes_media, "_safe_seek_video_path", return_value=(path, None, None)),
+                patch.object(routes_media, "_seek_route_allowed", return_value=(True, "profile_allowed", "vlc")),
+                patch.object(routes_media, "annotate_request", return_value=None),
+                patch.object(routes_media, "probe_cached", return_value=info),
+                patch.object(routes_media, "estimate_for_media", return_value=(1000, 2000, estimate)),
+                patch.object(routes_media, "_vmp4_mode_candidate", return_value=cache_path),
+            ):
+                response = asyncio.run(
+                    routes_media.passthrough_seek_head(
+                        request,
+                        "电影.mp4",
+                        mode=None,
+                        range_header=None,
+                        time_seek_range=None,
+                        get_content_features=None,
+                        transfer_mode=None,
+                    )
+                )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("%E7%94%B5%E5%BD%B1", response.headers["x-passthrough-vmp4-cache"])
+        self.assertNotIn("电影", response.headers["x-passthrough-vmp4-cache"])
 
     def test_seek_headers_advertise_byte_and_time_seek(self) -> None:
         info = SimpleNamespace(fps=30.0)
@@ -190,16 +755,34 @@ class ExistingPassthroughStrategyCharacterizationTests(unittest.TestCase):
     def test_seek_route_suffix_selects_container_without_changing_media_key(self) -> None:
         self.assertEqual(
             routes_media._split_seek_route_name("folder/movie.mp4.seek.ts"),
-            ("folder/movie.mp4", "mpegts"),
+            ("folder/movie.mp4", "mpegts", None),
         )
         self.assertEqual(
             routes_media._split_seek_route_name("folder/movie.mp4.seek.mp4"),
-            ("folder/movie.mp4", "mp4"),
+            ("folder/movie.mp4", "mp4", None),
         )
         self.assertEqual(
             routes_media._split_seek_route_name("folder/movie.mp4"),
-            ("folder/movie.mp4", None),
+            ("folder/movie.mp4", None, None),
         )
+        # The mode rides in the path so a player that drops the query still
+        # gets the picture the listing promised.
+        self.assertEqual(
+            routes_media._split_seek_route_name("folder/movie.mp4.superres.seek.mp4"),
+            ("folder/movie.mp4", "mp4", "superres"),
+        )
+        self.assertEqual(
+            routes_media._split_seek_route_name("folder/movie.mp4.alpha.seek.ts"),
+            ("folder/movie.mp4", "mpegts", "alpha"),
+        )
+        # The path-borne mode wins over the query, so a player that drops the
+        # query still gets the mode the listing promised.
+        with patch.object(
+            routes_media, "_configured_passthrough_modes", return_value=("green", "alpha", "superres")
+        ):
+            self.assertEqual(routes_media._seek_output_mode("green", "superres"), "superres")
+            self.assertEqual(routes_media._seek_output_mode(None, "alpha"), "alpha")
+            self.assertEqual(routes_media._seek_output_mode("superres", None), "superres")
 
     def test_seek_diag_headers_include_head_get_common_fields(self) -> None:
         headers: dict[str, str] = {}
@@ -212,7 +795,7 @@ class ExistingPassthroughStrategyCharacterizationTests(unittest.TestCase):
             mapped=mapped,
         )
 
-        self.assertEqual(headers["X-Passthrough-Mode"], "seek-mpegts-green")
+        self.assertEqual(headers["X-Passthrough-Mode"], "seek-vmp4-mp4-green")
         self.assertEqual(headers["X-Passthrough-Seek-Time"], "28.000")
         self.assertEqual(headers["X-Passthrough-Seek-Ratio"], "0.500000")
         self.assertEqual(headers["X-Passthrough-Seek-Raw-Time"], "30.000")
@@ -228,13 +811,15 @@ class ExistingPassthroughStrategyCharacterizationTests(unittest.TestCase):
         path = Path("movie.mp4")
 
         with (
-            patch.object(routes_media, "_safe_seek_video_path", return_value=(path, None)),
+            patch.object(routes_media, "_safe_seek_video_path", return_value=(path, None, None)),
             patch.object(routes_media, "_seek_route_allowed", return_value=(True, "profile_allowed", "vlc")),
             patch.object(routes_media, "annotate_request", return_value=None),
             patch.object(routes_media, "probe_cached", return_value=info),
             patch.object(routes_media, "_estimated_seek_passthrough_size", return_value=10_000),
             patch.object(routes_media, "estimate_for_media", return_value=(1000, 2000, estimate)),
             patch.object(routes_media, "PASSTHROUGH_SEEK_HEADER_BYTES", 2_000),
+            patch.object(routes_media, "PASSTHROUGH_SEEK_VMP4", False),
+            patch.object(routes_media, "PASSTHROUGH_SEEK_CONTAINER", "mpegts"),
         ):
             response = asyncio.run(
                 routes_media.passthrough_seek_head(
@@ -386,7 +971,7 @@ class ExistingPassthroughStrategyCharacterizationTests(unittest.TestCase):
             return response.status_code, dict(response.headers), bytes(body)
 
         with (
-            patch.object(routes_media, "_safe_seek_video_path", return_value=(path, None)),
+            patch.object(routes_media, "_safe_seek_video_path", return_value=(path, None, None)),
             patch.object(routes_media, "_seek_route_allowed", return_value=(True, "profile_allowed", "nplayer")),
             patch.object(routes_media, "annotate_request", return_value=None),
             patch.object(routes_media, "probe_cached", return_value=info),
@@ -401,6 +986,7 @@ class ExistingPassthroughStrategyCharacterizationTests(unittest.TestCase):
             patch.object(routes_media, "PASSTHROUGH_MAX_CONCURRENT", 1),
             patch.object(routes_media, "PASSTHROUGH_PAD_TO_LENGTH", False),
             patch.object(routes_media, "PASSTHROUGH_SEEK_HEADER_BYTES", 5),
+            patch.object(routes_media, "PASSTHROUGH_SEEK_VMP4", False),
         ):
             original_cache = dict(routes_media._probe_cache)
             original_streams = dict(routes_media._active_streams)
@@ -455,7 +1041,7 @@ class ExistingPassthroughStrategyCharacterizationTests(unittest.TestCase):
             return response.status_code, dict(response.headers), response.body
 
         with (
-            patch.object(routes_media, "_safe_seek_video_path", return_value=(path, None)),
+            patch.object(routes_media, "_safe_seek_video_path", return_value=(path, None, None)),
             patch.object(routes_media, "_seek_route_allowed", return_value=(True, "profile_allowed", "nplayer")),
             patch.object(routes_media, "annotate_request", return_value=None),
             patch.object(routes_media, "probe_cached", return_value=info),
@@ -465,6 +1051,7 @@ class ExistingPassthroughStrategyCharacterizationTests(unittest.TestCase):
             patch.object(routes_media, "_select_passthrough_stream", side_effect=AssertionError("stream should not start")),
             patch.object(routes_media, "PASSTHROUGH_SEEK_HEADER_BYTES", 5),
             patch.object(routes_media, "_PREFIX_CACHE_WAIT_SEC", 0),
+            patch.object(routes_media, "PASSTHROUGH_SEEK_VMP4", False),
         ):
             original_cache = dict(routes_media._probe_cache)
             routes_media._probe_cache.clear()
@@ -527,7 +1114,7 @@ class ExistingPassthroughStrategyCharacterizationTests(unittest.TestCase):
             return first
 
         with (
-            patch.object(routes_media, "_safe_seek_video_path", return_value=(path, None)),
+            patch.object(routes_media, "_safe_seek_video_path", return_value=(path, None, None)),
             patch.object(routes_media, "_seek_route_allowed", return_value=(True, "profile_allowed", "nplayer")),
             patch.object(routes_media, "annotate_request", return_value=None),
             patch.object(routes_media, "probe_cached", return_value=info),
@@ -540,6 +1127,7 @@ class ExistingPassthroughStrategyCharacterizationTests(unittest.TestCase):
             patch.object(routes_media, "PASSTHROUGH_MAX_CONCURRENT", 1),
             patch.object(routes_media, "PASSTHROUGH_PAD_TO_LENGTH", False),
             patch.object(routes_media, "PASSTHROUGH_SEEK_HEADER_BYTES", 2),
+            patch.object(routes_media, "PASSTHROUGH_SEEK_VMP4", False),
         ):
             original_streams = dict(routes_media._active_streams)
             original_started = dict(routes_media._active_started)
@@ -1474,3 +2062,63 @@ class LiveSupportTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class SeekOutputFpsTests(unittest.TestCase):
+    def test_seek_ceiling_lowers_the_rate_below_the_live_cap(self) -> None:
+        info = SimpleNamespace(fps=59.94)
+        with (
+            patch.object(config, "PASSTHROUGH_MAX_FPS", 30.0),
+            patch.object(config, "PASSTHROUGH_SEEK_VMP4_FRAMES_MAX_FPS", 20.0),
+        ):
+            self.assertEqual(routes_media._seek_output_fps(info), 20.0)
+
+    def test_seek_ceiling_never_raises_the_rate(self) -> None:
+        info = SimpleNamespace(fps=59.94)
+        with (
+            patch.object(config, "PASSTHROUGH_MAX_FPS", 24.0),
+            patch.object(config, "PASSTHROUGH_SEEK_VMP4_FRAMES_MAX_FPS", 30.0),
+        ):
+            self.assertEqual(routes_media._seek_output_fps(info), 24.0)
+
+    def test_zero_ceiling_follows_the_live_cap(self) -> None:
+        info = SimpleNamespace(fps=59.94)
+        with (
+            patch.object(config, "PASSTHROUGH_MAX_FPS", 30.0),
+            patch.object(config, "PASSTHROUGH_SEEK_VMP4_FRAMES_MAX_FPS", 0.0),
+        ):
+            self.assertEqual(routes_media._seek_output_fps(info), 30.0)
+
+    def test_a_slow_source_is_never_sped_up(self) -> None:
+        info = SimpleNamespace(fps=15.0)
+        with (
+            patch.object(config, "PASSTHROUGH_MAX_FPS", 30.0),
+            patch.object(config, "PASSTHROUGH_SEEK_VMP4_FRAMES_MAX_FPS", 20.0),
+        ):
+            self.assertEqual(routes_media._seek_output_fps(info), 15.0)
+
+
+class SeekVmp4SpanCapTests(unittest.TestCase):
+    """One ranged reply must not promise gigabytes just because the cache is warm."""
+
+    def test_cap_trims_the_served_end(self) -> None:
+        cap = 48 * 1024 * 1024
+        start = 1_000_000
+        # A warm cache would otherwise let served_end run to the end of a huge file.
+        served_end = 7_276_526_866
+        with patch.object(routes_media, "PASSTHROUGH_SEEK_VMP4_FRAMES_MAX_SPAN_BYTES", cap):
+            capped = min(served_end, start + routes_media.PASSTHROUGH_SEEK_VMP4_FRAMES_MAX_SPAN_BYTES - 1)
+        self.assertEqual(capped, start + cap - 1)
+        self.assertLess(capped - start + 1, 64 * 1024 * 1024)
+
+    def test_cap_does_not_extend_a_short_reply(self) -> None:
+        cap = 48 * 1024 * 1024
+        start, served_end = 0, 100_000
+        with patch.object(routes_media, "PASSTHROUGH_SEEK_VMP4_FRAMES_MAX_SPAN_BYTES", cap):
+            capped = min(served_end, start + routes_media.PASSTHROUGH_SEEK_VMP4_FRAMES_MAX_SPAN_BYTES - 1)
+        self.assertEqual(capped, served_end)
+
+    def test_zero_disables_the_cap(self) -> None:
+        self.assertGreater(routes_media.PASSTHROUGH_SEEK_VMP4_FRAMES_MAX_SPAN_BYTES, 0)
+        with patch.object(routes_media, "PASSTHROUGH_SEEK_VMP4_FRAMES_MAX_SPAN_BYTES", 0):
+            self.assertEqual(routes_media.PASSTHROUGH_SEEK_VMP4_FRAMES_MAX_SPAN_BYTES, 0)

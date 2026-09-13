@@ -31,7 +31,8 @@ VR Video Passthrough Server の目標は、すべてのVR動画をパススル�
 - 内蔵の時間方向安定化と、オフライン 16:9 ジョブ向け NVDS ONNX 安定化を含む、任意の 2D→3D 深度安定化
 - 対応する2D/VRソース向けリアルタイム/オフライン NVIDIA RTX Video Super Resolutionと、適応型 `8K VR / 4K 2D` 出力
 - 2:1 SBS VRの左右眼GPU処理と、オフライン4K VR→8K VR用8192x4096 HEVC出力
-- RTX VSRの低/中/高/Ultra品質と、オフ/自然/鮮明のSDR HDRルック
+- SuperResのターゲットは ネイティブ1x / 2K / 4K / 6K VR / 8K VR。ネイティブ1xは拡大せずソース解像度で強化します
+- RTX VSRの低/中/高/Ultra品質と、オフ/自然/鮮明のSDR HDRルック、さらにオフライン専用のNVIDIA TrueHDRによる本物のHDR10出力（コントラスト・彩度・ミドルグレー・ピーク輝度を調整可能）
 - リアルタイム/オフラインの顔美化（開発・テスト中。設定画面から有効化できます）
 - リアルタイム/オフラインのモザイク除去（開発・テスト中。設定画面から有効化できます）
 - 同名 `.si.wav` サイドカーによる吹替/同時通訳、`[SI]` DLNAエントリ、開始時間選択、チャンネルミックス、弱/標準/強ダッキング
@@ -130,7 +131,7 @@ Meta Quest 3 でテストしています。
 - `PT_PASSTHROUGH_OUTPUT_MODE` は `none`、`green`、`alpha`、`two_dvr`、`superres`、`green,alpha,two_dvr,superres` のような組み合わせ、旧互換のgreen + alpha用 `all` に対応しています
 - Alpha モードでは DLNA 仮想アイテムのタイトルとして `Alpha Passthrough` が使われます
 - リアルタイム 2D→3D は `PT_TWO_DVR_MODEL`、`PT_TWO_DVR_STRENGTH`、関連する `PT_TWO_DVR_*` 設定を使用します。オフライン 2D→3D / VR は、デスクトップ UI からモデル、品質/速度、時間方向安定化、既存ターゲットのスキップを設定できます。
-- リアルタイムSuperResは `PT_RTX_VSR_TARGET_HEIGHT`、`PT_RTX_VSR_QUALITY`、`PT_RTX_VSR_HDR_LOOK` を使用します。適応型4096ターゲットは、認識された2:1 SBS VRでは8192x4096、通常の2Dでは3840x2160を出力します。
+- リアルタイムSuperResは `PT_RTX_VSR_TARGET_HEIGHT`、`PT_RTX_VSR_QUALITY`、`PT_RTX_VSR_HDR_LOOK` を使用します。適応型4096ターゲットは、認識された2:1 SBS VRでは8192x4096、通常の2Dでは3840x2160を出力します。HDRルックを `truehdr` にしてもオフライン処理のみに適用され、リアルタイムはSDRルックのままです。
 - 同名 `.si.wav` ファイルで `[SI]` DLNAエントリが有効になります。現在のDLNA再生は `/si_live` のリアルタイムMPEG-TSと開始オフセットを使用し、旧 `/media_si` はフォールバックとして残ります。
 - DLNA Liveディレクトリには、該当する場合 `[GREEN]`、`[ALPHA]`、`[2D>3D]`、`[SuperRes]`、`[SI]` マーカーと、開始時間選択フォルダーが表示されます。
 - デスクトップ設定からDLNAサーバー名とHTTPポートを変更できます。ネットワーク設定を保存した後はサーバーを再起動してください。

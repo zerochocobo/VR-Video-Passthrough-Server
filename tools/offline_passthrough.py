@@ -26,6 +26,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import config  # noqa: E402
 from utils.bitrate_estimator import effective_default_bitrate, parse_bitrate, source_video_bitrate  # noqa: E402
 from utils.gpu_runtime_cache import configure_gpu_runtime_cache  # noqa: E402
+from utils.offline_outputs import (  # noqa: E402
+    discard_pending_output,
+    pending_output_path,
+    publish_pending_output,
+)
 from utils.subprocess_hidden import hidden_subprocess_kwargs, run_hidden_streaming  # noqa: E402
 from utils.scene_detection import SceneCutDetector  # noqa: E402
 from utils.trt_manifest import (  # noqa: E402
@@ -247,9 +252,25 @@ def _open_muxer(out: Path, fps: float, src: Path, codec: str):
     )
 
 
+def _is_prepass_child(args) -> bool:
+    """True when this process only runs a mask prepass for a parent run."""
+    return bool(
+        getattr(args, "sam3_prepass_out", "")
+        or getattr(args, "ywes_prepass_out", "")
+        or getattr(args, "y26es_prepass_out", "")
+        or getattr(args, "y26br_prepass_out", "")
+    )
+
+
+def _audio_sidecar_path(out: Path) -> Path:
+    # The pid keeps concurrent runs that share one output name from extracting
+    # and deleting each other's sidecar. routes_media still hides "._audio".
+    return out.with_name(f"{out.stem}._audio.{os.getpid()}.aac")
+
+
 def _extract_audio_sidecar(src: Path, out: Path, audio: str, start_sec: float = 0.0, duration: float = 0.0) -> tuple[list[str], subprocess.CompletedProcess, Path]:
     ffmpeg = shutil.which("ffmpeg") or "ffmpeg"
-    audio_path = out.with_name(f"{out.stem}._audio.aac")
+    audio_path = _audio_sidecar_path(out)
     codec_args = ["-c:a", "copy"] if audio == "copy" else ["-c:a", "aac", "-b:a", "192k"]
     cmd = [
         ffmpeg,
@@ -294,6 +315,61 @@ def _cleanup_audio_sidecar(audio_path: Path | None) -> None:
         audio_path.unlink(missing_ok=True)
     except Exception:
         pass
+
+
+def _mux_audio_from_source(
+    video_only: Path,
+    out: Path,
+    src: Path,
+    audio: str,
+    start_sec: float = 0.0,
+    duration: float = 0.0,
+) -> tuple[list[str], subprocess.CompletedProcess]:
+    """Fallback when the sidecar is gone: take the audio straight from the source."""
+    ffmpeg = shutil.which("ffmpeg") or "ffmpeg"
+    cmd = [
+        ffmpeg,
+        "-hide_banner",
+        "-loglevel",
+        "warning",
+        "-y",
+        "-i",
+        str(video_only),
+        *(
+            ["-ss", f"{start_sec:.6f}"]
+            if start_sec > 0
+            else []
+        ),
+        "-i",
+        str(src),
+        "-map",
+        "0:v:0",
+        "-map",
+        "1:a:0?",
+        "-c:v",
+        "copy",
+        "-c:a",
+        "copy" if audio == "copy" else "aac",
+        *(
+            ["-t", f"{duration:.6f}"]
+            if duration > 0
+            else []
+        ),
+        "-map_metadata",
+        "1",
+        *probe_color_metadata(src).ffmpeg_args(),
+        "-movflags",
+        "+faststart",
+        str(out),
+    ]
+    return cmd, subprocess.run(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        errors="replace",
+        **hidden_subprocess_kwargs(),
+    )
 
 
 def _mux_audio_sidecar_after(video_only: Path, out: Path, audio_path: Path, src: Path, duration: float = 0.0) -> tuple[list[str], subprocess.CompletedProcess]:
@@ -1193,6 +1269,12 @@ def main() -> int:
     args._y26es_child = bool(args.y26es_prepass_out)
     args._y26br_child = bool(args.y26br_prepass_out)
     args._tool_name = "offline_passthrough"
+    if _is_prepass_child(args):
+        # A prepass child writes a mask npz and exits before any encoding, and it
+        # derives the same default output name as its parent. Letting it run the
+        # audio path would extract a sidecar over the parent's and then delete it
+        # on exit, so the parent's final mux would find no audio file.
+        args.audio = "off"
 
     import PyNvVideoCodec as nvc
     if args.no_warmup:
@@ -1226,10 +1308,13 @@ def main() -> int:
         out = (config.ROOT / out).resolve()
     out.parent.mkdir(parents=True, exist_ok=True)
     final_out = out
-    video_only_out = out
     if args.audio != "off":
         suffix = "".join(out.suffixes[-1:]) or ".mp4"
         video_only_out = out.with_name(f"{out.stem}._video_only{suffix}")
+    else:
+        # Without an audio mux the encode itself produces the deliverable, so it
+        # still writes beside the final name and is renamed only once complete.
+        video_only_out = pending_output_path(out)
     print(
         f"[offline] input codec={meta.codec.codec_name} profile={meta.codec.profile} "
         f"pix_fmt={meta.codec.pix_fmt} bit_depth={meta.codec.bit_depth} "
@@ -1510,9 +1595,27 @@ def main() -> int:
         print("[ffmpeg stderr]")
         print(stderr.strip()[-2000:])
     audio_mux_proc = None
-    if rc == 0 and args.audio != "off" and audio_sidecar is not None:
+    if rc == 0 and args.audio == "off":
+        if publish_pending_output(video_only_out, final_out):
+            video_only_out = final_out
+        else:
+            print(f"[offline] could not rename {video_only_out.name} to {final_out.name}")
+            rc = 1
+    if rc == 0 and args.audio != "off":
         ta0 = time.perf_counter()
-        audio_mux_cmd, audio_mux_proc = _mux_audio_sidecar_after(video_only_out, final_out, audio_sidecar, src, output_duration)
+        pending_out = pending_output_path(final_out)
+        if audio_sidecar is not None and audio_sidecar.exists():
+            audio_mux_cmd, audio_mux_proc = _mux_audio_sidecar_after(video_only_out, pending_out, audio_sidecar, src, output_duration)
+        else:
+            print("[offline] audio sidecar is missing; muxing audio from the source instead")
+            audio_mux_cmd, audio_mux_proc = _mux_audio_from_source(
+                video_only_out,
+                pending_out,
+                src,
+                args.audio,
+                max(0.0, float(args.start or 0.0)),
+                output_duration,
+            )
         print("[offline] audio_mux=" + subprocess.list2cmdline(audio_mux_cmd))
         print(f"audio_mux_rc = {audio_mux_proc.returncode}")
         print(f"audio_mux_elapsed = {time.perf_counter() - ta0:.3f} s")
@@ -1522,6 +1625,11 @@ def main() -> int:
             print(audio_mux_stderr.strip()[-2000:])
         if audio_mux_proc.returncode != 0:
             rc = audio_mux_proc.returncode
+            discard_pending_output(pending_out)
+        elif not publish_pending_output(pending_out, final_out):
+            print(f"[offline] could not rename {pending_out.name} to {final_out.name}")
+            discard_pending_output(pending_out)
+            rc = 1
         else:
             try:
                 video_only_out.unlink(missing_ok=True)

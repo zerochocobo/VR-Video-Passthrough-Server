@@ -52,6 +52,7 @@ from offline.two_dvr_render import (
     effective_eye_distance_mm,
     strength_multiplier,
 )
+from utils.offline_outputs import discard_pending_output, pending_output_path, publish_pending_output
 from utils.subprocess_hidden import hidden_subprocess_kwargs
 
 FFMPEG = shutil.which("ffmpeg") or "ffmpeg"
@@ -388,7 +389,8 @@ def convert_clip_pynv(src: Path, out: Path, engine: Da3DepthEngine, args,
             f"(<= {'4x' if str(args.projection).lower() in ('fisheye','hequirect') else '3x'} source)")
     enc = nvc.CreateEncoder(out_w, out_h, "NV12", False, **_encoder_kwargs(eff_bitrate, fps))
     has_audio = _has_audio(src)
-    mux = _open_muxer(out, fps, src, start, duration, has_audio)
+    pending = pending_output_path(out)
+    mux = _open_muxer(pending, fps, src, start, duration, has_audio)
 
     # Preallocated device buffers.
     rgb_g = cp.empty((H, W, 3), cp.uint8)
@@ -472,10 +474,18 @@ def convert_clip_pynv(src: Path, out: Path, engine: Da3DepthEngine, args,
         mux.wait()
     if mux.returncode not in (0, None):
         log(f"mux failed rc={mux.returncode}: {mux_err.strip()[:400]}")
+        discard_pending_output(pending)
+        return 1
+    if count <= 0:
+        discard_pending_output(pending)
+        return 1
+    if not publish_pending_output(pending, out):
+        log(f"could not rename {pending.name} to {out.name}")
+        discard_pending_output(pending)
         return 1
     elapsed = time.time() - started
     log(f"done {out.name}: {count} frames in {elapsed:.1f}s ({count / max(1e-6, elapsed):.1f} fps)")
-    return 0 if count > 0 else 1
+    return 0
 
 
 def _has_audio(path: Path) -> bool:

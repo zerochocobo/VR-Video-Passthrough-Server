@@ -41,6 +41,33 @@ class _ThdrSetting(ctypes.Structure):
 
 
 @dataclass(frozen=True)
+class TrueHdrSettings:
+    """NGX TrueHDR evaluation controls, clamped to the SDK's documented ranges."""
+
+    contrast: int = 100
+    saturation: int = 100
+    middle_gray: int = 50
+    max_luminance: int = 1000
+
+    @classmethod
+    def from_config(cls) -> "TrueHdrSettings":
+        return cls(
+            contrast=config.RTX_VSR_TRUEHDR_CONTRAST,
+            saturation=config.RTX_VSR_TRUEHDR_SATURATION,
+            middle_gray=config.RTX_VSR_TRUEHDR_MIDDLE_GRAY,
+            max_luminance=config.RTX_VSR_TRUEHDR_MAX_NITS,
+        )
+
+    def to_struct(self) -> "_ThdrSetting":
+        return _ThdrSetting(
+            max(0, min(200, int(self.contrast))),
+            max(0, min(200, int(self.saturation))),
+            max(10, min(100, int(self.middle_gray))),
+            max(400, min(2000, int(self.max_luminance))),
+        )
+
+
+@dataclass(frozen=True)
 class RtxVsrCapability:
     available: bool
     reason: str
@@ -71,29 +98,91 @@ def runtime_candidates() -> list[Path]:
     return out
 
 
+# 0 is the native 1x target: VSR enhances at the source resolution instead of
+# enlarging.  It is a real height value everywhere else, so never fold it away
+# with `target_height or default`.
+NATIVE_TARGET_HEIGHT = 0
+# NVENC cannot encode a side longer than this, which bounds native 1x input.
+ENCODER_MAX_SIDE = 8192
+
+
+def resolve_target_height(target_height: int | None = None) -> int:
+    """`None` means "use the configured target"; 0 means native 1x."""
+    if target_height is None:
+        return int(config.RTX_VSR_TARGET_HEIGHT)
+    return max(NATIVE_TARGET_HEIGHT, int(target_height))
+
+
+def seek_target_height(target_height: int | None = None) -> int:
+    """The target the seekable virtual-file route renders.
+
+    It is simply the configured target: the route never silently substitutes a
+    different one, because a listing that promises 6K and plays 1x reads as a
+    setting that was ignored. What the target decides is whether the seek shape
+    is offered at all - see `seek_supported_target()`.
+    """
+    return resolve_target_height(target_height)
+
+
+def seek_supported_target(target_height: int | None = None) -> bool:
+    """Whether SuperRes may be served as a seekable virtual file.
+
+    The virtual-file route is pulled at playback speed, so the stage has to keep
+    up with the player, and NGX cost follows the INPUT resolution: enlarging a
+    4K VR source runs at 25-27 FPS whatever the output size, while native 1x
+    reaches 30 FPS on the same source and 75 FPS on 2D. Enlarging also needs a
+    much larger per-frame budget (about 173 Mbps at 6K against 63 at 1x). So
+    only native 1x gets the seek shape; every other target keeps the live
+    chapter container. `PT_RTX_VSR_SEEK_ALLOW_UPSCALE` opts back in.
+    """
+    if config.RTX_VSR_SEEK_ALLOW_UPSCALE:
+        return True
+    return resolve_target_height(target_height) == NATIVE_TARGET_HEIGHT
+
+
+def is_native_target(target_height: int | None = None) -> bool:
+    return resolve_target_height(target_height) == NATIVE_TARGET_HEIGHT
+
+
+def _even(value: int) -> int:
+    value = int(value)
+    return value + (value & 1)
+
+
 def target_resolution(target_height: int | None = None, width: int = 0, height: int = 0) -> tuple[int, int]:
-    """Return target bounds, including experimental 8K SBS VR output."""
-    out_h = int(target_height or config.RTX_VSR_TARGET_HEIGHT)
-    if out_h >= 2160 and int(width or 0) > 0 and int(height or 0) > 0 and is_half_equirectangular_source(width, height):
+    """Return target bounds, including 6K/8K SBS VR output and native 1x."""
+    out_h = resolve_target_height(target_height)
+    source_w, source_h = int(width or 0), int(height or 0)
+    if out_h == NATIVE_TARGET_HEIGHT:
+        return _even(source_w), _even(source_h)
+    if out_h >= 2160 and source_w > 0 and source_h > 0 and is_half_equirectangular_source(source_w, source_h):
         if out_h >= 4096:
             return 8192, 4096
+        if out_h >= 3072:
+            return 6144, 3072
         return 4096, 2048
-    if out_h >= 4096:
+    if out_h >= 3072:
+        # 6K and 8K are VR-only targets; ordinary 2D tops out at 4K.
         return 3840, 2160
     out_w = int(round(out_h * 16.0 / 9.0))
-    return out_w + (out_w & 1), out_h + (out_h & 1)
+    return _even(out_w), _even(out_h)
 
 
 def effective_offline_target_height(target_height: int | None, width: int, height: int) -> int:
-    """Limit experimental 8K output to 2:1 SBS VR sources; otherwise use 4K."""
-    requested = int(target_height or config.RTX_VSR_TARGET_HEIGHT)
-    if requested >= 4096 and not is_half_equirectangular_source(width, height):
+    """Limit 6K/8K output to 2:1 SBS VR sources; otherwise use 4K."""
+    requested = resolve_target_height(target_height)
+    if requested == NATIVE_TARGET_HEIGHT:
+        return NATIVE_TARGET_HEIGHT
+    if requested >= 3072 and not is_half_equirectangular_source(width, height):
         return 2160
     return requested
 
 
 def source_exceeds_target_resolution(width: int, height: int, target_height: int | None = None) -> bool:
     """Compare landscape or portrait sources against the configured target bounds."""
+    if is_native_target(target_height):
+        # Native 1x keeps the source size, so it can never overshoot.
+        return False
     target_w, target_h = target_resolution(target_height, width, height)
     source_long, source_short = max(int(width), int(height)), min(int(width), int(height))
     target_long, target_short = max(target_w, target_h), min(target_w, target_h)
@@ -108,6 +197,16 @@ def source_block_reason(width: int, height: int, *, is_vr: bool = False, is_10bi
     if is_10bit:
         return "unsupported_10bit_source"
     h = int(height or 0)
+    if is_native_target(target_height):
+        # Native 1x costs what the source costs, so the upscale input policy
+        # does not apply. What still applies is the encoder envelope.
+        if int(width or 0) <= 0 or h <= 0:
+            return "invalid_source_size"
+        if h < config.RTX_VSR_INPUT_MIN_HEIGHT or h > config.RTX_VSR_NATIVE_MAX_HEIGHT:
+            return "project_resolution_policy"
+        if max(int(width), h) > ENCODER_MAX_SIDE:
+            return "source_exceeds_encoder_limit"
+        return None
     if h < config.RTX_VSR_INPUT_MIN_HEIGHT or (h > config.RTX_VSR_INPUT_MAX_HEIGHT and not (is_vr and allow_vr)):
         return "project_resolution_policy"
     if int(width or 0) <= 0:
@@ -121,6 +220,8 @@ def target_dimensions(width: int, height: int, target_height: int | None = None)
     width, height = int(width), int(height)
     if width <= 0 or height <= 0:
         raise ValueError("source dimensions must be positive")
+    if is_native_target(target_height):
+        return _even(width), _even(height)
     target_w, target_h = target_resolution(target_height, width, height)
     if height > width:
         target_w, target_h = target_h, target_w
@@ -140,6 +241,9 @@ class RtxVsrBridge:
         self._context_key: tuple[int, int, int] | None = None
         self._lock = threading.RLock()
         self._bind()
+
+    def true_hdr_runtime_available(self) -> bool:
+        return (self.runtime_dir / "nvngx_truehdr.dll").is_file()
 
     def _bind(self) -> None:
         self._dll.pt_rtx_vsr_set_app_path.argtypes = [ctypes.c_wchar_p]
@@ -169,11 +273,34 @@ class RtxVsrBridge:
         self._dll.rtx_video_api_cuda_shutdown.argtypes = []
         self._dll.rtx_video_api_cuda_shutdown.restype = None
 
-    def initialize(self, gpu_index: int = 0, *, cu_context: int = 0, cu_stream: int = 0) -> bool:
+    def initialize(
+        self,
+        gpu_index: int = 0,
+        *,
+        cu_context: int = 0,
+        cu_stream: int = 0,
+        true_hdr: bool = False,
+    ) -> bool:
+        """Create the NGX features for this CUDA context.
+
+        TrueHDR is a separate NGX feature that has to be requested when the
+        bridge is created, so switching an existing bridge between SDR and
+        HDR output tears the native session down and builds it again.
+
+        The identity is the CUDA context, NOT the stream. A caller running
+        inside a CuPy stream context hands us a different stream pointer every
+        frame, and keying on it tore down and rebuilt NGX per frame - 16 ms a
+        frame, which halved the seekable route's throughput. The stream is
+        still passed to create() as the feature's default queue; evaluation is
+        safe across streams because the caller synchronizes around it and the
+        native bridge copies in and out with blocking cuMemcpy2D.
+        """
         with self._lock:
-            requested_key = (int(gpu_index), int(cu_context or 0), int(cu_stream or 0))
+            requested_key = (int(gpu_index), int(cu_context or 0), int(bool(true_hdr)))
             if self._initialized and self._context_key == requested_key:
                 return True
+            if true_hdr and not self.true_hdr_runtime_available():
+                raise RuntimeError(f"NGX TrueHDR runtime missing: {self.runtime_dir / 'nvngx_truehdr.dll'}")
             if self._initialized:
                 self._dll.rtx_video_api_cuda_shutdown()
                 self._initialized = False
@@ -186,7 +313,7 @@ class RtxVsrBridge:
                     ctypes.c_void_p(int(cu_context or 0)),
                     ctypes.c_void_p(int(cu_stream or 0)),
                     int(gpu_index),
-                    0,
+                    1 if true_hdr else 0,
                     1,
                 )
             )
@@ -194,7 +321,7 @@ class RtxVsrBridge:
                 self._context_key = requested_key
             return self._initialized
 
-    def initialize_cupy(self, cp: Any, gpu_index: int = 0) -> bool:
+    def initialize_cupy(self, cp: Any, gpu_index: int = 0, *, true_hdr: bool = False) -> bool:
         cp.cuda.Device(int(gpu_index)).use()
         # Force creation of the runtime/primary context before asking for its
         # handle.  NGX must be initialized with the same context that owns the
@@ -204,7 +331,7 @@ class RtxVsrBridge:
         stream = int(cp.cuda.get_current_stream().ptr)
         if not context:
             raise RuntimeError("CuPy did not provide a current CUDA context")
-        return self.initialize(gpu_index, cu_context=context, cu_stream=stream)
+        return self.initialize(gpu_index, cu_context=context, cu_stream=stream, true_hdr=true_hdr)
 
     def evaluate_deviceptr(
         self,
@@ -213,15 +340,24 @@ class RtxVsrBridge:
         input_size: tuple[int, int],
         output_size: tuple[int, int],
         quality: int | None = None,
+        *,
+        true_hdr: bool = False,
+        hdr_settings: TrueHdrSettings | None = None,
     ) -> None:
         with self._lock:
-            if not self._initialized and not self.initialize():
+            if not self._initialized and not self.initialize(true_hdr=true_hdr):
                 raise RuntimeError("RTX VSR feature initialization failed")
+            if self._context_key is not None and bool(self._context_key[2]) != bool(true_hdr):
+                raise RuntimeError(
+                    "RTX VSR bridge was created for "
+                    f"{'TrueHDR' if self._context_key[2] else 'SDR'} output; "
+                    "re-initialize it before switching"
+                )
             in_w, in_h = map(int, input_size)
             out_w, out_h = map(int, output_size)
             requested_quality = config.RTX_VSR_QUALITY if quality is None else quality
             setting = _VsrSetting(max(0, min(4, int(requested_quality))))
-            thdr = _ThdrSetting()
+            thdr = (hdr_settings or TrueHdrSettings.from_config()).to_struct() if true_hdr else _ThdrSetting()
             ok = self._dll.rtx_video_api_cuda_evaluate_deviceptr(
                 ctypes.c_void_p(int(input_ptr)),
                 ctypes.c_void_p(int(output_ptr)),
@@ -233,15 +369,38 @@ class RtxVsrBridge:
             if not ok:
                 raise RuntimeError(f"RTX VSR evaluate failed input={in_w}x{in_h} output={out_w}x{out_h}")
 
-    def process_cupy_rgba(self, rgba: Any, output_size: tuple[int, int], quality: int | None = None):
+    def process_cupy_rgba(
+        self,
+        rgba: Any,
+        output_size: tuple[int, int],
+        quality: int | None = None,
+        *,
+        out: Any = None,
+        true_hdr: bool = False,
+        hdr_settings: TrueHdrSettings | None = None,
+    ):
+        """Run VSR (and optionally TrueHDR) over a CuPy RGBA8 frame.
+
+        With ``true_hdr`` the NGX output is packed 10:10:10:2, so the result is
+        a ``uint32`` HxW buffer instead of ``uint8`` HxWx4.  ``out`` lets a
+        caller reuse a buffer across frames instead of allocating per frame.
+        """
         import cupy as cp
 
         if rgba.dtype != cp.uint8 or rgba.ndim != 3 or int(rgba.shape[2]) != 4 or not rgba.flags.c_contiguous:
             raise ValueError("RTX VSR input must be contiguous uint8 HxWx4 RGBA")
-        if not self.initialize_cupy(cp, int(rgba.device.id)):
+        if not self.initialize_cupy(cp, int(rgba.device.id), true_hdr=true_hdr):
             raise RuntimeError("RTX VSR feature initialization failed for CuPy context")
         out_w, out_h = map(int, output_size)
-        out = cp.empty((out_h, out_w, 4), dtype=cp.uint8)
+        expected_shape = (out_h, out_w) if true_hdr else (out_h, out_w, 4)
+        expected_dtype = cp.uint32 if true_hdr else cp.uint8
+        if out is None:
+            out = cp.empty(expected_shape, dtype=expected_dtype)
+        elif out.dtype != expected_dtype or tuple(out.shape) != expected_shape or not out.flags.c_contiguous:
+            raise ValueError(
+                f"RTX VSR output buffer must be contiguous "
+                f"{'uint32' if true_hdr else 'uint8'} {expected_shape}"
+            )
         cp.cuda.get_current_stream().synchronize()
         self.evaluate_deviceptr(
             int(rgba.data.ptr),
@@ -249,6 +408,8 @@ class RtxVsrBridge:
             (int(rgba.shape[1]), int(rgba.shape[0])),
             (out_w, out_h),
             quality,
+            true_hdr=true_hdr,
+            hdr_settings=hdr_settings,
         )
         cp.cuda.get_current_stream().synchronize()
         return out

@@ -88,6 +88,7 @@ def run_rtx_vsr_pynv(
     preset: str,
     cq: int,
     hdr_look: str,
+    hdr_settings=None,
     target_bitrate: int,
     max_bitrate: int,
     buffer_bitrate: int,
@@ -98,8 +99,11 @@ def run_rtx_vsr_pynv(
 
     from offline.two_dvr_pynv import _NV12_RGB_KERNELS
     from pipeline.hdr_look import HDR_LOOK_CUDA, apply_hdr_look, normalize_hdr_look
-    from pipeline.pynv_io import GpuNv12AppFrame, GpuP016Frame, PyNvSimpleDecoder, PyNvThreadedSerialDecoder
-    from utils.rtx_vsr import load_bridge, target_dimensions
+    from pipeline.pynv_io import (
+        GpuNv12AppFrame, GpuP010AppFrame, GpuP016Frame, PyNvSimpleDecoder, PyNvThreadedSerialDecoder,
+    )
+    from pipeline.true_hdr import TRUE_HDR_CUDA, is_true_hdr, p010_grid, true_hdr_color_metadata
+    from utils.rtx_vsr import is_native_target, load_bridge, target_dimensions
     from utils.vr_naming import is_half_equirectangular_source
 
     bit_depth = int(getattr(meta.codec, "bit_depth", 8) or 8)
@@ -115,7 +119,10 @@ def run_rtx_vsr_pynv(
     width, height = int(info.width), int(info.height)
     fps = float(meta.timing.source_fps or info.fps or 30.0)
     out_w, out_h = target_dimensions(width, height, target_height)
-    split_eyes = int(target_height) >= 2160 and is_half_equirectangular_source(width, height)
+    # Each eye is evaluated on its own, at 1x as well as when enlarging.
+    split_eyes = is_half_equirectangular_source(width, height) and (
+        is_native_target(target_height) or int(target_height) >= 2160
+    )
     if split_eyes and (width % 2 or out_w != out_h * 2):
         raise RuntimeError(f"split-eye RTX VSR requires even-width 2:1 SBS input; got {width}x{height}")
     start_frame = max(0, int(round(max(0.0, start) * fps)))
@@ -124,15 +131,18 @@ def run_rtx_vsr_pynv(
     if frame_count <= 0:
         raise RuntimeError("no source frames selected")
 
-    module = cp.RawModule(code=_NV12_RGB_KERNELS + HDR_LOOK_CUDA + _NV12_TO_SPLIT_RGBA)
+    module = cp.RawModule(code=_NV12_RGB_KERNELS + HDR_LOOK_CUDA + _NV12_TO_SPLIT_RGBA + TRUE_HDR_CUDA)
     k_to_rgb = module.get_function("nv12_to_rgb")
     k_to_split_rgba = module.get_function("nv12_to_split_rgba")
     k_to_nv12 = module.get_function("rgba_to_nv12")
     effective_hdr = normalize_hdr_look(hdr_look)
-    k_hdr = module.get_function("hdr_look_rgba") if effective_hdr != "off" else None
+    true_hdr = is_true_hdr(effective_hdr)
+    # TrueHDR replaces the SDR look: NGX produces the whole HDR10 grade.
+    k_hdr = module.get_function("hdr_look_rgba") if effective_hdr not in {"off", "truehdr"} else None
+    k_p010 = module.get_function("abgr10_to_p010") if true_hdr else None
 
     bridge = load_bridge()
-    if not bridge.initialize_cupy(cp):
+    if not bridge.initialize_cupy(cp, true_hdr=true_hdr):
         raise RuntimeError("RTX VSR bridge failed to initialize on the PyNv CUDA context")
 
     bitrate = max(1, int(target_bitrate))
@@ -152,7 +162,7 @@ def run_rtx_vsr_pynv(
         "bf": str(config.PASSTHROUGH_HEVC_BF),
         "repeatspspps": "1",
     }
-    encoder = nvc.CreateEncoder(out_w, out_h, "NV12", False, **enc_kwargs)
+    encoder = nvc.CreateEncoder(out_w, out_h, "P010" if true_hdr else "NV12", False, **enc_kwargs)
     decoder = PyNvThreadedSerialDecoder(
         src,
         bit_depth=bit_depth,
@@ -169,7 +179,7 @@ def run_rtx_vsr_pynv(
     mux_cmd, mux = _open_video_muxer(
         temp_video,
         fps,
-        list(meta.color.ffmpeg_args()),
+        list(true_hdr_color_metadata().ffmpeg_args() if true_hdr else meta.color.ffmpeg_args()),
     )
     if mux.stdin is None:
         decoder.stop()
@@ -184,9 +194,19 @@ def run_rtx_vsr_pynv(
     eye_out_w = out_w // 2 if split_eyes else 0
     left_eye = cp.empty((height, eye_in_w, 4), cp.uint8) if split_eyes else None
     right_eye = cp.empty((height, eye_in_w, 4), cp.uint8) if split_eyes else None
-    split_output = cp.empty((out_h, out_w, 4), cp.uint8) if split_eyes else None
+    # TrueHDR results are packed 10:10:10:2, one uint32 per pixel.
+    enhanced_dtype = cp.uint32 if true_hdr else cp.uint8
+    enhanced_shape = (out_h, out_w) if true_hdr else (out_h, out_w, 4)
+    eye_shape = (out_h, eye_out_w) if true_hdr else (out_h, eye_out_w, 4)
+    split_output = cp.empty(enhanced_shape, enhanced_dtype) if split_eyes else None
+    # NGX writes into a contiguous buffer, so each eye is evaluated into its
+    # own reused surface and copied into the joined frame.
+    left_out = cp.empty(eye_shape, enhanced_dtype) if split_eyes else None
+    right_out = cp.empty(eye_shape, enhanced_dtype) if split_eyes else None
+    whole_out = None if split_eyes else cp.empty(enhanced_shape, enhanced_dtype)
+    surface_dtype = cp.uint16 if true_hdr else cp.uint8
     ring = [
-        cp.empty((out_h * 3 // 2, out_w), cp.uint8)
+        cp.empty((out_h * 3 // 2, out_w), surface_dtype)
         for _ in range(2 if out_w >= 8192 else max(2, int(config.PASSTHROUGH_NV12_RING_SLOTS)))
     ]
     block = (16, 16, 1)
@@ -225,7 +245,7 @@ def run_rtx_vsr_pynv(
     print(
         f"[rtx-vsr] pipeline=pynv-gpu input={width}x{height} output={out_w}x{out_h} "
         f"frames={frame_count} fps={fps:.6f} quality={quality} preset={effective_preset.lower()} "
-        f"hdr_look={effective_hdr} bitrate={bitrate} "
+        f"hdr_look={effective_hdr} surface={'p010' if true_hdr else 'nv12'} bitrate={bitrate} "
         f"split_eyes={f'{eye_out_w}x{out_h}+{eye_out_w}x{out_h}' if split_eyes else 'off'}",
         flush=True,
     )
@@ -261,6 +281,7 @@ def run_rtx_vsr_pynv(
                 cpu_left_started = time.perf_counter()
                 split_output[:, :eye_out_w] = bridge.process_cupy_rgba(
                     left_eye, (eye_out_w, out_h), quality,
+                    out=left_out, true_hdr=true_hdr, hdr_settings=hdr_settings,
                 )
                 cpu_left_done = time.perf_counter()
                 if timing_events is not None:
@@ -268,6 +289,7 @@ def run_rtx_vsr_pynv(
                 cpu_right_started = time.perf_counter()
                 split_output[:, eye_out_w:] = bridge.process_cupy_rgba(
                     right_eye, (eye_out_w, out_h), quality,
+                    out=right_out, true_hdr=true_hdr, hdr_settings=hdr_settings,
                 )
                 cpu_right_done = time.perf_counter()
                 enhanced = split_output
@@ -280,7 +302,10 @@ def run_rtx_vsr_pynv(
                 if timing_events is not None:
                     timing_events["split"].record()
                 cpu_whole_started = time.perf_counter()
-                enhanced = bridge.process_cupy_rgba(rgba, (out_w, out_h), quality)
+                enhanced = bridge.process_cupy_rgba(
+                    rgba, (out_w, out_h), quality,
+                    out=whole_out, true_hdr=true_hdr, hdr_settings=hdr_settings,
+                )
                 cpu_whole_done = time.perf_counter()
             if timing_events is not None:
                 timing_events["vsr"].record()
@@ -289,7 +314,10 @@ def run_rtx_vsr_pynv(
             if timing_events is not None:
                 timing_events["hdr"].record()
             nv12 = ring[count % len(ring)]
-            k_to_nv12(grid_out, block, (enhanced, nv12, np.int32(out_w), np.int32(out_h)))
+            if k_p010 is not None:
+                k_p010(p010_grid(out_w, out_h, block), block, (enhanced, nv12, np.int32(out_w), np.int32(out_h)))
+            else:
+                k_to_nv12(grid_out, block, (enhanced, nv12, np.int32(out_w), np.int32(out_h)))
             if timing_events is not None:
                 timing_events["nv12"].record()
             cpu_output_sync_started = time.perf_counter()
@@ -298,7 +326,9 @@ def run_rtx_vsr_pynv(
             flags = 0
             if count == 0:
                 flags = int(nvc.NV_ENC_PIC_FLAGS.FORCEIDR) | int(nvc.NV_ENC_PIC_FLAGS.OUTPUT_SPSPPS)
-            app_frame = GpuNv12AppFrame(nv12, out_w, out_h)
+            app_frame = (
+                GpuP010AppFrame(nv12, out_w, out_h) if true_hdr else GpuNv12AppFrame(nv12, out_w, out_h)
+            )
             cpu_encode_started = time.perf_counter()
             bitstream = encoder.Encode(app_frame, flags) if flags else encoder.Encode(app_frame)
             cpu_after_encode = time.perf_counter()

@@ -41,12 +41,25 @@ class ConfigDefaultTests(unittest.TestCase):
         self.assertEqual(config.PASSTHROUGH_FMP4_FRAG_DURATION_US, 100000)
         self.assertEqual(config.PASSTHROUGH_AUDIO_MPEGTS_INTERLEAVE_DELTA, "500000000")
 
-    def test_seekable_passthrough_is_hidden_by_default(self) -> None:
+    def test_seekable_passthrough_is_off_by_default_but_vmp4_backed(self) -> None:
+        # The seek endpoint stays opt-in so the shipped realtime path is
+        # untouched; when it is switched on it must land on the vmp4 backend.
         self.assertFalse(config.PASSTHROUGH_SEEK_ENABLED)
         self.assertFalse(config.PASSTHROUGH_SEEK_DLNA)
         self.assertEqual(config.PASSTHROUGH_SEEK_ROUTE_POLICY, "profile")
         self.assertIn("nplayer", config.PASSTHROUGH_SEEK_PROFILES)
-        self.assertEqual(config.PASSTHROUGH_SEEK_CONTAINER, "mpegts")
+        self.assertEqual(config.PASSTHROUGH_SEEK_CONTAINER, "mp4")
+        self.assertTrue(config.PASSTHROUGH_SEEK_VMP4)
+        self.assertEqual(config.PASSTHROUGH_SEEK_VMP4_BACKEND, "slot_frames")
+        self.assertTrue(config.PASSTHROUGH_SEEK_VMP4_SLOT_BUILD_PLACEHOLDER)
+        self.assertTrue(config.PASSTHROUGH_SEEK_VMP4_SLOT_READY_ONLY)
+        self.assertEqual(config.PASSTHROUGH_SEEK_VMP4_SLOT_MAX_SAMPLE_BYTES, 512 * 1024)
+        self.assertTrue(config.PASSTHROUGH_SEEK_VMP4_BUILD_MISSING)
+        self.assertEqual(config.PASSTHROUGH_SEEK_VMP4_BUILD_MAX_ACTIVE, 1)
+        self.assertIn("green", config.PASSTHROUGH_SEEK_VMP4_BUILD_MODES)
+        self.assertIn("alpha", config.PASSTHROUGH_SEEK_VMP4_BUILD_MODES)
+        self.assertIn("two_dvr", config.PASSTHROUGH_SEEK_VMP4_BUILD_MODES)
+        self.assertEqual(config.PASSTHROUGH_SEEK_VMP4_BUILD_BITRATE, "budget")
         self.assertEqual(config.PASSTHROUGH_SEEK_HEADER_BYTES, 2 * 1024 * 1024)
 
     def test_si_progressive_is_enabled_by_default_for_m1_testing(self) -> None:
@@ -89,3 +102,8 @@ class ConfigDefaultTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+    def test_seek_frame_rate_ceiling_defaults_to_the_live_cap(self) -> None:
+        # 0 means "no separate seek ceiling", so the seek path follows
+        # PT_PASSTHROUGH_MAX_FPS exactly as before this knob existed.
+        self.assertEqual(config.PASSTHROUGH_SEEK_VMP4_FRAMES_MAX_FPS, 0.0)

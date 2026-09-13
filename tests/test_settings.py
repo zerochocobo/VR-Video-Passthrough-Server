@@ -52,16 +52,24 @@ class SettingsTests(unittest.TestCase):
         self.assertEqual(env["PT_ALPHA_STRIDE"], "1")
         self.assertEqual(env["PT_PASSTHROUGH_MAX_FPS"], "30")
         self.assertEqual(env["PT_PASSTHROUGH_PRODUCER_REALTIME_PACING"], "1")
-        self.assertEqual(env["PT_PASSTHROUGH_SEEK_ENABLED"], "0")
-        self.assertEqual(env["PT_PASSTHROUGH_SEEK_DLNA"], "0")
+        # Both come from passthrough_playback_mode, which defaults to the
+        # draggable virtual-file entry.
+        self.assertEqual(env["PT_PASSTHROUGH_SEEK_ENABLED"], "1")
+        self.assertEqual(env["PT_PASSTHROUGH_SEEK_DLNA"], "1")
+        s.data["passthrough_playback_mode"] = "live"
+        live_env = s.server_env()
+        self.assertEqual(live_env["PT_PASSTHROUGH_SEEK_ENABLED"], "0")
+        self.assertEqual(live_env["PT_PASSTHROUGH_SEEK_DLNA"], "0")
         self.assertEqual(env["PT_PASSTHROUGH_SEEK_ROUTE_POLICY"], "profile")
-        self.assertEqual(env["PT_PASSTHROUGH_SEEK_CONTAINER"], "mpegts")
+        self.assertEqual(env["PT_PASSTHROUGH_SEEK_CONTAINER"], "mp4")
         self.assertEqual(env["PT_DLNA_IMAGE_ENABLED"], "0")
         self.assertEqual(env["PT_DECODE_MAX_SIDE"], "4096")
         self.assertEqual(env["PT_LIGHT_MATCH_PRESET"], "daylight")
         self.assertEqual(env["PT_RM_ENABLED"], "0")
         self.assertEqual(env["PT_RTX_VSR_QUALITY"], "4")
-        self.assertEqual(env["PT_RTX_VSR_TARGET_HEIGHT"], "4096")
+        # Realtime defaults to native 1x, the only target that can also be
+        # served as a draggable virtual file.
+        self.assertEqual(env["PT_RTX_VSR_TARGET_HEIGHT"], "0")
         self.assertEqual(env["PT_RTX_VSR_HDR_LOOK"], "natural")
         self.assertEqual(env["PT_ALPHA_2D_ENABLE"], "1")
 
@@ -113,7 +121,7 @@ class SettingsTests(unittest.TestCase):
         self.assertEqual(env["PT_PASSTHROUGH_SEEK_ROUTE_POLICY"], "all")
         self.assertEqual(env["PT_PASSTHROUGH_SEEK_CONTAINER"], "mp4")
 
-    def test_legacy_seekable_passthrough_dlna_migrates_off(self) -> None:
+    def test_legacy_seekable_passthrough_settings_move_to_the_playback_mode(self) -> None:
         root = Path("runtime_cache/test_ui_settings_seek_dlna_migration")
         root.mkdir(parents=True, exist_ok=True)
         self.addCleanup(lambda: shutil.rmtree(root, ignore_errors=True))
@@ -130,10 +138,11 @@ class SettingsTests(unittest.TestCase):
         ):
             s = settings_module.Settings()
 
-        self.assertTrue(s.data["passthrough_seek_enabled"])
-        self.assertFalse(s.data["passthrough_seek_dlna"])
+        # The old pair no longer drives the server env: one choice does, and an
+        # existing install lands on the current default like a fresh one.
+        self.assertEqual(s.data["passthrough_playback_mode"], "virtual")
         self.assertEqual(s.server_env()["PT_PASSTHROUGH_SEEK_ENABLED"], "1")
-        self.assertEqual(s.server_env()["PT_PASSTHROUGH_SEEK_DLNA"], "0")
+        self.assertEqual(s.server_env()["PT_PASSTHROUGH_SEEK_DLNA"], "1")
 
     def test_server_env_default_dlna_identity(self) -> None:
         s = self._settings()

@@ -20,6 +20,7 @@ import threading
 import traceback
 import time
 from pathlib import Path
+from collections.abc import Sequence
 from typing import AsyncIterator
 
 import config
@@ -34,7 +35,7 @@ from utils.cache_key import fingerprint, stat_key
 from utils.bitrate_estimator import effective_default_bitrate, parse_bitrate
 from utils.runtime_settings import get_light_match
 from utils.subprocess_hidden import hidden_subprocess_kwargs
-from utils.video_metadata import VideoProbeMetadata, cfr_source_index, probe_color_metadata, probe_timing_metadata
+from utils.video_metadata import VideoProbeMetadata, cfr_source_index, probe_color_metadata, probe_timing_metadata, probe_video_metadata
 
 log = get("pynv_stream")
 
@@ -92,6 +93,11 @@ def _drain_async_queue_nowait(q: asyncio.Queue, *, keep_sentinel: bool = True) -
             chunks += 1
             bytes_dropped += len(item)
     return chunks, bytes_dropped, saw_sentinel
+
+
+# One GOP's worth of frames is the shortest span over which "are we over-driving
+# the encoder?" is a question about the content rather than about one frame.
+_HR_WINDOW = 60
 
 
 def _pynv_encoder_kwargs(*, bitrate: str, fps: str) -> dict[str, str]:
@@ -292,6 +298,482 @@ def _hevc_nal_summary(data: bytes | bytearray | memoryview, *, limit: int = 12) 
         nal_type = (b[nal_start] >> 1) & 0x3F
         parts.append(f"{nal_type}:{nal_end - nal_start}")
     return ",".join(parts) if parts else "none"
+
+
+# Output modes the frame-level (slot_frames) backend can produce. The seek
+# route, its GOP/filler builders and the DLNA browse side all read this one
+# set: keeping separate copies in step by comment is what let SuperRes be
+# advertised, routed and then refused by a guard nobody updated.
+SEEK_FRAME_MODES = frozenset({"green", "alpha", "superres", "dlss5"})
+
+# Modes served by a per-session GPU stage that takes a decoded NV12 frame and
+# hands back an enhanced GPU NV12 surface.
+_FRAME_STAGE_MODES = frozenset({"superres", "dlss5"})
+
+
+def make_frame_stage(
+    mode: str,
+    *,
+    width: int,
+    height: int,
+    source_stem: str = "",
+    is_10bit: bool = False,
+    source_fps: float = 0.0,
+    seek: bool = False,
+    logger=None,
+    label: str = "",
+):
+    """Build the per-session enhancement stage for ``mode``, or None.
+
+    Both the live worker and the seek frame generator go through here. They used
+    to each construct SuperResStage themselves, and the one time the two drifted
+    apart the seek route advertised a mode the worker then refused with a 409.
+    Adding a mode is one branch in one function now.
+
+    ``seek`` says which of the two is asking. It only matters to SuperRes, whose
+    seek route renders the target that route can sustain rather than the
+    configured one; whether that target is offered as a virtual file at all is
+    decided when the listing is built (utils.rtx_vsr.seek_supported_target).
+
+    Every stage returned exposes ``output_size`` and ``process(frame, index)``.
+    """
+    name = str(mode or "").lower()
+    if name not in _FRAME_STAGE_MODES:
+        return None
+    if name == "dlss5":
+        from pipeline.dlss5_stage import DLSS5Stage
+        from utils.dlss5 import DLSS5Settings
+
+        # 1x: no target_height, because Neural Rendering never resizes.
+        return DLSS5Stage(
+            width=width,
+            height=height,
+            settings=DLSS5Settings.from_config(),
+            is_10bit=bool(is_10bit),
+            fps=float(source_fps or 0.0),
+            realtime=True,
+            logger=logger,
+            label=label,
+        )
+    from pipeline.superres_stage import SuperResStage
+    from utils.rtx_vsr import seek_target_height
+
+    return SuperResStage(
+        width=width,
+        height=height,
+        source_stem=source_stem,
+        is_10bit=bool(is_10bit),
+        target_height=seek_target_height() if seek else None,
+        logger=logger,
+        label=label,
+    )
+
+
+def iter_pynv_passthrough_annexb_frames(
+    src: Path,
+    *,
+    start_sec: float,
+    frame_count: int,
+    matter: Matter,
+    metadata: VideoProbeMetadata | None = None,
+    output_mode: str = "green",
+    max_fps: float | None = None,
+    per_frame_cap_bytes: int = 0,
+    per_frame_cap_schedule: Sequence[int] | None = None,
+    cancel: threading.Event | None = None,
+):
+    """Persistent streaming encode: set up decoder/encoder/matter ONCE and yield
+    one HEVC Annex-B access unit per output frame (in order).
+
+    ``per_frame_cap_schedule`` gives a byte budget per output frame (indexed from
+    ``start_sec``); the encoder is retargeted with ``Reconfigure`` whenever the
+    budget changes, so a source-derived per-GOP allocation costs no extra encoder
+    setup. Without it, ``per_frame_cap_bytes`` applies flat to the whole run.
+
+    ``cancel`` aborts the run, including DURING setup. Setup opens an 8K decoder,
+    resets the matter and creates an encoder - seconds during which the caller
+    already holds a Matter from a pool of PT_MAX_CONCURRENT. A seek that
+    repositions the filler must be able to hand that Matter back before the
+    replacement asks for one, or the pool runs dry and the next seek never starts.
+
+    The per-GOP ``build_passthrough_hevc_annexb_gop`` rebuilt the whole pipeline
+    (open decoder, seek, CreateEncoder, RVM reset) for every 1.2s GOP, so setup
+    dominated and throughput collapsed far below the live path's 60fps+. This
+    generator pays that setup once and streams frames continuously like live, so
+    a long run (a whole title / large span) runs at live throughput. The frame
+    layout's background filler drains it into per-frame files.
+    """
+    import PyNvVideoCodec as nvc
+
+    from pipeline.passthrough_vmp4_slot import split_hevc_annexb_access_units
+
+    # abspath, not resolve(): resolve() opens the file to ask Windows for its
+    # final path name, and the user's mounted library volume answers that call
+    # with WinError 1005 even though reading the same path works. That failure
+    # killed the encode before it started, so every title on that mount came
+    # back to the player as unsupported.
+    source = Path(os.path.abspath(str(src)))
+    mode = (output_mode or "green").lower()
+    if mode == "all":
+        mode = "green"
+    if mode not in SEEK_FRAME_MODES:
+        raise RuntimeError(f"slot PyNv GOP builder does not support output_mode={mode!r}")
+    if matter is None:
+        raise RuntimeError("slot PyNv GOP builder requires a Matter instance")
+
+    def _cancelled() -> bool:
+        return cancel is not None and cancel.is_set()
+
+    if _cancelled():
+        return
+    meta = metadata or probe_video_metadata(source)
+    codec_meta = meta.codec if meta is not None else None
+    bit_depth = int(codec_meta.bit_depth if codec_meta and codec_meta.bit_depth > 0 else 8)
+    meta_dec = PyNvSimpleDecoder(source, bit_depth=bit_depth)
+    dec = None
+    enc = None
+    pending_nv12_slots: list[object] = []
+    try:
+        info = meta_dec.info
+        dec_len = len(meta_dec)
+        timing = meta.timing if meta is not None else probe_timing_metadata(source)
+        if not timing.is_cfr:
+            raise RuntimeError("slot PyNv GOP builder requires strong CFR source")
+        source_fps = float(timing.source_fps or info.fps or 30.0)
+        fps_cap = config.PASSTHROUGH_MAX_FPS if max_fps is None else float(max_fps)
+        fps = float(timing.effective_fps(fps_cap))
+        if fps <= 0:
+            raise RuntimeError("slot PyNv GOP builder output fps unavailable")
+        out_w, out_h = matter.pynv_scaled_size(info.width, info.height)
+        frame_stage = make_frame_stage(
+            mode,
+            width=info.width,
+            height=info.height,
+            source_stem=source.stem,
+            is_10bit=bool(bit_depth > 8),
+            source_fps=source_fps,
+            seek=True,
+            logger=log,
+            label="PyNv frame stream",
+        )
+        if frame_stage is not None:
+            out_w, out_h = frame_stage.output_size
+        alpha_process_w, alpha_process_h = out_w, out_h
+        alpha_packer = None
+        if mode == "alpha":
+            from pipeline.alpha_packer import AlphaPacker, alpha_output_size, alpha_src_fisheye_fov
+
+            out_w, out_h = alpha_output_size(alpha_process_w, alpha_process_h)
+            alpha_packer = AlphaPacker(matter, src_fisheye_fov=alpha_src_fisheye_fov(source.stem))
+
+        start_out = int(round(max(0.0, float(start_sec or 0.0)) * fps))
+        max_target = int((dec_len - 1) * fps / source_fps) + 1 if source_fps > 0 else dec_len
+        remaining = max(1, max_target - start_out)
+        target = min(max(1, int(frame_count or 1)), remaining)
+        initial_src_idx = min(dec_len - 1, cfr_source_index(start_out, source_fps, fps))
+        decoder_mode = config.PASSTHROUGH_PYNV_DECODER
+        if mode == "alpha" and decoder_mode == "threaded_serial" and not config.PASSTHROUGH_ALPHA_ALLOW_THREADED_DECODER:
+            decoder_mode = "simple"
+        alpha_threaded_owned_copy = mode == "alpha" and decoder_mode == "threaded_serial"
+        if decoder_mode == "threaded_serial":
+            meta_dec.stop()
+            dec = PyNvThreadedSerialDecoder(
+                source,
+                bit_depth=bit_depth,
+                start_frame=initial_src_idx,
+                batch_size=config.PASSTHROUGH_PYNV_THREADED_BATCH_SIZE,
+                buffer_size=config.PASSTHROUGH_PYNV_THREADED_BUFFER_SIZE,
+                info=info,
+                num_frames=dec_len,
+            )
+        elif decoder_mode == "simple":
+            dec = meta_dec
+        else:
+            raise RuntimeError(f"unknown PT_PASSTHROUGH_PYNV_DECODER={decoder_mode!r}")
+
+        if _cancelled():
+            return
+        matter.reset_state()
+        log.info(
+            "PyNv frame stream begin: source=%s mode=%s start=%.3f frames=%d size=%dx%d fps=%.3f cap_bytes=%d schedule=%d",
+            source.name, mode, max(0.0, float(start_sec or 0.0)), target, out_w, out_h, fps,
+            int(per_frame_cap_bytes or 0), len(per_frame_cap_schedule or ()),
+        )
+        bitrate_estimate = effective_default_bitrate(source, PYNV_BACKEND_LABEL)
+        bitrate_bps = int(bitrate_estimate.bps)
+        # Safe rate-control overrides (rc/bitrate use the same kwarg names the
+        # existing path already passes) vs uncertain VBV kwargs tried separately.
+        safe_cap: dict[str, str] = {}
+        vbv_cap: dict[str, str] = {}
+        # Headroom is a closed loop, not a constant: one number cannot serve both
+        # 4K (which never overshot its budget even at 0.85) and 8K (18% of frames
+        # over at that same value). Whatever the encoder does not spend is sent as
+        # filler, so a headroom set low enough to be safe everywhere throws away
+        # bandwidth everywhere - at 0.6 that was 40% of every frame. The loop
+        # below judges a GOP at a time and settles where over-budget frames are
+        # rare, per source, instead of guessing one value for all of them.
+        headroom = float(config.PASSTHROUGH_SEEK_VMP4_FRAMES_RATE_HEADROOM)
+        hr_adapt = bool(config.PASSTHROUGH_SEEK_VMP4_FRAMES_RATE_ADAPT)
+        hr_max = float(config.PASSTHROUGH_SEEK_VMP4_FRAMES_RATE_HEADROOM_MAX)
+        hr_min = float(config.PASSTHROUGH_SEEK_VMP4_FRAMES_RATE_HEADROOM_MIN)
+        headroom = max(hr_min, min(hr_max, headroom)) if hr_adapt else headroom
+
+        # NVENC rejects an initialise whose bitrate/VBV are out of range with
+        # error 8 (INVALID_PARAM), and a rejected encoder means that position of
+        # the title can never be produced. Budgets come from the source's own bit
+        # distribution, so clamp what is handed to the encoder rather than trust
+        # every value that arrives.
+        rc_ceiling_bps = max(1_000_000, int(config.PASSTHROUGH_PYNV_MAX_RC_BPS))
+
+        def _rc_for_budget(budget_bytes: int) -> tuple[int, int]:
+            """Encoder bitrate and 1-frame VBV size, in bits, for a byte budget.
+
+            The VBV stays at the full budget (the hard per-frame ceiling); only
+            the CBR target moves with the headroom.
+            """
+            target_bytes = max(4096, int(budget_bytes * headroom))
+            bps = min(rc_ceiling_bps, max(250_000, int(target_bytes * 8.0 * fps)))
+            vbv = min(rc_ceiling_bps, max(target_bytes * 8, int(budget_bytes * 8)))
+            return bps, vbv
+
+        schedule = [max(1024, int(b)) for b in (per_frame_cap_schedule or ())]
+        if schedule and per_frame_cap_bytes <= 0:
+            per_frame_cap_bytes = schedule[0]
+        if per_frame_cap_bytes > 0:
+            # Fixed-byte-budget per frame (slot_frames backend). HTTP bandwidth is
+            # fixed at budget*fps regardless of rate control, so CBR each frame
+            # toward the budget to maximize real data per byte and equalize frame
+            # sizes (the default VBR produced multi-hundred-KB P spikes that blew
+            # the budget). The 1-frame VBV buffer is a hard per-frame cap on top.
+            bitrate_bps, vbv_bits = _rc_for_budget(schedule[0] if schedule else per_frame_cap_bytes)
+            safe_cap = {"rc": "cbr"}
+            vbv_cap = {"maxbitrate": str(bitrate_bps), "vbvbufsize": str(int(vbv_bits)), "vbvinit": str(int(vbv_bits))}
+
+        def _make_encoder() -> object:
+            base = _pynv_encoder_kwargs(bitrate=str(bitrate_bps), fps=f"{fps:.6f}")
+            base.update(safe_cap)
+            try:
+                return nvc.CreateEncoder(out_w, out_h, "NV12", False, **base, **vbv_cap)
+            except Exception:
+                if not vbv_cap:
+                    raise
+                # This PyNvVideoCodec build rejects the VBV kwargs; keep CBR
+                # (the main fix) and rely on the per-frame oversize guard.
+                return nvc.CreateEncoder(out_w, out_h, "NV12", False, **base)
+
+        if _cancelled():
+            return
+        enc = _make_encoder()
+        if _cancelled():
+            return
+        last_src_idx = -1
+        max_pending_nv12_slots = max(0, int(config.PASSTHROUGH_NV12_RING_SLOTS) - 1)
+        active_budget = schedule[0] if schedule else int(per_frame_cap_bytes or 0)
+        applied = (active_budget, round(headroom, 3))
+        reconfigured = 0
+        emitted = 0                 # AUs handed out so far == frame index they map to
+        over_budget = 0
+        win_n = win_over = win_stuck = 0   # frames / overshoots in the current window
+        hr_logged = round(headroom, 2)
+
+        def _budget_for(idx: int) -> int:
+            if schedule and idx < len(schedule):
+                return schedule[idx]
+            return int(per_frame_cap_bytes or 0)
+
+        for i in range(target):
+            if _cancelled():
+                return
+            want = _budget_for(i)
+            if want > 0 and (want, round(headroom, 3)) != applied:
+                # Per-GOP budgets inherited from the source, plus whatever the
+                # headroom loop has settled on: retarget the running encoder
+                # instead of rebuilding it (a rebuild per GOP is what collapsed
+                # throughput before the persistent session).
+                new_bps, new_vbv = _rc_for_budget(want)
+                try:
+                    params = enc.GetEncodeReconfigureParams()
+                    params.averageBitrate = int(new_bps)
+                    params.maxBitRate = int(new_bps)
+                    params.vbvBufferSize = int(new_vbv)
+                    params.vbvInitialDelay = int(new_vbv)
+                    if enc.Reconfigure(params):
+                        active_budget = want
+                        applied = (want, round(headroom, 3))
+                        reconfigured += 1
+                    else:
+                        log.warning("PyNv frame stream reconfigure rejected at frame=%d budget=%d", i, want)
+                except Exception as exc:
+                    log.warning(
+                        "PyNv frame stream reconfigure failed at frame=%d budget=%d: %s: %s",
+                        i, want, type(exc).__name__, exc,
+                    )
+                    schedule = []       # stop retrying; stay on the initial rate
+                    hr_adapt = False
+            out_idx = start_out + i
+            src_idx = min(dec_len - 1, cfr_source_index(out_idx, source_fps, fps))
+            if src_idx <= last_src_idx:
+                src_idx = min(dec_len - 1, last_src_idx + 1)
+            last_src_idx = src_idx
+            frame = dec.frame_at(src_idx)
+            nv12_slot = None
+            if frame_stage is not None:
+                out_nv12 = frame_stage.process(frame, out_idx)
+            elif alpha_packer is not None:
+                if alpha_threaded_owned_copy:
+                    frame = frame.owned_copy()
+                if isinstance(frame, GpuP016Frame):
+                    out_nv12, _timing = alpha_packer.pack_gpu_p016_frame(
+                        frame,
+                        shift_bits=config.PASSTHROUGH_PYNV_10BIT_SHIFT,
+                        out_h=out_h,
+                        out_w=out_w,
+                    )
+                else:
+                    out_nv12, _timing = alpha_packer.pack_gpu_nv12_frame(
+                        frame,
+                        out_h=out_h,
+                        out_w=out_w,
+                    )
+            elif isinstance(frame, GpuP016Frame):
+                nv12_slot = matter.acquire_nv12_output_slot(out_h, out_w)
+                out_nv12, _timing = matter.composite_green_gpu_p016_frame_to_gpu_nv12_profile(
+                    frame,
+                    shift_bits=config.PASSTHROUGH_PYNV_10BIT_SHIFT,
+                    out_h=out_h,
+                    out_w=out_w,
+                    out_slot=nv12_slot,
+                )
+            else:
+                nv12_slot = matter.acquire_nv12_output_slot(out_h, out_w)
+                out_nv12, _timing = matter.composite_green_gpu_nv12_frame_to_gpu_nv12_profile(
+                    frame,
+                    out_h=out_h,
+                    out_w=out_w,
+                    out_slot=nv12_slot,
+                )
+            cuda_stream = getattr(matting_module, "_CUDA_STREAM", None)
+            if cuda_stream is not None:
+                cuda_stream.synchronize()
+            app_frame = GpuNv12AppFrame(out_nv12, out_w, out_h)
+            flags = 0
+            if i == 0:
+                flags = int(nvc.NV_ENC_PIC_FLAGS.FORCEIDR) | int(nvc.NV_ENC_PIC_FLAGS.OUTPUT_SPSPPS)
+            try:
+                bitstream = enc.Encode(app_frame, flags)
+            except Exception:
+                matter.release_nv12_output_slot(nv12_slot)
+                raise
+            if nv12_slot is not None:
+                pending_nv12_slots.append(nv12_slot)
+                nv12_slot = None
+                while len(pending_nv12_slots) > max_pending_nv12_slots:
+                    matter.release_nv12_output_slot(pending_nv12_slots.pop(0))
+            matter.release_nv12_output_slot(nv12_slot)
+            if bitstream:
+                for au in split_hevc_annexb_access_units(bitstream):
+                    if hr_adapt:
+                        b = _budget_for(emitted)
+                        if b > 0:
+                            win_n += 1
+                            if len(au) > b:
+                                over_budget += 1
+                                # Count it against the target only if the encoder
+                                # was still tracking that target. A frame several
+                                # times the target came out at the QP ceiling and
+                                # is as small as this content gets - lowering the
+                                # target cannot shrink it, it only starves the
+                                # frames that were complying. Measured: chasing
+                                # those drove the headroom down to 0.46 while the
+                                # overshoots continued regardless.
+                                if len(au) * 2 < b * headroom * 3:
+                                    win_over += 1
+                                else:
+                                    win_stuck += 1
+                            # Judge over a GOP, not a frame. One hard frame (a cut,
+                            # an IDR) is not evidence the whole run is over-driven,
+                            # and reacting to it dropped the rate below where a
+                            # fixed headroom would have sat. Two in one window is.
+                            if win_over >= 2 or win_n >= _HR_WINDOW:
+                                # Asymmetric on purpose: give ground quickly, take
+                                # it back slowly. The equilibrium is roughly one
+                                # over-budget frame in 300 - field evidence puts
+                                # 0.02% of frames truncated at "looks fine" and
+                                # 2.6% at "heavy blocking", so the target belongs
+                                # near the bottom of that range, not the middle.
+                                if win_over:
+                                    headroom = max(hr_min, headroom * 0.85)
+                                elif win_stuck:
+                                    pass      # budget-bound, not target-bound
+                                else:
+                                    headroom = min(hr_max, headroom * 1.04)
+                                win_n = win_over = win_stuck = 0
+                            if round(headroom, 2) != hr_logged:
+                                hr_logged = round(headroom, 2)
+                                log.info(
+                                    "PyNv frame stream headroom -> %.2f at frame=%d (over=%d)",
+                                    headroom, emitted, over_budget,
+                                )
+                    emitted += 1
+                    yield au
+        tail = enc.EndEncode()
+        if tail:
+            for au in split_hevc_annexb_access_units(tail):
+                yield au
+    finally:
+        while pending_nv12_slots:
+            matter.release_nv12_output_slot(pending_nv12_slots.pop(0))
+        if dec is not None:
+            try:
+                dec.stop()
+            except Exception:
+                pass
+        elif meta_dec is not None:
+            try:
+                meta_dec.stop()
+            except Exception:
+                pass
+        try:
+            gc.collect()
+        except Exception:
+            pass
+
+
+def build_passthrough_hevc_annexb_gop(
+    src: Path,
+    *,
+    start_sec: float,
+    frame_count: int,
+    matter: Matter,
+    metadata: VideoProbeMetadata | None = None,
+    output_mode: str = "green",
+    max_fps: float | None = None,
+    max_bytes: int = 0,
+    per_frame_cap_bytes: int = 0,
+) -> bytes:
+    """Build one seek-slot HEVC Annex-B GOP via the persistent frame generator.
+
+    Thin wrapper kept for the legacy ``slot`` backend: drains the per-frame
+    generator and concatenates. The realtime ``slot_frames`` filler uses the
+    generator directly so setup is amortized across the whole run.
+    """
+    out = bytearray()
+    for au in iter_pynv_passthrough_annexb_frames(
+        src,
+        start_sec=start_sec,
+        frame_count=frame_count,
+        matter=matter,
+        metadata=metadata,
+        output_mode=output_mode,
+        max_fps=max_fps,
+        per_frame_cap_bytes=per_frame_cap_bytes,
+    ):
+        out += au
+        if max_bytes > 0 and len(out) > int(max_bytes):
+            raise RuntimeError(f"slot PyNv GOP Annex-B oversize: {len(out)}>{int(max_bytes)}")
+    if not out:
+        raise RuntimeError("slot PyNv GOP Annex-B empty")
+    return bytes(out)
 
 
 def _mpegts_color_args(color_meta) -> list[str]:
@@ -2035,75 +2517,28 @@ class PyNvPassthroughStream:
             fps = float(timing.effective_fps(fps_cap))
             producer_pacing = bool(config.PASSTHROUGH_PRODUCER_REALTIME_PACING or fps_cap > 0)
             out_w, out_h = self.matter.pynv_scaled_size(info.width, info.height)
-            sr_bridge = None
-            sr_k_to_rgb = sr_k_to_nv12 = sr_k_hdr = None
-            sr_rgb = sr_rgba = sr_out_nv12 = None
-            sr_left_eye = sr_right_eye = sr_split_output = None
-            sr_split_eyes = False
-            sr_eye_in_w = sr_eye_out_w = 0
-            sr_out_nv12_ring = None
-            if self.output_mode == "superres":
-                from offline.two_dvr_pynv import _NV12_RGB_KERNELS
-                from pipeline.hdr_look import HDR_LOOK_CUDA, normalize_hdr_look
-                from utils.rtx_vsr import source_block_reason, target_dimensions
-                from utils.vr_naming import has_vr_filename_marker, is_half_equirectangular_source
-
-                sr_is_sbs_vr = is_half_equirectangular_source(info.width, info.height)
-                reason = source_block_reason(
-                    info.width,
-                    info.height,
-                    is_vr=has_vr_filename_marker(self.src.stem) or sr_is_sbs_vr,
-                    is_10bit=bool(bit_depth > 8),
-                    allow_vr=True,
-                )
-                if reason:
-                    raise RuntimeError(f"RTX VSR source rejected: {reason}")
-                out_w, out_h = target_dimensions(info.width, info.height)
-                sr_split_eyes = bool(
-                    sr_is_sbs_vr and int(config.RTX_VSR_TARGET_HEIGHT) >= 2160 and out_w == out_h * 2
-                )
-                if sr_split_eyes and info.width % 2:
-                    raise RuntimeError(f"split-eye RTX VSR requires even-width SBS input: {info.width}x{info.height}")
-                import cupy as cp
-
-                from utils.rtx_vsr import load_bridge
-
-                sr_bridge = load_bridge()
-                if not sr_bridge.initialize_cupy(cp):
-                    raise RuntimeError("RTX VSR feature unavailable")
-                sr_mod = cp.RawModule(code=_NV12_RGB_KERNELS + HDR_LOOK_CUDA)
-                sr_k_to_rgb = sr_mod.get_function("nv12_to_rgb")
-                sr_k_to_nv12 = sr_mod.get_function("rgba_to_nv12")
-                sr_hdr_mode = normalize_hdr_look(config.RTX_VSR_HDR_LOOK)
-                if sr_hdr_mode != "off":
-                    sr_k_hdr = sr_mod.get_function("hdr_look_rgba")
-                sr_rgb = cp.empty((info.height, info.width, 3), cp.uint8)
-                if sr_split_eyes:
-                    sr_eye_in_w = info.width // 2
-                    sr_eye_out_w = out_w // 2
-                    sr_left_eye = cp.empty((info.height, sr_eye_in_w, 4), cp.uint8)
-                    sr_right_eye = cp.empty((info.height, sr_eye_in_w, 4), cp.uint8)
-                    sr_split_output = cp.empty((out_h, out_w, 4), cp.uint8)
-                else:
-                    sr_rgba = cp.empty((info.height, info.width, 4), cp.uint8)
-                # NVENC may retain an input surface asynchronously after
-                # Encode() returns. Keep a ring of distinct surfaces instead
-                # of overwriting one buffer on the next frame.
-                sr_out_nv12_ring = [
-                    cp.empty((out_h * 3 // 2, out_w), cp.uint8)
-                    for _ in range(2 if out_w >= 8192 else max(1, int(config.PASSTHROUGH_NV12_RING_SLOTS)))
-                ]
-                log.info(
-                    "[PYNV][%d] RTX VSR active source=%dx%d output=%dx%d quality=%d hdr_look=%s split_eyes=%s",
-                    self.sid, info.width, info.height, out_w, out_h, config.RTX_VSR_QUALITY, sr_hdr_mode,
-                    f"{sr_eye_out_w}x{out_h}+{sr_eye_out_w}x{out_h}" if sr_split_eyes else "off",
-                )
+            frame_stage = make_frame_stage(
+                self.output_mode,
+                width=info.width,
+                height=info.height,
+                source_stem=self.src.stem,
+                is_10bit=bool(bit_depth > 8),
+                source_fps=source_fps,
+                logger=log,
+                label=f"[PYNV][{self.sid}]",
+            )
+            if frame_stage is not None:
+                out_w, out_h = frame_stage.output_size
             alpha_projection_mode = ""
+            alpha_src_fov = 0.0
             alpha_process_w, alpha_process_h = out_w, out_h
             if self.output_mode == "alpha":
-                from pipeline.alpha_packer import AlphaPacker, alpha_output_size
+                from pipeline.alpha_packer import AlphaPacker, alpha_output_size, alpha_src_fisheye_fov
 
-                alpha_projection_mode = AlphaPacker.projection_mode_static(alpha_process_w, alpha_process_h)
+                alpha_src_fov = alpha_src_fisheye_fov(self.src.stem)
+                alpha_projection_mode = AlphaPacker.projection_mode_static(
+                    alpha_process_w, alpha_process_h, alpha_src_fov
+                )
                 out_w, out_h = alpha_output_size(alpha_process_w, alpha_process_h)
             self.output_fps = fps
             if not timing.is_cfr:
@@ -2295,10 +2730,10 @@ class PyNvPassthroughStream:
             if self.output_mode == "alpha":
                 from pipeline.alpha_packer import AlphaPacker, alpha_2d_disparity_px
 
-                alpha_packer = AlphaPacker(self.matter)
+                alpha_packer = AlphaPacker(self.matter, src_fisheye_fov=alpha_src_fov)
                 alpha_2d_disparity = alpha_2d_disparity_px(out_w)
                 log.info(
-                    "[PYNV][%d] alpha passthrough active: projection=%s process=%dx%d output=%dx%d scale=%.3f radius=%.3f layout=alpha-packer-6block flat2d_fov=%.1f flat2d_distance=%.2fm flat2d_disparity=%.1fpx",
+                    "[PYNV][%d] alpha passthrough active: projection=%s process=%dx%d output=%dx%d scale=%.3f radius=%.3f layout=alpha-packer-6block src_fisheye_fov=%.1f src_fit=%s src_radial=%.4f flat2d_fov=%.1f flat2d_distance=%.2fm flat2d_disparity=%.1fpx",
                     self.sid,
                     alpha_projection_mode or alpha_packer.projection_mode(alpha_process_w, alpha_process_h),
                     alpha_process_w,
@@ -2307,6 +2742,9 @@ class PyNvPassthroughStream:
                     out_h,
                     alpha_packer.scale,
                     alpha_packer.radius_scale,
+                    alpha_packer.src_fisheye_fov,
+                    config.ALPHA_SRC_FIT,
+                    alpha_packer.src_radial_scale,
                     config.ALPHA_2D_FOV,
                     config.ALPHA_2D_DISTANCE_M,
                     alpha_2d_disparity,
@@ -2466,43 +2904,8 @@ class PyNvPassthroughStream:
                 if self._stop.is_set():
                     break
                 nv12_slot = None
-                if self.output_mode == "superres":
-                    assert sr_bridge is not None and sr_k_to_rgb is not None and sr_k_to_nv12 is not None
-                    assert sr_rgb is not None and sr_out_nv12_ring is not None
-                    if isinstance(frame, GpuP016Frame):
-                        raise RuntimeError("RTX VSR realtime currently requires 8-bit NV12 input")
-                    import cupy as cp
-
-                    y = frame.y.as_cupy(cp.uint8).reshape(info.height, info.width)
-                    uv = frame.uv.as_cupy(cp.uint8).reshape(info.height // 2, info.width)
-                    block = (16, 16, 1)
-                    grid = ((info.width + 15) // 16, (info.height + 15) // 16, 1)
-                    sr_k_to_rgb(grid, block, (y, uv, sr_rgb, info.width, info.height))
-                    if sr_split_eyes:
-                        assert sr_left_eye is not None and sr_right_eye is not None and sr_split_output is not None
-                        sr_left_eye[:, :, :3] = sr_rgb[:, :sr_eye_in_w]
-                        sr_left_eye[:, :, 3] = 255
-                        sr_right_eye[:, :, :3] = sr_rgb[:, sr_eye_in_w:]
-                        sr_right_eye[:, :, 3] = 255
-                        sr_split_output[:, :sr_eye_out_w] = sr_bridge.process_cupy_rgba(
-                            sr_left_eye, (sr_eye_out_w, out_h), config.RTX_VSR_QUALITY,
-                        )
-                        sr_split_output[:, sr_eye_out_w:] = sr_bridge.process_cupy_rgba(
-                            sr_right_eye, (sr_eye_out_w, out_h), config.RTX_VSR_QUALITY,
-                        )
-                        sr_out = sr_split_output
-                    else:
-                        assert sr_rgba is not None
-                        sr_rgba[:, :, :3] = sr_rgb
-                        sr_rgba[:, :, 3] = 255
-                        sr_out = sr_bridge.process_cupy_rgba(sr_rgba, (out_w, out_h), config.RTX_VSR_QUALITY)
-                    if sr_k_hdr is not None:
-                        from pipeline.hdr_look import apply_hdr_look
-                        apply_hdr_look(sr_k_hdr, sr_out, config.RTX_VSR_HDR_LOOK)
-                    grid_out = ((out_w + 15) // 16, (out_h + 15) // 16, 1)
-                    sr_out_nv12 = sr_out_nv12_ring[out_idx % len(sr_out_nv12_ring)]
-                    sr_k_to_nv12(grid_out, block, (sr_out, sr_out_nv12, out_w, out_h))
-                    out_nv12, timing = sr_out_nv12, None
+                if frame_stage is not None:
+                    out_nv12, timing = frame_stage.process(frame, out_idx), None
                 elif alpha_packer is not None:
                     if alpha_threaded_owned_copy:
                         frame = frame.owned_copy()

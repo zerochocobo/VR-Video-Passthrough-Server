@@ -13,6 +13,7 @@ import numpy as np
 import config
 from pipeline.light_match import LIGHT_MATCH_DEVICE_SRC
 from utils.logger import get
+from utils.vr_naming import parse_fisheye_fov
 
 log = get("alpha_packer")
 
@@ -36,6 +37,35 @@ def alpha_2d_disparity_px(output_w: int) -> float:
 
 def is_sbs_vr_size(w: int, h: int) -> bool:
     return int(w) > 0 and int(h) > 0 and int(w) >= 2 * int(h)
+
+
+def alpha_src_fisheye_fov(stem_or_name: str = "") -> float:
+    """Return the source lens FOV alpha packing should assume, 0 if not fisheye.
+
+    Only the filename can answer this: a 180, 190 or 200 degree circle fills the
+    same inscribed circle, so the frame's shape and pixels look identical.
+    """
+    if str(config.ALPHA_SRC_FISHEYE).strip().lower() in {"0", "off", "no", "false"}:
+        return 0.0
+    forced = float(config.ALPHA_SRC_FOV or 0.0)
+    if forced > 0.0:
+        return forced
+    return float(parse_fisheye_fov(stem_or_name or ""))
+
+
+def fisheye_src_radial_scale(src_fov: float, radius_scale: float = FISHEYE_RADIUS_SCALE) -> float:
+    """Output radius -> source radius factor for a fisheye source.
+
+    ``fit`` maps the whole source circle onto the output circle: nothing is cut,
+    and the player's F180 mesh compresses angles by (fov-180)/2 at the rim.
+    ``crop`` keeps angles exact by sampling only the source's inner 180 degrees.
+    With a 180 degree source both are 1.0, i.e. a straight copy.
+    """
+    fov = max(0.0, float(src_fov or 0.0))
+    scale = float(config.ALPHA_SRC_RADIUS_SCALE) / max(1e-6, float(radius_scale))
+    if str(config.ALPHA_SRC_FIT).strip().lower() == "crop" and fov > 180.0:
+        scale *= 180.0 / fov
+    return scale
 
 
 def alpha_output_size(src_w: int, src_h: int) -> tuple[int, int]:
@@ -142,6 +172,38 @@ class AlphaPacker:
         float src_theta = asinf(dir_y) / 1.5707963267948966f;
         float u = (0.5f * src_phi + 0.5f) * (float)(eye_w - 1);
         float v = (0.5f * src_theta + 0.5f) * (float)(out_h - 1);
+        u = u < 0.f ? 0.f : (u > (float)(eye_w - 1) ? (float)(eye_w - 1) : u);
+        v = v < 0.f ? 0.f : (v > (float)(out_h - 1) ? (float)(out_h - 1) : v);
+        *src_x = u + (float)(eye * eye_w);
+        *src_y = v;
+        return true;
+    }
+
+    // Fisheye source -> fisheye output: both circles are concentric and both
+    // are equidistant, so the whole mapping is one radial scale about the eye
+    // centre. src_radial_scale == 1 makes this an exact copy.
+    __device__ bool fisheye_src_to_src(
+        int x, int y,
+        int out_w, int out_h,
+        float radius_scale,
+        float src_radial_scale,
+        float* src_x,
+        float* src_y
+    ) {
+        int eye_w = out_w >> 1;
+        int eye = x >= eye_w ? 1 : 0;
+        float fx = (float)(x - eye * eye_w);
+        float fy = (float)y;
+        float cx = ((float)eye_w - 1.f) * 0.5f;
+        float cy = ((float)out_h - 1.f) * 0.5f;
+        float radius = fminf((float)eye_w, (float)out_h) * 0.5f * radius_scale;
+        float nx = (fx - cx) / radius;
+        float ny = (fy - cy) / radius;
+        if (nx * nx + ny * ny > 1.f) {
+            return false;
+        }
+        float u = cx + (fx - cx) * src_radial_scale;
+        float v = cy + (fy - cy) * src_radial_scale;
         u = u < 0.f ? 0.f : (u > (float)(eye_w - 1) ? (float)(eye_w - 1) : u);
         v = v < 0.f ? 0.f : (v > (float)(out_h - 1) ? (float)(out_h - 1) : v);
         *src_x = u + (float)(eye * eye_w);
@@ -421,6 +483,60 @@ class AlphaPacker:
     }
 
     extern "C" __global__
+    void project_fisheye_src_nv12_alpha(
+        const unsigned char* __restrict__ src_nv12,
+        const float* __restrict__ alpha_lr,
+        int out_w, int out_h,
+        int aw, int ah,
+        float radius_scale,
+        float src_radial_scale,
+        float alpha_cutoff, int alpha_hard_edge, float alpha_contrast,
+        unsigned char* __restrict__ out_nv12,
+        unsigned char* __restrict__ fisheye_alpha,
+        const float* __restrict__ light_coeffs,
+        const unsigned char* __restrict__ light_gamma_lut,
+        int light_identity
+    ) {
+        int x = blockIdx.x * blockDim.x + threadIdx.x;
+        int y = blockIdx.y * blockDim.y + threadIdx.y;
+        if (x >= out_w || y >= out_h) return;
+
+        int y_idx = y * out_w + x;
+        float src_x = 0.f;
+        float src_y = 0.f;
+        bool inside = fisheye_src_to_src(x, y, out_w, out_h, radius_scale, src_radial_scale, &src_x, &src_y);
+        unsigned char yv = inside ? sample_y_bilinear(src_nv12, out_w, out_h, src_x, src_y) : (unsigned char)16;
+        unsigned char uv_u = 128;
+        unsigned char uv_v = 128;
+        if (inside) {
+            sample_uv_nearest(src_nv12, out_w, out_h, src_x, src_y, &uv_u, &uv_v);
+            float yy = (float)yv;
+            float uu = (float)uv_u;
+            float vv = (float)uv_v;
+            apply_light_match(&yy, &uu, &vv, light_coeffs, light_gamma_lut, light_identity);
+            yv = (unsigned char)(yy + 0.5f);
+            uv_u = (unsigned char)(uu + 0.5f);
+            uv_v = (unsigned char)(vv + 0.5f);
+        }
+        out_nv12[y_idx] = yv;
+
+        float a = 0.f;
+        if (inside) {
+            a = adjust_alpha(
+                sample_alpha_lr(alpha_lr, aw, ah, out_w, out_h, (int)src_x, (int)src_y),
+                alpha_cutoff, alpha_hard_edge, alpha_contrast
+            );
+        }
+        fisheye_alpha[y_idx] = (unsigned char)(a * 255.f + 0.5f);
+
+        if (((x | y) & 1) == 0) {
+            int uv_idx = out_w * out_h + (y >> 1) * out_w + x;
+            out_nv12[uv_idx] = uv_u;
+            out_nv12[uv_idx + 1] = uv_v;
+        }
+    }
+
+    extern "C" __global__
     void project_flat2d_fisheye_nv12_alpha(
         const unsigned char* __restrict__ src_nv12,
         const float* __restrict__ alpha_lr,
@@ -543,6 +659,8 @@ class AlphaPacker:
         int out_w, int out_h,
         int alpha_w, int alpha_h,
         float radius_scale,
+        int fisheye_src_mode,
+        float src_radial_scale,
         const unsigned char* __restrict__ rgba,
         int overlay_w, int overlay_h,
         int dst_x, int dst_y
@@ -554,7 +672,10 @@ class AlphaPacker:
 
         float src_x = 0.f;
         float src_y = 0.f;
-        if (!fisheye_to_half_equirect(x, y, out_w, out_h, radius_scale, &src_x, &src_y)) return;
+        bool mapped = fisheye_src_mode
+            ? fisheye_src_to_src(x, y, out_w, out_h, radius_scale, src_radial_scale, &src_x, &src_y)
+            : fisheye_to_half_equirect(x, y, out_w, out_h, radius_scale, &src_x, &src_y);
+        if (!mapped) return;
         float ox_f = src_x - (float)dst_x;
         float oy_f = src_y - (float)dst_y;
         int ox = (int)floorf(ox_f + 0.5f);
@@ -637,6 +758,7 @@ class AlphaPacker:
         alpha_cutoff: float | None = None,
         alpha_hard_edge: bool | None = None,
         alpha_contrast: float | None = None,
+        src_fisheye_fov: float = 0.0,
     ) -> None:
         import cupy as cp
 
@@ -645,6 +767,8 @@ class AlphaPacker:
         self.blocks_x = int(blocks_x)
         self.blocks_y = int(blocks_y)
         self.radius_scale = float(radius_scale)
+        self.src_fisheye_fov = max(0.0, float(src_fisheye_fov or 0.0))
+        self.src_radial_scale = fisheye_src_radial_scale(self.src_fisheye_fov, self.radius_scale)
         self.alpha_cutoff = config.ALPHA_CUTOFF if alpha_cutoff is None else float(alpha_cutoff)
         self.alpha_hard_edge = config.ALPHA_HARD_EDGE if alpha_hard_edge is None else bool(alpha_hard_edge)
         self.alpha_contrast = config.ALPHA_CONTRAST if alpha_contrast is None else float(alpha_contrast)
@@ -652,6 +776,7 @@ class AlphaPacker:
         self._project_kernel = cp.RawKernel(self._KERNEL_SRC, "project_fisheye_nv12_alpha")
         self._project_flat2d_kernel = cp.RawKernel(self._KERNEL_SRC, "project_flat2d_fisheye_nv12_alpha")
         self._project_flat3d_kernel = cp.RawKernel(self._KERNEL_SRC, "project_flat2d_3d_nv12_alpha")
+        self._project_fisheye_src_kernel = cp.RawKernel(self._KERNEL_SRC, "project_fisheye_src_nv12_alpha")
         self._overlay_kernel = cp.RawKernel(self._KERNEL_SRC, "overlay_alpha_packer_layout")
         self._blend_projected_overlay_kernel = cp.RawKernel(self._KERNEL_SRC, "blend_projected_overlay_to_fisheye")
         self._g_alpha = None
@@ -662,7 +787,11 @@ class AlphaPacker:
         return alpha_output_size(src_w, src_h)
 
     @staticmethod
-    def projection_mode_static(src_w: int, src_h: int) -> str:
+    def projection_mode_static(src_w: int, src_h: int, src_fisheye_fov: float = 0.0) -> str:
+        # A dual-fisheye SBS frame has the same 2:1 shape as a half-equirect SBS
+        # one, so only the caller's filename-derived FOV can separate them.
+        if float(src_fisheye_fov or 0.0) > 0.0 and is_sbs_vr_size(src_w, src_h):
+            return "fisheye_src"
         if is_sbs_vr_size(src_w, src_h) or not config.ALPHA_2D_ENABLE:
             return "sbs_half_equirect"
         if str(config.ALPHA_2D_PROJECTION).lower() == "flat3d":
@@ -670,7 +799,7 @@ class AlphaPacker:
         return "flat2d_fisheye"
 
     def projection_mode(self, src_w: int, src_h: int) -> str:
-        return self.projection_mode_static(src_w, src_h)
+        return self.projection_mode_static(src_w, src_h, getattr(self, "src_fisheye_fov", 0.0))
 
     def _blend_one_projected_subtitle(self, out_nv12, h: int, w: int, alpha_w: int, alpha_h: int, subtitle_overlay) -> None:
         cp = self._cp
@@ -694,6 +823,8 @@ class AlphaPacker:
                 np.int32(alpha_w),
                 np.int32(alpha_h),
                 np.float32(self.radius_scale),
+                np.int32(1 if getattr(self, "src_fisheye_fov", 0.0) > 0.0 else 0),
+                np.float32(getattr(self, "src_radial_scale", 1.0)),
                 self._g_overlay,
                 np.int32(overlay_w),
                 np.int32(overlay_h),
@@ -754,7 +885,33 @@ class AlphaPacker:
         else:
             log.warning("Matter.light_match_kernel_args unavailable; alpha packer disables light matching")
             light_coeffs, light_gamma_lut, light_identity = None, None, np.int32(1)
-        if projection_mode == "flat2d_fisheye":
+        if projection_mode == "fisheye_src" and not hasattr(self, "_project_fisheye_src_kernel"):
+            log.warning("alpha packer fisheye-source kernel unavailable; falling back to the half-equirect projection")
+            projection_mode = "sbs_half_equirect"
+        if projection_mode == "fisheye_src":
+            self._project_fisheye_src_kernel(
+                grid,
+                block,
+                (
+                    self.matter._g_frame,
+                    alpha_dev,
+                    np.int32(out_w),
+                    np.int32(out_h),
+                    np.int32(aw),
+                    np.int32(ah),
+                    np.float32(self.radius_scale),
+                    np.float32(self.src_radial_scale),
+                    np.float32(self.alpha_cutoff),
+                    np.int32(1 if self.alpha_hard_edge else 0),
+                    np.float32(self.alpha_contrast),
+                    out_nv12,
+                    self._g_fisheye_alpha,
+                    light_coeffs,
+                    light_gamma_lut,
+                    light_identity,
+                ),
+            )
+        elif projection_mode == "flat2d_fisheye":
             self._project_flat2d_kernel(
                 grid,
                 block,

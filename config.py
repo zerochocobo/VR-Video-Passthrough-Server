@@ -11,6 +11,7 @@ client-specific A/B tests.
 from __future__ import annotations
 
 import os
+import re
 import socket
 import sys
 from pathlib import Path
@@ -45,10 +46,31 @@ RTX_VSR_OFFLINE_PYNV_ENABLED = _env("RTX_VSR_OFFLINE_PYNV_ENABLE", "1") == "1"
 RTX_VSR_QUALITY = max(0, min(4, int(_env("RTX_VSR_QUALITY", 2))))
 RTX_VSR_INPUT_MIN_HEIGHT = max(1, int(_env("RTX_VSR_INPUT_MIN_HEIGHT", 360)))
 RTX_VSR_INPUT_MAX_HEIGHT = max(RTX_VSR_INPUT_MIN_HEIGHT, int(_env("RTX_VSR_INPUT_MAX_HEIGHT", 1440)))
-RTX_VSR_TARGET_HEIGHT = max(2, int(_env("RTX_VSR_TARGET_HEIGHT", 4096)))
+# 0 selects native 1x enhancement: VSR runs at the source resolution.
+_RTX_VSR_TARGET_HEIGHT_RAW = int(_env("RTX_VSR_TARGET_HEIGHT", 0))
+RTX_VSR_TARGET_HEIGHT = 0 if _RTX_VSR_TARGET_HEIGHT_RAW <= 0 else max(2, _RTX_VSR_TARGET_HEIGHT_RAW)
+# Native 1x costs roughly what the source resolution costs, so it has its
+# own input ceiling instead of the upscale input policy.
+RTX_VSR_NATIVE_MAX_HEIGHT = max(
+    RTX_VSR_INPUT_MIN_HEIGHT, int(_env("RTX_VSR_NATIVE_MAX_HEIGHT", 4096))
+)
 RTX_VSR_HDR_LOOK = str(_env("RTX_VSR_HDR_LOOK", "natural")).strip().lower()
-if RTX_VSR_HDR_LOOK not in {"off", "natural", "vivid"}:
+if RTX_VSR_HDR_LOOK not in {"off", "natural", "vivid", "truehdr"}:
     RTX_VSR_HDR_LOOK = "natural"
+# NGX TrueHDR (SDR -> HDR10) evaluation controls. Ranges come from
+# nvsdk_ngx_defs_truehdr.h and are clamped there as well.
+RTX_VSR_TRUEHDR_CONTRAST = max(0, min(200, int(_env("RTX_VSR_TRUEHDR_CONTRAST", 100))))
+RTX_VSR_TRUEHDR_SATURATION = max(0, min(200, int(_env("RTX_VSR_TRUEHDR_SATURATION", 100))))
+RTX_VSR_TRUEHDR_MIDDLE_GRAY = max(10, min(100, int(_env("RTX_VSR_TRUEHDR_MIDDLE_GRAY", 50))))
+RTX_VSR_TRUEHDR_MAX_NITS = max(400, min(2000, int(_env("RTX_VSR_TRUEHDR_MAX_NITS", 1000))))
+# PT_RTX_VSR_SEEK_ALLOW_UPSCALE:
+#   The virtual-file (seek) route is pulled at the real frame rate, so the
+#   stage has to keep up with playback. Measured on an RTX 5060 Ti at
+#   quality 3: native 1x runs 75 FPS on 2D and 30 FPS on 4K VR, while 6K/8K
+#   VR sit at 25-27 FPS - below a 60 fps title. Seek therefore falls back to
+#   native 1x instead of enlarging. Set 1 to keep the configured target and
+#   accept whatever the GPU delivers.
+RTX_VSR_SEEK_ALLOW_UPSCALE = _env("RTX_VSR_SEEK_ALLOW_UPSCALE", "0") == "1"
 RTX_VSR_PREFIX = str(_env("RTX_VSR_PREFIX", "[SuperRes]")).strip() or "[SuperRes]"
 RTX_VSR_FALLBACK = str(_env("RTX_VSR_FALLBACK", "passthrough")).strip().lower()
 if RTX_VSR_FALLBACK not in {"passthrough", "error"}:
@@ -57,6 +79,75 @@ if RTX_VSR_FALLBACK not in {"passthrough", "error"}:
 # to stall the media worker indefinitely.  The preflight runs in a child
 # process and is terminated after this timeout.
 RTX_VSR_EVALUATE_TIMEOUT_SEC = max(5, float(_env("RTX_VSR_EVALUATE_TIMEOUT_SEC", 45)))
+
+# ---- NVIDIA DLSS 5 Neural Rendering (NR) ----
+# The neutral value of each Neural Rendering control is the one the runtime
+# itself treats as "no adjustment", and several of them are 1.0 rather than 0.0
+# - Skin Structure Strength's is -1.0. Zero-initialising the block looked
+# harmless and was not: it asked for no colour work at all, and a skin
+# structure of 0.0 reads as a deliberate adjustment (which is why the value is
+# what decides whether the automatic mask is needed).
+DLSS5_ENABLED = _env("DLSS5_ENABLE", "1") == "1"
+DLSS5_STYLE = int(_env("DLSS5_STYLE", 0))              # 0 default, 1 natural, 2 cinematic
+DLSS5_INTENSITY = float(_env("DLSS5_INTENSITY", 1.0))              # 0.00 - 2.00
+DLSS5_LOCAL_TONE = float(_env("DLSS5_LOCAL_TONE", 1.0))            # 0.00 - 2.00
+DLSS5_LOCAL_STRUCTURE = float(_env("DLSS5_LOCAL_STRUCTURE", 1.0))  # 0.00 - 2.00
+DLSS5_SKIN_STRUCTURE = float(_env("DLSS5_SKIN_STRUCTURE", -1.0))   # -1.00 - 2.00, native -1
+DLSS5_AUTO_MASK = _env("DLSS5_AUTO_MASK", "0") == "1"
+DLSS5_COLOR_STRENGTH = float(_env("DLSS5_COLOR_STRENGTH", 1.0))    # 0.00 - 1.00
+DLSS5_TONE_PRESERVATION = float(_env("DLSS5_TONE_PRESERVATION", 0.0))      # 0.00 - 1.00
+DLSS5_FACE_SKIN_PROTECTION = float(_env("DLSS5_FACE_SKIN_PROTECTION", 0.0))  # 0.00 - 1.00
+DLSS5_GRAIN_PRESERVATION = float(_env("DLSS5_GRAIN_PRESERVATION", 0.0))      # 0.00 - 1.00
+DLSS5_NR_PASSES = max(1, min(4, int(_env("DLSS5_NR_PASSES", 1))))           # 1 - 4
+# Temporal stabilisation, and the engine applies it itself on the CUDA path we
+# use. It is a moving-picture control, so video defaults it on.
+DLSS5_SHIMMER_SUPPRESSION = float(_env("DLSS5_SHIMMER_SUPPRESSION", 0.70))  # 0.00 - 1.00
+DLSS5_PREFER_NVOF = _env("DLSS5_PREFER_NVOF", "0") == "1"
+DLSS5_PREFIX = str(_env("DLSS5_PREFIX", "[DLSS5]")).strip() or "[DLSS5]"
+DLSS5_REALTIME_ENABLED = _env("DLSS5_REALTIME_ENABLE", "0") == "1"
+# Measured NR cost per frame on an RTX 5060 Ti, stage only (no decode/encode):
+# 1080p 10.0ms (100fps), 2.5K 18.0ms (55fps), 4K 2D 34.4ms (29fps),
+# 4K VR 3840x1920 30.4ms (33fps), 6K VR 69.9ms (14fps), 8K VR 127.4ms (8fps).
+# Decode and NVENC share the same GPU, so the realtime channel stops where the
+# stage alone still has headroom: 4K (2160 tall, or a 4096-wide VR pair) is the
+# last size that plays, and 6K/8K are offline-only.
+DLSS5_INPUT_MIN_HEIGHT = max(1, int(_env("DLSS5_INPUT_MIN_HEIGHT", 360)))
+DLSS5_INPUT_MAX_HEIGHT = max(DLSS5_INPUT_MIN_HEIGHT, int(_env("DLSS5_INPUT_MAX_HEIGHT", 2160)))
+DLSS5_INPUT_MAX_WIDTH = max(2, int(_env("DLSS5_INPUT_MAX_WIDTH", 4096)))
+# A resolution ceiling alone is not the whole answer: 4K at 24fps plays and the
+# same 4K at 60fps does not. Measured end to end (decode + NR + NVENC) on an
+# RTX 5060 Ti the chain sustains about 230 Mpixel/s - 78fps at 1216x2160,
+# 31.9fps at 3840x1920, 28.3fps at 3840x2160 - so the listing asks for
+# width*height*fps under this budget.
+#
+# The budget covers the 4K VR shape the library actually holds, 4096x2048,
+# which at 30fps asks for 252 Mpixel/s. That is above the measured rate: the
+# same pixel count (3840x2160) ran 28.3fps, so a 30fps title of that size is
+# expected to run a few percent short and the player takes up the slack. It is
+# offered anyway, because a 4K VR channel that lists no 4K VR title is worth
+# less than one that runs slightly under speed. 60fps at that size (503) stays
+# out - that is not a few percent, it is half.
+#
+# A faster or slower GPU moves this number; it is one env var. Lower it to
+# 230_000_000 to offer only what the measurements sustain outright (3840x1920
+# at 30fps and below).
+DLSS5_REALTIME_PIXEL_RATE = max(0, int(_env("DLSS5_REALTIME_PIXEL_RATE", 260_000_000)))
+
+# PT_DLSS5_SEEK_SOURCE_MULTIPLIER:
+#   PASSTHROUGH_HEVC_SOURCE_MAX_MULTIPLIER, but for the [DLSS5] virtual file.
+#
+#   That multiplier answers "how much more than the source does this output
+#   need", and every other mode changes the picture enough to want 2x or more:
+#   green re-encodes a composited frame, alpha packs SBS plus a matte, 2D->VR
+#   asks projection_capped_bitrate for 3x/4x. Neural Rendering is the one mode
+#   that is 1:1 with its source - same resolution, same content, denoised and
+#   sharpened - so it wants the source's own level, not twice it.
+#
+#   At 2x a 20 Mbps 4K VR source was laid out at 53 Mbps (2x, then /0.75 for the
+#   VMP4 filler) and those filler bytes are really sent, so it was bandwidth
+#   spent on nothing. 8K never showed it: an 8K source sits at or above the 50M
+#   cap already, so the multiplier does not bind there.
+DLSS5_SEEK_SOURCE_MULTIPLIER = max(0.1, float(_env("DLSS5_SEEK_SOURCE_MULTIPLIER", "1.0")))
 
 
 def _rgb_hex(value: str, default: str = "000000") -> tuple[int, int, int]:
@@ -579,6 +670,36 @@ ALPHA_2D_FLAT3D_SAFE_H = max(0.01, min(1.0, float(_env("ALPHA_2D_FLAT3D_SAFE_H",
 #   more parallax. Runtime code converts this to pixels using the same IPD
 #   formula as subtitles and the current output eye width.
 ALPHA_2D_DISTANCE_M = max(0.1, float(_env("ALPHA_2D_DISTANCE_M", 4.0)))
+
+# PT_ALPHA_SRC_FISHEYE:
+#   auto reads the source's own projection from its filename markers
+#   (_fisheye190, MKX200, VRCA220, RF52, _f180) and, for a fisheye source,
+#   keeps the picture in fisheye instead of re-projecting it as if it were
+#   half-equirectangular. off restores the pre-fisheye behaviour.
+#   Size cannot decide this: a dual-fisheye SBS frame and a half-equirect SBS
+#   frame have exactly the same 2:1 shape.
+ALPHA_SRC_FISHEYE = _env("ALPHA_SRC_FISHEYE", "auto").strip().lower()
+
+# PT_ALPHA_SRC_FOV:
+#   Override the source lens FOV in degrees. 0 takes it from the filename
+#   marker (and treats an unmarked source as non-fisheye).
+ALPHA_SRC_FOV = max(0.0, float(_env("ALPHA_SRC_FOV", 0.0)))
+
+# PT_ALPHA_SRC_FIT:
+#   How a source wider than the 180-degree output mesh is placed in the frame.
+#     fit  - keep the whole circle; the player renders it on its F180 mesh, so
+#            angles are compressed by (fov-180)/2 at the rim (5 deg for a 190
+#            lens). Nothing is cut, and with fov=180 this is a pure copy.
+#     crop - keep angles exact and drop the ring beyond 180 degrees.
+ALPHA_SRC_FIT = _env("ALPHA_SRC_FIT", "fit").strip().lower()
+if ALPHA_SRC_FIT not in {"fit", "crop"}:
+    ALPHA_SRC_FIT = "fit"
+
+# PT_ALPHA_SRC_RADIUS_SCALE:
+#   Radius of the source's fisheye circle relative to the inscribed circle of
+#   one eye. 1.0 is the usual "circle touches all four edges" framing; lower it
+#   only for a source that letterboxes its circle.
+ALPHA_SRC_RADIUS_SCALE = max(0.1, min(2.0, float(_env("ALPHA_SRC_RADIUS_SCALE", 1.0))))
 
 # PT_TWO_DVR_MODEL:
 #   DA3 depth model preset for 2D->3D: base/small (518) or base_hd/small_hd (1036).
@@ -1720,16 +1841,22 @@ PASSTHROUGH_SEEK_MODE = _env("SEEK_MODE", "bytes").lower()
 
 # PT_PASSTHROUGH_SEEK_ENABLED:
 #   Master switch for the experimental seekable passthrough endpoint
-#   `/passthrough_seek`. Default 0 keeps the existing `/passthrough_live`
-#   behavior untouched. When this is 0, direct/manual `/passthrough_seek` URLs
-#   are rejected even if DLNA exposure is enabled.
+#   `/passthrough_seek`. Default 1 exposes the VMP4 cache-file test path for
+#   GUI-started service testing. When this is 0, direct/manual
+#   `/passthrough_seek` URLs are rejected even if DLNA exposure is enabled.
 PASSTHROUGH_SEEK_ENABLED = _env("PASSTHROUGH_SEEK_ENABLED", "0") == "1"
 
 # PT_PASSTHROUGH_SEEK_DLNA:
-#   1 adds seekable passthrough entries to DLNA Browse while keeping the
-#   existing live/chapter fallback items visible. This is only an advertisement
-#   switch: it does not by itself enable the HTTP route. Keep it 0 for
-#   hidden/manual URL testing while PT_PASSTHROUGH_SEEK_ENABLED=1.
+#   1 exposes the seekable entry for a mode INSTEAD OF its live/chapter entry;
+#   0 exposes the live entry. Never both: offering the same mode twice makes the
+#   viewer guess which one is draggable, and the two even differ in shape (live
+#   is a chapter container, seek a single file).
+#   Only green and alpha have a seek form - every other mode keeps its live entry
+#   whatever this is set to, because the frames backend answers them with 409.
+#   This is only an advertisement switch: it does not by itself enable the HTTP
+#   route (see PT_PASSTHROUGH_SEEK_ENABLED).
+#   Note 0 is the safe setting for a client that cannot handle the seek entry:
+#   with 1 there is no live fallback listed for green/alpha.
 PASSTHROUGH_SEEK_DLNA = _env("PASSTHROUGH_SEEK_DLNA", "0") == "1"
 
 # PT_PASSTHROUGH_SEEK_ROUTE_POLICY:
@@ -1737,7 +1864,8 @@ PASSTHROUGH_SEEK_DLNA = _env("PASSTHROUGH_SEEK_DLNA", "0") == "1"
 #     profile - allow only route profiles listed in PT_PASSTHROUGH_SEEK_PROFILES.
 #     all     - allow every client while the master switch is on.
 #     off     - reject even when the master switch is on.
-#   Aliases: auto/manual/list are treated as profile.
+#   Aliases: auto/manual/list are treated as profile. Default all keeps the
+#   VMP4 route reachable from VR players whose profile is still being tested.
 PASSTHROUGH_SEEK_ROUTE_POLICY = _env("PASSTHROUGH_SEEK_ROUTE_POLICY", "profile").lower()
 if PASSTHROUGH_SEEK_ROUTE_POLICY in {"auto", "manual", "list"}:
     PASSTHROUGH_SEEK_ROUTE_POLICY = "profile"
@@ -1759,9 +1887,536 @@ PASSTHROUGH_SEEK_PROFILES = tuple(
 #     mpegts - current default; true MPEG-TS bytes with byte-range mapping.
 #     mp4    - true fragmented MP4 experiment for clients that refuse TS VOD.
 #   Do not fake this with only headers: the body container must match.
-PASSTHROUGH_SEEK_CONTAINER = _env("PASSTHROUGH_SEEK_CONTAINER", "mpegts").lower()
+PASSTHROUGH_SEEK_CONTAINER = _env("PASSTHROUGH_SEEK_CONTAINER", "mp4").lower()
 if PASSTHROUGH_SEEK_CONTAINER not in {"mpegts", "mp4"}:
     PASSTHROUGH_SEEK_CONTAINER = "mpegts"
+
+# PT_PASSTHROUGH_SEEK_VMP4:
+#   Direct `/passthrough_seek` VMP4 rework switch. When enabled, the seek route
+#   advertises a source-size, source-duration MP4 resource and emits VMP4
+#   diagnostics. The current guarded phase serves an already-generated full
+#   duration faststart passthrough MP4 cache beside the source when one is
+#   available, with valid MP4 free-box padding up to the source file size.
+#   Missing, oversized, non-faststart, or duration-mismatched caches fail
+#   explicitly. Default 1 lets GUI service startup exercise this path directly;
+#   set it to 0 to return to the older seek experiment.
+PASSTHROUGH_SEEK_VMP4 = _env("PASSTHROUGH_SEEK_VMP4", "1") == "1"
+
+# PT_PASSTHROUGH_SEEK_VMP4_BACKEND:
+#   Backend used by the VMP4 `/passthrough_seek` route.
+#     cache_file  - serve a full-duration faststart MP4 cache beside the source.
+#     slot        - one-sample-per-GOP slot layout (plays ~1fps; superseded).
+#     slot_frames - frame-level layout: one MP4 sample per frame at 1/fps stts,
+#                   fixed per-frame budget + filler, real fps. Default.
+#   Set cache_file explicitly to return to the validated full-cache fallback.
+PASSTHROUGH_SEEK_VMP4_BACKEND = _env("PASSTHROUGH_SEEK_VMP4_BACKEND", "slot_frames").strip().lower().replace("-", "_")
+if PASSTHROUGH_SEEK_VMP4_BACKEND not in {"cache_file", "slot", "slot_frames"}:
+    PASSTHROUGH_SEEK_VMP4_BACKEND = "slot_frames"
+
+# PT_PASSTHROUGH_SEEK_VMP4_FRAMES_FRAME_BYTES:
+#   Uniform fixed per-frame MP4 sample budget for the slot_frames backend. Every
+#   frame (IDR and P) gets this byte budget; the real HEVC bytes are filler-padded
+#   up to it so co64 offsets stay fixed before encoding.
+#
+#   KEY: the server always sends `budget` bytes per sample (payload + filler), so
+#   HTTP bandwidth == FRAME_BYTES * fps * 8 regardless of encoder rate control. We
+#   therefore CBR-encode each frame to ~this budget (with a 1-frame VBV cap) so no
+#   frame overflows AND the fixed bandwidth is used for real data, not filler.
+#   256 KiB @ 50fps ~= 100 Mbps, matching the live path's send rate. Raise for
+#   quality at higher bandwidth; lower to reduce bandwidth at lower quality.
+PASSTHROUGH_SEEK_VMP4_FRAMES_FRAME_BYTES = max(
+    32 * 1024, int(_env("PASSTHROUGH_SEEK_VMP4_FRAMES_FRAME_BYTES", 256 * 1024))
+)
+# Fraction of the frame budget the encoder targets (CBR). Kept well below 1.0 so
+# rate-control overshoot on a hard frame still lands under the hard sample budget
+# (without a working 1-frame VBV cap, CBR equalizes but does not hard-clamp).
+PASSTHROUGH_SEEK_VMP4_FRAMES_RATE_HEADROOM = min(
+    0.95, max(0.4, float(_env("PASSTHROUGH_SEEK_VMP4_FRAMES_RATE_HEADROOM", "0.75")))
+)
+
+# PT_PASSTHROUGH_SEEK_VMP4_FRAMES_RATE_ADAPT:
+#   Let the encoder find its own headroom instead of holding one number for every
+#   resolution. Measured on real sources: 4K never overshot its budget even at
+#   0.85 (0/60 frames) while 8K overshot 18% of frames at the same value - a
+#   single constant is either wasting bandwidth on one or breaking frames on the
+#   other. With this on, the run starts at _RATE_HEADROOM, backs off at once when
+#   a frame lands over budget, and creeps back up while frames keep fitting.
+#   Set 0 to pin the headroom at _RATE_HEADROOM (the old behaviour).
+PASSTHROUGH_SEEK_VMP4_FRAMES_RATE_ADAPT = _env(
+    "PASSTHROUGH_SEEK_VMP4_FRAMES_RATE_ADAPT", "1"
+) == "1"
+# Bounds for that loop. The ceiling is what a well-behaved source converges to;
+# the floor is low enough that a hard 8K stretch can still fit its budget.
+PASSTHROUGH_SEEK_VMP4_FRAMES_RATE_HEADROOM_MAX = min(
+    0.98, max(0.5, float(_env("PASSTHROUGH_SEEK_VMP4_FRAMES_RATE_HEADROOM_MAX", "0.90")))
+)
+PASSTHROUGH_SEEK_VMP4_FRAMES_RATE_HEADROOM_MIN = min(
+    0.9, max(0.2, float(_env("PASSTHROUGH_SEEK_VMP4_FRAMES_RATE_HEADROOM_MIN", "0.45")))
+)
+
+# PT_PASSTHROUGH_SEEK_VMP4_FRAMES_BUDGET_MATCH_LIVE:
+#   What the encoder needs is set by the OUTPUT resolution and the content, not
+#   by how many bits the source happened to be encoded at. Two 8K sources, one at
+#   20 Mbps and one at 60, both come out of our NVENC at 8192x4096 needing bits
+#   of the same order. Inheriting the source's absolute level therefore starves
+#   us whenever the source was cheaply encoded: an 8K title whose own budget is
+#   28 Mbps left us 0.029 bits/pixel of real picture where 4K was getting 0.069,
+#   and that is what showed as blocking.
+#
+#   What IS worth inheriting is the source's SHAPE - which stretches of the title
+#   are busy and which are static. So keep the per-GOP distribution and set the
+#   overall level here instead, from the same rule the realtime path uses:
+#   min(PASSTHROUGH_HEVC_BITRATE, source_bitrate * PASSTHROUGH_HEVC_SOURCE_MAX_MULTIPLIER).
+#   Seek then targets the picture rate live already targets and is known to carry.
+#
+#   The budget has to cover filler too (the encoder is asked for _RATE_HEADROOM of
+#   each sample), so the byte budget is that target divided by the headroom.
+#   Set 0 to go back to inheriting the source's level exactly (virtual size ==
+#   source size).
+PASSTHROUGH_SEEK_VMP4_FRAMES_BUDGET_MATCH_LIVE = _env(
+    "PASSTHROUGH_SEEK_VMP4_FRAMES_BUDGET_MATCH_LIVE", "1"
+) == "1"
+# Ceiling on how far that may stretch the virtual file, as a multiple of the
+# source size. Bandwidth is real: a headset on wifi has to keep up.
+PASSTHROUGH_SEEK_VMP4_FRAMES_BUDGET_MAX_SCALE = min(
+    6.0, max(1.0, float(_env("PASSTHROUGH_SEEK_VMP4_FRAMES_BUDGET_MAX_SCALE", "3.0")))
+)
+# PT_PASSTHROUGH_SEEK_VMP4_FRAMES_MIN_BITS_PER_PIXEL:
+#   Floor under how much each output FRAME gets, per pixel. Without it the output
+#   frame rate silently sets the picture quality: the same bitrate over more
+#   frames leaves each one less to spend, and blocking is a per-frame failure.
+#   The default is what an 8K title receives at 30fps under the rule above, so
+#   raising the frame rate costs bandwidth rather than picture. 4K sits far above
+#   it and is unaffected. 0 disables the floor.
+PASSTHROUGH_SEEK_VMP4_FRAMES_MIN_BITS_PER_PIXEL = max(
+    0.0, float(_env("PASSTHROUGH_SEEK_VMP4_FRAMES_MIN_BITS_PER_PIXEL", "0.066"))
+)
+
+
+def _parse_bitrate_bps(value, default: int = 50_000_000) -> int:
+    text = str(value or "").strip().upper()
+    try:
+        if text.endswith("M"):
+            return int(float(text[:-1]) * 1_000_000)
+        if text.endswith("K"):
+            return int(float(text[:-1]) * 1_000)
+        return int(float(text))
+    except ValueError:
+        return default
+
+
+def seek_source_multiplier(mode: str = "") -> float:
+    """How much more than the source this output mode is expected to need.
+
+    One number per output shape, the way projection_capped_bitrate picks 3x for
+    SBS and 4x for a VR projection. Everything but DLSS5 shares the passthrough
+    multiplier; see DLSS5_SEEK_SOURCE_MULTIPLIER for why 1:1 output does not.
+    """
+    if str(mode or "").strip().lower() == "dlss5":
+        return float(DLSS5_SEEK_SOURCE_MULTIPLIER or 0.0)
+    return float(PASSTHROUGH_HEVC_SOURCE_MAX_MULTIPLIER or 0.0)
+
+
+def seek_target_picture_bps(source_size: int, duration: float, mode: str = "") -> int:
+    """Picture bitrate the seek path aims for - the realtime path's own rule."""
+    src_bps = (int(source_size or 0) * 8 / duration) if duration and duration > 0 else 0
+    configured = _parse_bitrate_bps(PASSTHROUGH_HEVC_BITRATE)
+    mult = seek_source_multiplier(mode)
+    if src_bps <= 0 or mult <= 0:
+        return configured
+    return int(min(configured, max(1.0, src_bps * mult)))
+
+
+def seek_output_fps(source_fps: float) -> float:
+    """Frame rate the seek path emits for a source of this rate.
+
+    Lives here because the budget below depends on it and the DLNA layer has to
+    reach the same number the HTTP layer will.
+    """
+    src = float(source_fps or 0.0)
+    cap = float(PASSTHROUGH_MAX_FPS or 0.0)
+    # The seek path may run below the live cap: it has to encode faster than
+    # realtime to stay ahead of the player, which the live path never has to do.
+    seek_cap = float(PASSTHROUGH_SEEK_VMP4_FRAMES_MAX_FPS or 0.0)
+    if seek_cap > 0:
+        cap = min(cap, seek_cap) if cap > 0 else seek_cap
+    if cap > 0 and src > 0:
+        return min(src, cap)
+    return src if src > 0 else cap
+
+
+def seek_budget_scale(
+    source_size: int,
+    duration: float,
+    width: int = 0,
+    height: int = 0,
+    source_fps: float = 0.0,
+    mode: str = "",
+) -> float:
+    """Multiple of the source size the virtual seek file is laid out to."""
+    if not PASSTHROUGH_SEEK_VMP4_FRAMES_BUDGET_MATCH_LIVE:
+        return 1.0
+    if not duration or duration <= 0 or int(source_size or 0) <= 0:
+        return 1.0
+    src_bps = int(source_size) * 8 / duration
+    headroom = max(0.2, float(PASSTHROUGH_SEEK_VMP4_FRAMES_RATE_HEADROOM))
+    target_bps = seek_target_picture_bps(source_size, duration, mode)
+    # A bitrate target says nothing about how much each FRAME gets, and the frame
+    # is what blocks. Raising the output frame rate at a fixed bitrate divides the
+    # same bytes among more frames: measured on an 8K title, 0.066 bits/pixel per
+    # frame at 30fps, 0.049 at 40 and 0.033 at 60 - the same setting quietly
+    # costing most of the picture. Hold a floor under bits/pixel/frame so the
+    # frame rate is a frame-rate choice and not a quality one. It only binds where
+    # pixels are many and the rate is high; 4K never reaches it.
+    px = max(0, int(width or 0)) * max(0, int(height or 0))
+    fps = seek_output_fps(source_fps)
+    if px > 0 and fps > 0:
+        floor_bps = float(PASSTHROUGH_SEEK_VMP4_FRAMES_MIN_BITS_PER_PIXEL) * px * fps
+        target_bps = max(target_bps, floor_bps)
+    want_bps = target_bps / headroom
+    scale = want_bps / src_bps
+    # Rounded because DIDL and the HTTP layer compute this independently and must
+    # land on the same byte count; a hair's difference in the inputs must not
+    # produce two different declared sizes.
+    return round(max(1.0, min(float(PASSTHROUGH_SEEK_VMP4_FRAMES_BUDGET_MAX_SCALE), scale)), 3)
+
+
+def seek_declared_total_bytes(
+    source_size: int,
+    duration: float,
+    width: int = 0,
+    height: int = 0,
+    source_fps: float = 0.0,
+    mode: str = "",
+) -> int:
+    """Byte count the virtual seek file declares and serves.
+
+    Derived from the source size and duration alone so the DLNA layer can state
+    it without building a layout, and the layout can land on it exactly. Both
+    sides must pass the same ``mode``, or DIDL advertises one size and HTTP
+    serves another.
+    """
+    return int(
+        max(0, int(source_size or 0))
+        * seek_budget_scale(source_size, duration, width, height, source_fps, mode)
+    )
+
+
+
+# PT_PASSTHROUGH_SEEK_VMP4_FRAMES_SOURCE_BUDGET:
+#   Take the per-GOP byte budget from the source file's own bit distribution
+#   instead of the flat FRAME_BYTES constant, so the virtual file is exactly the
+#   source's size and complex stretches get the bits the source spent there. The
+#   encoder is retargeted per GOP with NVENC Reconfigure (no rebuild). Falls back
+#   to FRAME_BYTES whenever the source cannot fund the floor (see
+#   pipeline/source_budget_plan.py) or the output is not 1:1 with the source
+#   (superres). Measured on the local library: the source budget is 50-85% of the
+#   live path's current rate, at half the frame rate, so per-frame bytes hold.
+PASSTHROUGH_SEEK_VMP4_FRAMES_SOURCE_BUDGET = _env(
+    "PASSTHROUGH_SEEK_VMP4_FRAMES_SOURCE_BUDGET", "1"
+) == "1"
+
+# PT_PASSTHROUGH_SEEK_VMP4_FRAMES_FLOOR_BYTES:
+#   Minimum per-frame byte budget under the source-budget plan. Source black or
+#   static stretches fall to ~2 KiB/frame, but our composited output is not
+#   necessarily static there; GOPs below this floor are raised and the deficit is
+#   taken proportionally from richer GOPs (total bytes conserved). 48 KiB/frame
+#   ~= 11.8 Mbps at 30fps.
+PASSTHROUGH_SEEK_VMP4_FRAMES_FLOOR_BYTES = max(
+    8 * 1024, int(_env("PASSTHROUGH_SEEK_VMP4_FRAMES_FLOOR_BYTES", 48 * 1024))
+)
+# PT_PASSTHROUGH_SEEK_VMP4_FRAMES_FLOOR_BITS_PER_PIXEL:
+#   The floor above is one constant for every resolution, which makes it three
+#   times too small at 8K: measured there, 418 truncated frames were ALL P frames,
+#   89% of them in GOPs budgeted at or under 160 KiB, and each wanted about
+#   123 KiB - the same as a P frame anywhere else in the title. Our encoder's
+#   appetite is fairly flat while the source's plan swings from 88 KiB to 711 KiB,
+#   so the thin end of that plan is below what any frame of ours costs, and every
+#   frame landing there is truncated - which is a broken frame, and the mosaic the
+#   user sees. Scale the floor with the pixel count so it means the same thing at
+#   every resolution. The bytes come from the fat GOPs, so the total does not move
+#   and neither does bandwidth. 4K stays on the constant above (0.03 bpp is under
+#   48 KiB there), so only the resolutions that were starved change. 0 disables.
+PASSTHROUGH_SEEK_VMP4_FRAMES_FLOOR_BITS_PER_PIXEL = max(
+    0.0, float(_env("PASSTHROUGH_SEEK_VMP4_FRAMES_FLOOR_BITS_PER_PIXEL", "0.03"))
+)
+
+
+# PT_PASSTHROUGH_SEEK_VMP4_FRAMES_BUDGET_FLATTEN:
+#   How far to flatten the source's per-GOP bit distribution before using it,
+#   0 = inherit it exactly, 1 = give every GOP the same budget.
+#
+#   Inheriting it was the premise of the whole source-budget design, and measured
+#   against a flat plan at identical total bytes it loses badly. On the reported
+#   8K title, four 300-frame stretches:
+#
+#     source-shaped   21 truncated frames, 47.5 Mbps of picture
+#     flat             3 truncated frames, 62.6 Mbps
+#
+#   The reason is that the source's plan describes what OFFLINE multi-pass x265
+#   found cheap, and our realtime single-pass NVENC does not find the same
+#   stretches cheap - it wants about the same bytes per frame everywhere. So the
+#   thin end of the inherited plan starves exactly the frames that needed help:
+#   at the start of that title the source's shape left 24.7 Mbps where a flat plan
+#   put 52.8 through, and the live path (which never looks at the source's shape)
+#   puts 50 through everywhere. That is why live had no such problem.
+PASSTHROUGH_SEEK_VMP4_FRAMES_BUDGET_FLATTEN = min(
+    1.0, max(0.0, float(_env("PASSTHROUGH_SEEK_VMP4_FRAMES_BUDGET_FLATTEN", "1.0")))
+)
+
+
+def seek_frame_floor_bytes(width: int, height: int) -> int:
+    """Per-frame byte floor for a source of this size."""
+    px = max(0, int(width or 0)) * max(0, int(height or 0))
+    scaled = int(PASSTHROUGH_SEEK_VMP4_FRAMES_FLOOR_BITS_PER_PIXEL * px / 8)
+    return max(int(PASSTHROUGH_SEEK_VMP4_FRAMES_FLOOR_BYTES), scaled)
+
+# PT_PASSTHROUGH_SEEK_VMP4_FRAMES_IDR_WEIGHT:
+#   How many P-frame budgets a GOP head is worth when the source-derived GOP
+#   budget is split across its frames. An IDR costs several times a P frame, so
+#   an even split starves the one frame a player must decode to show anything -
+#   on a quiet 4K stretch that gave an IDR a ~52 KiB budget when it wanted
+#   ~200 KiB, which clamps to a corrupt keyframe and a black screen. P frames are
+#   never pushed below _FRAMES_FLOOR_BYTES to pay for it.
+PASSTHROUGH_SEEK_VMP4_FRAMES_IDR_WEIGHT = min(
+    12.0, max(1.0, float(_env("PASSTHROUGH_SEEK_VMP4_FRAMES_IDR_WEIGHT", "4.0")))
+)
+
+# PT_PASSTHROUGH_SEEK_VMP4_FRAMES_MAX_ACTIVE:
+#   How many background encode runs may exist across ALL titles at once. A run
+#   encodes forward to the end of its title and only ever stopped when the SAME
+#   title was repositioned, so switching videos left the previous one encoding
+#   something nobody was watching - two of those filled the Matter pool
+#   (PT_MAX_CONCURRENT) and the next title could never start, waited out its
+#   30s and returned 503: a black screen on the first segment. Only one playback
+#   position is being served at a time, so the default is 1; raise it only if
+#   several clients really do watch different titles at once, and remember the
+#   pool has to have a Matter for each.
+PASSTHROUGH_SEEK_VMP4_FRAMES_MAX_ACTIVE = max(
+    1, int(_env("PASSTHROUGH_SEEK_VMP4_FRAMES_MAX_ACTIVE", 1))
+)
+
+# PT_PASSTHROUGH_PYNV_MAX_RC_BPS:
+#   Ceiling on the bitrate and VBV size handed to NVENC. Initialising an encoder
+#   with an out-of-range value fails with error 8 (INVALID_PARAM), and a filler
+#   that cannot create its encoder never produces that part of the title - the
+#   request waits out its timeout and the player is left with nothing. 500 Mbps
+#   is far above any realtime target here and well inside what NVENC accepts.
+PASSTHROUGH_PYNV_MAX_RC_BPS = max(
+    1_000_000, int(_env("PASSTHROUGH_PYNV_MAX_RC_BPS", 500_000_000))
+)
+
+# PT_PASSTHROUGH_SEEK_VMP4_FRAMES_BODY_FRAME_WAIT:
+#   Seconds the body of a ranged reply may block on a single frame the encoder
+#   has not produced yet, before emitting that frame as filler and moving on.
+#   Players read far faster than realtime, so within seconds of a seek the reader
+#   is at the encoder's position; answering that by ending the reply early makes
+#   the player quit, and answering with filler wastes the frame. Blocking briefly
+#   inside the body does neither - it hands back real frames and paces the reader
+#   to the rate they are produced, the way the live path paces its stream.
+#
+#   This must be long, not a short "give up and pad" timeout. A frame that has
+#   not been encoded is served as a lone filler-data NAL - an access unit with no
+#   VCL NAL at all, which H.265 does not allow - and a player that decodes one
+#   abandons the item. Since the encoder produces at above realtime, a frame is
+#   at most tens of milliseconds away; this budget only exists so a run that has
+#   died cannot hold a response open forever, and the wait ends immediately when
+#   the run is no longer producing.
+PASSTHROUGH_SEEK_VMP4_FRAMES_BODY_FRAME_WAIT = max(
+    0.0, float(_env("PASSTHROUGH_SEEK_VMP4_FRAMES_BODY_FRAME_WAIT", "20.0"))
+)
+
+# PT_PASSTHROUGH_SEEK_VMP4_FRAMES_RANGED_WAIT:
+#   How long a RANGED reply waits for its frames before answering with what it
+#   has. The chunked (no-Range) path may block for _READY_WAIT because the player
+#   is streaming and will wait; a ranged request is a player that has just seeked
+#   and is filling a buffer, and it drops the connection long before 30s. Keep
+#   this inside what players tolerate - measured: OPlayer retries after ~0.3s,
+#   Skybox waited 3.3s - and let the reply carry filler for whatever is not
+#   encoded yet rather than leave the request hanging.
+PASSTHROUGH_SEEK_VMP4_FRAMES_RANGED_WAIT = max(
+    0.5, float(_env("PASSTHROUGH_SEEK_VMP4_FRAMES_RANGED_WAIT", "6.0"))
+)
+
+# PT_PASSTHROUGH_SEEK_VMP4_FRAMES_MIN_SPAN_BYTES:
+#   Smallest body a ranged reply may carry once it has decided to answer. Players
+#   read far ahead of playback - Skybox pulled 13s of content in 3s - while the
+#   encoder only produces at ~1.2x realtime, so a reader catches up with the
+#   encoder within seconds of a seek. From then on every reply carried only the
+#   handful of frames built since the last one, and the player treated that as
+#   the end of the stream and moved on. Frames past the encoder are served as
+#   filler (a brief freeze) rather than as a short body that ends playback; the
+#   encoder keeps closing the gap behind it. 0 disables the floor.
+PASSTHROUGH_SEEK_VMP4_FRAMES_MIN_SPAN_BYTES = max(
+    0, int(_env("PASSTHROUGH_SEEK_VMP4_FRAMES_MIN_SPAN_BYTES", 4 * 1024 * 1024))
+)
+
+# PT_PASSTHROUGH_SEEK_VMP4_FRAMES_MAX_SPAN_BYTES:
+#   Upper bound on how much one ranged reply serves. The body is otherwise
+#   trimmed only by how far the encoder has got, so on a title with a large warm
+#   cache an open-ended range answered with a multi-GB Content-Length - 4.6 GB in
+#   one field log - which a phone player will not sit through. Returning less
+#   than asked is normal for a 206: the player reads it and asks for the next
+#   piece, which also keeps the server from pinning a thread on one connection
+#   for minutes. 0 disables the cap.
+PASSTHROUGH_SEEK_VMP4_FRAMES_MAX_SPAN_BYTES = max(
+    0, int(_env("PASSTHROUGH_SEEK_VMP4_FRAMES_MAX_SPAN_BYTES", 48 * 1024 * 1024))
+)
+
+# PT_PASSTHROUGH_SEEK_VMP4_FRAMES_PREBUFFER_FRAMES:
+#   How many contiguous frames a ranged reply waits for before answering. This
+#   once guarded against handing a player a fraction of a second of video, back
+#   when a reply was trimmed to the built prefix.
+#
+#   That no longer applies: length now comes from _MIN_SPAN / _MAX_SPAN and the
+#   body blocks on frames the encoder has not reached, so a reply is never short
+#   regardless. All the wait does now is block. A player opens a second
+#   connection part-way through a reply, asking for a position just ahead of it -
+#   that frame is usually encoded already, but requiring 60 CONSECUTIVE frames
+#   from it meant sitting out the ready-wait while the encoder caught up, and the
+#   player abandoned the item first. Start as soon as the first frame exists.
+PASSTHROUGH_SEEK_VMP4_FRAMES_PREBUFFER_FRAMES = max(
+    0, int(_env("PASSTHROUGH_SEEK_VMP4_FRAMES_PREBUFFER_FRAMES", 1))
+)
+
+# PT_PASSTHROUGH_SEEK_VMP4_FRAMES_MAX_FPS:
+#   Output frame-rate ceiling for the seek path only, independent of
+#   PT_PASSTHROUGH_MAX_FPS (which the live path shares). Realtime encode has to
+#   outrun playback or the player rebuffers forever: measured 21.7 fps produced
+#   for a 1216x2160 green title, i.e. 0.72x of the 30fps it was being asked to
+#   sustain, and an 8K alpha title is slower still. Lowering this lowers the
+#   demand proportionally AND grows the per-frame byte budget by the same factor,
+#   so the picture does not simply get worse. 0 keeps PT_PASSTHROUGH_MAX_FPS.
+PASSTHROUGH_SEEK_VMP4_FRAMES_MAX_FPS = max(
+    0.0, float(_env("PASSTHROUGH_SEEK_VMP4_FRAMES_MAX_FPS", 0))
+)
+
+# PT_PASSTHROUGH_SEEK_VMP4_FRAMES_PROBE_BYTES:
+#   MP4 players open a file by reading its header and probing its tail before
+#   playing (see the nPlayer capture in summary_20260528_SEEKABLE_PASSTHROUGH_
+#   LESSONS_CN.md). Those bounded ranges are structural, not playback, so they
+#   are answered straight from the layout (real bytes where built, filler where
+#   not) instead of 503-ing on an encode the player is not waiting for. This is
+#   the size ceiling for treating a bounded range as such a probe; it also sets
+#   how much of the file tail counts as the tail region. Set to 0 to disable and
+#   make every range wait for its GOP.
+PASSTHROUGH_SEEK_VMP4_FRAMES_PROBE_BYTES = max(
+    0, int(_env("PASSTHROUGH_SEEK_VMP4_FRAMES_PROBE_BYTES", 1024 * 1024))
+)
+
+# PT_PASSTHROUGH_SEEK_VMP4_FRAMES_READY_WAIT:
+#   Seconds a slot_frames request waits for the requested GOP to build before
+#   returning 503. A 60-frame 4K/8K-alpha GOP can take many seconds to encode, so
+#   this is much larger than the slot-backend wait; too small makes every first
+#   request 503 even though the build is in progress.
+PASSTHROUGH_SEEK_VMP4_FRAMES_READY_WAIT = max(
+    1.0, float(_env("PASSTHROUGH_SEEK_VMP4_FRAMES_READY_WAIT", "30.0"))
+)
+
+# PT_PASSTHROUGH_SEEK_VMP4_FRAMES_PREFETCH:
+#   Legacy/no-op since the slot_frames backend switched from per-GOP builds to a
+#   single persistent forward filler (one decoder/encoder/matter setup, streamed
+#   continuously) that always runs ahead of the read cursor. Kept for config
+#   compatibility; no longer consumed.
+PASSTHROUGH_SEEK_VMP4_FRAMES_PREFETCH = max(
+    0, int(_env("PASSTHROUGH_SEEK_VMP4_FRAMES_PREFETCH", 1))
+)
+
+# PT_PASSTHROUGH_SEEK_VMP4_SLOT_BUILD_PLACEHOLDER:
+#   Legacy env name for enabling seek-slot payload builds. When a requested
+#   slot has no ready payload file yet, queue a background PyNv job that writes
+#   a real HEVC Annex-B GOP converted into the slot's MP4 sample payload. Set 0
+#   only for local layout tests that intentionally stream placeholder bytes.
+PASSTHROUGH_SEEK_VMP4_SLOT_BUILD_PLACEHOLDER = _env("PASSTHROUGH_SEEK_VMP4_SLOT_BUILD_PLACEHOLDER", "1") == "1"
+
+# PT_PASSTHROUGH_SEEK_VMP4_SLOT_READY_ONLY:
+#   1 keeps the slot backend byte-stable by refusing media slot ranges until
+#   that slot has a ready payload file. The request still queues the slot build
+#   and returns 503/Retry-After. Set 0 only for local placeholder-layout tests.
+PASSTHROUGH_SEEK_VMP4_SLOT_READY_ONLY = _env("PASSTHROUGH_SEEK_VMP4_SLOT_READY_ONLY", "1") == "1"
+
+# PT_PASSTHROUGH_SEEK_VMP4_SLOT_READY_WAIT:
+#   Seconds a ready-only HTTP request waits for the requested slot payload before
+#   exposing `slot-not-ready` to the player. This keeps Skybox/4XVR startup from
+#   seeing transient 503s while the PyNv slot worker is already producing HEVC.
+PASSTHROUGH_SEEK_VMP4_SLOT_READY_WAIT = max(
+    0.0,
+    float(_env("PASSTHROUGH_SEEK_VMP4_SLOT_READY_WAIT", "8.0")),
+)
+
+# PT_PASSTHROUGH_SEEK_VMP4_SLOT_MAX_SAMPLE_BYTES:
+# Upper bound for each virtual MP4 slot sample (the stsz entry the decoder sees).
+# slot_size = min(slot_stride, this cap); the difference (slot_gap) stays OUTSIDE
+# stsz so the decoder never reads it. The real per-slot HEVC IDR is padded with a
+# filler NAL up to slot_size, and that filler lives INSIDE the access unit. So a
+# smaller cap means a smaller access unit and less in-AU filler -- mobile HEVC
+# hardware decoders (Quest) have per-AU input limits, so keep this tight, just
+# above the largest expected single IDR. Observed 8K alpha IDRs are <=~300 KB, so
+# 512 KB leaves headroom while keeping the AU small. Payloads above the cap fail
+# that slot (permanent, see slot retry policy) rather than bloating every sample.
+# Raising this back toward several MB reintroduces multi-megabyte filler AUs.
+PASSTHROUGH_SEEK_VMP4_SLOT_MAX_SAMPLE_BYTES = max(
+    64 * 1024,
+    int(_env("PASSTHROUGH_SEEK_VMP4_SLOT_MAX_SAMPLE_BYTES", 512 * 1024)),
+)
+
+# PT_PASSTHROUGH_SEEK_VMP4_SLOT_MATTER_TIMEOUT:
+#   Seconds a slot build worker waits for a pooled Matter instance before failing
+#   the build (transient, retried with backoff). Prevents a build thread from
+#   hanging forever behind a long-lived /passthrough_live stream.
+PASSTHROUGH_SEEK_VMP4_SLOT_MATTER_TIMEOUT = max(
+    1.0,
+    float(_env("PASSTHROUGH_SEEK_VMP4_SLOT_MATTER_TIMEOUT", "20.0")),
+)
+
+# PT_PASSTHROUGH_SEEK_VMP4_SLOT_RETRY_BASE:
+#   Base seconds for transient slot-build retry backoff. Effective delay is
+#   min(RETRY_MAX, RETRY_BASE * 2**attempts). Permanent failures (payload
+#   oversize, unsupported mode) are never auto-retried so they do not thrash the
+#   GPU under a player's Retry-After loop.
+PASSTHROUGH_SEEK_VMP4_SLOT_RETRY_BASE = max(
+    0.5,
+    float(_env("PASSTHROUGH_SEEK_VMP4_SLOT_RETRY_BASE", "5.0")),
+)
+PASSTHROUGH_SEEK_VMP4_SLOT_RETRY_MAX = max(
+    PASSTHROUGH_SEEK_VMP4_SLOT_RETRY_BASE,
+    float(_env("PASSTHROUGH_SEEK_VMP4_SLOT_RETRY_MAX", "60.0")),
+)
+
+# PT_PASSTHROUGH_SEEK_VMP4_BUILD_MISSING:
+#   When a VMP4 seek cache is missing, queue a background offline conversion
+#   instead of only returning `503 cache-missing`. The HTTP request still
+#   returns quickly with Retry-After; the generated cache is used on a later
+#   request. Default 1 supports GUI-started real-device testing.
+PASSTHROUGH_SEEK_VMP4_BUILD_MISSING = _env("PASSTHROUGH_SEEK_VMP4_BUILD_MISSING", "1") == "1"
+
+# PT_PASSTHROUGH_SEEK_VMP4_BUILD_MAX_ACTIVE:
+#   Maximum number of background VMP4 cache builders. Keep this low: each build
+#   may use NVDEC/NVENC plus matting or DA3 inference resources.
+PASSTHROUGH_SEEK_VMP4_BUILD_MAX_ACTIVE = max(1, int(_env("PASSTHROUGH_SEEK_VMP4_BUILD_MAX_ACTIVE", 1)))
+
+_PASSTHROUGH_SEEK_VMP4_BUILD_MODES_RAW = str(
+    _env("PASSTHROUGH_SEEK_VMP4_BUILD_MODES", "green,alpha,two_dvr")
+).replace(";", ",")
+_passthrough_seek_vmp4_build_modes: list[str] = []
+for _token in re.split(r"[,\s]+", _PASSTHROUGH_SEEK_VMP4_BUILD_MODES_RAW.strip().lower()):
+    _modes = ("green", "alpha", "two_dvr") if _token == "all" else (_token,)
+    for _mode in _modes:
+        if _mode in {"green", "alpha", "two_dvr"} and _mode not in _passthrough_seek_vmp4_build_modes:
+            _passthrough_seek_vmp4_build_modes.append(_mode)
+PASSTHROUGH_SEEK_VMP4_BUILD_MODES = tuple(_passthrough_seek_vmp4_build_modes) or ("green", "alpha", "two_dvr")
+
+PASSTHROUGH_SEEK_VMP4_BUILD_ENGINE = _env("PASSTHROUGH_SEEK_VMP4_BUILD_ENGINE", "rvm_fast").strip().lower()
+if PASSTHROUGH_SEEK_VMP4_BUILD_ENGINE not in {"rvm_fast", "matanyone2_medium", "matanyone2"}:
+    PASSTHROUGH_SEEK_VMP4_BUILD_ENGINE = "rvm_fast"
+
+PASSTHROUGH_SEEK_VMP4_BUILD_BITRATE = _env("PASSTHROUGH_SEEK_VMP4_BUILD_BITRATE", "budget")
+PASSTHROUGH_SEEK_VMP4_BUILD_PRESET = _env("PASSTHROUGH_SEEK_VMP4_BUILD_PRESET", PASSTHROUGH_PYNV_PRESET)
+PASSTHROUGH_SEEK_VMP4_BUILD_TWO_DVR_BITRATE = _env("PASSTHROUGH_SEEK_VMP4_BUILD_TWO_DVR_BITRATE", "40M")
+PASSTHROUGH_SEEK_VMP4_BUILD_TWO_DVR_MAX_SIDE = max(0, int(_env("PASSTHROUGH_SEEK_VMP4_BUILD_TWO_DVR_MAX_SIDE", 1920)))
+PASSTHROUGH_SEEK_VMP4_BUILD_TWO_DVR_PROVIDER = _env("PASSTHROUGH_SEEK_VMP4_BUILD_TWO_DVR_PROVIDER", "trt").strip().lower()
+if PASSTHROUGH_SEEK_VMP4_BUILD_TWO_DVR_PROVIDER not in {"trt", "cuda", "cpu"}:
+    PASSTHROUGH_SEEK_VMP4_BUILD_TWO_DVR_PROVIDER = "trt"
 
 # PT_PASSTHROUGH_SEEK_HEADER_BYTES:
 #   Stable real prefix region for `/passthrough_seek`. Ranges intersecting this

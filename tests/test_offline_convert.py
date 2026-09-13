@@ -58,6 +58,8 @@ class OfflineConvertTests(unittest.TestCase):
         (root / "a.mp4").write_text("a", encoding="utf-8")
         (root / "b_ALPHA_passthrough.mp4").write_text("b", encoding="utf-8")
         (root / "c.txt").write_text("c", encoding="utf-8")
+        for done in ("d_1X.mp4", "e_2K.mp4", "f_4K.mp4", "g_6K.mp4", "h_8K.mp4"):
+            (root / done).write_text("x", encoding="utf-8")
         files = convert._video_files(root, recursive=False)
         self.assertEqual([p.name for p in files], ["a.mp4"])
 

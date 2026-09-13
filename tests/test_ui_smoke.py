@@ -121,6 +121,223 @@ class UiSmokeTests(unittest.TestCase):
             dialog.close()
             app.processEvents()
 
+    def test_superres_dialog_offers_playback_mode_only_for_the_native_target(self) -> None:
+        from types import SimpleNamespace
+
+        from PySide6.QtWidgets import QApplication
+        from ui.dialogs.feature_dialogs import SuperResSettingsDialog
+        from ui.i18n import I18n
+        from ui.settings import DEFAULTS
+
+        app = QApplication.instance() or QApplication([])
+        i18n = I18n("zh_CN")
+        # Realtime now defaults to native 1x, the only seekable target.
+        self.assertEqual(DEFAULTS["superres_target_height"], 0)
+        data = dict(DEFAULTS)
+        dialog = SuperResSettingsDialog(i18n, SimpleNamespace(data=data))
+        try:
+            self.assertEqual(dialog.target.currentData(), 0)
+            self.assertFalse(dialog.playback.isHidden())
+            # The rule stays on screen at every target, not only when the
+            # chooser disappears.
+            self.assertFalse(dialog.playback_note.isHidden())
+            self.assertEqual(dialog.playback_note.text(), i18n.t("superres.playback_native_only"))
+            self.assertIn(dialog.selected_playback_mode(), {"virtual", "live"})
+
+            dialog.target.setCurrentIndex(dialog.target.findData(3072))
+            app.processEvents()
+            self.assertTrue(dialog.playback.isHidden())
+            self.assertFalse(dialog.playback_note.isHidden())
+            # An enlarging target must not rewrite the shared playback setting.
+            self.assertEqual(dialog.selected_playback_mode(), "")
+        finally:
+            dialog.close()
+            app.processEvents()
+
+    def test_dlss5_dialog_reads_back_every_control_it_writes(self) -> None:
+        from types import SimpleNamespace
+
+        from PySide6.QtWidgets import QApplication
+        from ui.dialogs.feature_dialogs import DLSS5SettingsDialog
+        from ui.i18n import I18n
+        from ui.settings import DEFAULTS
+        from utils.dlss5 import DLSS5_RANGES
+
+        app = QApplication.instance() or QApplication([])
+        i18n = I18n("zh_CN")
+        data = dict(DEFAULTS)
+        data.update({
+            "dlss5_style": 2,
+            "dlss5_nr_passes": 3,
+            "dlss5_intensity": 1.5,
+            "dlss5_skin_structure": -1.0,
+            "dlss5_auto_mask": True,
+        })
+        dialog = DLSS5SettingsDialog(i18n, SimpleNamespace(data=data))
+        try:
+            payload = dialog.payload()
+            self.assertEqual(payload["dlss5_style"], 2)
+            self.assertEqual(payload["dlss5_nr_passes"], 3)
+            self.assertAlmostEqual(payload["dlss5_intensity"], 1.5)
+            self.assertAlmostEqual(payload["dlss5_skin_structure"], -1.0)
+            self.assertTrue(payload["dlss5_auto_mask"])
+            # Every control the dialog saves has a default to fall back on.
+            for key in payload:
+                self.assertIn(key, DEFAULTS)
+            # A slider must not be able to ask for a value the runtime rejects.
+            for key, _label, range_key in (
+                DLSS5SettingsDialog.MAIN_SLIDERS + DLSS5SettingsDialog.ADVANCED_SLIDERS
+            ):
+                low, high = DLSS5_RANGES[range_key]
+                slider = dialog.sliders[key]
+                self.assertEqual(slider.minimum(), int(round(low * 100)))
+                self.assertEqual(slider.maximum(), int(round(high * 100)))
+            self.assertEqual(dialog.performance_note.text(), i18n.t("dlss5.performance_note"))
+            self.assertIsNotNone(dialog.playback)
+        finally:
+            dialog.close()
+            app.processEvents()
+
+    def test_dlss5_dialog_drops_the_playback_chooser_when_it_is_offline(self) -> None:
+        """The offline page reuses this dialog, and offline has no playback
+        channel to choose - so the chooser is absent and the note is the one
+        that says the realtime 4K ceiling does not apply."""
+        from types import SimpleNamespace
+
+        from PySide6.QtWidgets import QApplication
+        from ui.dialogs.feature_dialogs import DLSS5SettingsDialog
+        from ui.i18n import I18n
+        from ui.settings import DEFAULTS
+
+        app = QApplication.instance() or QApplication([])
+        i18n = I18n("zh_CN")
+        dialog = DLSS5SettingsDialog(i18n, SimpleNamespace(data=dict(DEFAULTS)), offline=True)
+        try:
+            self.assertIsNone(dialog.playback)
+            self.assertEqual(dialog.selected_playback_mode(), "")
+            self.assertEqual(dialog.performance_note.text(), i18n.t("dlss5.offline_note"))
+            self.assertEqual(dialog.windowTitle(), i18n.t("dlss5.offline_title"))
+            # Same settings either way: the payload keeps every NR control.
+            self.assertIn("dlss5_intensity", dialog.payload())
+        finally:
+            dialog.close()
+            app.processEvents()
+
+    def test_dlss5_dialog_hides_the_advanced_block_until_it_is_asked_for(self) -> None:
+        """Thirteen sliders at once is a dialog nobody adjusts; four is one they
+        do. The rest stay one click away rather than gone."""
+        from types import SimpleNamespace
+
+        from PySide6.QtWidgets import QApplication
+        from ui.dialogs.feature_dialogs import DLSS5SettingsDialog
+        from ui.i18n import I18n
+        from ui.settings import DEFAULTS
+
+        app = QApplication.instance() or QApplication([])
+        dialog = DLSS5SettingsDialog(I18n("zh_CN"), SimpleNamespace(data=dict(DEFAULTS)))
+        try:
+            dialog.show()
+            app.processEvents()
+            self.assertFalse(dialog.advanced_panel.isVisible())
+            dialog.advanced_toggle.setChecked(True)
+            app.processEvents()
+            self.assertTrue(dialog.advanced_panel.isVisible())
+            # NR is 1x, so unlike SuperRes the playback chooser always applies.
+            self.assertFalse(dialog.playback.isHidden())
+            self.assertIn(dialog.selected_playback_mode(), {"virtual", "live"})
+        finally:
+            dialog.close()
+            app.processEvents()
+
+    def test_superres_page_exposes_true_hdr_controls_only_for_truehdr(self) -> None:
+        from types import SimpleNamespace
+
+        from PySide6.QtWidgets import QApplication
+        from ui.i18n import I18n
+        from ui.pages.superres_page import SuperResPage
+        from ui.services.offline_process import SuperResProcess
+        from ui.settings import DEFAULTS
+
+        app = QApplication.instance() or QApplication([])
+        data = dict(DEFAULTS)
+        data["superres_offline_hdr_look"] = "natural"
+        settings = SimpleNamespace(data=data, save=lambda: None)
+        page = SuperResPage(I18n("zh_CN"), settings, SuperResProcess())
+        try:
+            self.assertEqual(page.single_hdr_look.count(), 4)
+            self.assertGreaterEqual(page.single_hdr_look.findData("truehdr"), 0)
+            # The NGX controls stay hidden while an SDR look is selected.
+            self.assertTrue(page.single_true_hdr_box.isHidden())
+            self.assertTrue(page.single_labels["truehdr"].isHidden())
+            args = page._common_args(page.single_target, page.single_quality, page.single_hdr_look, page.single_bitrate)
+            self.assertNotIn("--rtx-vsr-truehdr-contrast", args)
+
+            page.single_hdr_look.setCurrentIndex(page.single_hdr_look.findData("truehdr"))
+            app.processEvents()
+            self.assertEqual(settings.data["superres_offline_hdr_look"], "truehdr")
+            self.assertFalse(page.single_true_hdr_box.isHidden())
+            self.assertFalse(page.single_labels["truehdr"].isHidden())
+            self.assertFalse(page.batch_true_hdr_box.isHidden())
+            # Both tabs share one value.
+            page.single_true_hdr["max_nits"].setValue(1400)
+            app.processEvents()
+            self.assertEqual(page.batch_true_hdr["max_nits"].value(), 1400)
+            self.assertEqual(settings.data["superres_truehdr_max_nits"], 1400)
+            args = page._common_args(page.single_target, page.single_quality, page.single_hdr_look, page.single_bitrate)
+            self.assertIn("--rtx-vsr-truehdr-max-nits", args)
+            self.assertEqual(args[args.index("--rtx-vsr-truehdr-max-nits") + 1], "1400")
+            self.assertIn("--rtx-vsr-truehdr-middle-gray", args)
+        finally:
+            page.close()
+            app.processEvents()
+
+    def test_playback_mode_chooser_appears_on_both_passthrough_dialogs(self) -> None:
+        """Green and Alpha both switch between the virtual file and the live stream."""
+        from types import SimpleNamespace
+
+        from PySide6.QtWidgets import QApplication
+        from ui.dialogs.feature_dialogs import (
+            AlphaPassthroughSettingsDialog,
+            GreenScreenSettingsDialog,
+        )
+        from ui.i18n import I18n
+        from ui.settings import DEFAULTS
+
+        app = QApplication.instance() or QApplication([])
+        self.assertEqual(DEFAULTS["passthrough_playback_mode"], "virtual")
+        for lang in ("zh_CN", "en_US", "ja_JP"):
+            i18n = I18n(lang)
+            for key in (
+                "playback.title", "playback.virtual", "playback.virtual_hint",
+                "playback.live", "playback.live_hint", "playback.note",
+            ):
+                self.assertTrue(i18n.t(key).strip(), f"{lang}:{key}")
+
+        i18n = I18n("zh_CN")
+        for cls in (GreenScreenSettingsDialog, AlphaPassthroughSettingsDialog):
+            settings = SimpleNamespace(data={"background_color": "00FF00"})
+            dialog = cls(i18n, settings)
+            try:
+                # Nothing stored yet -> the recommended virtual file.
+                self.assertEqual(dialog.selected_playback_mode(), "virtual", cls.__name__)
+                self.assertTrue(dialog.playback.virtual_radio.isChecked())
+                dialog.playback.live_radio.setChecked(True)
+                self.assertEqual(dialog.selected_playback_mode(), "live", cls.__name__)
+                # Mutually exclusive: picking one clears the other.
+                self.assertFalse(dialog.playback.virtual_radio.isChecked())
+            finally:
+                dialog.close()
+                app.processEvents()
+
+        settings = SimpleNamespace(data={"passthrough_playback_mode": "live"})
+        dialog = AlphaPassthroughSettingsDialog(i18n, settings)
+        try:
+            self.assertEqual(dialog.selected_playback_mode(), "live")
+            self.assertTrue(dialog.playback.live_radio.isChecked())
+        finally:
+            dialog.close()
+            app.processEvents()
+
     def test_video_dirs_dialog_has_mount_timeout_note(self) -> None:
         from PySide6.QtWidgets import QApplication
         from ui.dialogs.video_dirs_dialog import VideoDirsDialog
@@ -188,7 +405,7 @@ class UiSmokeTests(unittest.TestCase):
             self.assertEqual(window.nav.current(), "home")
             for key in ("home", "tools", "subtitle", "log", "settings"):
                 self.assertTrue(window.nav._items[key]._text_label.text())
-            self.assertEqual(window.stack.count(), 10)
+            self.assertEqual(window.stack.count(), 11)
             self.assertIs(window.stack.currentWidget(), window.dashboard)
 
             # Dashboard: server bar and feature cards.
@@ -199,8 +416,8 @@ class UiSmokeTests(unittest.TestCase):
             self.assertFalse(window.dashboard.project_link.openExternalLinks())
             self.assertEqual(
                 set(window.dashboard.cards),
-                {"green", "alpha", "alpha2d", "face_beauty", "two_dvr", "superres", "rm",
-                 "subtitle", "si", "light"},
+                {"green", "alpha", "alpha2d", "face_beauty", "two_dvr", "superres", "dlss5",
+                 "rm", "subtitle", "si", "light"},
             )
             for key, card in window.dashboard.cards.items():
                 self.assertTrue(card.title_label.text(), key)
@@ -208,7 +425,14 @@ class UiSmokeTests(unittest.TestCase):
             self.assertTrue(window.dashboard.cards["alpha"].is_checked())
             self.assertTrue(window.dashboard.cards["alpha2d"].is_checked())
             self.assertTrue(window.dashboard.cards["green"].summary_label.text().startswith("[GREEN]"))
-            self.assertEqual(window.dashboard.cards["alpha"].summary_label.text(), "[ALPHA]最好的透视效果")
+            # The card also states which playback mode the entry is offered in.
+            self.assertTrue(
+                window.dashboard.cards["alpha"].summary_label.text().startswith("[ALPHA]最好的透视效果")
+            )
+            self.assertIn(
+                window.i18n.t("playback.virtual"),
+                window.dashboard.cards["alpha"].summary_label.text(),
+            )
             self.assertFalse(window.dashboard.cards["alpha"].help_button.isHidden())
             self.assertTrue(window.dashboard.cards["superres"].summary_label.text().startswith("[SuperRes]"))
             self.assertTrue(window.dashboard.cards["two_dvr"].summary_label.text().startswith("[2D>3D]"))
@@ -236,6 +460,9 @@ class UiSmokeTests(unittest.TestCase):
             window.show()
             app.processEvents()
             base_size = window.size()
+            # DLSS5, RM and face beauty are all hidden by default, so no group
+            # holds a fourth card and the page is three columns wide.
+            self.assertEqual(window.dashboard.grid_columns, 3)
             self.assertEqual(base_size.width(), NAV_WIDTH + 700)
 
             # Settings page: performance combos + TRT (cache missing => disabled).

@@ -36,6 +36,12 @@ apply_runtime_dll_paths()
 
 from offline import two_dvr_render as render
 from offline.da3_depth import Da3DepthEngine, ensure_model_available, trt_engine_cached
+from utils.offline_outputs import (
+    discard_pending_output,
+    is_internal_intermediate_name,
+    pending_output_path,
+    publish_pending_output,
+)
 from utils.subprocess_hidden import hidden_subprocess_kwargs
 from utils.vr_naming import TWO_DVR_SUFFIX
 
@@ -378,7 +384,8 @@ def convert_clip(src: Path, out: Path, engine: Da3DepthEngine, args, start: floa
 
     dec = _decode_proc(src, start, duration, proc_w, proc_h)
     eff_bitrate = _effective_3d_bitrate(args, src)
-    enc = _encode_proc(src, out, out_w, out_h, fps, start, duration, args.preset, eff_bitrate, with_audio)
+    pending = pending_output_path(out)
+    enc = _encode_proc(src, pending, out_w, out_h, fps, start, duration, args.preset, eff_bitrate, with_audio)
     started = time.time()
     _reset_renderer(renderer)
     expected_frames = _clip_expected_frames(fps, total, start, duration)
@@ -396,9 +403,15 @@ def convert_clip(src: Path, out: Path, engine: Da3DepthEngine, args, start: floa
 
     if enc.returncode not in (0, None):
         log(f"encode failed rc={enc.returncode}: {enc_err.strip()[:400]}")
+        discard_pending_output(pending)
         return 1
     if count == 0:
         log(f"no frames decoded: {dec_err.strip()[:400]}")
+        discard_pending_output(pending)
+        return 1
+    if not publish_pending_output(pending, out):
+        log(f"could not rename {pending.name} to {out.name}")
+        discard_pending_output(pending)
         return 1
     elapsed = time.time() - started
     log(f"done {out.name}: {count} frames in {elapsed:.1f}s ({count / max(1e-6, elapsed):.1f} fps)")
@@ -529,6 +542,8 @@ def _video_files(root: Path, recursive: bool) -> list[Path]:
     for path in iterator:
         if not path.is_file() or path.suffix.lower() not in VIDEO_EXTS:
             continue
+        if is_internal_intermediate_name(path.name):
+            continue
         if OUTPUT_MARKER in path.name or path.stem.lower().endswith(TWO_DVR_SUFFIX.lower()):
             continue
         out.append(path)
@@ -585,7 +600,8 @@ def _run_segments(engine, args, src, segments, out) -> int:
     renderer = _make_renderer(proc_w, proc_h, args)
     depth_stabilizer = _create_depth_stabilizer(args, proc_w, proc_h)
     out.parent.mkdir(parents=True, exist_ok=True)
-    enc = _encode_proc(src, out, renderer.out_w, renderer.out_h, fps, 0.0, 0.0, args.preset, _effective_3d_bitrate(args, src), False)
+    pending = pending_output_path(out)
+    enc = _encode_proc(src, pending, renderer.out_w, renderer.out_h, fps, 0.0, 0.0, args.preset, _effective_3d_bitrate(args, src), False)
     total = 0
     total_expected = sum(_estimated_frames(fps, seg_end - seg_start) for seg_start, seg_end in segments)
     started = time.time()
@@ -616,10 +632,17 @@ def _run_segments(engine, args, src, segments, out) -> int:
             except Exception:
                 pass
         enc.wait()
+    if total <= 0 or enc.returncode not in (0, None):
+        discard_pending_output(pending)
+        return 1
+    if not publish_pending_output(pending, out):
+        log(f"could not rename {pending.name} to {out.name}")
+        discard_pending_output(pending)
+        return 1
     log(f"done {out.name}: {total} frames (segments) in {time.time() - started:.1f}s")
     if depth_stabilizer is not None:
         log(depth_stabilizer.fps_summary())
-    return 0 if total > 0 and enc.returncode in (0, None) else 1
+    return 0
 
 
 def _pump_segment(

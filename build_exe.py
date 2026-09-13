@@ -500,6 +500,8 @@ def verify_rtx_vsr_runtime() -> None:
     required = (
         "pt_rtx_vsr_bridge.dll",
         "nvngx_vsr.dll",
+        # NGX TrueHDR feature runtime, used by offline SuperRes HDR10 output.
+        "nvngx_truehdr.dll",
         "NVIDIA_RTX_Video_SDK_License.pdf",
         "VERSION.txt",
     )
@@ -508,6 +510,33 @@ def verify_rtx_vsr_runtime() -> None:
             fail(f"Missing RTX VSR runtime asset: {runtime / name}")
     if not list(runtime.glob("cudart64_*.dll")):
         fail(f"Missing CUDA runtime DLL for RTX VSR bridge under {runtime}")
+
+
+
+def _has_authenticode_signature(path: Path) -> bool:
+    """Whether a PE file still carries the signature blob its header points to.
+
+    Stripping a signature leaves the certificate-table entry in place while the
+    bytes it names fall outside the file, so the size check matters as much as
+    the presence of the directory entry.
+    """
+    try:
+        with path.open("rb") as handle:
+            head = handle.read(0x400)
+            pe = int.from_bytes(head[0x3C:0x40], "little")
+            handle.seek(pe + 4 + 16)
+            optional_size = int.from_bytes(handle.read(2), "little")
+            handle.seek(pe + 24)
+            optional = handle.read(optional_size)
+            magic = int.from_bytes(optional[:2], "little")
+            # Certificate table is data directory entry 4, and it stores a file
+            # offset rather than an RVA.
+            base = (112 if magic == 0x20B else 96) + 4 * 8
+            offset = int.from_bytes(optional[base:base + 4], "little")
+            size = int.from_bytes(optional[base + 4:base + 8], "little")
+        return bool(offset and size and offset + size <= path.stat().st_size)
+    except (OSError, IndexError, ValueError):
+        return False
 
 
 def verify_clip_tokenizer_runtime() -> None:

@@ -20,7 +20,11 @@ import config
 from media_library import safe_resolve_path
 from utils.logger import get
 from utils.mkv_cues import MkvCuesInfo, probe_mkv_cues
-from utils.offline_outputs import has_offline_passthrough_output, is_offline_passthrough_output_name
+from utils.offline_outputs import (
+    has_offline_passthrough_output,
+    is_internal_intermediate_name,
+    is_offline_passthrough_output_name,
+)
 from utils.video_metadata import probe_video_metadata, select_backend
 
 log = get("media_index")
@@ -325,7 +329,10 @@ class MediaIndex:
                 is_dir = child.is_dir()
                 suffix = child.suffix.lower()
                 is_file = child.is_file()
-                is_video = is_file and suffix in config.VIDEO_EXTS
+                # A run in flight writes its video beside the final name; it is
+                # not a library item, and a client that opens one gets a file
+                # that is still being written.
+                is_video = is_file and suffix in config.VIDEO_EXTS and not is_internal_intermediate_name(child.name)
                 is_image = is_file and config.DLNA_IMAGE_ENABLED and suffix in config.IMAGE_EXTS
                 si_source_name = _si_sidecar_source_name(child.name).lower()
                 is_si_sidecar = is_file and bool(si_source_name) and si_source_name in child_names
@@ -603,7 +610,7 @@ class MediaIndex:
             try:
                 if child.is_dir():
                     count += 1
-                elif child.is_file() and child.suffix.lower() in config.VIDEO_EXTS:
+                elif child.is_file() and child.suffix.lower() in config.VIDEO_EXTS and not is_internal_intermediate_name(child.name):
                     if (
                         is_offline_passthrough_output_name(child.name)
                         or config.PASSTHROUGH_OUTPUT_MODE == "none"

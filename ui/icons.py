@@ -133,6 +133,18 @@ def _draw_superres(p: QPainter, s: float) -> None:
     ])
 
 
+def _draw_dlss5(p: QPainter, s: float) -> None:
+    # Neural Rendering: one frame, same size, with a sparkle inside. The
+    # SuperRes icon says "bigger"; this one must not, because NR is 1x.
+    p.drawRoundedRect(QRectF(s * 0.12, s * 0.18, s * 0.76, s * 0.64), s * 0.08, s * 0.08)
+    cx, cy, r = s * 0.42, s * 0.5, s * 0.18
+    p.drawLine(QPointF(cx, cy - r), QPointF(cx, cy + r))
+    p.drawLine(QPointF(cx - r, cy), QPointF(cx + r, cy))
+    small_x, small_y, sr = s * 0.68, s * 0.34, s * 0.09
+    p.drawLine(QPointF(small_x, small_y - sr), QPointF(small_x, small_y + sr))
+    p.drawLine(QPointF(small_x - sr, small_y), QPointF(small_x + sr, small_y))
+
+
 def _draw_translate(p: QPainter, s: float) -> None:
     font = QFont()
     font.setPointSizeF(max(6.0, s * 0.34))
@@ -207,6 +219,7 @@ _DRAWERS = {
     "two_dvr": _draw_two_dvr,
     "rm": _draw_rm,
     "superres": _draw_superres,
+    "dlss5": _draw_dlss5,
     "face_beauty": _draw_face_beauty,
     "translate": _draw_translate,
     "light": _draw_light,

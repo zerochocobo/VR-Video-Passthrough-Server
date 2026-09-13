@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import unittest
 import shutil
@@ -18,6 +18,8 @@ class ContentDirectoryModeTests(unittest.TestCase):
             "alpha": ("alpha",),
             "all": ("green", "alpha"),
             "superres": ("superres",),
+            "dlss5": ("dlss5",),
+            "green,dlss5": ("green", "dlss5"),
         }
         for mode, expected in cases.items():
             with self.subTest(mode=mode), patch.object(cds, "PASSTHROUGH_OUTPUT_MODE", mode):
@@ -56,6 +58,8 @@ class ContentDirectoryModeTests(unittest.TestCase):
         with patch.object(cds, "PASSTHROUGH_OUTPUT_MODE", "all"):
             self.assertEqual(cds._passthrough_live_prefix("green"), "pl_")
             self.assertEqual(cds._passthrough_live_prefix("alpha"), "pla_")
+            self.assertEqual(cds._passthrough_live_prefix("dlss5"), "pldn_")
+            self.assertEqual(cds._passthrough_live_item_prefix("dlss5"), "pldn_item_")
             self.assertEqual(cds._passthrough_live_item_prefix("green"), "lg_")
             self.assertEqual(cds._passthrough_live_item_prefix("alpha"), "la_")
             self.assertIn("mode=green", cds._passthrough_live_query("green"))
@@ -137,7 +141,7 @@ class ContentDirectoryModeTests(unittest.TestCase):
         live = [item for item in items if item.get("container") and item["id"] == "pl_ptv11_movie.mp4"]
         self.assertEqual(live[0]["child_count"], 2)
 
-    def test_seek_dlna_switch_adds_live_fallback_virtual_entry(self) -> None:
+    def test_seek_dlna_switch_replaces_the_live_entry_for_that_mode(self) -> None:
         child = SimpleNamespace(
             size=1024,
             video=SimpleNamespace(
@@ -162,19 +166,25 @@ class ContentDirectoryModeTests(unittest.TestCase):
         ):
             items = cds._video_items_from_index(Path("movie.mp4"), "0", child)
 
-        self.assertEqual(len(items), 3)
+        # live or seek, never both: the plain entry plus one green entry.
+        self.assertEqual(len(items), 2)
         seek = next(item for item in items if "/passthrough_seek/" in item.get("url", ""))
-        live = next(item for item in items if item.get("container"))
         self.assertFalse(seek.get("container"))
+        self.assertEqual([i for i in items if i.get("container")], [])
         self.assertEqual(seek["id"], "sg_ptv11_movie.mp4")
-        self.assertIn("/passthrough_seek/movie.mp4.seek.ts", seek["url"])
-        self.assertIn("_seek", seek["title"])
+        # The output mode rides in the path: a player that drops the query still
+        # gets the mode the listing promised.
+        self.assertIn("/passthrough_seek/movie.mp4.green.seek.mp4", seek["url"])
+        # Seek entries lead with the mode and keep the original name.
+        self.assertEqual(seek["title"], "[GREEN]movie")
         self.assertEqual(seek["protocol_info"].split(";")[1], "DLNA.ORG_OP=11")
         self.assertIn("DLNA.ORG_CI=0", seek["protocol_info"])
         self.assertIn("DLNA.ORG_FLAGS=01F00000000000000000000000000000", seek["protocol_info"])
-        self.assertEqual(seek["size"], 14_345_678)
-        self.assertEqual(live["id"], "pl_ptv11_movie.mp4")
-        self.assertIn("_live", live["title"])
+        # The frames backend lays the virtual file out to the source's exact byte
+        # count, so DIDL advertises that rather than the legacy pseudo-VOD
+        # estimate (2 MB header + 12,345,678), which is why players used to show
+        # a file far larger than the original.
+        self.assertEqual(seek["size"], 1024)
 
     def test_seek_dlna_requires_route_master_switch(self) -> None:
         child = SimpleNamespace(
@@ -231,7 +241,9 @@ class ContentDirectoryModeTests(unittest.TestCase):
         seek = next(item for item in items if "/passthrough_seek/" in item.get("url", ""))
         self.assertEqual(seek["mime"], "video/mp4")
         self.assertEqual(seek["dlna_pn"], "HEVC_MP4_MAIN")
-        self.assertIn("/passthrough_seek/movie.mp4.seek.mp4", seek["url"])
+        # The output mode rides in the path: a player that drops the query still
+        # gets the mode the listing promised.
+        self.assertIn("/passthrough_seek/movie.mp4.green.seek.mp4", seek["url"])
         self.assertIn("http-get:*:video/mp4:DLNA.ORG_PN=HEVC_MP4_MAIN", seek["protocol_info"])
 
     def test_existing_offline_output_hides_virtual_modes(self) -> None:
@@ -789,3 +801,40 @@ class ContentDirectoryModeTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class SeekDeclaredSizeTests(unittest.TestCase):
+    """DIDL must advertise the same total the HTTP layer will."""
+
+    def test_source_budget_mode_advertises_the_source_size(self) -> None:
+        self.assertTrue(cds._seek_vmp4_matches_source_size("green"))
+        self.assertEqual(
+            cds._seek_declared_size(Path("m.mp4"), "green", 1234567, 99_000_000, 600.0),
+            1234567,
+        )
+
+    def test_superres_keeps_the_estimate(self) -> None:
+        # Superres emits more pixels than the source, so its output is not sized
+        # to the source and the estimate still applies.
+        self.assertFalse(cds._seek_vmp4_matches_source_size("superres"))
+        with patch.object(cds, "PASSTHROUGH_SEEK_HEADER_BYTES", 2_000_000):
+            self.assertEqual(
+                cds._seek_declared_size(Path("m.mp4"), "superres", 1234567, 99_000_000, 600.0),
+                2_000_000 + 99_000_000,
+            )
+
+    def test_falls_back_to_the_estimate_without_the_frames_backend(self) -> None:
+        with (
+            patch.object(cds, "PASSTHROUGH_SEEK_VMP4_BACKEND", "cache_file"),
+            patch.object(cds, "PASSTHROUGH_SEEK_HEADER_BYTES", 2_000_000),
+        ):
+            self.assertFalse(cds._seek_vmp4_matches_source_size("green"))
+            self.assertEqual(
+                cds._seek_declared_size(Path("m.mp4"), "green", 1234567, 99_000_000, 600.0),
+                2_000_000 + 99_000_000,
+            )
+
+    def test_zero_duration_declares_nothing(self) -> None:
+        self.assertEqual(
+            cds._seek_declared_size(Path("m.mp4"), "green", 1234567, 99_000_000, 0.0), 0
+        )

@@ -240,8 +240,9 @@ Responsibilities:
 - PyNv preflight and preflight cache;
 - PyNv decoder/encoder lifecycle;
 - Green/Alpha matting, 2D-to-3D stereo rendering, and RTX VSR mode branches;
-- split-eye VR processing and RGBA-stride-aware VSR output conversion;
-- optional SDR HDR-look after NGX VSR;
+- split-eye VR processing (at native 1x as well as when enlarging) and
+  RGBA-stride-aware VSR output conversion;
+- optional SDR HDR-look after NGX VSR (TrueHDR is offline-only here);
 - GPU ring-buffer ownership and synchronization before NVENC reads NV12;
 - FFmpeg muxing to fMP4 or MPEG-TS;
 - stderr draining;
@@ -293,8 +294,29 @@ Thumbnail generation and cache:
 ### `pipeline/hdr_look.py`
 
 Shared CUDA SDR appearance kernel used after RTX VSR output. User-facing modes
-are Off, Natural, and Vivid. This is an 8-bit BT.709 look adjustment, not NVIDIA
-RTX Video HDR / TrueHDR and not an HDR10 output path.
+are Off, Natural, and Vivid. This is an 8-bit BT.709 look adjustment. The fourth
+mode, TrueHDR, is not handled by this kernel: it selects the NGX TrueHDR feature
+and the HDR10 output path in `pipeline/true_hdr.py`.
+
+### `pipeline/superres_stage.py`
+
+One RTX VSR session (NV12 in, NV12 out, all on the GPU) shared by the live
+worker and the seekable virtual-file frame generator. It owns source gating,
+eye splitting for SBS VR, the reused CuPy buffers, the NVENC input ring and the
+SDR look, so the two callers cannot drift apart. TrueHDR is refused here and
+downgraded to the SDR look: realtime and seek both deliver 8-bit NV12.
+
+The seek route asks `utils.rtx_vsr.seek_target_height()` rather than the
+configured target, and `_vmp4_slot_output_size()` in `http_app/routes_media.py`
+asks the same function, so the MP4 shell always declares what the stage encodes.
+
+### `pipeline/true_hdr.py`
+
+NGX TrueHDR (SDR to HDR10) support for offline SuperRes. TrueHDR writes packed
+10:10:10:2 PQ BT.2020 RGB, so this module owns the `abgr10_to_p010` CUDA kernel
+that converts it to limited-range BT.2020 non-constant-luminance P010, plus the
+BT.2020/PQ colour metadata handed to the muxer. Offline only: the realtime chain
+delivers 8-bit NV12 and keeps the SDR look.
 
 ## Offline Package
 
@@ -309,6 +331,9 @@ RTX Video HDR / TrueHDR and not an HDR10 output path.
 ```text
 NVDEC/PyNv -> fused NV12-to-eye-RGBA -> NGX VSR -> HDR-look
             -> RGBA-to-NV12 -> NVENC -> FFmpeg video/audio stream-copy mux
+
+with TrueHDR selected, NGX VSR -> NGX TrueHDR replaces the SDR look and the
+tail becomes packed-10-bit-to-P010 -> NVENC HEVC Main 10 -> BT.2020/PQ mux
 ```
 
 The 8K VR path evaluates two 2048x2048 input eyes into two 4096x4096 output
@@ -481,8 +506,14 @@ These directories are generated or environment-specific:
 | `PT_RTX_VSR_QUALITY` | backend `2`, desktop `4` | VSR quality enum: 0 Bicubic, 1 Low, 2 Medium, 3 High, 4 Ultra. Dashboard exposes 1-4. |
 | `PT_RTX_VSR_INPUT_MIN_HEIGHT` | `360` | Project policy minimum input height for SuperRes. |
 | `PT_RTX_VSR_INPUT_MAX_HEIGHT` | `1440` | Normal 2D project-policy maximum; eligible recognized VR uses the VR gate. |
-| `PT_RTX_VSR_TARGET_HEIGHT` | `4096` | Adaptive default: 8192x4096 for recognized SBS VR, 3840x2160 for ordinary 2D. |
-| `PT_RTX_VSR_HDR_LOOK` | `natural` | SDR appearance mode: `off`, `natural`, or `vivid`. |
+| `PT_RTX_VSR_TARGET_HEIGHT` | `4096` | Adaptive default: 8192x4096 for recognized SBS VR, 3840x2160 for ordinary 2D. `3072` selects the 6K VR step (6144x3072); `0` selects native 1x, which enhances at the source resolution without enlarging. |
+| `PT_RTX_VSR_SEEK_ALLOW_UPSCALE` | `0` | Keep the configured target on the seekable virtual-file route instead of falling back to native 1x. That route is pulled at playback speed, so enlarging there has not been verified against a real player. |
+| `PT_RTX_VSR_NATIVE_MAX_HEIGHT` | `4096` | Input ceiling for native 1x, which replaces the upscale input policy because 1x costs what the source costs. NVENC's 8192-pixel side limit still applies. |
+| `PT_RTX_VSR_HDR_LOOK` | `natural` | Appearance mode: `off`, `natural`, `vivid`, or `truehdr`. `truehdr` runs NGX TrueHDR and is offline-only; realtime falls back to the SDR look. |
+| `PT_RTX_VSR_TRUEHDR_CONTRAST` | `100` | NGX TrueHDR contrast, 0-200. |
+| `PT_RTX_VSR_TRUEHDR_SATURATION` | `100` | NGX TrueHDR saturation, 0-200. |
+| `PT_RTX_VSR_TRUEHDR_MIDDLE_GRAY` | `50` | NGX TrueHDR middle gray, 10-100. |
+| `PT_RTX_VSR_TRUEHDR_MAX_NITS` | `1000` | NGX TrueHDR peak luminance in nits, 400-2000. |
 | `PT_RTX_VSR_EVALUATE_TIMEOUT_SEC` | `45` | Timeout for isolated real NGX evaluation preflight. |
 | `PT_ALPHA_PASSTHROUGH_TITLE` | `Alpha Passthrough` | DLNA virtual item title when alpha output mode is enabled. |
 | `PT_COMPOSITE_BG_RGB` | `808080` | Green-screen/composite background color as RGB hex. UI presets: `808080`, `C8C8C8`, `2BE640`, `0047BB`. |
@@ -542,9 +573,17 @@ DLNA client
   RTX 5060 Ti it sustains roughly 23-24 processing FPS; lowering NGX quality or
   the global output FPS is the supported performance tradeoff. NVENC P1/P4/P7
   is a separate encoding-speed choice.
-- RTX VSR HDR-look is deliberately documented as SDR BT.709 appearance
-  processing. TrueHDR/HDR10 requires a separate 10-bit P010/Main10 and metadata
-  path and is not a current product feature.
+- NGX VSR cost follows the INPUT resolution, not the output. Measured at quality
+  3 on the RTX 5060 Ti with a 4K VR source (1920x1920 per eye): 17.2 ms/eye for
+  an 8K output, 16.1 ms/eye for 6K, 15.1 ms/eye at native 1x; the same 8K output
+  from a 2K VR source (960x960 per eye) takes 6.2 ms/eye. So the 6K target
+  reduces bitrate and headset decode load rather than raising frame rate, and
+  realtime VR SuperRes is bounded near 29 FPS for 4K VR input whatever the
+  output size. Raising realtime frame rate requires a smaller NGX input.
+- RTX VSR HDR-look remains SDR BT.709 appearance processing. Real HDR10 comes
+  from the separate TrueHDR path (`pipeline/true_hdr.py`), which is offline-only
+  and costs a second NGX evaluation: on the test RTX 5060 Ti, 4K SBS VR to 8K
+  split-eye drops from roughly 23-24 to 15.6 processing FPS.
 - Startup GPU warmup is important on systems where ORT CUDA first-run JIT is
   expensive.
 - Direct development diagnostics that need ONNX Runtime CUDA must launch with

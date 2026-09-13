@@ -54,6 +54,13 @@ def superres_offline_command() -> tuple[str, list[str]]:
     return python_executable(), [str(ROOT / "offline" / "superres_offline.py")]
 
 
+def dlss5_offline_command() -> tuple[str, list[str]]:
+    if getattr(sys, "frozen", False):
+        server, args = server_command()
+        return server, [*args, "dlss5_offline"]
+    return python_executable(), [str(ROOT / "offline" / "dlss5_convert.py")]
+
+
 def face_beauty_command() -> tuple[str, list[str]]:
     if getattr(sys, "frozen", False):
         server, args = server_command()

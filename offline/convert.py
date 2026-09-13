@@ -19,12 +19,18 @@ if __package__ in (None, ""):
         sys.path.insert(0, str(project_root))
 
 import config
+from utils.offline_outputs import (
+    discard_pending_output,
+    is_internal_intermediate_name,
+    pending_output_path,
+    publish_pending_output,
+)
 from utils.gpu_requirements import detect_nvidia_gpu_requirement, unsupported_gpu_message
-from utils.rtx_vsr import effective_offline_target_height
+from utils.rtx_vsr import effective_offline_target_height, resolve_target_height
 from utils.subprocess_hidden import hidden_subprocess_kwargs, run_hidden_streaming
 from utils.trt_manifest import TRT_MODEL_MATANYONE2, TRT_MODEL_RVM, TRT_PROVIDER_CHAIN, cache_dir_for_model, cache_status
 from utils.video_metadata import probe_video_metadata, select_backend
-from utils.vr_naming import offline_passthrough_stem, superres_output_stem
+from utils.vr_naming import dlss5_output_stem, offline_passthrough_stem, superres_output_stem
 
 ROOT = config.ROOT
 VIDEO_EXTS = {".mp4", ".mkv", ".mov", ".m4v"}
@@ -32,6 +38,7 @@ _WARMUP_NOTICE_PRINTED = False
 
 ENGINES = {
     "rtx_vsr": ("rtx_vsr", None),
+    "dlss5": ("dlss5", None),
     "rvm_fast": ("rvm", ROOT / "models" / "rvm_mobilenetv3_fp32.onnx"),
     "matanyone2_medium": ("matanyone2_onnx", None),
     "matanyone2": ("matanyone2_onnx", None),
@@ -39,6 +46,7 @@ ENGINES = {
 
 ENGINE_TAGS = {
     "rtx_vsr": "rtxvsr",
+    "dlss5": "dlss5",
     "rvm_fast": "rvm1",
     "matanyone2_medium": "matanyone2m",
     "matanyone2": "matanyone2",
@@ -179,12 +187,17 @@ def _segment_arg(text: str) -> tuple[float, float]:
 
 def _single_out(src: Path, args: argparse.Namespace, width: int = 0, height: int = 0) -> Path:
     if args.engine == "rtx_vsr":
-        requested = int(getattr(args, "rtx_vsr_target_height", config.RTX_VSR_TARGET_HEIGHT) or config.RTX_VSR_TARGET_HEIGHT)
+        requested = resolve_target_height(getattr(args, "rtx_vsr_target_height", None))
         target_height = effective_offline_target_height(requested, width, height)
         if float(args.duration or 0.0) > 0 or float(args.start or 0.0) > 0:
             base = f"{src.stem}_S{_time_tag(float(args.start or 0.0))}_D{_duration_tag(float(args.duration or 0.0))}"
             return src.with_name(superres_output_stem(base, target_height) + ".mp4")
         return src.with_name(superres_output_stem(src.stem, target_height) + ".mp4")
+    if args.engine == "dlss5":
+        if float(args.duration or 0.0) > 0 or float(args.start or 0.0) > 0:
+            base = f"{src.stem}_S{_time_tag(float(args.start or 0.0))}_D{_duration_tag(float(args.duration or 0.0))}"
+            return src.with_name(dlss5_output_stem(base) + ".mp4")
+        return src.with_name(dlss5_output_stem(src.stem) + ".mp4")
     engine_tag = ENGINE_TAGS[args.engine]
     start_tag = f"S{_time_tag(args.start)}"
     duration_tag = _duration_tag(args.duration)
@@ -205,9 +218,12 @@ def _single_segments_out(
 ) -> Path:
     if args.engine == "rtx_vsr":
         base = f"{src.stem}_rtxvsr_SEG{len(segments)}_S{_time_tag(segments[0][0])}_E{_time_tag(segments[-1][1])}"
-        requested = int(getattr(args, "rtx_vsr_target_height", config.RTX_VSR_TARGET_HEIGHT) or config.RTX_VSR_TARGET_HEIGHT)
+        requested = resolve_target_height(getattr(args, "rtx_vsr_target_height", None))
         target_height = effective_offline_target_height(requested, width, height)
         return src.with_name(superres_output_stem(base, target_height) + ".mp4")
+    if args.engine == "dlss5":
+        base = f"{src.stem}_dlss5_SEG{len(segments)}_S{_time_tag(segments[0][0])}_E{_time_tag(segments[-1][1])}"
+        return src.with_name(dlss5_output_stem(base) + ".mp4")
     engine_tag = ENGINE_TAGS[args.engine]
     start_tag = f"S{_time_tag(segments[0][0])}"
     end_tag = f"E{_time_tag(segments[-1][1])}"
@@ -221,7 +237,10 @@ def _video_files(root: Path, recursive: bool) -> list[Path]:
     for path in iterator:
         if not path.is_file() or path.suffix.lower() not in VIDEO_EXTS:
             continue
-        if "passthrough" in path.name.lower() or path.stem.lower().startswith("[superres]") or path.stem.lower().endswith(("_2k", "_4k", "_8k")):
+        if is_internal_intermediate_name(path.name):
+            continue
+        stem_lower = path.stem.lower()
+        if "passthrough" in path.name.lower() or stem_lower.startswith("[superres]") or stem_lower.startswith("[dlss5]") or stem_lower.endswith(("_1x", "_2k", "_4k", "_6k", "_8k")):
             continue
         out.append(path)
     return sorted(out, key=lambda p: str(p).lower())
@@ -327,7 +346,7 @@ def _run_one(args: argparse.Namespace, src: Path) -> int:
         return 4
     width = int(getattr(meta.codec, "width", 0) or 0)
     height = int(getattr(meta.codec, "height", 0) or 0)
-    requested_vsr_target = int(getattr(args, "rtx_vsr_target_height", config.RTX_VSR_TARGET_HEIGHT) or config.RTX_VSR_TARGET_HEIGHT)
+    requested_vsr_target = resolve_target_height(getattr(args, "rtx_vsr_target_height", None))
     effective_vsr_target = effective_offline_target_height(requested_vsr_target, width, height)
     if args.engine == "rtx_vsr" and effective_vsr_target != requested_vsr_target:
         print(
@@ -342,6 +361,10 @@ def _run_one(args: argparse.Namespace, src: Path) -> int:
     ) if args.engine == "rtx_vsr" else (
         _single_out(src, args, width, height)
         if getattr(args, "command", "") == "single"
+        else src.with_name(dlss5_output_stem(src.stem) + ".mp4")
+    ) if args.engine == "dlss5" else (
+        _single_out(src, args, width, height)
+        if getattr(args, "command", "") == "single"
         else _default_out(src, args.mode, width, height)
     )
     if getattr(args, "out_dir", ""):
@@ -352,8 +375,38 @@ def _run_one(args: argparse.Namespace, src: Path) -> int:
         print(f"[offline] skip existing: {out}")
         return 0
     out.parent.mkdir(parents=True, exist_ok=True)
+    if args.engine == "dlss5":
+        from offline.dlss5_offline import run_dlss5
+        from utils.dlss5 import DLSS5Settings
+
+        settings = DLSS5Settings(
+            style=int(getattr(args, "dlss5_style", config.DLSS5_STYLE)),
+            intensity=float(getattr(args, "dlss5_intensity", config.DLSS5_INTENSITY)),
+            local_tone=float(getattr(args, "dlss5_local_tone", config.DLSS5_LOCAL_TONE)),
+            local_structure=float(getattr(args, "dlss5_local_structure", config.DLSS5_LOCAL_STRUCTURE)),
+            skin_structure=float(getattr(args, "dlss5_skin_structure", config.DLSS5_SKIN_STRUCTURE)),
+            auto_mask=bool(getattr(args, "dlss5_auto_mask", config.DLSS5_AUTO_MASK)),
+            color_strength=float(getattr(args, "dlss5_color_strength", config.DLSS5_COLOR_STRENGTH)),
+            tone_preservation=float(getattr(args, "dlss5_tone_preservation", config.DLSS5_TONE_PRESERVATION)),
+            face_skin_protection=float(getattr(args, "dlss5_face_skin_protection", config.DLSS5_FACE_SKIN_PROTECTION)),
+            grain_preservation=float(getattr(args, "dlss5_grain_preservation", config.DLSS5_GRAIN_PRESERVATION)),
+            nr_passes=int(getattr(args, "dlss5_nr_passes", config.DLSS5_NR_PASSES)),
+            shimmer_suppression=float(getattr(args, "dlss5_shimmer_suppression", config.DLSS5_SHIMMER_SUPPRESSION)),
+            prefer_nvof=bool(getattr(args, "dlss5_prefer_nvof", config.DLSS5_PREFER_NVOF)),
+        )
+        return run_dlss5(
+            src,
+            out,
+            meta,
+            start=float(getattr(args, "start", 0.0) or 0.0),
+            duration=float(getattr(args, "duration", 0.0) or 0.0),
+            settings=settings,
+            preset=str(getattr(args, "preset", config.PASSTHROUGH_PYNV_PRESET) or config.PASSTHROUGH_PYNV_PRESET),
+            cq=int(getattr(args, "cq", 19) if int(getattr(args, "cq", -1)) >= 0 else 19),
+        )
     if args.engine == "rtx_vsr":
         from offline.rtx_vsr import run_rtx_vsr
+        from utils.rtx_vsr import TrueHdrSettings
 
         return run_rtx_vsr(
             src,
@@ -367,6 +420,12 @@ def _run_one(args: argparse.Namespace, src: Path) -> int:
             hdr_look=str(getattr(args, "rtx_vsr_hdr_look", config.RTX_VSR_HDR_LOOK) or config.RTX_VSR_HDR_LOOK),
             cq=int(getattr(args, "cq", 19) if int(getattr(args, "cq", -1)) >= 0 else 19),
             bitrate_mode=str(getattr(args, "rtx_vsr_bitrate_mode", "auto") or "auto"),
+            hdr_settings=TrueHdrSettings(
+                contrast=int(getattr(args, "rtx_vsr_truehdr_contrast", config.RTX_VSR_TRUEHDR_CONTRAST)),
+                saturation=int(getattr(args, "rtx_vsr_truehdr_saturation", config.RTX_VSR_TRUEHDR_SATURATION)),
+                middle_gray=int(getattr(args, "rtx_vsr_truehdr_middle_gray", config.RTX_VSR_TRUEHDR_MIDDLE_GRAY)),
+                max_luminance=int(getattr(args, "rtx_vsr_truehdr_max_nits", config.RTX_VSR_TRUEHDR_MAX_NITS)),
+            ),
         )
     cmd = _base_cmd(args, src, out)
     print("[offline] run: " + subprocess.list2cmdline(cmd), flush=True)
@@ -417,6 +476,7 @@ def _concat_file_line(path: Path) -> str:
 
 def _concat_segments(segment_paths: list[Path], out: Path, work_dir: Path) -> int:
     ffmpeg = shutil.which("ffmpeg") or "ffmpeg"
+    pending = pending_output_path(out)
     list_path = work_dir / "concat.txt"
     list_path.write_text("\n".join(_concat_file_line(path) for path in segment_paths) + "\n", encoding="utf-8")
     cmd = [
@@ -433,7 +493,7 @@ def _concat_segments(segment_paths: list[Path], out: Path, work_dir: Path) -> in
         "copy",
         "-movflags",
         "+faststart",
-        str(out),
+        str(pending),
     ]
     print("[offline] concat=" + subprocess.list2cmdline(cmd), flush=True)
     proc = subprocess.run(
@@ -451,7 +511,14 @@ def _concat_segments(segment_paths: list[Path], out: Path, work_dir: Path) -> in
         print("[concat stderr]", flush=True)
         print(proc.stderr.strip()[-2000:], flush=True)
     print(f"[offline] concat_rc={proc.returncode}", flush=True)
-    return int(proc.returncode)
+    if proc.returncode != 0:
+        discard_pending_output(pending)
+        return int(proc.returncode)
+    if not publish_pending_output(pending, out):
+        print(f"[offline] could not rename {pending.name} to {out.name}", flush=True)
+        discard_pending_output(pending)
+        return 1
+    return 0
 
 
 def _run_segments(args: argparse.Namespace, src: Path) -> int:
@@ -535,8 +602,27 @@ def main(argv: list[str] | None = None) -> int:
     single.add_argument("--engine", choices=sorted(ENGINES), default="rvm_fast")
     single.add_argument("--rtx-vsr-target-height", type=int, default=config.RTX_VSR_TARGET_HEIGHT)
     single.add_argument("--rtx-vsr-quality", type=int, choices=[2, 3, 4], default=config.RTX_VSR_QUALITY)
-    single.add_argument("--rtx-vsr-hdr-look", choices=["off", "natural", "vivid"], default=config.RTX_VSR_HDR_LOOK)
+    single.add_argument("--rtx-vsr-hdr-look", choices=["off", "natural", "vivid", "truehdr"], default=config.RTX_VSR_HDR_LOOK)
     single.add_argument("--rtx-vsr-bitrate-mode", choices=["auto", "1.2", "1.5", "2", "3"], default="auto")
+    # NGX TrueHDR controls; only read when --rtx-vsr-hdr-look is truehdr.
+    single.add_argument("--rtx-vsr-truehdr-contrast", type=int, default=config.RTX_VSR_TRUEHDR_CONTRAST)
+    single.add_argument("--rtx-vsr-truehdr-saturation", type=int, default=config.RTX_VSR_TRUEHDR_SATURATION)
+    single.add_argument("--rtx-vsr-truehdr-middle-gray", type=int, default=config.RTX_VSR_TRUEHDR_MIDDLE_GRAY)
+    single.add_argument("--rtx-vsr-truehdr-max-nits", type=int, default=config.RTX_VSR_TRUEHDR_MAX_NITS)
+    # DLSS 5 Neural Rendering controls.
+    single.add_argument("--dlss5-style", type=int, default=config.DLSS5_STYLE)
+    single.add_argument("--dlss5-intensity", type=float, default=config.DLSS5_INTENSITY)
+    single.add_argument("--dlss5-local-tone", type=float, default=config.DLSS5_LOCAL_TONE)
+    single.add_argument("--dlss5-local-structure", type=float, default=config.DLSS5_LOCAL_STRUCTURE)
+    single.add_argument("--dlss5-skin-structure", type=float, default=config.DLSS5_SKIN_STRUCTURE)
+    single.add_argument("--dlss5-auto-mask", action=argparse.BooleanOptionalAction, default=config.DLSS5_AUTO_MASK)
+    single.add_argument("--dlss5-color-strength", type=float, default=config.DLSS5_COLOR_STRENGTH)
+    single.add_argument("--dlss5-tone-preservation", type=float, default=config.DLSS5_TONE_PRESERVATION)
+    single.add_argument("--dlss5-face-skin-protection", type=float, default=config.DLSS5_FACE_SKIN_PROTECTION)
+    single.add_argument("--dlss5-grain-preservation", type=float, default=config.DLSS5_GRAIN_PRESERVATION)
+    single.add_argument("--dlss5-nr-passes", type=int, default=config.DLSS5_NR_PASSES)
+    single.add_argument("--dlss5-shimmer-suppression", type=float, default=config.DLSS5_SHIMMER_SUPPRESSION)
+    single.add_argument("--dlss5-prefer-nvof", action=argparse.BooleanOptionalAction, default=config.DLSS5_PREFER_NVOF)
     single.add_argument("--start", type=float, default=0.0)
     single.add_argument("--duration", type=float, default=0.0)
     single.add_argument("--segment", dest="segments", type=_segment_arg, action="append", default=[], metavar="START-END")
@@ -558,8 +644,27 @@ def main(argv: list[str] | None = None) -> int:
     batch.add_argument("--engine", choices=sorted(ENGINES), default="rvm_fast")
     batch.add_argument("--rtx-vsr-target-height", type=int, default=config.RTX_VSR_TARGET_HEIGHT)
     batch.add_argument("--rtx-vsr-quality", type=int, choices=[2, 3, 4], default=config.RTX_VSR_QUALITY)
-    batch.add_argument("--rtx-vsr-hdr-look", choices=["off", "natural", "vivid"], default=config.RTX_VSR_HDR_LOOK)
+    batch.add_argument("--rtx-vsr-hdr-look", choices=["off", "natural", "vivid", "truehdr"], default=config.RTX_VSR_HDR_LOOK)
     batch.add_argument("--rtx-vsr-bitrate-mode", choices=["auto", "1.2", "1.5", "2", "3"], default="auto")
+    # NGX TrueHDR controls; only read when --rtx-vsr-hdr-look is truehdr.
+    batch.add_argument("--rtx-vsr-truehdr-contrast", type=int, default=config.RTX_VSR_TRUEHDR_CONTRAST)
+    batch.add_argument("--rtx-vsr-truehdr-saturation", type=int, default=config.RTX_VSR_TRUEHDR_SATURATION)
+    batch.add_argument("--rtx-vsr-truehdr-middle-gray", type=int, default=config.RTX_VSR_TRUEHDR_MIDDLE_GRAY)
+    batch.add_argument("--rtx-vsr-truehdr-max-nits", type=int, default=config.RTX_VSR_TRUEHDR_MAX_NITS)
+    # DLSS 5 Neural Rendering controls.
+    batch.add_argument("--dlss5-style", type=int, default=config.DLSS5_STYLE)
+    batch.add_argument("--dlss5-intensity", type=float, default=config.DLSS5_INTENSITY)
+    batch.add_argument("--dlss5-local-tone", type=float, default=config.DLSS5_LOCAL_TONE)
+    batch.add_argument("--dlss5-local-structure", type=float, default=config.DLSS5_LOCAL_STRUCTURE)
+    batch.add_argument("--dlss5-skin-structure", type=float, default=config.DLSS5_SKIN_STRUCTURE)
+    batch.add_argument("--dlss5-auto-mask", action=argparse.BooleanOptionalAction, default=config.DLSS5_AUTO_MASK)
+    batch.add_argument("--dlss5-color-strength", type=float, default=config.DLSS5_COLOR_STRENGTH)
+    batch.add_argument("--dlss5-tone-preservation", type=float, default=config.DLSS5_TONE_PRESERVATION)
+    batch.add_argument("--dlss5-face-skin-protection", type=float, default=config.DLSS5_FACE_SKIN_PROTECTION)
+    batch.add_argument("--dlss5-grain-preservation", type=float, default=config.DLSS5_GRAIN_PRESERVATION)
+    batch.add_argument("--dlss5-nr-passes", type=int, default=config.DLSS5_NR_PASSES)
+    batch.add_argument("--dlss5-shimmer-suppression", type=float, default=config.DLSS5_SHIMMER_SUPPRESSION)
+    batch.add_argument("--dlss5-prefer-nvof", action=argparse.BooleanOptionalAction, default=config.DLSS5_PREFER_NVOF)
     batch.add_argument("--recursive", action=argparse.BooleanOptionalAction, default=True)
     batch.add_argument("--skip-existing", action="store_true")
     batch.add_argument("--fps", type=float, default=RVM_DEFAULT_ARGS["fps"])

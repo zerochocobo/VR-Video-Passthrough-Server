@@ -13,7 +13,8 @@ from PySide6.QtWidgets import QHBoxLayout, QLabel, QMainWindow, QMessageBox, QWi
 from ui.diagnostics import build_diagnostic_report
 from ui.i18n import I18n, system_language
 from ui.metadata import load_app_metadata
-from ui.pages.dashboard_page import DASHBOARD_HEIGHT, DASHBOARD_WIDTH, DashboardPage
+from ui.pages.dashboard_page import DASHBOARD_HEIGHT, DashboardPage
+from ui.pages.dlss5_page import Dlss5Page
 from ui.pages.face_beauty_page import FaceBeautyPage
 from ui.pages.log_page import LogPage
 from ui.pages.offline_page import OfflinePage
@@ -24,7 +25,7 @@ from ui.pages.subtitle_page import SUBTITLE_PAGE_HEIGHT, SUBTITLE_PAGE_WIDTH, Su
 from ui.pages.tools_page import ToolsPage
 from ui.pages.two_dvr_page import TwoDvrPage
 from ui.resources import app_icon
-from ui.services.offline_process import FaceBeautyProcess, OfflineProcess, RmProcess, SuperResProcess, TwoDvrProcess
+from ui.services.offline_process import Dlss5Process, FaceBeautyProcess, OfflineProcess, RmProcess, SuperResProcess, TwoDvrProcess
 from ui.services.server_process import ServerProcess
 from ui.services.startup_diagnostics import LOG_PATH as UI_STARTUP_LOG_PATH, log_startup_event
 from ui.services.startup_status_poller import DEFAULT_PORT as STATUS_DEFAULT_PORT, StartupStatusPoller
@@ -59,6 +60,7 @@ class MainWindow(QMainWindow):
         self.two_dvr_process = TwoDvrProcess()
         self.rm_process = RmProcess()
         self.superres_process = SuperResProcess()
+        self.dlss5_process = Dlss5Process()
         self.face_beauty_process = FaceBeautyProcess()
 
         self.stack = CurrentPageStackedWidget()
@@ -68,6 +70,7 @@ class MainWindow(QMainWindow):
         self.two_dvr = TwoDvrPage(self.i18n, self.settings, self.two_dvr_process)
         self.rm = RmPage(self.i18n, self.settings, self.rm_process)
         self.superres = SuperResPage(self.i18n, self.settings, self.superres_process)
+        self.dlss5 = Dlss5Page(self.i18n, self.settings, self.dlss5_process)
         self.face_beauty = FaceBeautyPage(self.i18n, self.settings, self.face_beauty_process)
         self.subtitle = SubtitlePage(self.i18n, self.settings)
         self.log_page = LogPage(self.i18n)
@@ -82,6 +85,7 @@ class MainWindow(QMainWindow):
             self.two_dvr,
             self.rm,
             self.superres,
+            self.dlss5,
             self.face_beauty,
         ):
             self.stack.addWidget(page)
@@ -120,6 +124,7 @@ class MainWindow(QMainWindow):
         self.tools.open_two_dvr.connect(self.open_two_dvr)
         self.tools.open_rm.connect(self.open_rm)
         self.tools.open_superres.connect(self.open_superres)
+        self.tools.open_dlss5.connect(self.open_dlss5)
         self.tools.open_face_beauty.connect(self.open_face_beauty)
         self.settings_page.language.currentIndexChanged.connect(self.change_language)
         self.settings_page.rm_card_visibility_changed.connect(self.dashboard.set_rm_card_visible)
@@ -131,6 +136,7 @@ class MainWindow(QMainWindow):
         self.two_dvr.back_button.clicked.connect(lambda: self._show_page("tools"))
         self.rm.back_button.clicked.connect(lambda: self._show_page("tools"))
         self.superres.back_button.clicked.connect(lambda: self._show_page("home"))
+        self.dlss5.back_button.clicked.connect(lambda: self._show_page("tools"))
         self.face_beauty.back_button.clicked.connect(lambda: self._show_page("tools"))
         self.subtitle.back_button.clicked.connect(lambda: self._show_page("home"))
 
@@ -142,6 +148,7 @@ class MainWindow(QMainWindow):
         self.two_dvr_process.state_changed.connect(self._two_dvr_state_changed)
         self.rm_process.state_changed.connect(self._rm_state_changed)
         self.superres_process.state_changed.connect(self._superres_state_changed)
+        self.dlss5_process.state_changed.connect(self._dlss5_state_changed)
         self.face_beauty_process.state_changed.connect(self._face_beauty_state_changed)
 
         # Startup overlay + status poller (lazy: created when first needed).
@@ -223,6 +230,7 @@ class MainWindow(QMainWindow):
         self.two_dvr.retranslate()
         self.rm.retranslate()
         self.superres.retranslate()
+        self.dlss5.retranslate()
         self.face_beauty.retranslate()
         self.subtitle.retranslate()
         self.dashboard.set_server_running(self.server.is_running())
@@ -252,10 +260,10 @@ class MainWindow(QMainWindow):
     def _resize_for(self, page: QWidget) -> None:
         if page is self.subtitle:
             content = QSize(SUBTITLE_PAGE_WIDTH, SUBTITLE_PAGE_HEIGHT)
-        elif page in (self.offline, self.two_dvr, self.rm, self.superres, self.face_beauty):
+        elif page in (self.offline, self.two_dvr, self.rm, self.superres, self.dlss5, self.face_beauty):
             content = QSize(OFFLINE_PAGE_WIDTH, OFFLINE_PAGE_HEIGHT)
         else:
-            content = QSize(DASHBOARD_WIDTH, self.dashboard.preferred_height())
+            content = QSize(self.dashboard.preferred_width(), self.dashboard.preferred_height())
         self.resize(NAV_WIDTH + content.width(), max(content.height(), 560))
 
     def toggle_server(self) -> None:
@@ -270,6 +278,7 @@ class MainWindow(QMainWindow):
             or self.two_dvr_process.is_running()
             or self.rm_process.is_running()
             or self.superres_process.is_running()
+            or self.dlss5_process.is_running()
             or self.face_beauty_process.is_running()
         ):
             QMessageBox.warning(self, self.i18n.t("dialog.warning"), self.i18n.t("dialog.stop_offline_first"))
@@ -332,6 +341,15 @@ class MainWindow(QMainWindow):
         self.superres.sync_from_settings()
         self._show_sub_page(self.superres)
 
+    def open_dlss5(self) -> None:
+        if not bool(self.settings.data.get("dlss5_card_visible")):
+            return
+        if self.server.is_running():
+            QMessageBox.warning(self, self.i18n.t("dialog.warning"), self.i18n.t("dialog.stop_server_first"))
+            return
+        self.dlss5.sync_from_settings()
+        self._show_sub_page(self.dlss5)
+
     def open_face_beauty(self) -> None:
         if not bool(self.settings.data.get("face_beauty_card_visible")):
             return
@@ -357,6 +375,10 @@ class MainWindow(QMainWindow):
         if running:
             self._show_sub_page(self.superres)
 
+    def _dlss5_state_changed(self, running: bool) -> None:
+        if running:
+            self._show_sub_page(self.dlss5)
+
     def _face_beauty_state_changed(self, running: bool) -> None:
         if running:
             self._show_sub_page(self.face_beauty)
@@ -370,6 +392,7 @@ class MainWindow(QMainWindow):
         self.two_dvr_process.stop()
         self.rm_process.stop()
         self.superres_process.stop()
+        self.dlss5_process.stop()
         self.face_beauty_process.stop()
         super().closeEvent(event)
 
@@ -588,7 +611,7 @@ class MainWindow(QMainWindow):
         if any(
             process.is_running()
             for process in (self.offline_process, self.two_dvr_process, self.rm_process,
-                            self.superres_process, self.face_beauty_process)
+                            self.superres_process, self.dlss5_process, self.face_beauty_process)
         ):
             QMessageBox.warning(self, self.i18n.t("dialog.warning"), self.i18n.t("dialog.stop_offline_first"))
             if self.startup_overlay is not None:

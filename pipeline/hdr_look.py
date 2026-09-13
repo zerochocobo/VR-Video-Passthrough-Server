@@ -2,7 +2,9 @@
 from __future__ import annotations
 
 
-HDR_LOOK_MODES = ("off", "natural", "vivid")
+# "truehdr" routes to the NGX TrueHDR feature instead of this SDR grade;
+# see pipeline/true_hdr.py.  It is a no-op for this kernel.
+HDR_LOOK_MODES = ("off", "natural", "vivid", "truehdr")
 
 
 def normalize_hdr_look(value: object, default: str = "natural") -> str:
@@ -11,7 +13,7 @@ def normalize_hdr_look(value: object, default: str = "natural") -> str:
 
 
 def hdr_look_mode_value(value: object) -> int:
-    return {"off": 0, "natural": 1, "vivid": 2}[normalize_hdr_look(value)]
+    return {"off": 0, "natural": 1, "vivid": 2, "truehdr": 0}[normalize_hdr_look(value)]
 
 
 HDR_LOOK_CUDA = r'''

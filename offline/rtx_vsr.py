@@ -20,9 +20,11 @@ configure_gpu_runtime_cache()
 
 import config
 from utils.rtx_vsr import (
-    effective_offline_target_height, load_bridge, run_evaluation_preflight,
-    source_block_reason, target_dimensions, target_resolution,
+    TrueHdrSettings, effective_offline_target_height, is_native_target, load_bridge,
+    resolve_target_height, run_evaluation_preflight, source_block_reason, target_dimensions,
+    target_resolution,
 )
+from utils.offline_outputs import discard_pending_output, pending_output_path, publish_pending_output
 from utils.subprocess_hidden import hidden_subprocess_kwargs
 from utils.superres_bitrate import plan_superres_bitrate
 from utils.vr_naming import has_vr_filename_marker, is_half_equirectangular_source, superres_output_stem
@@ -71,16 +73,17 @@ def run_rtx_vsr(
     quality: int | None = None,
     preset: str | None = None,
     hdr_look: str | None = None,
+    hdr_settings: TrueHdrSettings | None = None,
     cq: int = 19,
     bitrate_mode: str = "auto",
 ) -> int:
     width = int(meta.codec.width)
     height = int(meta.codec.height)
-    requested_target_height = int(target_height or config.RTX_VSR_TARGET_HEIGHT)
+    requested_target_height = resolve_target_height(target_height)
     target_height = effective_offline_target_height(requested_target_height, width, height)
     if target_height != requested_target_height:
         print(
-            f"[rtx-vsr] 8K is limited to 2:1 SBS VR sources; "
+            f"[rtx-vsr] 6K/8K is limited to 2:1 SBS VR sources; "
             f"source={width}x{height} fallback=4K",
             flush=True,
         )
@@ -138,42 +141,59 @@ def run_rtx_vsr(
             flush=True,
         )
         return 3
+    pending = pending_output_path(out)
     if config.RTX_VSR_OFFLINE_PYNV_ENABLED:
         try:
             from offline.rtx_vsr_pynv import run_rtx_vsr_pynv
 
-            return run_rtx_vsr_pynv(
+            rc = run_rtx_vsr_pynv(
                 src,
-                out,
+                pending,
                 meta,
                 start=float(start or 0.0),
                 duration=float(duration or 0.0),
-                target_height=int(target_height or config.RTX_VSR_TARGET_HEIGHT),
+                target_height=int(target_height),
                 quality=int(config.RTX_VSR_QUALITY if quality is None else quality),
                 preset=str(preset or config.PASSTHROUGH_PYNV_PRESET or "p4"),
                 cq=int(cq),
                 hdr_look=str(hdr_look or config.RTX_VSR_HDR_LOOK),
+                hdr_settings=hdr_settings,
                 target_bitrate=bitrate_plan.target_bps,
                 max_bitrate=bitrate_plan.max_bps,
                 buffer_bitrate=bitrate_plan.buffer_bps,
             )
+            if rc != 0:
+                discard_pending_output(pending)
+                return rc
+            if not publish_pending_output(pending, out):
+                print(f"[rtx-vsr] could not rename {pending.name} to {out.name}", flush=True)
+                discard_pending_output(pending)
+                return 1
+            return 0
         except Exception as exc:
-            if int(target_height or 0) >= 4096:
+            if resolve_target_height(target_height) >= 3072:
                 print(f"[rtx-vsr] split-eye GPU pipeline failed: {type(exc).__name__}: {exc}", flush=True)
             else:
                 print(f"[rtx-vsr] GPU pipeline unavailable, falling back to FFmpeg rawvideo: {type(exc).__name__}: {exc}", flush=True)
-            try:
-                if out.exists():
-                    out.unlink()
-            except OSError:
-                pass
-            if int(target_height or 0) >= 4096:
+            discard_pending_output(pending)
+            if resolve_target_height(target_height) >= 3072:
                 print(
-                    "[rtx-vsr] experimental 8K requires the split-eye GPU pipeline; "
+                    "[rtx-vsr] 6K/8K VR requires the split-eye GPU pipeline; "
                     "legacy whole-frame fallback is disabled",
                     flush=True,
                 )
                 return 3
+    from pipeline.true_hdr import is_true_hdr
+
+    if is_true_hdr(hdr_look or config.RTX_VSR_HDR_LOOK):
+        # The rawvideo fallback is an 8-bit RGBA pipe; TrueHDR output is
+        # 10-bit and only the GPU pipeline can carry it to a P010 encoder.
+        print(
+            "[rtx-vsr] TrueHDR requires the GPU pipeline; "
+            "the FFmpeg rawvideo fallback cannot produce HDR10 output",
+            flush=True,
+        )
+        return 3
     ffmpeg = shutil.which("ffmpeg") or "ffmpeg"
     decode_cmd = [ffmpeg, "-hide_banner", "-loglevel", "error"]
     if start > 0:
@@ -199,7 +219,7 @@ def run_rtx_vsr(
         "-rc", "vbr", "-b:v", str(bitrate_plan.target_bps),
         "-maxrate", str(bitrate_plan.max_bps), "-bufsize", str(bitrate_plan.buffer_bps),
         "-cq", str(int(cq)), "-c:a", "copy", "-shortest",
-        *meta.color.ffmpeg_args(), str(out),
+        *meta.color.ffmpeg_args(), str(pending),
     ]
     effective_quality = config.RTX_VSR_QUALITY if quality is None else quality
     from pipeline.hdr_look import apply_hdr_look, create_hdr_look_kernel, normalize_hdr_look
@@ -285,6 +305,11 @@ def run_rtx_vsr(
     if decoder.returncode != 0 or encoder.returncode != 0:
         detail = " | ".join(stderr_lines[-10:])
         print(f"[rtx-vsr] failed decode_rc={decoder.returncode} encode_rc={encoder.returncode} {detail}", flush=True)
+        discard_pending_output(pending)
+        return 1
+    if not publish_pending_output(pending, out):
+        print(f"[rtx-vsr] could not rename {pending.name} to {out.name}", flush=True)
+        discard_pending_output(pending)
         return 1
     elapsed = max(1e-6, time.monotonic() - progress_started)
     print(f"[rtx-vsr] complete {_progress_message(frames, total_frames or frames, elapsed)} out={out}", flush=True)

@@ -94,6 +94,8 @@ def _startup_plan_steps(
         steps.append(("trt_validate", 2.0))
     if config.RTX_VSR_REALTIME_ENABLED and "superres" in output_modes:
         steps.append(("vsr_preflight", 8.0))
+    if config.DLSS5_ENABLED and config.DLSS5_REALTIME_ENABLED and "dlss5" in output_modes:
+        steps.append(("dlss5_warmup", 20.0))
     if config.STARTUP_GPU_WARMUP:
         steps.extend([
             ("predict_probe", 2.0),
@@ -502,6 +504,11 @@ def main(argv: list[str] | None = None) -> int:
         from offline.superres_offline import main as superres_offline_main
 
         return superres_offline_main(argv[1:])
+    if argv and argv[0] == "dlss5_offline":
+        _force_line_buffered_stdio()
+        from offline.dlss5_convert import main as dlss5_offline_main
+
+        return dlss5_offline_main(argv[1:])
     if argv and argv[0] == "face_beauty":
         _force_line_buffered_stdio()
         from offline.face_beauty import main as face_beauty_main
@@ -533,6 +540,17 @@ def main(argv: list[str] | None = None) -> int:
     _apply_debug_arg(args)
     apply_runtime_dll_paths()
     cache_env = configure_gpu_runtime_cache()
+    # Before anything in this process touches CUDA. The DLSS5 NR engine reaches
+    # the picture through CUDA interop and refuses to set that up unless the
+    # device's primary context carries the blocking-sync scheduling flag, and
+    # that flag can only be claimed while the context is still inactive - once
+    # cupy, PyNvVideoCodec or TensorRT has created it, it is too late for the
+    # whole process. One cuInit, no DLSS5 DLL touched, so a build without the
+    # runtime pays a few milliseconds and nothing else.
+    if config.DLSS5_ENABLED:
+        from utils.dlss5 import prepare_cuda_context_for_dlss5
+
+        prepare_cuda_context_for_dlss5()
     setup()
     log = get("main")
     start_startup_status_server(config.STARTUP_STATUS_PORT)
@@ -613,6 +631,28 @@ def main(argv: list[str] | None = None) -> int:
                 log.warning("RTX VSR evaluate preflight failed; realtime SuperRes will be rejected: %s", preflight)
         except Exception as exc:
             log.warning("RTX VSR evaluate preflight unavailable: %s", exc)
+        finally:
+            stop_heartbeat()
+    # Bring the NR runtime up here rather than on the viewer's first play: the
+    # D3D12 device, the NGX snippet load and the first feature build cost tens
+    # of seconds on a cold driver cache, and a player waiting on them has
+    # nothing to show for it.
+    if config.DLSS5_ENABLED and config.DLSS5_REALTIME_ENABLED and "dlss5" in output_modes:
+        set_startup_phase("starting", "loading DLSS5 neural rendering", step="dlss5_warmup")
+        start_heartbeat(20.0, baseline_progress=0.0, ceiling_progress=0.95)
+        try:
+            from utils.dlss5 import warmup_dlss5_runtime
+
+            warmup = warmup_dlss5_runtime()
+            if warmup.get("ok"):
+                log.info("DLSS5 neural rendering warmup succeeded: %s", warmup)
+            else:
+                log.warning(
+                    "DLSS5 neural rendering warmup failed; the first play will pay for it: %s",
+                    warmup,
+                )
+        except Exception as exc:
+            log.warning("DLSS5 neural rendering warmup unavailable: %s", exc)
         finally:
             stop_heartbeat()
     provider_kind = provider_kind_from_config()

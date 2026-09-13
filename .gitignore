@@ -39,5 +39,10 @@ baseline/
 
 VR_Video_Passthrough_Server_compare/
 /models/rtx_vsr/native/diagnostics
+# DLSS 5 Neural Rendering runtime: ~158 MB, fetched per models/dlss5/get_dlss5.txt.
+/models/dlss5/runtime/
 models/realesr/*.pth
 delivery_demosaic/*
+
+# Diagnostic output from tools/dlss5_probe.py.
+probe_out/

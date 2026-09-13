@@ -31,7 +31,8 @@ VR视频透视服务器 的目标是让所有VR视频都可以透视，实现混
 - 2D 转 3D 可选深度稳定，包括内置时域稳定和面向离线 16:9 任务的 NVDS ONNX 稳定
 - 面向符合条件的2D与VR源视频的实时/离线 NVIDIA RTX视频超分，支持自适应“8K VR / 4K 2D”输出
 - 2:1 SBS VR左右眼全GPU处理，离线4K VR转8K VR可输出8192x4096 HEVC
-- RTX VSR目标质量提供低/中/高/超高，HDR观感提供关闭/自然/鲜明三档SDR画面处理
+- 超分目标提供 原生1x / 2K / 4K / 6K VR / 8K VR，其中原生1x在源分辨率上增强而不放大
+- RTX VSR目标质量提供低/中/高/超高，HDR观感提供关闭/自然/鲜明三档SDR画面处理，另有仅限离线的NVIDIA TrueHDR真HDR10输出，可调对比度、饱和度、中灰和峰值亮度
 - 实时与离线美颜（正在开发测试，可在设置界面中开启）
 - 实时与离线去马赛克（正在开发测试，可在设置界面中开启）
 - 基于同名 `.si.wav` sidecar 的配音/同传播放，提供 `[SI]` DLNA入口、时间选择、声道混音和轻度/正常/强力压低原声
@@ -130,7 +131,7 @@ netsh advfirewall firewall add rule name="PTServer SSDP Private" dir=in action=a
 - `PT_PASSTHROUGH_OUTPUT_MODE` 支持 `none`、`green`、`alpha`、`two_dvr`、`superres`，也支持 `green,alpha,two_dvr,superres` 这类逗号分隔组合；旧的 `all` 表示 green + alpha
 - Alpha 模式下虚拟条目标题为 `Alpha Passthrough`
 - 实时 2D 转 3D 使用 `PT_TWO_DVR_MODEL`、`PT_TWO_DVR_STRENGTH` 和相关 `PT_TWO_DVR_*` 设置；离线 2D 转 3D / VR 在桌面 UI 中提供模型、画质速度、时域稳定和“目标文件存在则跳过”等控制。
-- 实时超分使用 `PT_RTX_VSR_TARGET_HEIGHT`、`PT_RTX_VSR_QUALITY` 和 `PT_RTX_VSR_HDR_LOOK`。自适应4096目标对识别出的2:1 SBS VR输出8192x4096，对普通2D输出3840x2160。
+- 实时超分使用 `PT_RTX_VSR_TARGET_HEIGHT`、`PT_RTX_VSR_QUALITY` 和 `PT_RTX_VSR_HDR_LOOK`。自适应4096目标对识别出的2:1 SBS VR输出8192x4096，对普通2D输出3840x2160。HDR观感设为 `truehdr` 只影响离线任务，实时链路保持SDR观感。
 - 同名 `.si.wav` 文件会启用 `[SI]` DLNA入口。当前DLNA播放通过 `/si_live` 实时输出MPEG-TS并支持起播偏移；旧的渐进式 `/media_si` 保留为后备路由。
 - DLNA Live目录会按功能显示 `[GREEN]`、`[ALPHA]`、`[2D>3D]`、`[SuperRes]` 和 `[SI]` 标记，并提供本地化的 `[选择时间索引]` 目录。
 - 桌面设置页可修改DLNA服务器名称和HTTP端口；保存网络身份配置后需要重启服务器。

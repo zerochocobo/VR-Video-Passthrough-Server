@@ -55,6 +55,12 @@ from offline.face_beauty_engine import (
     trt_cache_keys,
     trt_cache_ready,
 )
+from utils.offline_outputs import (
+    discard_pending_output,
+    is_internal_intermediate_name,
+    pending_output_path,
+    publish_pending_output,
+)
 from utils.subprocess_hidden import hidden_subprocess_kwargs
 from utils.vr_naming import FACE_BEAUTY_SUFFIX
 
@@ -381,7 +387,8 @@ def convert_clip_gpu(src: Path, out: Path, options: BeautyOptions, args,
     enc = nvc.CreateEncoder(width, height, "NV12", False,
                             **_pynv_encoder_kwargs(bitrate=str(_effective_bitrate(args, src)),
                                                    fps=f"{fps:.6f}"))
-    mux = _mux_proc(src, out, fps, start, duration)
+    pending = pending_output_path(out)
+    mux = _mux_proc(src, pending, fps, start, duration)
     mux_err: list[bytes] = []
 
     def _drain() -> None:
@@ -450,9 +457,14 @@ def convert_clip_gpu(src: Path, out: Path, options: BeautyOptions, args,
         if mux.poll() is None:
             mux.kill()
     stderr_thread.join(timeout=5)
-    if mux.returncode not in (0, None) or not out.is_file():
+    if mux.returncode not in (0, None) or not pending.is_file():
         error = b"".join(mux_err).decode("utf-8", "replace").strip()
         log(f"mux failed rc={mux.returncode}: {error[:800]}")
+        discard_pending_output(pending)
+        return 1
+    if not publish_pending_output(pending, out):
+        log(f"could not rename {pending.name} to {out.name}")
+        discard_pending_output(pending)
         return 1
     elapsed = max(1e-3, time.time() - started)
     log(f"done {out.name}: {produced} frames, {faces} faces in {elapsed:.1f}s "
@@ -473,7 +485,8 @@ def convert_clip(src: Path, out: Path, engine: FaceBeautyEngine, args, start: fl
         f"{engine.options.retouch_summary()} {engine.provider_summary()}")
 
     dec = _decode_proc(src, start, duration, proc_w, proc_h)
-    enc = _encode_proc(src, out, proc_w, proc_h, fps, start, duration,
+    pending = pending_output_path(out)
+    enc = _encode_proc(src, pending, proc_w, proc_h, fps, start, duration,
                        args.preset, _effective_bitrate(args, src), with_audio)
     started = time.time()
     engine.reset()
@@ -484,9 +497,15 @@ def convert_clip(src: Path, out: Path, engine: FaceBeautyEngine, args, start: fl
 
     if enc.returncode not in (0, None):
         log(f"encode failed rc={enc.returncode}: {enc_err.strip()[:400]}")
+        discard_pending_output(pending)
         return 1
     if count == 0:
         log(f"no frames decoded: {dec_err.strip()[:400]}")
+        discard_pending_output(pending)
+        return 1
+    if not publish_pending_output(pending, out):
+        log(f"could not rename {pending.name} to {out.name}")
+        discard_pending_output(pending)
         return 1
     elapsed = time.time() - started
     log(f"done {out.name}: {count} frames, {faces} faces in {elapsed:.1f}s "
@@ -565,7 +584,8 @@ def _run_segments(engine: FaceBeautyEngine, args, src: Path, segments: list, out
     width, height, fps, _ = probe_video(src)
     proc_w, proc_h = _processing_size(width, height, args.max_side)
     out.parent.mkdir(parents=True, exist_ok=True)
-    enc = _encode_proc(src, out, proc_w, proc_h, fps, 0.0, 0.0, args.preset,
+    pending = pending_output_path(out)
+    enc = _encode_proc(src, pending, proc_w, proc_h, fps, 0.0, 0.0, args.preset,
                        _effective_bitrate(args, src), False)
     total = 0
     faces = 0
@@ -589,8 +609,15 @@ def _run_segments(engine: FaceBeautyEngine, args, src: Path, segments: list, out
             except Exception:
                 pass
         enc.wait()
+    if total <= 0 or enc.returncode not in (0, None):
+        discard_pending_output(pending)
+        return 1
+    if not publish_pending_output(pending, out):
+        log(f"could not rename {pending.name} to {out.name}")
+        discard_pending_output(pending)
+        return 1
     log(f"done {out.name}: {total} frames, {faces} faces (segments) in {time.time() - started:.1f}s")
-    return 0 if total > 0 and enc.returncode in (0, None) else 1
+    return 0
 
 
 def _pump_segment(dec, enc, engine, proc_w, proc_h, started: float, progress_offset: int,
@@ -656,6 +683,8 @@ def _video_files(root: Path, recursive: bool) -> list[Path]:
     out = []
     for path in iterator:
         if not path.is_file() or path.suffix.lower() not in VIDEO_EXTS:
+            continue
+        if is_internal_intermediate_name(path.name):
             continue
         if path.stem.lower().endswith(FACE_BEAUTY_SUFFIX.lower()):
             continue

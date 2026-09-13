@@ -3,7 +3,10 @@ from __future__ import annotations
 import unittest
 import math
 
-from pipeline.alpha_packer import AlphaPacker
+from unittest import mock
+
+import config
+from pipeline.alpha_packer import AlphaPacker, alpha_src_fisheye_fov, fisheye_src_radial_scale
 
 
 class _Plane:
@@ -105,6 +108,67 @@ class AlphaPackerTests(unittest.TestCase):
         self.assertAlmostEqual(top_x, (eye_w - 1) * 0.5, places=4)
         self.assertAlmostEqual(top_y, 1.0, delta=1.0)
         self.assertEqual((corner_x, corner_y), (-1.0, -1.0))
+
+    def test_fisheye_source_keeps_the_picture_in_fisheye(self) -> None:
+        # A dual-fisheye SBS frame and a half-equirect SBS frame are the same
+        # shape, so only the filename-derived FOV can pick the fisheye path.
+        self.assertEqual(AlphaPacker.projection_mode_static(8192, 4096, 190.0), "fisheye_src")
+        self.assertEqual(AlphaPacker.projection_mode_static(8192, 4096, 0.0), "sbs_half_equirect")
+        # A flat 2D source is never fisheye, whatever a marker claims.
+        self.assertEqual(AlphaPacker.projection_mode_static(1920, 1080, 190.0), "flat2d_fisheye")
+
+    def test_fisheye_source_fov_reads_the_filename_and_honours_the_override(self) -> None:
+        with mock.patch.object(config, "ALPHA_SRC_FISHEYE", "auto"), mock.patch.object(config, "ALPHA_SRC_FOV", 0.0):
+            self.assertEqual(alpha_src_fisheye_fov("TEST_4096p_91983_FISHEYE190_x265"), 190.0)
+            self.assertEqual(alpha_src_fisheye_fov("movie_LR_180_SBS"), 0.0)
+        with mock.patch.object(config, "ALPHA_SRC_FISHEYE", "auto"), mock.patch.object(config, "ALPHA_SRC_FOV", 200.0):
+            self.assertEqual(alpha_src_fisheye_fov("movie_LR_180_SBS"), 200.0)
+        with mock.patch.object(config, "ALPHA_SRC_FISHEYE", "off"), mock.patch.object(config, "ALPHA_SRC_FOV", 200.0):
+            self.assertEqual(alpha_src_fisheye_fov("TEST_FISHEYE190"), 0.0)
+
+    def test_fisheye_source_radial_scale_fit_keeps_the_whole_circle(self) -> None:
+        with mock.patch.object(config, "ALPHA_SRC_RADIUS_SCALE", 1.0):
+            with mock.patch.object(config, "ALPHA_SRC_FIT", "fit"):
+                # fit maps circle onto circle: nothing is cut and 180 is a copy.
+                self.assertAlmostEqual(fisheye_src_radial_scale(190.0), 1.0, places=6)
+                self.assertAlmostEqual(fisheye_src_radial_scale(200.0), 1.0, places=6)
+            with mock.patch.object(config, "ALPHA_SRC_FIT", "crop"):
+                self.assertAlmostEqual(fisheye_src_radial_scale(190.0), 180.0 / 190.0, places=6)
+                self.assertAlmostEqual(fisheye_src_radial_scale(200.0), 0.9, places=6)
+                # A 180 source has no ring to drop, so crop is also a copy.
+                self.assertAlmostEqual(fisheye_src_radial_scale(180.0), 1.0, places=6)
+
+    def test_fisheye_source_mapping_anchors(self) -> None:
+        eye_w = 4096
+        out_w = eye_w * 2
+        out_h = 4096
+        radius = min(eye_w, out_h) * 0.5
+
+        def map_pixel(x: int, y: int, src_radial_scale: float) -> tuple[float, float]:
+            eye = 1 if x >= eye_w else 0
+            fx = float(x - eye * eye_w)
+            fy = float(y)
+            cx = (eye_w - 1) * 0.5
+            cy = (out_h - 1) * 0.5
+            nx = (fx - cx) / radius
+            ny = (fy - cy) / radius
+            if nx * nx + ny * ny > 1.0:
+                return -1.0, -1.0
+            u = min(max(cx + (fx - cx) * src_radial_scale, 0.0), eye_w - 1)
+            v = min(max(cy + (fy - cy) * src_radial_scale, 0.0), out_h - 1)
+            return u + eye * eye_w, v
+
+        # fit: an exact copy, so every output pixel reads its own source pixel.
+        for x, y in [(0, out_h // 2), (eye_w // 2, out_h // 2), (eye_w // 2, 0), (eye_w + 10, out_h // 2)]:
+            with self.subTest(pixel=(x, y)):
+                self.assertEqual(map_pixel(x, y, 1.0), (float(x), float(y)))
+        # crop: the rim samples the source's 180-degree radius, not its edge.
+        crop = 180.0 / 190.0
+        u, _v = map_pixel(0, out_h // 2, crop)
+        self.assertAlmostEqual(u, (eye_w - 1) * 0.5 * (1.0 - crop), places=3)
+        # Outside the circle stays outside in both modes.
+        self.assertEqual(map_pixel(0, 0, 1.0), (-1.0, -1.0))
+        self.assertEqual(map_pixel(0, 0, crop), (-1.0, -1.0))
 
     def test_pack_gpu_p016_frame_uploads_as_nv12_before_packing(self) -> None:
         matter = _Matter()

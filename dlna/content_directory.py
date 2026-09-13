@@ -36,6 +36,10 @@ from config import (
     PASSTHROUGH_SEEK_ENABLED,
     PASSTHROUGH_SEEK_CONTAINER,
     PASSTHROUGH_SEEK_HEADER_BYTES,
+    PASSTHROUGH_SEEK_VMP4,
+    PASSTHROUGH_SEEK_VMP4_BACKEND,
+    PASSTHROUGH_SEEK_VMP4_FRAMES_SOURCE_BUDGET,
+    seek_declared_total_bytes,
     PASSTHROUGH_SEEK_MODE,
     SI_PROGRESSIVE_DLNA,
     SI_PROGRESSIVE_ENABLED,
@@ -47,7 +51,9 @@ from config import (
     RTX_VSR_REALTIME_ENABLED,
     RTX_VSR_INPUT_MIN_HEIGHT,
     RTX_VSR_INPUT_MAX_HEIGHT,
+    RTX_VSR_NATIVE_MAX_HEIGHT,
     RTX_VSR_TARGET_HEIGHT,
+    DLSS5_ENABLED,
 )
 from dlna.profiles import passthrough_frame_rate
 from media_library import safe_resolve_path
@@ -64,10 +70,11 @@ from utils.offline_outputs import (
 from utils.runtime_settings import get_face_beauty, get_rm, get_si_mix
 from utils.subtitles import SubtitleTrack, find_external_subtitles
 from utils.video_metadata import probe_video_metadata, select_backend
-from utils.rtx_vsr import source_exceeds_target_resolution
+from utils.rtx_vsr import is_native_target, source_exceeds_target_resolution
 from utils.vr_naming import (
     has_vr_filename_marker,
     is_half_equirectangular_source,
+    alpha_passthrough_stem,
     live_passthrough_title,
     source_display_stem,
     superres_stem,
@@ -88,12 +95,14 @@ TWO_DVR_LIVE_PREFIX = "pl3_"
 RM_LIVE_PREFIX = "plr_"
 FACE_BEAUTY_LIVE_PREFIX = "plfb_"
 SUPERRES_LIVE_PREFIX = "plsr_"
+DLSS5_LIVE_PREFIX = "pldn_"
 LIVE_ITEM_PREFIX = "lg_"
 ALPHA_LIVE_ITEM_PREFIX = "la_"
 TWO_DVR_LIVE_ITEM_PREFIX = "l3_"
 RM_LIVE_ITEM_PREFIX = "lr_"
 FACE_BEAUTY_LIVE_ITEM_PREFIX = "lfb_"
 SUPERRES_LIVE_ITEM_PREFIX = "plsr_item_"
+DLSS5_LIVE_ITEM_PREFIX = "pldn_item_"
 LIVE_TIME_INDEX_PREFIX = "lix_"
 LIVE_TIME_GROUP_PREFIX = "lig_"
 LIVE_TIME_MINUTE_PREFIX = "lim_"
@@ -101,6 +110,7 @@ LIVE_TIME_POINT_PREFIX = "li5_"
 SEEK_ITEM_PREFIX = "sg_"
 ALPHA_SEEK_ITEM_PREFIX = "sa_"
 SUPERRES_SEEK_ITEM_PREFIX = "ssr_"
+DLSS5_SEEK_ITEM_PREFIX = "sdn_"
 IMAGE_ITEM_PREFIX = "img_"
 SI_ITEM_PREFIX = "si_"
 # Realtime SI ([SI]) directory + time-index object ids. The [SI] entry is a
@@ -140,7 +150,9 @@ _CDS_CLIENT_DEOVR = "deovr"
 _TIME_INDEX_GROUP_SEC = 10 * 60
 _TIME_INDEX_MINUTE_SEC = 60
 _TIME_INDEX_POINT_SEC = 5
-_LIVE_TIME_MODE_TOKEN_BY_MODE = {"green": "g", "alpha": "a", "two_dvr": "3", "rm": "r", "superres": "s"}
+_LIVE_TIME_MODE_TOKEN_BY_MODE = {
+    "green": "g", "alpha": "a", "two_dvr": "3", "rm": "r", "superres": "s", "dlss5": "d",
+}
 _LIVE_TIME_MODE_BY_TOKEN = {token: mode for mode, token in _LIVE_TIME_MODE_TOKEN_BY_MODE.items()}
 _SELECT_TIME_INDEX_LABELS = {
     "en_US": "Select Time Index",
@@ -309,7 +321,10 @@ def _id_to_dir(object_id: str) -> Path | None:
 def _id_to_live(object_id: str) -> tuple[Path, str] | None:
     mode = "green"
     prefix = LIVE_PREFIX
-    if object_id.startswith(SUPERRES_LIVE_ITEM_PREFIX):
+    if object_id.startswith(DLSS5_LIVE_ITEM_PREFIX):
+        mode = "dlss5"
+        prefix = DLSS5_LIVE_ITEM_PREFIX
+    elif object_id.startswith(SUPERRES_LIVE_ITEM_PREFIX):
         mode = "superres"
         prefix = SUPERRES_LIVE_ITEM_PREFIX
     elif object_id.startswith(FACE_BEAUTY_LIVE_ITEM_PREFIX):
@@ -329,6 +344,9 @@ def _id_to_live(object_id: str) -> tuple[Path, str] | None:
     elif object_id.startswith(FACE_BEAUTY_LIVE_PREFIX):
         mode = "face_beauty"
         prefix = FACE_BEAUTY_LIVE_PREFIX
+    elif object_id.startswith(DLSS5_LIVE_PREFIX):
+        mode = "dlss5"
+        prefix = DLSS5_LIVE_PREFIX
     elif object_id.startswith(SUPERRES_LIVE_PREFIX):
         mode = "superres"
         prefix = SUPERRES_LIVE_PREFIX
@@ -413,7 +431,10 @@ def _id_to_live_time_index(object_id: str) -> tuple[Path, str, str, int, int] | 
 
 def _id_to_seek(object_id: str) -> tuple[Path, str] | None:
     mode = "green"
-    if object_id.startswith(SUPERRES_SEEK_ITEM_PREFIX):
+    if object_id.startswith(DLSS5_SEEK_ITEM_PREFIX):
+        mode = "dlss5"
+        prefix = DLSS5_SEEK_ITEM_PREFIX
+    elif object_id.startswith(SUPERRES_SEEK_ITEM_PREFIX):
         mode = "superres"
         prefix = SUPERRES_SEEK_ITEM_PREFIX
     elif object_id.startswith(ALPHA_SEEK_ITEM_PREFIX):
@@ -545,7 +566,8 @@ def _video_item_count(path: Path, child: IndexedChild | None = None) -> int:
     width, height = _indexed_video_dimensions(child)
     passthrough_modes_list = [
         mode for mode in _passthrough_modes()
-        if mode != "superres" or _superres_dlna_enabled(path, width, height, child)
+        if (mode != "superres" or _superres_dlna_enabled(path, width, height, child))
+        and (mode != "dlss5" or _dlss5_dlna_enabled(path, width, height, child))
     ]
     passthrough_modes = len(passthrough_modes_list)
     seek_items = passthrough_modes if _seek_passthrough_dlna_enabled() else 0
@@ -626,7 +648,7 @@ def _passthrough_modes() -> tuple[str, ...]:
         else:
             tokens = (token,)
         for mode in tokens:
-            if mode in {"green", "alpha", "two_dvr", "superres"} and mode not in out:
+            if mode in {"green", "alpha", "two_dvr", "superres", "dlss5"} and mode not in out:
                 out.append(mode)
     return tuple(out)
 
@@ -964,14 +986,50 @@ def _passthrough_virtual_title(path: Path, mode: str, width: int = 0, height: in
     return live_passthrough_title(path.stem, mode, width, height)
 
 
+_SEEK_TITLE_LABELS = {
+    "green": "GREEN",
+    "alpha": "ALPHA",
+    "superres": "SUPERRES",
+    "dlss5": "DLSS5",
+    "two_dvr": "2D>3D",
+    "rm": "RM",
+    "face_beauty": "FACEBEAUTY",
+}
+
+
 def _passthrough_seek_title(path: Path, mode: str, width: int = 0, height: int = 0) -> str:
-    title = _passthrough_virtual_title(path, mode, width, height)
-    if title.endswith("_live"):
-        return f"{title[:-5]}_seek"
-    return f"{title}_seek"
+    """Seek entries read ``[MODE]`` plus the source's own display name.
+
+    They used to run the stem through the per-mode rewriting the live entries use
+    (green appends a layout suffix, alpha renames, superres builds a display
+    stem) and then add a ``_seek`` tail, so the same title carried the mode in
+    two places and the name the file is listed under in none of them.
+
+    The name has to keep the VR markers, and they describe the OUTPUT rather than
+    the source.
+
+    Green emits the source's own geometry, so it is the source's display name
+    with the mode in front - that display stem is also where a 2:1
+    half-equirectangular source picks up the SBS 180 marker a VR player needs to
+    enter VR180 by itself. It does NOT carry the live entry's ``_passthrough``
+    tail: that tag only existed to tell the live entry apart from the source,
+    and the prefix does that job now.
+
+    Alpha is different. It emits LR 180 fisheye with the matte packed in, and
+    ``_FISHEYE_F180_alpha`` is what says so; naming an alpha stream after the
+    source would have the player project fisheye content as equirectangular SBS.
+    """
+    label = _SEEK_TITLE_LABELS.get(str(mode or "").strip().lower(), str(mode or "").upper())
+    if str(mode or "").strip().lower() == "alpha":
+        stem = alpha_passthrough_stem(path.stem)
+    else:
+        stem = source_display_stem(path.stem, width, height)
+    return f"[{label}]{stem}"
 
 
 def _passthrough_live_prefix(mode: str) -> str:
+    if mode == "dlss5":
+        return DLSS5_LIVE_PREFIX
     if mode == "face_beauty":
         return FACE_BEAUTY_LIVE_PREFIX
     if mode == "rm":
@@ -984,6 +1042,8 @@ def _passthrough_live_prefix(mode: str) -> str:
 
 
 def _passthrough_live_item_prefix(mode: str) -> str:
+    if mode == "dlss5":
+        return DLSS5_LIVE_ITEM_PREFIX
     if mode == "face_beauty":
         return FACE_BEAUTY_LIVE_ITEM_PREFIX
     if mode == "rm":
@@ -995,7 +1055,75 @@ def _passthrough_live_item_prefix(mode: str) -> str:
     return ALPHA_LIVE_ITEM_PREFIX if mode == "alpha" else LIVE_ITEM_PREFIX
 
 
+def _seek_vmp4_matches_source_size(mode: str) -> bool:
+    """True when /passthrough_seek serves a file exactly the source's size.
+
+    The frames backend with a source-derived budget lays the virtual file out to
+    land on a byte count derived from the source's (the source's own size, times
+    the budget scale for resolutions where inheriting it exactly under-codes the
+    picture), so that is what DIDL must advertise. Superres is excluded because
+    it emits more pixels than the source and keeps the estimated budget.
+    """
+    return (
+        PASSTHROUGH_SEEK_VMP4
+        and PASSTHROUGH_SEEK_VMP4_BACKEND == "slot_frames"
+        and PASSTHROUGH_SEEK_VMP4_FRAMES_SOURCE_BUDGET
+        and str(mode or "").lower() != "superres"
+    )
+
+
+def _seek_declared_bitrate(mode: str, declared_size: int, pt_bps_est: int, duration: float) -> int:
+    """Bitrate DIDL should advertise for a seek item.
+
+    It has to agree with the size and duration on the same res element. Leaving
+    the old realtime estimate there while size became the source's real size made
+    the seek item claim a rate the file does not have - the plain /media entry for
+    the very same file reports size*8/duration - and a player comparing the two
+    can decide the stream is too demanding to attempt.
+    """
+    if duration > 0 and declared_size > 0 and _seek_vmp4_matches_source_size(mode):
+        return int(declared_size * 8 / duration)
+    return int(pt_bps_est or 0)
+
+
+def _seek_declared_size(path: Path, mode: str, source_size: int, pt_size: int, duration: float) -> int:
+    """Size DIDL should advertise for a seek item.
+
+    The legacy pseudo-VOD endpoint declared a realtime-bitrate estimate, which is
+    where "the file looks much bigger than the original" came from: the estimate
+    runs well above what the source actually spends, while the HTTP layer has
+    been serving Content-Range against the source's real size since the
+    source-budget work. Advertise the same number HTTP will.
+    """
+    if duration <= 0:
+        return 0
+    if _seek_vmp4_matches_source_size(mode) and source_size > 0:
+        # Above the scale threshold the layout is laid out to source_size * the
+        # budget scale, not to source_size, so ask for the same number the HTTP
+        # layer will serve rather than assuming they are equal.
+        # The scale below is continuous in the duration, and DIDL normally reads
+        # duration from the library index while the HTTP side reads it from
+        # probe_cached. Two slightly different durations would advertise two
+        # different sizes, so take both inputs from exactly where HTTP takes
+        # them.
+        try:
+            probed = probe_cached(path)
+            return seek_declared_total_bytes(
+                int(path.stat().st_size),
+                float(probed.duration or duration),
+                int(getattr(probed, "width", 0) or 0),
+                int(getattr(probed, "height", 0) or 0),
+                float(getattr(probed, "fps", 0.0) or 0.0),
+                mode,
+            )
+        except OSError:
+            return int(source_size)
+    return max(0, int(PASSTHROUGH_SEEK_HEADER_BYTES)) + pt_size
+
+
 def _passthrough_seek_item_prefix(mode: str) -> str:
+    if mode == "dlss5":
+        return DLSS5_SEEK_ITEM_PREFIX
     if mode == "superres":
         return SUPERRES_SEEK_ITEM_PREFIX
     return ALPHA_SEEK_ITEM_PREFIX if mode == "alpha" else SEEK_ITEM_PREFIX
@@ -1003,7 +1131,7 @@ def _passthrough_seek_item_prefix(mode: str) -> str:
 
 def _passthrough_live_query(mode: str) -> str:
     version = f"ptv={_DIDL_SCHEMA_VERSION}"
-    if mode in {"green", "alpha", "two_dvr", "rm", "superres", "face_beauty"}:
+    if mode in {"green", "alpha", "two_dvr", "rm", "superres", "dlss5", "face_beauty"}:
         return f"mode={mode}&{version}"
     return version
 
@@ -1039,6 +1167,32 @@ def _seek_passthrough_protocol_info() -> str:
     )
 
 
+def _seek_supported_modes() -> frozenset[str]:
+    """The frames backend's own set, read lazily to keep DLNA import-light.
+
+    Advertising a seek entry the backend refuses lists something no player can
+    open, so the browse side must not keep its own copy of this list.
+    """
+    from pipeline.pynv_stream import SEEK_FRAME_MODES
+
+    return SEEK_FRAME_MODES
+
+
+def _seek_supported_mode(mode: str) -> bool:
+    name = str(mode or "").strip().lower()
+    if name not in _seek_supported_modes():
+        return False
+    if name == "superres":
+        # Only native 1x SuperRes can be served as a virtual file; the enlarging
+        # targets stay on the live chapter container.
+        from utils.rtx_vsr import seek_supported_target
+
+        return seek_supported_target(RTX_VSR_TARGET_HEIGHT)
+    # DLSS5 Neural Rendering is always 1x, so its output shares the source's
+    # geometry and the source MP4 shell describes it: always seekable.
+    return True
+
+
 def _seek_passthrough_dlna_enabled() -> bool:
     return bool(PASSTHROUGH_SEEK_ENABLED and PASSTHROUGH_SEEK_DLNA)
 
@@ -1055,8 +1209,16 @@ def _seek_passthrough_dlna_pn(container: str | None = None) -> str:
     return "HEVC_MP4_MAIN" if (container or _seek_passthrough_container()) == "mp4" else "HEVC_TS_NA_ISO"
 
 
-def _seek_passthrough_route_suffix(container: str | None = None) -> str:
-    return ".seek.mp4" if (container or _seek_passthrough_container()) == "mp4" else ".seek.ts"
+def _seek_passthrough_route_suffix(container: str | None = None, mode: str | None = None) -> str:
+    """Route suffix for a seek entry, carrying the output mode in the path.
+
+    Players re-issue this URL for their range requests and some drop the query
+    when they do, which used to resolve `mode` by fallback and play the wrong
+    picture. The mode therefore lives in the path.
+    """
+    tail = ".seek.mp4" if (container or _seek_passthrough_container()) == "mp4" else ".seek.ts"
+    name = str(mode or "").strip().lower()
+    return f".{name}{tail}" if name in {"green", "alpha", "superres", "dlss5"} else tail
 
 
 def _resolution_str(width: int, height: int) -> str:
@@ -1070,9 +1232,21 @@ def _parse_resolution(value: str) -> tuple[int, int]:
     return int(match.group(1)), int(match.group(2))
 
 
-def _passthrough_resolution(width: int, height: int, mode: str) -> str:
+def _passthrough_resolution(width: int, height: int, mode: str, *, seekable: bool = False) -> str:
+    """Resolution DIDL advertises for one passthrough entry.
+
+    SuperRes differs between the two shapes: the live entry encodes the
+    configured target, while the seek entry encodes whatever that route can
+    sustain (native 1x by default), so they cannot share one answer.
+    """
     if mode == "alpha" and width > 0 and height > 0:
         out_w, out_h = alpha_output_size(width, height)
+        return _resolution_str(out_w, out_h)
+    if mode == "superres" and width > 0 and height > 0:
+        from utils.rtx_vsr import seek_target_height, target_dimensions
+
+        target = seek_target_height() if seekable else RTX_VSR_TARGET_HEIGHT
+        out_w, out_h = target_dimensions(int(width), int(height), target)
         return _resolution_str(out_w, out_h)
     if mode == "two_dvr" and width > 0 and height > 0:
         proc_w = min(int(width), 4096)
@@ -1123,7 +1297,11 @@ def _superres_dlna_enabled(
     if is_vr and int(width or 0) > 4096:
         return False
     source_shape_allowed = _is_two_d_source(path, width, height) or is_vr
-    input_height_allowed = int(height) >= RTX_VSR_INPUT_MIN_HEIGHT and (is_vr or int(height) <= RTX_VSR_INPUT_MAX_HEIGHT)
+    # Native 1x does not enlarge, so the upscale input ceiling does not apply.
+    max_input_height = (
+        RTX_VSR_NATIVE_MAX_HEIGHT if is_native_target(RTX_VSR_TARGET_HEIGHT) else RTX_VSR_INPUT_MAX_HEIGHT
+    )
+    input_height_allowed = int(height) >= RTX_VSR_INPUT_MIN_HEIGHT and (is_vr or int(height) <= max_input_height)
     return bool(
         RTX_VSR_ENABLED
         and RTX_VSR_REALTIME_ENABLED
@@ -1132,6 +1310,49 @@ def _superres_dlna_enabled(
         and input_height_allowed
         and not source_exceeds_target_resolution(width, height, RTX_VSR_TARGET_HEIGHT)
     )
+
+
+def _dlss5_dlna_enabled(
+    path: Path,
+    width: int = 0,
+    height: int = 0,
+    child: IndexedChild | None = None,
+) -> bool:
+    """Whether a [DLSS5] entry may be listed for this source.
+
+    The runtime is gitignored and optional, so a clean clone must not show a
+    channel it cannot play: without the three DLLs the entry never appears.
+
+    Everything else is the realtime budget. Measured end to end on an RTX 5060
+    Ti - decode, NR and NVENC together - the chain holds about 230 Mpixel/s:
+    78fps at 1216x2160, 31.9fps at 3840x1920, 28.3fps at 3840x2160. So 4K is
+    the last size offered at all, and within it the source's own frame rate
+    still decides: 4K/24 plays, 4K/60 does not.
+    source_block_reason_dlss5(realtime=True) owns those limits, and the routes
+    ask the same function, so nothing can be listed that then answers 409.
+    """
+    from utils.dlss5 import source_block_reason_dlss5
+
+    if not DLSS5_ENABLED:
+        return False
+    video = child.video if child is not None else None
+    fps = float(getattr(video, "fps", 0.0) or 0.0)
+    reason = source_block_reason_dlss5(
+        int(width or 0),
+        int(height or 0),
+        is_10bit=_indexed_is_10bit(child),
+        fps=fps,
+        realtime=True,
+    )
+    if reason:
+        # Four different limits can hide a title, and from the player's side
+        # they all look the same: the entry is simply not there. Say which one
+        # it was, with the numbers that decided it.
+        log.debug(
+            "DLSS5 entry withheld: %s %dx%d@%.3f reason=%s",
+            path.name, int(width or 0), int(height or 0), fps, reason,
+        )
+    return not reason
 
 
 def _live_chapter_offsets(duration: float) -> list[int]:
@@ -1333,27 +1554,34 @@ def _video_items_from_index(
     for mode in _passthrough_modes():
         if mode == "superres" and not _superres_dlna_enabled(path, width, height, child):
             continue
+        if mode == "dlss5" and not _dlss5_dlna_enabled(path, width, height, child):
+            continue
         if mode == "two_dvr" and (
             not _is_two_d_source(path, width, height)
             or has_offline_two_dvr_output(path, siblings)
             or width > 4096
         ):
             continue
-        if mode != "two_dvr" and _seek_passthrough_dlna_enabled():
+        # live or seek, never both: a title that offers the same mode twice makes
+        # the viewer guess which entry is the draggable one, and the two differ in
+        # shape as well (live is a chapter container, seek a single file). Modes
+        # the seek backend cannot produce keep their live entry.
+        if _seek_supported_mode(mode) and _seek_passthrough_dlna_enabled():
             query = _passthrough_seek_query(mode)
-            seek_size = max(0, int(PASSTHROUGH_SEEK_HEADER_BYTES)) + pt_size if duration > 0 else 0
+            seek_size = _seek_declared_size(path, mode, size, pt_size, duration)
+            seek_bps = _seek_declared_bitrate(mode, seek_size, pt_bps_est, duration)
             seek_container = _seek_passthrough_container()
             items.append(
                 {
                     "id": f"{_passthrough_seek_item_prefix(mode)}{_versioned_rel(rel)}",
                     "parent_id": parent_id,
                     "title": _passthrough_seek_title(path, mode, width, height),
-                    "url": f"{base}/passthrough_seek/{quoted}{_seek_passthrough_route_suffix(seek_container)}" + (f"?{query}" if query else ""),
+                    "url": f"{base}/passthrough_seek/{quoted}{_seek_passthrough_route_suffix(seek_container, mode)}" + (f"?{query}" if query else ""),
                     "thumb": f"{base}/thumb/{quoted}",
                     "size": seek_size,
                     "duration": duration,
-                    "resolution": _passthrough_resolution(width, height, mode),
-                    "bitrate": pt_bps_est,
+                    "resolution": _passthrough_resolution(width, height, mode, seekable=True),
+                    "bitrate": seek_bps,
                     "mime": _seek_passthrough_mime(seek_container),
                     "dlna_pn": _seek_passthrough_dlna_pn(seek_container),
                     "frame_rate": passthrough_frame_rate(source_fps),
@@ -1362,6 +1590,7 @@ def _video_items_from_index(
                     "protocol_info": _seek_passthrough_protocol_info(),
                 }
             )
+            continue
         live_id = f"{_passthrough_live_prefix(mode)}{_versioned_rel(rel)}"
         items.append(
             {
@@ -1490,6 +1719,8 @@ def _live_time_index_items(
     if mode == "rm" and not _rm_dlna_enabled(path, width, height):
         return []
     if mode == "superres" and not _superres_dlna_enabled(path, width, height):
+        return []
+    if mode == "dlss5" and not _dlss5_dlna_enabled(path, width, height):
         return []
 
     virtual_title = _passthrough_virtual_title(path, mode, width, height)
@@ -1638,6 +1869,8 @@ def _live_chapter_items(
         return []
     if mode == "superres" and not _superres_dlna_enabled(path, width, height):
         return []
+    if mode == "dlss5" and not _dlss5_dlna_enabled(path, width, height):
+        return []
     pt_bps = _parse_bitrate(PASSTHROUGH_BITRATE)
     if duration > 0:
         _, pt_bps_est, _ = estimate_for_media(path, duration, PYNV_OUTPUT_CODEC)
@@ -1645,7 +1878,7 @@ def _live_chapter_items(
         pt_bps_est = pt_bps
     items: list[dict] = []
     virtual_title = _passthrough_virtual_title(path, mode, width, height)
-    suffix = {"alpha": "a", "two_dvr": "3", "rm": "r", "superres": "s"}.get(mode, "g")
+    suffix = {"alpha": "a", "two_dvr": "3", "rm": "r", "superres": "s", "dlss5": "d"}.get(mode, "g")
     live_route_suffix = _live_route_hint_suffix(client_profile)
     live_omit_filelike_attrs = not _is_deovr_cds_client(client_profile)
     items.append(_live_time_index_root_item(path, mode, parent_id, duration, width, height, language))

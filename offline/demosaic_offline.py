@@ -37,6 +37,12 @@ from utils.runtime_dll_paths import apply_runtime_dll_paths
 apply_runtime_dll_paths()
 
 import config
+from utils.offline_outputs import (
+    discard_pending_output,
+    is_internal_intermediate_name,
+    pending_output_path,
+    publish_pending_output,
+)
 from utils.subprocess_hidden import hidden_subprocess_kwargs
 
 FFMPEG = shutil.which("ffmpeg") or "ffmpeg"
@@ -139,7 +145,8 @@ def _run_clip(processor_factory, src: Path, out: Path, start: float, duration: f
     bitrate = str(effective_default_bitrate(src, PYNV_BACKEND_LABEL).bps)
     enc = nvc.CreateEncoder(width, height, "NV12", False,
                             **_pynv_encoder_kwargs(bitrate=bitrate, fps=f"{fps:.6f}"))
-    mux = _mux_proc(src, out, fps, start, duration)
+    pending = pending_output_path(out)
+    mux = _mux_proc(src, pending, fps, start, duration)
     # Drain mux stderr concurrently so a full pipe buffer can never block ffmpeg
     # (which would stall its stdin reads and deadlock our bitstream writes).
     mux_err_chunks: list[bytes] = []
@@ -270,8 +277,13 @@ def _run_clip(processor_factory, src: Path, out: Path, start: float, duration: f
             mux.kill()
     stderr_thread.join(timeout=5)
     mux_err = b"".join(mux_err_chunks).decode("utf-8", "replace").strip()
-    if mux.returncode not in (0, None) or not out.is_file():
+    if mux.returncode not in (0, None) or not pending.is_file():
         log(f"mux failed rc={mux.returncode}: {mux_err[:800]}")
+        discard_pending_output(pending)
+        return 1
+    if not publish_pending_output(pending, out):
+        log(f"could not rename {pending.name} to {out.name}")
+        discard_pending_output(pending)
         return 1
     produced = enc_state["produced"]
     elapsed = max(1e-3, time.perf_counter() - t0)
@@ -284,6 +296,8 @@ def _video_files(root: Path, recursive: bool) -> list[Path]:
     out = []
     for path in iterator:
         if not path.is_file() or path.suffix.lower() not in VIDEO_EXTS:
+            continue
+        if is_internal_intermediate_name(path.name):
             continue
         if path.stem.endswith(OUTPUT_SUFFIX):
             continue

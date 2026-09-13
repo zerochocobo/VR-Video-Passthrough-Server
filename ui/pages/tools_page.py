@@ -17,6 +17,12 @@ from ui.icons import line_pixmap
 TOOL_ICON_SIZE = 30
 
 
+def _dlss5_available() -> bool:
+    from utils.dlss5 import is_dlss5_available
+
+    return bool(is_dlss5_available())
+
+
 class ToolCard(QFrame):
     open_requested = Signal()
 
@@ -65,6 +71,7 @@ class ToolsPage(QWidget):
     open_two_dvr = Signal()
     open_rm = Signal()
     open_superres = Signal()
+    open_dlss5 = Signal()
     open_face_beauty = Signal()
 
     def __init__(self, i18n, settings=None) -> None:
@@ -86,11 +93,13 @@ class ToolsPage(QWidget):
         self.two_dvr_card = ToolCard("two_dvr")
         self.rm_card = ToolCard("rm")
         self.superres_card = ToolCard("superres")
+        self.dlss5_card = ToolCard("dlss5")
         self.face_beauty_card = ToolCard("face_beauty")
         self.offline_card.open_requested.connect(self.open_offline)
         self.two_dvr_card.open_requested.connect(self.open_two_dvr)
         self.rm_card.open_requested.connect(self.open_rm)
         self.superres_card.open_requested.connect(self.open_superres)
+        self.dlss5_card.open_requested.connect(self.open_dlss5)
         self.face_beauty_card.open_requested.connect(self.open_face_beauty)
 
         layout = QVBoxLayout(self)
@@ -103,12 +112,25 @@ class ToolsPage(QWidget):
         layout.addWidget(self.two_dvr_card)
         layout.addWidget(self.rm_card)
         layout.addWidget(self.superres_card)
+        layout.addWidget(self.dlss5_card)
         layout.addWidget(self.face_beauty_card)
         layout.addStretch(1)
 
+        self.set_dlss5_card_visible(
+            bool(settings and settings.data.get("dlss5_card_visible")) and _dlss5_available()
+        )
         self.set_rm_card_visible(bool(settings and settings.data.get("rm_card_visible")))
         self.set_face_beauty_card_visible(bool(settings and settings.data.get("face_beauty_card_visible")))
         self.retranslate()
+
+    def set_dlss5_card_visible(self, visible: bool) -> None:
+        """Show or hide the offline DLSS5 entry.
+
+        The runtime is gitignored and optional, so a clean clone has nothing to
+        run and the card is absent rather than greyed out - the same rule the
+        dashboard card follows.
+        """
+        self.dlss5_card.setVisible(bool(visible))
 
     def set_rm_card_visible(self, visible: bool) -> None:
         """Show or hide the offline Remove Mosaic entry from the tools page."""
@@ -129,8 +151,10 @@ class ToolsPage(QWidget):
         self.rm_card.desc_label.setText(self.i18n.t("tools.rm_desc"))
         self.superres_card.title_label.setText(self.i18n.t("superres.offline_title"))
         self.superres_card.desc_label.setText(self.i18n.t("tools.superres_desc"))
+        self.dlss5_card.title_label.setText(self.i18n.t("dlss5.offline_title"))
+        self.dlss5_card.desc_label.setText(self.i18n.t("tools.dlss5_desc"))
         self.face_beauty_card.title_label.setText(self.i18n.t("beauty.title"))
         self.face_beauty_card.desc_label.setText(self.i18n.t("tools.face_beauty_desc"))
         for card in (self.offline_card, self.two_dvr_card, self.rm_card,
-                     self.superres_card, self.face_beauty_card):
+                     self.superres_card, self.dlss5_card, self.face_beauty_card):
             card.open_button.setText(self.i18n.t("tools.open"))

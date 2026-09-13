@@ -7,18 +7,23 @@
 from __future__ import annotations
 
 import asyncio
+import functools
 import hashlib
 import itertools
 import os
 import re
 import shutil
 import subprocess
-from dataclasses import dataclass
+import sys
+import threading
+import time
+from dataclasses import dataclass, field as dataclass_field
 from pathlib import Path
 from urllib.parse import quote, unquote
 
 from fastapi import APIRouter, HTTPException, Header, Query, Request
 from fastapi.responses import FileResponse, Response, StreamingResponse
+from starlette.concurrency import run_in_threadpool
 
 import config
 from config import (
@@ -45,6 +50,7 @@ from config import (
     PASSTHROUGH_LIVE_VLC_PSEUDO_VOD,
     PASSTHROUGH_OUTPUT_MODE,
     RTX_VSR_REALTIME_ENABLED,
+    RTX_VSR_TARGET_HEIGHT,
     PASSTHROUGH_AUDIO_MPEGTS_VLC,
     PASSTHROUGH_FALLBACK_MAX_FPS,
     PASSTHROUGH_GOP,
@@ -62,8 +68,49 @@ from config import (
     PASSTHROUGH_SEEK_HEADER_BYTES,
     PASSTHROUGH_SEEK_PROFILES,
     PASSTHROUGH_SEEK_ROUTE_POLICY,
+    PASSTHROUGH_SEEK_VMP4,
+    PASSTHROUGH_SEEK_VMP4_BACKEND,
+    PASSTHROUGH_SEEK_VMP4_BUILD_BITRATE,
+    PASSTHROUGH_SEEK_VMP4_BUILD_ENGINE,
+    PASSTHROUGH_SEEK_VMP4_BUILD_MAX_ACTIVE,
+    PASSTHROUGH_SEEK_VMP4_BUILD_MISSING,
+    PASSTHROUGH_SEEK_VMP4_BUILD_MODES,
+    PASSTHROUGH_SEEK_VMP4_BUILD_PRESET,
+    PASSTHROUGH_SEEK_VMP4_BUILD_TWO_DVR_BITRATE,
+    PASSTHROUGH_SEEK_VMP4_BUILD_TWO_DVR_MAX_SIDE,
+    PASSTHROUGH_SEEK_VMP4_BUILD_TWO_DVR_PROVIDER,
+    PASSTHROUGH_SEEK_VMP4_SLOT_BUILD_PLACEHOLDER,
+    PASSTHROUGH_SEEK_VMP4_SLOT_READY_ONLY,
+    PASSTHROUGH_SEEK_VMP4_SLOT_READY_WAIT,
+    PASSTHROUGH_SEEK_VMP4_SLOT_MAX_SAMPLE_BYTES,
+    PASSTHROUGH_SEEK_VMP4_SLOT_MATTER_TIMEOUT,
+    PASSTHROUGH_SEEK_VMP4_SLOT_RETRY_BASE,
+    PASSTHROUGH_SEEK_VMP4_SLOT_RETRY_MAX,
+    PASSTHROUGH_SEEK_VMP4_FRAMES_FRAME_BYTES,
+    PASSTHROUGH_SEEK_VMP4_FRAMES_SOURCE_BUDGET,
+    seek_budget_scale,
+    seek_declared_total_bytes,
+    seek_output_fps,
+    PASSTHROUGH_SEEK_VMP4_FRAMES_BUDGET_FLATTEN,
+    PASSTHROUGH_SEEK_VMP4_FRAMES_FLOOR_BYTES,
+    seek_frame_floor_bytes,
+    PASSTHROUGH_SEEK_VMP4_FRAMES_PROBE_BYTES,
+    PASSTHROUGH_SEEK_VMP4_FRAMES_IDR_WEIGHT,
+    PASSTHROUGH_SEEK_VMP4_FRAMES_MAX_FPS,
+    PASSTHROUGH_SEEK_VMP4_FRAMES_PREBUFFER_FRAMES,
+    PASSTHROUGH_SEEK_VMP4_FRAMES_MAX_SPAN_BYTES,
+    PASSTHROUGH_SEEK_VMP4_FRAMES_MIN_SPAN_BYTES,
+    PASSTHROUGH_SEEK_VMP4_FRAMES_RANGED_WAIT,
+    PASSTHROUGH_SEEK_VMP4_FRAMES_BODY_FRAME_WAIT,
+    PASSTHROUGH_SEEK_VMP4_FRAMES_MAX_ACTIVE,
+    PASSTHROUGH_SEEK_VMP4_FRAMES_READY_WAIT,
+    RUNTIME_CACHE_DIR,
     SI_PROGRESSIVE_ENABLED,
+    TWO_DVR_HOLE_FILL,
+    TWO_DVR_MODEL,
+    TWO_DVR_STRENGTH,
     DEBUG_LOGS,
+    DECODE_MAX_SIDE,
     LIVE_REQUEST_HEADER_DUMP,
     LIGHT_MATCH_FLUSH_QUEUES,
     MEDIA_LIBRARY,
@@ -74,11 +121,44 @@ from config import (
 from dlna.profiles import passthrough_dlna_pn, passthrough_frame_rate
 from media_library import safe_resolve_path
 from http_app.si_stream import DEFAULT_CHUNK_SIZE, get_si_stream_service, iter_si_mpegts, parse_range_header
-from pipeline.ffmpeg_io import probe_cached
-from pipeline.si_virtual_mp4 import build_progressive_si_virtual_mp4, iter_virtual_range
+from pipeline.ffmpeg_io import FFMPEG, probe_cached
+from pipeline.passthrough_vmp4_slot import (
+    PassthroughVmp4SlotLayout,
+    Vmp4SlotCacheStatus,
+    Vmp4SlotLayoutError,
+    Vmp4SlotOutputTemplate,
+    build_passthrough_vmp4_slot_layout,
+    ensure_vmp4_slot_manifest,
+    iter_vmp4_slot_range,
+    load_vmp4_slot_output_template,
+    update_vmp4_slot_manifest_slot_state,
+    vmp4_slot_index_for_offset,
+    write_vmp4_slot_hevc_annexb_payload,
+    hevc_annexb_to_length_prefixed_sample,
+    split_hevc_annexb_access_units,
+)
+from pipeline.source_budget_plan import (
+    SourceBudgetError,
+    SourceBudgetPlan,
+    build_source_budget_plan,
+)
+from pipeline.passthrough_vmp4_frames import (
+    PassthroughVmp4FramesLayout,
+    build_passthrough_vmp4_frames_layout,
+    iter_vmp4_frames_range,
+    vmp4_frame_index_for_offset,
+)
+from pipeline.si_virtual_mp4 import build_progressive_si_virtual_mp4, iter_virtual_range, read_media_sample_table
 from pipeline.matting import acquire_matter, release_matter
 from pipeline.stream import PassthroughStream
-from pipeline.pynv_stream import PYNV_BACKEND_LABEL, PYNV_OUTPUT_CODEC, PyNvPassthroughStream
+from pipeline.pynv_stream import SEEK_FRAME_MODES
+from utils.rtx_vsr import seek_supported_target
+from pipeline.pynv_stream import (
+    PYNV_BACKEND_LABEL,
+    PYNV_OUTPUT_CODEC,
+    PyNvPassthroughStream,
+    build_passthrough_hevc_annexb_gop,
+)
 from pipeline.thumbnail import get_thumb
 from utils.bitrate_estimator import estimate_for_media, parse_bitrate, record_actual_bps
 from utils.byte_seek_map import map_byte_start_to_time
@@ -90,13 +170,14 @@ from utils.player_compat import (
     live_response_profile_from_ua,
 )
 from utils.request_history import annotate_request
+from utils.runtime_dll_paths import apply_runtime_dll_paths
 from utils.runtime_settings import get_light_match
 from utils.subprocess_hidden import hidden_subprocess_kwargs
 from utils.mkv_cues import probe_mkv_cues
-from utils.offline_outputs import has_offline_two_dvr_output
+from utils.offline_outputs import has_offline_two_dvr_output, is_internal_intermediate_name, matches_offline_output_for_source, matches_offline_two_dvr_output_for_source
 from utils.subtitles import find_external_subtitles, is_subtitle_path, subtitle_mime
 from utils.video_metadata import probe_video_metadata, select_backend
-from utils.vr_naming import has_vr_filename_marker, is_half_equirectangular_source
+from utils.vr_naming import has_vr_filename_marker, is_half_equirectangular_source, offline_passthrough_stem, two_dvr_stem
 
 log = get("media")
 router = APIRouter()
@@ -164,6 +245,8 @@ _SI_STARTUP_PROBE_BYTES = 1024 * 1024
 
 
 def _seek_container() -> str:
+    if PASSTHROUGH_SEEK_VMP4:
+        return "mp4"
     return PASSTHROUGH_SEEK_CONTAINER if PASSTHROUGH_SEEK_CONTAINER in {"mpegts", "mp4"} else "mpegts"
 
 
@@ -175,13 +258,27 @@ def _seek_dlna_pn(container: str | None = None) -> str:
     return "HEVC_MP4_MAIN" if (container or _seek_container()) == "mp4" else "HEVC_TS_NA_ISO"
 
 
-def _split_seek_route_name(name: str) -> tuple[str, str | None]:
+# The output mode rides in the path, not only in the query: players re-issue a
+# seek URL for their range requests and some drop the query when they do. A
+# dropped `mode=superres` then fell back to another mode and played the wrong
+# picture, so the route carries `<key>.<mode>.seek.<ext>` and the query stays
+# as a hint for links that predate this.
+_SEEK_ROUTE_MODES = ("green", "alpha", "superres", "dlss5")
+
+
+def _split_seek_route_name(name: str) -> tuple[str, str | None, str | None]:
     decoded = unquote(name)
     lower = decoded.lower()
     for suffix, container in _SEEK_ROUTE_SUFFIXES:
         if lower.endswith(suffix):
-            return decoded[: -len(suffix)], container
-    return decoded, None
+            key = decoded[: -len(suffix)]
+            key_lower = key.lower()
+            for mode in _SEEK_ROUTE_MODES:
+                tag = f".{mode}"
+                if key_lower.endswith(tag):
+                    return key[: -len(tag)], container, mode
+            return key, container, None
+    return decoded, None, None
 
 
 _LIVE_END = object()
@@ -990,9 +1087,9 @@ def _safe_media_path(name: str) -> Path:
     return _safe_media_path_from_key(unquote(name))
 
 
-def _safe_seek_video_path(name: str) -> tuple[Path, str | None]:
-    key, route_container = _split_seek_route_name(name)
-    return _safe_video_path_from_key(key), route_container
+def _safe_seek_video_path(name: str) -> tuple[Path, str | None, str | None]:
+    key, route_container, route_mode = _split_seek_route_name(name)
+    return _safe_video_path_from_key(key), route_container, route_mode
 
 
 def _safe_subtitle_path(name: str) -> Path:
@@ -1633,8 +1730,41 @@ def _estimated_seek_passthrough_size(path: Path, duration: float, codec: str, cl
     return total
 
 
+def _seek_vmp4_enabled(container: str | None = None) -> bool:
+    return bool(PASSTHROUGH_SEEK_VMP4 and (container or _seek_container()) == "mp4")
+
+
+def _seek_vmp4_backend() -> str:
+    raw = str(PASSTHROUGH_SEEK_VMP4_BACKEND or "cache_file").strip().lower().replace("-", "_")
+    return raw if raw in {"cache_file", "slot", "slot_frames"} else "cache_file"
+
+
+def _source_declared_size(path: Path) -> int:
+    try:
+        return max(0, int(Path(path).stat().st_size))
+    except OSError:
+        return 0
+
+
+def _seek_declared_total(
+    path: Path,
+    duration: float,
+    codec: str,
+    client_host: str = "",
+    container: str | None = None,
+) -> int:
+    # Deliberately NOT scaled by the budget rule: this is shared by every seek
+    # backend, including the prebuilt-cache path that pads a real file up to the
+    # source size. Only the frames layout stretches the file, and that path
+    # serves layout.total_size, which carries the scale already.
+    if _seek_vmp4_enabled(container):
+        return _source_declared_size(path)
+    return _estimated_seek_passthrough_size(path, duration, codec, client_host, container)
+
+
 def _seek_probe_cache_key(path: Path, codec: str, duration: float, total: int, container: str | None = None) -> str:
-    return f"seek|{container or _seek_container()}|{safe_resolve_path(path)}|{codec}|{round(float(duration or 0.0), 3)}|{total}"
+    flavor = "vmp4" if _seek_vmp4_enabled(container) else "seek"
+    return f"{flavor}|{container or _seek_container()}|{safe_resolve_path(path)}|{codec}|{round(float(duration or 0.0), 3)}|{total}"
 
 
 def _seek_route_allowed(user_agent: str) -> tuple[bool, str, str]:
@@ -1661,11 +1791,9 @@ def _seek_blocked_response(reason: str) -> Response:
 
 
 def _seek_output_fps(info) -> float:
-    source_fps = float(getattr(info, "fps", 0.0) or 0.0)
-    cap = float(PASSTHROUGH_MAX_FPS or 0.0)
-    if cap > 0 and source_fps > 0:
-        return min(source_fps, cap)
-    return source_fps if source_fps > 0 else cap
+    # config owns the rule: the budget scale depends on it and the DLNA layer has
+    # to arrive at the same number this path will.
+    return seek_output_fps(float(getattr(info, "fps", 0.0) or 0.0))
 
 
 def _seek_prefix_cache_limit() -> int:
@@ -1685,11 +1813,2836 @@ def _apply_seek_diag_headers(
     mapped=None,
 ) -> None:
     headers["X-Passthrough-Seek-Time"] = f"{start_sec:.3f}"
-    headers["X-Passthrough-Mode"] = f"seek-{container or _seek_container()}-{output_mode}"
+    prefix = "seek-vmp4" if _seek_vmp4_enabled(container) else "seek"
+    headers["X-Passthrough-Mode"] = f"{prefix}-{container or _seek_container()}-{output_mode}"
     if mapped is not None:
         headers["X-Passthrough-Seek-Ratio"] = f"{mapped.ratio:.6f}"
         headers["X-Passthrough-Seek-Raw-Time"] = f"{mapped.time_sec:.3f}"
         headers["X-Passthrough-Seek-Gop"] = f"{mapped.gop_seconds:.3f}"
+
+
+def _apply_seek_vmp4_headers(
+    headers: dict[str, str],
+    *,
+    path: Path,
+    duration: float,
+    total: int,
+    container: str,
+) -> None:
+    if not _seek_vmp4_enabled(container):
+        return
+    headers["X-Passthrough-VMP4"] = "1"
+    headers["X-Passthrough-VMP4-Phase"] = "source-size-harness"
+    headers["X-Passthrough-VMP4-Layout-Size"] = str(max(0, int(total)))
+    headers["X-Passthrough-VMP4-Source-Size"] = str(_source_declared_size(path))
+    headers["X-Passthrough-VMP4-Duration"] = f"{max(0.0, float(duration or 0.0)):.3f}"
+
+
+def _header_safe_text(value: object) -> str:
+    return quote(str(value), safe="._-+~")
+
+
+@dataclass
+class _Vmp4CacheBuild:
+    key: str
+    source: Path
+    mode: str
+    target: Path
+    work_dir: Path
+    temp_target: Path
+    log_path: Path
+    cmd: tuple[str, ...]
+    state: str = "queued"
+    pid: int = 0
+    returncode: int | None = None
+    reason: str = ""
+    started_at: float = 0.0
+    finished_at: float = 0.0
+
+
+@dataclass(frozen=True)
+class _Vmp4CacheBuildView:
+    state: str
+    target: Path | None
+    log_path: Path | None = None
+    pid: int = 0
+    returncode: int | None = None
+    reason: str = ""
+
+
+_VMP4_BUILD_LOG_DIR = ROOT / "debug_output" / "vmp4_cache_build"
+_VMP4_BUILD_STATES_KEEP = 128
+_vmp4_build_lock = threading.RLock()
+_vmp4_builds: dict[str, _Vmp4CacheBuild] = {}
+_vmp4_active_builds = 0
+
+
+@dataclass
+class _Vmp4SlotBuild:
+    key: str
+    slot_index: int
+    output_mode: str
+    cache_dir: Path
+    payload_path: Path
+    manifest_path: Path
+    state: str = "queued"
+    payload_size: int = 0
+    reason: str = ""
+    started_at: float = 0.0
+    finished_at: float = 0.0
+    attempts: int = 0
+    permanent: bool = False
+    next_retry_at: float = 0.0
+
+
+@dataclass(frozen=True)
+class _Vmp4SlotBuildView:
+    state: str
+    payload_path: Path | None = None
+    payload_size: int = 0
+    reason: str = ""
+
+
+@dataclass(frozen=True)
+class _Vmp4SlotReadyWait:
+    status: Vmp4SlotCacheStatus
+    build: _Vmp4SlotBuildView
+    slot_state: str
+    ready: bool
+    waited_sec: float
+
+
+_vmp4_slot_build_lock = threading.RLock()
+_vmp4_slot_builds: dict[str, _Vmp4SlotBuild] = {}
+_VMP4_SLOT_LAYOUT_CACHE_LIMIT = 64
+_vmp4_slot_layout_cache_lock = threading.RLock()
+_vmp4_slot_layout_cache: dict[tuple, PassthroughVmp4SlotLayout] = {}
+
+
+def _vmp4_cache_candidate_ignored(candidate: Path) -> bool:
+    return is_internal_intermediate_name(candidate.name)
+
+
+def _vmp4_mode_candidate_stems(path: Path, output_mode: str, info) -> list[str]:
+    width = int(getattr(info, "width", 0) or 0)
+    height = int(getattr(info, "height", 0) or 0)
+    stems: list[str] = []
+    mode = (output_mode or "green").lower()
+    if mode == "alpha":
+        stems.append(offline_passthrough_stem(path.stem, "alpha", width, height))
+    elif mode == "two_dvr":
+        stems.append(two_dvr_stem(path.stem))
+    else:
+        stems.append(offline_passthrough_stem(path.stem, "green", width, height))
+        stems.append(f"{path.stem}_passthrough")
+    return list(dict.fromkeys(stems))
+
+
+def _vmp4_expected_cache_names(path: Path, output_mode: str, info) -> list[str]:
+    return [f"{stem}.mp4" for stem in _vmp4_mode_candidate_stems(path, output_mode, info)]
+
+
+def _vmp4_expected_cache_target(path: Path, output_mode: str, info) -> Path | None:
+    names = _vmp4_expected_cache_names(path, output_mode, info)
+    return path.with_name(names[0]) if names else None
+
+
+def _vmp4_mode_candidate(path: Path, output_mode: str, info) -> Path | None:
+    mode = (output_mode or "green").lower()
+    seen: set[Path] = set()
+    for stem in _vmp4_mode_candidate_stems(path, output_mode, info):
+        candidate = path.with_name(f"{stem}.mp4")
+        if candidate in seen:
+            continue
+        seen.add(candidate)
+        if candidate.is_file() and candidate.resolve() != path.resolve():
+            return candidate
+    try:
+        siblings = list(path.parent.iterdir())
+    except OSError:
+        siblings = []
+    for candidate in siblings:
+        if candidate == path or candidate.suffix.lower() != ".mp4":
+            continue
+        if _vmp4_cache_candidate_ignored(candidate):
+            continue
+        stem_l = candidate.stem.lower()
+        if mode == "two_dvr":
+            if matches_offline_two_dvr_output_for_source(path, candidate):
+                return candidate
+        elif mode == "alpha":
+            if matches_offline_output_for_source(path, candidate) and "alpha" in stem_l:
+                return candidate
+        else:
+            if matches_offline_output_for_source(path, candidate) and "alpha" not in stem_l:
+                return candidate
+    return None
+
+
+def _vmp4_build_view(build: _Vmp4CacheBuild) -> _Vmp4CacheBuildView:
+    return _Vmp4CacheBuildView(
+        state=build.state,
+        target=build.target,
+        log_path=build.log_path,
+        pid=build.pid,
+        returncode=build.returncode,
+        reason=build.reason,
+    )
+
+
+def _vmp4_disabled_build_view(reason: str, target: Path | None = None) -> _Vmp4CacheBuildView:
+    return _Vmp4CacheBuildView(state="disabled", target=target, reason=reason)
+
+
+def _vmp4_python_command(*args: str) -> list[str]:
+    if getattr(sys, "frozen", False):
+        return [sys.executable, *args]
+    venv_python = ROOT / ".venv" / "Scripts" / "python.exe"
+    python = venv_python if venv_python.exists() else Path(sys.executable)
+    return [str(python), str(ROOT / "main.py"), *args]
+
+
+def _vmp4_build_env() -> dict[str, str]:
+    env = dict(os.environ)
+    env["PYTHONUNBUFFERED"] = "1"
+    env["PYTHONUTF8"] = "1"
+    env["PYTHONIOENCODING"] = "utf-8:replace"
+    # Match the offline GUI path: do not apply the realtime decode-size cap to
+    # full-file cache generation.
+    env["PT_DECODE_MAX_SIDE"] = "0"
+    apply_runtime_dll_paths(env)
+    return env
+
+
+def _vmp4_build_paths(path: Path, output_mode: str, target: Path, key: str) -> tuple[Path, Path, Path]:
+    digest = hashlib.sha1(key.encode("utf-8", "replace")).hexdigest()[:12]
+    safe_mode = re.sub(r"[^a-z0-9_]+", "_", (output_mode or "green").lower())
+    work_dir = path.parent / f".{target.stem}.vmp4build_{safe_mode}_{digest}"
+    temp_target = work_dir / target.name
+    log_path = _VMP4_BUILD_LOG_DIR / f"{path.stem}_{safe_mode}_{digest}.log"
+    return work_dir, temp_target, log_path
+
+
+def _vmp4_budget_bitrate(info, total: int, output_mode: str, observed_cache_size: int = 0) -> str:
+    duration = max(0.0, float(getattr(info, "duration", 0.0) or 0.0))
+    budget_bytes = max(0, int(total))
+    if duration <= 0.0 or budget_bytes <= 0:
+        return "12000000"
+    raw_budget_bps = budget_bytes * 8.0 / duration
+    mode = (output_mode or "green").lower()
+    safety = 0.84 if mode == "alpha" else 0.90
+    if observed_cache_size > budget_bytes:
+        safety = min(safety, 0.90 * (budget_bytes / max(1, int(observed_cache_size))))
+    target_bps = int(raw_budget_bps * safety)
+    return str(max(1_000_000, target_bps))
+
+
+def _vmp4_build_bitrate(info, total: int, output_mode: str, observed_cache_size: int = 0) -> str:
+    raw = str(PASSTHROUGH_SEEK_VMP4_BUILD_BITRATE or "budget").strip()
+    if raw.lower() in {"", "auto", "budget"}:
+        return _vmp4_budget_bitrate(info, total, output_mode, observed_cache_size)
+    return raw
+
+
+def _vmp4_two_dvr_build_bitrate(info, total: int, output_mode: str, observed_cache_size: int = 0) -> str:
+    raw = str(PASSTHROUGH_SEEK_VMP4_BUILD_TWO_DVR_BITRATE or "budget").strip()
+    if raw.lower() in {"", "auto", "budget"}:
+        return _vmp4_budget_bitrate(info, total, output_mode, observed_cache_size)
+    return raw
+
+
+def _vmp4_build_command(
+    path: Path,
+    output_mode: str,
+    target: Path,
+    temp_target: Path,
+    work_dir: Path,
+    bitrate: str,
+) -> list[str]:
+    mode = (output_mode or "green").lower()
+    if mode in SEEK_FRAME_MODES:
+        return _vmp4_python_command(
+            "offline",
+            "single",
+            str(path),
+            "--mode",
+            mode,
+            "--engine",
+            PASSTHROUGH_SEEK_VMP4_BUILD_ENGINE,
+            "--out",
+            str(temp_target),
+            "--skip-frames",
+            "0",
+            "--bitrate",
+            str(bitrate),
+            "--preset",
+            str(PASSTHROUGH_SEEK_VMP4_BUILD_PRESET),
+        )
+    if mode == "two_dvr":
+        return _vmp4_python_command(
+            "two_dvr",
+            "single",
+            str(path),
+            "--out-dir",
+            str(work_dir),
+            "--projection",
+            "flat3d",
+            "--model",
+            str(TWO_DVR_MODEL),
+            "--hole-fill",
+            str(TWO_DVR_HOLE_FILL),
+            "--strength",
+            f"{float(TWO_DVR_STRENGTH):g}",
+            "--max-side",
+            str(PASSTHROUGH_SEEK_VMP4_BUILD_TWO_DVR_MAX_SIDE),
+            "--provider",
+            str(PASSTHROUGH_SEEK_VMP4_BUILD_TWO_DVR_PROVIDER),
+            "--bitrate",
+            str(bitrate),
+        )
+    raise ValueError(f"unsupported VMP4 cache build mode: {output_mode!r}")
+
+
+def _vmp4_build_key(path: Path, output_mode: str, target: Path, bitrate: str, reason: str = "") -> str:
+    try:
+        st = path.stat()
+        source_fingerprint = f"{st.st_size}:{st.st_mtime_ns}"
+    except OSError:
+        source_fingerprint = "missing"
+    return (
+        f"{_media_key_path(path)}|{(output_mode or 'green').lower()}|"
+        f"{target.name}|{source_fingerprint}|bitrate={bitrate}|reason={reason}"
+    )
+
+
+def _vmp4_prune_builds_locked() -> None:
+    if len(_vmp4_builds) <= _VMP4_BUILD_STATES_KEEP:
+        return
+    removable = [
+        (build.finished_at or build.started_at or 0.0, key)
+        for key, build in _vmp4_builds.items()
+        if build.state in {"ready", "failed"}
+    ]
+    for _, key in sorted(removable)[: max(0, len(_vmp4_builds) - _VMP4_BUILD_STATES_KEEP)]:
+        _vmp4_builds.pop(key, None)
+
+
+def _vmp4_start_build_locked(build: _Vmp4CacheBuild) -> None:
+    global _vmp4_active_builds
+    if build.state != "queued":
+        return
+    build.state = "starting"
+    build.started_at = time.time()
+    _vmp4_active_builds += 1
+    thread = threading.Thread(
+        target=_vmp4_build_worker,
+        args=(build.key,),
+        name=f"vmp4-cache-{build.mode}",
+        daemon=True,
+    )
+    thread.start()
+
+
+def _vmp4_start_next_build_locked() -> None:
+    if _vmp4_active_builds >= max(1, int(PASSTHROUGH_SEEK_VMP4_BUILD_MAX_ACTIVE)):
+        return
+    for build in _vmp4_builds.values():
+        if build.state == "queued":
+            _vmp4_start_build_locked(build)
+            return
+
+
+def _vmp4_build_worker(key: str) -> None:
+    global _vmp4_active_builds
+    with _vmp4_build_lock:
+        build = _vmp4_builds.get(key)
+        if build is None:
+            _vmp4_active_builds = max(0, _vmp4_active_builds - 1)
+            return
+        build.state = "running"
+    rc: int | None = None
+    failure = ""
+    try:
+        shutil.rmtree(build.work_dir, ignore_errors=True)
+        build.work_dir.mkdir(parents=True, exist_ok=True)
+        build.log_path.parent.mkdir(parents=True, exist_ok=True)
+        with build.log_path.open("a", encoding="utf-8", errors="replace") as log_fh:
+            log_fh.write(f"[vmp4-cache] source={build.source}\n")
+            log_fh.write(f"[vmp4-cache] mode={build.mode} target={build.target}\n")
+            log_fh.write("[vmp4-cache] command=" + subprocess.list2cmdline(list(build.cmd)) + "\n")
+            log_fh.flush()
+            proc = subprocess.Popen(
+                list(build.cmd),
+                cwd=str(ROOT),
+                env=_vmp4_build_env(),
+                stdin=subprocess.DEVNULL,
+                stdout=log_fh,
+                stderr=subprocess.STDOUT,
+                **hidden_subprocess_kwargs(),
+            )
+            with _vmp4_build_lock:
+                current = _vmp4_builds.get(key)
+                if current is not None:
+                    current.pid = int(proc.pid or 0)
+            log.info(
+                "passthrough_seek VMP4 cache build started: mode=%s pid=%s source=%s target=%s log=%s cmd=%s",
+                build.mode,
+                proc.pid,
+                build.source.name,
+                build.target.name,
+                build.log_path,
+                subprocess.list2cmdline(list(build.cmd)),
+            )
+            rc = int(proc.wait())
+            log_fh.write(f"\n[vmp4-cache] rc={rc}\n")
+        if rc == 0 and build.temp_target.is_file():
+            build.target.parent.mkdir(parents=True, exist_ok=True)
+            os.replace(build.temp_target, build.target)
+            shutil.rmtree(build.work_dir, ignore_errors=True)
+        elif rc == 0:
+            failure = f"output missing: {build.temp_target}"
+        else:
+            failure = f"process exited rc={rc}"
+    except Exception as exc:
+        failure = f"{type(exc).__name__}: {exc}"
+    finally:
+        with _vmp4_build_lock:
+            current = _vmp4_builds.get(key)
+            if current is not None:
+                current.returncode = rc
+                current.finished_at = time.time()
+                if failure:
+                    current.state = "failed"
+                    current.reason = failure
+                    log.warning(
+                        "passthrough_seek VMP4 cache build failed: mode=%s source=%s target=%s rc=%s reason=%s log=%s",
+                        current.mode,
+                        current.source.name,
+                        current.target.name,
+                        rc,
+                        failure,
+                        current.log_path,
+                    )
+                else:
+                    current.state = "ready"
+                    current.reason = ""
+                    log.info(
+                        "passthrough_seek VMP4 cache build ready: mode=%s source=%s target=%s log=%s",
+                        current.mode,
+                        current.source.name,
+                        current.target.name,
+                        current.log_path,
+                    )
+            _vmp4_active_builds = max(0, _vmp4_active_builds - 1)
+            _vmp4_prune_builds_locked()
+            _vmp4_start_next_build_locked()
+
+
+def _vmp4_schedule_cache_build(
+    path: Path,
+    info,
+    output_mode: str,
+    target: Path | None,
+    *,
+    total: int,
+    force: bool = False,
+    reason: str = "",
+    observed_cache_size: int = 0,
+) -> _Vmp4CacheBuildView:
+    mode = (output_mode or "green").lower()
+    if target is None:
+        return _vmp4_disabled_build_view("target-missing", target)
+    if not PASSTHROUGH_SEEK_VMP4_BUILD_MISSING:
+        return _vmp4_disabled_build_view("build-disabled", target)
+    if mode not in set(PASSTHROUGH_SEEK_VMP4_BUILD_MODES):
+        return _vmp4_disabled_build_view("mode-disabled", target)
+    if target.is_file() and not force:
+        return _Vmp4CacheBuildView(state="ready", target=target)
+    bitrate = (
+        _vmp4_two_dvr_build_bitrate(info, total, mode, observed_cache_size)
+        if mode == "two_dvr"
+        else _vmp4_build_bitrate(info, total, mode, observed_cache_size)
+    )
+    key = _vmp4_build_key(path, mode, target, bitrate, reason if force else "")
+    work_dir, temp_target, log_path = _vmp4_build_paths(path, mode, target, key)
+    try:
+        cmd = tuple(_vmp4_build_command(path, mode, target, temp_target, work_dir, bitrate))
+    except Exception as exc:
+        return _vmp4_disabled_build_view(f"command-error:{type(exc).__name__}", target)
+    with _vmp4_build_lock:
+        build = _vmp4_builds.get(key)
+        if build is None:
+            build = _Vmp4CacheBuild(
+                key=key,
+                source=path,
+                mode=mode,
+                target=target,
+                work_dir=work_dir,
+                temp_target=temp_target,
+                log_path=log_path,
+                cmd=cmd,
+            )
+            _vmp4_builds[key] = build
+            log.info(
+                "passthrough_seek VMP4 cache build queued: mode=%s source=%s target=%s log=%s",
+                mode,
+                path.name,
+                target.name,
+                log_path,
+            )
+            _vmp4_start_next_build_locked()
+        return _vmp4_build_view(build)
+
+
+def _apply_vmp4_build_headers(headers: dict[str, str], build: _Vmp4CacheBuildView) -> None:
+    headers["X-Passthrough-VMP4-Build"] = build.state
+    if build.target is not None:
+        headers["X-Passthrough-VMP4-Build-Target"] = _header_safe_text(build.target.name)
+    if build.log_path is not None:
+        headers["X-Passthrough-VMP4-Build-Log"] = _header_safe_text(build.log_path.name)
+    if build.pid:
+        headers["X-Passthrough-VMP4-Build-Pid"] = str(build.pid)
+    if build.returncode is not None:
+        headers["X-Passthrough-VMP4-Build-RC"] = str(build.returncode)
+    if build.reason:
+        headers["X-Passthrough-VMP4-Build-Reason"] = _header_safe_text(build.reason)
+
+
+def _vmp4_slot_build_view(build: _Vmp4SlotBuild) -> _Vmp4SlotBuildView:
+    return _Vmp4SlotBuildView(
+        state=build.state,
+        payload_path=build.payload_path,
+        payload_size=build.payload_size,
+        reason=build.reason,
+    )
+
+
+def _vmp4_slot_disabled_build_view(reason: str) -> _Vmp4SlotBuildView:
+    return _Vmp4SlotBuildView(state="disabled", reason=reason)
+
+
+def _vmp4_slot_build_key(status: Vmp4SlotCacheStatus, slot_index: int) -> str:
+    return f"{status.digest}:slot={int(slot_index)}"
+
+
+def _vmp4_slot_start_build_locked(build: _Vmp4SlotBuild, layout: PassthroughVmp4SlotLayout) -> None:
+    if build.state not in {"queued", "failed"}:
+        return
+    build.state = "running"
+    build.started_at = time.time()
+    update_vmp4_slot_manifest_slot_state(build.manifest_path, build.slot_index, "building")
+    thread = threading.Thread(
+        target=_vmp4_slot_build_worker,
+        args=(build.key, layout),
+        name=f"vmp4-slot-{build.slot_index}",
+        daemon=True,
+    )
+    thread.start()
+
+
+def _vmp4_slot_schedule_placeholder_build(
+    layout: PassthroughVmp4SlotLayout,
+    status: Vmp4SlotCacheStatus,
+    slot_index: int,
+    output_mode: str = "green",
+) -> _Vmp4SlotBuildView:
+    if not PASSTHROUGH_SEEK_VMP4_SLOT_BUILD_PLACEHOLDER:
+        return _vmp4_slot_disabled_build_view("slot-build-disabled")
+    slot = status.slot(slot_index)
+    if slot is None:
+        return _vmp4_slot_disabled_build_view("slot-index-missing")
+    if slot.state == "ready":
+        return _Vmp4SlotBuildView(
+            state="ready",
+            payload_path=slot.payload_path,
+            payload_size=slot.payload_size,
+        )
+    payload_path = status.cache_dir / f"slot_{int(slot_index):06d}.bin"
+    key = _vmp4_slot_build_key(status, slot_index)
+    with _vmp4_slot_build_lock:
+        build = _vmp4_slot_builds.get(key)
+        if build is None:
+            build = _Vmp4SlotBuild(
+                key=key,
+                slot_index=int(slot_index),
+                output_mode=(output_mode or "green").lower(),
+                cache_dir=status.cache_dir,
+                payload_path=payload_path,
+                manifest_path=status.manifest_path,
+            )
+            _vmp4_slot_builds[key] = build
+            _vmp4_slot_start_build_locked(build, layout)
+        elif build.state == "failed" and not build.permanent and time.time() >= build.next_retry_at:
+            # Transient failure (e.g. matter timeout, GPU hiccup): retry with the
+            # accumulated backoff. Permanent failures (oversize/unsupported) are
+            # never auto-retried so a player's Retry-After loop cannot thrash the
+            # GPU with a slot that can never fit.
+            build.state = "queued"
+            build.reason = ""
+            _vmp4_slot_start_build_locked(build, layout)
+        return _vmp4_slot_build_view(build)
+
+
+def _vmp4_slot_state_with_build(
+    slot_state: str,
+    build: _Vmp4SlotBuildView,
+) -> str:
+    if build.state in {"queued", "running"} and slot_state != "ready":
+        return "building"
+    return slot_state
+
+
+def _vmp4_slot_refresh_status(
+    layout: PassthroughVmp4SlotLayout,
+    status: Vmp4SlotCacheStatus,
+    output_mode: str,
+    fps: float,
+) -> Vmp4SlotCacheStatus:
+    return ensure_vmp4_slot_manifest(
+        layout,
+        status.cache_dir.parent,
+        output_mode=output_mode,
+        fps=fps,
+        gop_frames=PASSTHROUGH_GOP,
+    )
+
+
+def _vmp4_slot_wait_for_ready(
+    layout: PassthroughVmp4SlotLayout,
+    status: Vmp4SlotCacheStatus,
+    slot_index: int,
+    output_mode: str,
+    fps: float,
+    timeout_sec: float,
+) -> _Vmp4SlotReadyWait:
+    start = time.time()
+    deadline = start + max(0.0, float(timeout_sec or 0.0))
+    current_status = status
+    build = _vmp4_slot_disabled_build_view("slot-build-not-started")
+    slot_state = "missing"
+
+    while True:
+        slot = current_status.slot(slot_index)
+        if slot is not None:
+            slot_state = slot.state
+            if slot.state == "ready":
+                return _Vmp4SlotReadyWait(
+                    status=current_status,
+                    build=build,
+                    slot_state=slot_state,
+                    ready=True,
+                    waited_sec=time.time() - start,
+                )
+
+        build = _vmp4_slot_schedule_placeholder_build(layout, current_status, slot_index, output_mode)
+        current_status = _vmp4_slot_refresh_status(layout, current_status, output_mode, fps)
+        slot = current_status.slot(slot_index)
+        slot_state = slot.state if slot is not None else "missing"
+        if slot is not None and slot.state == "ready":
+            return _Vmp4SlotReadyWait(
+                status=current_status,
+                build=build,
+                slot_state=slot_state,
+                ready=True,
+                waited_sec=time.time() - start,
+            )
+
+        slot_state = _vmp4_slot_state_with_build(slot_state, build)
+        now = time.time()
+        if timeout_sec <= 0.0 or now >= deadline or build.state == "disabled":
+            return _Vmp4SlotReadyWait(
+                status=current_status,
+                build=build,
+                slot_state=slot_state,
+                ready=False,
+                waited_sec=now - start,
+            )
+        time.sleep(min(0.05, max(0.001, deadline - now)))
+
+
+def _vmp4_slot_build_worker(key: str, layout: PassthroughVmp4SlotLayout) -> None:
+    failure = ""
+    payload_size = 0
+    matter = None
+    try:
+        with _vmp4_slot_build_lock:
+            build = _vmp4_slot_builds.get(key)
+        if build is None:
+            return
+        sample = layout.samples[build.slot_index]
+        mode = (build.output_mode or "green").lower()
+        if mode not in SEEK_FRAME_MODES:
+            raise RuntimeError(f"slot-real-builder-unsupported-mode:{mode}")
+        matter = acquire_matter(blocking=True, timeout=PASSTHROUGH_SEEK_VMP4_SLOT_MATTER_TIMEOUT)
+        if matter is None:
+            raise RuntimeError("slot-real-builder-matter-timeout")
+        annexb = build_passthrough_hevc_annexb_gop(
+            layout.source_path,
+            start_sec=sample.start_time_sec,
+            frame_count=1,
+            matter=matter,
+            output_mode=mode,
+            max_bytes=max(0, int(sample.sample_size)),
+        )
+        payload_size = write_vmp4_slot_hevc_annexb_payload(layout, build.slot_index, build.payload_path, annexb)
+        if payload_size <= 0:
+            failure = "payload-empty"
+            try:
+                build.payload_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+        elif payload_size > sample.sample_size:
+            failure = "payload-oversize"
+            try:
+                build.payload_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+        else:
+            update_vmp4_slot_manifest_slot_state(
+                build.manifest_path,
+                build.slot_index,
+                "ready",
+                payload_size=payload_size,
+            )
+    except Exception as exc:
+        failure = f"{type(exc).__name__}: {exc}"
+    finally:
+        release_matter(matter)
+        with _vmp4_slot_build_lock:
+            build = _vmp4_slot_builds.get(key)
+            if build is not None:
+                build.payload_size = payload_size
+                build.finished_at = time.time()
+                if failure:
+                    build.state = "failed"
+                    build.reason = failure
+                    build.attempts += 1
+                    lowered = failure.lower()
+                    build.permanent = "oversize" in lowered or "unsupported" in lowered
+                    backoff = min(
+                        PASSTHROUGH_SEEK_VMP4_SLOT_RETRY_MAX,
+                        PASSTHROUGH_SEEK_VMP4_SLOT_RETRY_BASE * (2 ** min(build.attempts - 1, 16)),
+                    )
+                    build.next_retry_at = build.finished_at + backoff
+                    update_vmp4_slot_manifest_slot_state(
+                        build.manifest_path,
+                        build.slot_index,
+                        "failed",
+                        payload_size=payload_size,
+                        reason=failure,
+                    )
+                    log.warning(
+                        "passthrough_seek VMP4 slot build failed: slot=%d payload=%s reason=%s permanent=%s attempts=%d retry_in=%.1fs",
+                        build.slot_index,
+                        build.payload_path.name,
+                        failure,
+                        build.permanent,
+                        build.attempts,
+                        0.0 if build.permanent else backoff,
+                    )
+                else:
+                    build.state = "ready"
+                    build.reason = ""
+                    log.info(
+                        "passthrough_seek VMP4 slot build ready: slot=%d payload=%s bytes=%d",
+                        build.slot_index,
+                        build.payload_path.name,
+                        payload_size,
+                    )
+
+
+_vmp4_slot_template_lock = threading.RLock()
+
+
+def _vmp4_slot_even(value: int) -> int:
+    return max(2, int(value) & ~1)
+
+
+def _vmp4_slot_scaled_size(width: int, height: int) -> tuple[int, int]:
+    width = max(2, int(width or 0))
+    height = max(2, int(height or 0))
+    max_side = int(DECODE_MAX_SIDE or 0)
+    if max_side <= 0 or max(width, height) <= max_side:
+        return _vmp4_slot_even(width), _vmp4_slot_even(height)
+    if width >= height:
+        out_w = max_side
+        out_h = int(round(height * max_side / width))
+    else:
+        out_h = max_side
+        out_w = int(round(width * max_side / height))
+    return _vmp4_slot_even(out_w), _vmp4_slot_even(out_h)
+
+
+def _vmp4_slot_output_size(info, output_mode: str) -> tuple[int, int]:
+    out_w, out_h = _vmp4_slot_scaled_size(
+        int(getattr(info, "width", 0) or 0),
+        int(getattr(info, "height", 0) or 0),
+    )
+    mode = str(output_mode or "green").lower()
+    if mode == "alpha":
+        from pipeline.alpha_packer import alpha_output_size
+
+        out_w, out_h = alpha_output_size(out_w, out_h)
+    elif mode == "two_dvr":
+        out_w = min(8192, _vmp4_slot_even(out_w * 2))
+    elif mode == "superres":
+        from utils.rtx_vsr import seek_target_height, target_dimensions
+
+        # The MP4 shell must declare what the stage actually encodes, so both
+        # sides ask the same function for the seek-sustainable target. The
+        # stage works from the source size, not the decode-capped one.
+        out_w, out_h = target_dimensions(
+            int(getattr(info, "width", 0) or 0),
+            int(getattr(info, "height", 0) or 0),
+            seek_target_height(),
+        )
+    elif mode == "dlss5":
+        # Neural Rendering is 1x, but it is still a stage: like SuperRes it
+        # works from the source size and never sees DECODE_MAX_SIDE, so the
+        # shell has to declare the source's geometry rather than the
+        # decode-capped one it would otherwise inherit.
+        out_w = int(getattr(info, "width", 0) or 0)
+        out_h = int(getattr(info, "height", 0) or 0)
+    return _vmp4_slot_even(out_w), _vmp4_slot_even(out_h)
+
+
+def _vmp4_slot_template_path(width: int, height: int, fps: float) -> Path:
+    fps_milli = int(round(max(1.0, float(fps or 0.0)) * 1000.0))
+    return RUNTIME_CACHE_DIR / "vmp4_slot_template" / f"hevc_{int(width)}x{int(height)}_{fps_milli}.mp4"
+
+
+def _vmp4_slot_output_template(info, output_mode: str) -> Vmp4SlotOutputTemplate:
+    width, height = _vmp4_slot_output_size(info, output_mode)
+    fps = max(1.0, float(_seek_output_fps(info) or 0.0))
+    path = _vmp4_slot_template_path(width, height, fps)
+    with _vmp4_slot_template_lock:
+        if not path.is_file() or path.stat().st_size <= 0:
+            _vmp4_slot_generate_hevc_template(path, width, height, fps)
+        template = load_vmp4_slot_output_template(path)
+        return Vmp4SlotOutputTemplate(
+            stsd=template.stsd,
+            payload=template.payload,
+            codec_name="hevc",
+            nal_length_size=template.nal_length_size,
+            width=width,
+            height=height,
+        )
+
+
+def _vmp4_slot_layout_cache_key(
+    path: Path,
+    info,
+    output_mode: str,
+    total: int,
+    output_template: Vmp4SlotOutputTemplate,
+) -> tuple:
+    try:
+        st = Path(path).stat()
+        stat_key = (int(st.st_size), int(st.st_mtime_ns))
+    except OSError:
+        stat_key = (0, 0)
+    return (
+        _media_key_path(path),
+        stat_key,
+        str(output_mode or "green").lower(),
+        round(float(getattr(info, "duration", 0.0) or 0.0), 6),
+        round(float(_seek_output_fps(info) or 0.0), 6),
+        int(total),
+        int(PASSTHROUGH_GOP),
+        int(PASSTHROUGH_SEEK_VMP4_SLOT_MAX_SAMPLE_BYTES),
+        hashlib.sha256(output_template.stsd).hexdigest(),
+        hashlib.sha256(output_template.payload).hexdigest(),
+        str(output_template.codec_name or "hevc").lower(),
+        int(output_template.nal_length_size),
+        int(output_template.width),
+        int(output_template.height),
+    )
+
+
+def _vmp4_slot_cached_layout(
+    path: Path,
+    info,
+    output_mode: str,
+    total: int,
+    output_template: Vmp4SlotOutputTemplate,
+) -> PassthroughVmp4SlotLayout:
+    key = _vmp4_slot_layout_cache_key(path, info, output_mode, total, output_template)
+    with _vmp4_slot_layout_cache_lock:
+        cached = _vmp4_slot_layout_cache.get(key)
+        if cached is not None:
+            _vmp4_slot_layout_cache.pop(key, None)
+            _vmp4_slot_layout_cache[key] = cached
+            return cached
+    layout = build_passthrough_vmp4_slot_layout(
+        path,
+        duration_sec=float(getattr(info, "duration", 0.0) or 0.0),
+        fps=_seek_output_fps(info),
+        total_size=total,
+        gop_frames=PASSTHROUGH_GOP,
+        max_sample_bytes=PASSTHROUGH_SEEK_VMP4_SLOT_MAX_SAMPLE_BYTES,
+        output_stsd=output_template.stsd,
+        output_codec_name=output_template.codec_name,
+        output_width=output_template.width,
+        output_height=output_template.height,
+        placeholder_payload=output_template.payload,
+    )
+    with _vmp4_slot_layout_cache_lock:
+        _vmp4_slot_layout_cache[key] = layout
+        while len(_vmp4_slot_layout_cache) > _VMP4_SLOT_LAYOUT_CACHE_LIMIT:
+            old_key = next(iter(_vmp4_slot_layout_cache))
+            _vmp4_slot_layout_cache.pop(old_key, None)
+    return layout
+
+
+def _vmp4_slot_first_intersecting_slot(
+    layout: PassthroughVmp4SlotLayout,
+    start: int,
+    end_inclusive: int,
+) -> int | None:
+    if end_inclusive < layout.mdat_payload_start or layout.slot_stride <= 0:
+        return None
+    cursor = max(int(start), int(layout.mdat_payload_start))
+    slot_index = max(0, (cursor - layout.mdat_payload_start) // layout.slot_stride)
+    while slot_index < layout.slot_count:
+        sample = layout.samples[int(slot_index)]
+        slot_start = layout.mdat_payload_start + sample.slot_index * layout.slot_stride
+        slot_end = slot_start + sample.sample_size - 1
+        if slot_end < cursor:
+            slot_index += 1
+            continue
+        if slot_start > end_inclusive:
+            return None
+        return int(slot_index)
+    return None
+
+
+def _vmp4_slot_first_unready_slot(
+    layout: PassthroughVmp4SlotLayout,
+    status: Vmp4SlotCacheStatus,
+    start: int,
+    end_inclusive: int,
+) -> int | None:
+    if end_inclusive < layout.mdat_payload_start or layout.slot_stride <= 0:
+        return None
+    cursor = max(int(start), int(layout.mdat_payload_start))
+    slot_index = max(0, (cursor - layout.mdat_payload_start) // layout.slot_stride)
+    while slot_index < layout.slot_count:
+        sample = layout.samples[int(slot_index)]
+        slot_start = layout.mdat_payload_start + sample.slot_index * layout.slot_stride
+        slot_end = slot_start + sample.sample_size - 1
+        if slot_end < cursor:
+            slot_index += 1
+            continue
+        if slot_start > end_inclusive:
+            return None
+        slot = status.slot(int(slot_index))
+        if slot is None or slot.state != "ready":
+            return int(slot_index)
+        slot_index += 1
+    return None
+
+
+def _iter_vmp4_slot_range_ready_only(
+    layout: PassthroughVmp4SlotLayout,
+    status: Vmp4SlotCacheStatus,
+    output_mode: str,
+    fps: float,
+    start: int,
+    end_inclusive: int,
+    *,
+    chunk_size: int,
+    wait_timeout_sec: float,
+    rid: int = 0,
+):
+    cursor = max(0, int(start))
+    stop = min(max(0, int(end_inclusive)), max(0, layout.total_size - 1))
+    if cursor > stop:
+        return
+
+    init_end = len(layout.init)
+    if cursor < init_end:
+        init_stop = min(stop, init_end - 1)
+        yield layout.init[cursor : init_stop + 1]
+        cursor = init_stop + 1
+    if cursor > stop:
+        return
+
+    current_status = status
+    for sample in layout.samples:
+        slot_start = layout.mdat_payload_start + sample.slot_index * layout.slot_stride
+        slot_end = slot_start + sample.sample_size
+        if slot_end <= cursor:
+            continue
+        if slot_start > stop:
+            break
+        if cursor < slot_start:
+            gap_end = min(stop + 1, slot_start)
+            yield from iter_vmp4_slot_range(
+                layout,
+                cursor,
+                gap_end - 1,
+                chunk_size=chunk_size,
+                payload_paths=current_status.ready_payloads,
+            )
+            cursor = gap_end
+            if cursor > stop:
+                return
+
+        overlap_start = max(cursor, slot_start)
+        overlap_end = min(stop + 1, slot_end)
+        if overlap_start >= overlap_end:
+            continue
+
+        wait = _vmp4_slot_wait_for_ready(
+            layout,
+            current_status,
+            sample.slot_index,
+            output_mode,
+            fps,
+            wait_timeout_sec,
+        )
+        current_status = wait.status
+        if not wait.ready:
+            log.warning(
+                "passthrough_seek[%d] VMP4 slot stream wait failed: slot=%d state=%s build=%s waited=%.3fs reason=%s",
+                rid,
+                sample.slot_index,
+                wait.slot_state,
+                wait.build.state,
+                wait.waited_sec,
+                wait.build.reason,
+            )
+            raise RuntimeError(f"VMP4 slot not ready: slot={sample.slot_index} state={wait.slot_state}")
+
+        yield from iter_vmp4_slot_range(
+            layout,
+            overlap_start,
+            overlap_end - 1,
+            chunk_size=chunk_size,
+            payload_paths=current_status.ready_payloads,
+        )
+        cursor = overlap_end
+        if cursor > stop:
+            return
+
+    if cursor <= stop:
+        yield from iter_vmp4_slot_range(
+            layout,
+            cursor,
+            stop,
+            chunk_size=chunk_size,
+            payload_paths=current_status.ready_payloads,
+        )
+
+
+def _vmp4_slot_generate_hevc_template(path: Path, width: int, height: int, fps: float) -> None:
+    target = Path(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    tmp = target.with_name(f".{target.stem}.tmp.mp4")
+    try:
+        tmp.unlink(missing_ok=True)
+    except OSError:
+        pass
+    pyav_error = _vmp4_slot_generate_hevc_template_pyav(tmp, width, height, fps)
+    if not pyav_error and tmp.is_file() and tmp.stat().st_size > 0:
+        os.replace(tmp, target)
+        log.info(
+            "passthrough_seek VMP4 slot HEVC template ready via pyav: %s size=%dx%d fps=%.3f bytes=%d",
+            target.name,
+            width,
+            height,
+            fps,
+            target.stat().st_size,
+        )
+        return
+    try:
+        tmp.unlink(missing_ok=True)
+    except OSError:
+        pass
+    if pyav_error:
+        log.warning(
+            "passthrough_seek VMP4 slot PyAV HEVC template failed, falling back to ffmpeg: %s",
+            pyav_error,
+        )
+    base = [
+        FFMPEG,
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-y",
+        "-f",
+        "lavfi",
+        "-i",
+        f"color=c=black:s={int(width)}x{int(height)}:r={max(1.0, float(fps)):.6f}:d=1",
+        "-frames:v",
+        "1",
+        "-an",
+        "-pix_fmt",
+        "yuv420p",
+        "-g",
+        "1",
+        "-bf",
+        "0",
+        "-tag:v",
+        "hvc1",
+        "-movflags",
+        "+faststart",
+    ]
+    attempts = (
+        [*base, "-c:v", "hevc_nvenc", "-preset", "p1", "-b:v", "2M", str(tmp)],
+        [
+            *base,
+            "-c:v",
+            "libx265",
+            "-preset",
+            "ultrafast",
+            "-x265-params",
+            "log-level=error:keyint=1:min-keyint=1:scenecut=0",
+            "-b:v",
+            "2M",
+            str(tmp),
+        ],
+    )
+    last_error = ""
+    for cmd in attempts:
+        try:
+            proc = subprocess.run(
+                cmd,
+                capture_output=True,
+                timeout=45,
+                **hidden_subprocess_kwargs(),
+            )
+        except Exception as exc:
+            last_error = f"{type(exc).__name__}: {exc}"
+            continue
+        if proc.returncode == 0 and tmp.is_file() and tmp.stat().st_size > 0:
+            os.replace(tmp, target)
+            log.info(
+                "passthrough_seek VMP4 slot HEVC template ready: %s size=%dx%d fps=%.3f bytes=%d",
+                target.name,
+                width,
+                height,
+                fps,
+                target.stat().st_size,
+            )
+            return
+        stderr = (proc.stderr or b"").decode("utf-8", "replace").strip()
+        last_error = stderr[-500:] if stderr else f"rc={proc.returncode}"
+    try:
+        tmp.unlink(missing_ok=True)
+    except OSError:
+        pass
+    raise Vmp4SlotLayoutError(f"slot-output-template-build-failed:{last_error or 'unknown'}")
+
+
+def _vmp4_slot_generate_hevc_template_pyav(path: Path, width: int, height: int, fps: float) -> str:
+    try:
+        from fractions import Fraction
+
+        import av  # type: ignore[import-not-found]
+        import numpy as np
+    except Exception as exc:
+        return f"pyav-import:{type(exc).__name__}: {exc}"
+
+    target = Path(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    rate = Fraction(max(1.0, float(fps or 0.0))).limit_denominator(1_000_000)
+    attempts = (
+        (
+            "hevc_nvenc",
+            "nv12",
+            {
+                "preset": "p1",
+                "b": "2M",
+                "g": "1",
+                "bf": "0",
+            },
+        ),
+        (
+            "libx265",
+            "yuv420p",
+            {
+                "preset": "ultrafast",
+                "b": "2M",
+                "x265-params": "log-level=error:keyint=1:min-keyint=1:scenecut=0:bframes=0",
+            },
+        ),
+        (
+            "hevc",
+            "yuv420p",
+            {
+                "preset": "ultrafast",
+                "b": "2M",
+                "x265-params": "log-level=error:keyint=1:min-keyint=1:scenecut=0:bframes=0",
+            },
+        ),
+    )
+    errors: list[str] = []
+    for codec_name, pix_fmt, options in attempts:
+        container = None
+        try:
+            try:
+                target.unlink(missing_ok=True)
+            except OSError:
+                pass
+            container = av.open(str(target), "w", format="mp4")
+            stream = container.add_stream(codec_name, rate=rate, options=options)
+            stream.width = int(width)
+            stream.height = int(height)
+            stream.pix_fmt = pix_fmt
+            ctx = stream.codec_context
+            try:
+                ctx.gop_size = 1
+            except Exception:
+                pass
+            try:
+                ctx.max_b_frames = 0
+            except Exception:
+                pass
+            try:
+                ctx.bit_rate = 2_000_000
+            except Exception:
+                pass
+            try:
+                ctx.codec_tag = "hvc1"
+            except Exception:
+                pass
+            frame = av.VideoFrame.from_ndarray(
+                np.zeros((int(height), int(width), 3), dtype=np.uint8),
+                format="rgb24",
+            )
+            frame = frame.reformat(width=int(width), height=int(height), format=pix_fmt)
+            for packet in stream.encode(frame):
+                container.mux(packet)
+            for packet in stream.encode():
+                container.mux(packet)
+            container.close()
+            container = None
+            if target.is_file() and target.stat().st_size > 0:
+                return ""
+            errors.append(f"{codec_name}:empty-output")
+        except Exception as exc:
+            errors.append(f"{codec_name}:{type(exc).__name__}: {exc}")
+        finally:
+            if container is not None:
+                try:
+                    container.close()
+                except Exception:
+                    pass
+    try:
+        target.unlink(missing_ok=True)
+    except OSError:
+        pass
+    return "; ".join(errors[-3:]) or "pyav-unknown"
+
+
+def _mp4_free_box_header(size: int) -> bytes:
+    size = int(size)
+    if size < 8:
+        return b""
+    if size <= 0xFFFFFFFF:
+        return size.to_bytes(4, "big") + b"free"
+    return (1).to_bytes(4, "big") + b"free" + size.to_bytes(8, "big")
+
+
+def _iter_mp4_free_box_range(
+    box_size: int,
+    start: int,
+    end: int,
+    *,
+    chunk_size: int = 64 * 1024,
+):
+    header = _mp4_free_box_header(box_size)
+    cursor = max(0, int(start))
+    stop = min(max(0, int(end)), max(0, int(box_size) - 1))
+    if cursor > stop or not header:
+        return
+    if cursor < len(header):
+        header_end = min(stop, len(header) - 1)
+        yield header[cursor : header_end + 1]
+        cursor = header_end + 1
+    if cursor <= stop:
+        pad = b"\x00" * min(max(1, int(chunk_size)), stop - cursor + 1)
+        while cursor <= stop:
+            chunk = pad[: min(len(pad), stop - cursor + 1)]
+            cursor += len(chunk)
+            yield chunk
+
+
+def _iter_mp4_file_with_free_pad_range(
+    path: Path,
+    start: int,
+    end: int,
+    *,
+    declared_total: int,
+    chunk_size: int = 64 * 1024,
+):
+    file_size = max(0, int(path.stat().st_size))
+    cursor = max(0, int(start))
+    stop = min(max(0, int(end)), max(0, int(declared_total) - 1))
+    if cursor <= stop and cursor < file_size:
+        file_end = min(stop, file_size - 1)
+        with path.open("rb") as fh:
+            fh.seek(cursor)
+            remaining = file_end - cursor + 1
+            while remaining > 0:
+                chunk = fh.read(min(max(1, int(chunk_size)), remaining))
+                if not chunk:
+                    break
+                remaining -= len(chunk)
+                yield chunk
+        cursor = file_end + 1
+    if cursor <= stop and file_size < declared_total:
+        pad_size = declared_total - file_size
+        pad_start = max(0, cursor - file_size)
+        pad_end = min(pad_size - 1, stop - file_size)
+        yield from _iter_mp4_free_box_range(
+            pad_size,
+            pad_start,
+            pad_end,
+            chunk_size=chunk_size,
+        )
+
+
+def _mp4_top_level_offsets(path: Path, max_boxes: int = 256) -> tuple[int | None, int | None, str]:
+    try:
+        file_size = max(0, int(path.stat().st_size))
+        with path.open("rb") as fh:
+            offset = 0
+            moov_offset: int | None = None
+            mdat_offset: int | None = None
+            boxes = 0
+            while offset + 8 <= file_size and boxes < max_boxes:
+                fh.seek(offset)
+                header = fh.read(16)
+                if len(header) < 8:
+                    return moov_offset, mdat_offset, "short-header"
+                box_size = int.from_bytes(header[:4], "big")
+                box_type = header[4:8]
+                header_size = 8
+                if box_size == 1:
+                    if len(header) < 16:
+                        return moov_offset, mdat_offset, "short-large-header"
+                    box_size = int.from_bytes(header[8:16], "big")
+                    header_size = 16
+                elif box_size == 0:
+                    box_size = file_size - offset
+                if box_size < header_size or offset + box_size > file_size:
+                    return moov_offset, mdat_offset, "invalid-box-size"
+                if box_type == b"moov":
+                    moov_offset = offset
+                    return moov_offset, mdat_offset, ""
+                if box_type == b"mdat" and mdat_offset is None:
+                    mdat_offset = offset
+                offset += box_size
+                boxes += 1
+            if boxes >= max_boxes:
+                return moov_offset, mdat_offset, "too-many-boxes"
+            return moov_offset, mdat_offset, ""
+    except OSError as e:
+        return None, None, type(e).__name__
+
+
+def _seek_vmp4_cache_response(
+    *,
+    path: Path,
+    info,
+    output_mode: str,
+    total: int,
+    range_header: str | None,
+    headers: dict[str, str],
+    head_only: bool,
+    rid: int = 0,
+) -> Response:
+    headers["Accept-Ranges"] = "bytes"
+    headers["Content-Type"] = "video/mp4"
+    headers["X-Passthrough-VMP4-Backend"] = "cache_file"
+    if total <= 0:
+        error_headers = dict(headers)
+        error_headers["X-Passthrough-VMP4-Phase"] = "source-size-missing"
+        error_headers.pop("Content-Length", None)
+        error_headers.pop("Content-Range", None)
+        error_headers.pop("Content-Type", None)
+        return Response("VMP4 source size unavailable", status_code=409, headers=error_headers, media_type="text/plain")
+    byte_range = _parse_byte_range(range_header, total)
+    if range_header and byte_range is None:
+        error_headers = dict(headers)
+        error_headers["X-Passthrough-VMP4-Phase"] = "range-unsatisfiable"
+        error_headers["Content-Range"] = f"bytes */{max(0, int(total))}"
+        error_headers.pop("Content-Length", None)
+        error_headers.pop("Content-Type", None)
+        return Response(status_code=416, headers=error_headers)
+    cache_path = _vmp4_mode_candidate(path, output_mode, info)
+    if cache_path is None:
+        error_headers = dict(headers)
+        error_headers["X-Passthrough-VMP4-Phase"] = "cache-missing"
+        expected = _vmp4_expected_cache_names(path, output_mode, info)
+        if expected:
+            error_headers["X-Passthrough-VMP4-Expected-Cache"] = ",".join(_header_safe_text(name) for name in expected)
+        target = _vmp4_expected_cache_target(path, output_mode, info)
+        build = _vmp4_schedule_cache_build(path, info, output_mode, target, total=total)
+        _apply_vmp4_build_headers(error_headers, build)
+        log.info(
+            "passthrough_seek[%d] VMP4 cache missing: %s mode=%s expected=%s build=%s target=%s log=%s reason=%s",
+            rid,
+            path.name,
+            output_mode,
+            ",".join(expected),
+            build.state,
+            build.target.name if build.target else "",
+            build.log_path.name if build.log_path else "",
+            build.reason,
+        )
+        error_headers["Retry-After"] = "2"
+        error_headers.pop("Content-Length", None)
+        error_headers.pop("Content-Range", None)
+        error_headers.pop("Content-Type", None)
+        return Response("VMP4 cache not ready", status_code=503, headers=error_headers, media_type="text/plain")
+    cache_size = max(0, int(cache_path.stat().st_size))
+    pad_size = max(0, int(total) - cache_size)
+    headers["X-Passthrough-VMP4-Phase"] = "cache-file"
+    headers["X-Passthrough-VMP4-Cache"] = _header_safe_text(cache_path.name)
+    headers["X-Passthrough-VMP4-Cache-Size"] = str(cache_size)
+    headers["X-Passthrough-VMP4-Pad"] = "free" if pad_size else "none"
+    headers["X-Passthrough-VMP4-Pad-Bytes"] = str(pad_size)
+    moov_offset, mdat_offset, moov_error = _mp4_top_level_offsets(cache_path)
+    if moov_offset is not None:
+        headers["X-Passthrough-VMP4-Moov-Offset"] = str(moov_offset)
+    if mdat_offset is not None:
+        headers["X-Passthrough-VMP4-Mdat-Offset"] = str(mdat_offset)
+    if moov_error:
+        error_headers = dict(headers)
+        error_headers["X-Passthrough-VMP4-Phase"] = "cache-moov-probe-error"
+        error_headers["X-Passthrough-VMP4-Moov-Probe-Error"] = moov_error
+        error_headers.pop("Content-Length", None)
+        error_headers.pop("Content-Range", None)
+        error_headers.pop("Content-Type", None)
+        return Response("VMP4 cache MP4 box probe failed", status_code=409, headers=error_headers, media_type="text/plain")
+    if moov_offset is None:
+        error_headers = dict(headers)
+        error_headers["X-Passthrough-VMP4-Phase"] = "cache-moov-missing"
+        error_headers.pop("Content-Length", None)
+        error_headers.pop("Content-Range", None)
+        error_headers.pop("Content-Type", None)
+        return Response("VMP4 cache moov box missing", status_code=409, headers=error_headers, media_type="text/plain")
+    if mdat_offset is not None and mdat_offset < moov_offset:
+        error_headers = dict(headers)
+        error_headers["X-Passthrough-VMP4-Phase"] = "cache-moov-after-mdat"
+        error_headers.pop("Content-Length", None)
+        error_headers.pop("Content-Range", None)
+        error_headers.pop("Content-Type", None)
+        return Response("VMP4 cache must be faststart with moov before mdat", status_code=409, headers=error_headers, media_type="text/plain")
+    try:
+        cache_info = probe_cached(cache_path)
+        cache_duration = max(0.0, float(getattr(cache_info, "duration", 0.0) or 0.0))
+        source_duration = max(0.0, float(getattr(info, "duration", 0.0) or 0.0))
+        source_fps = max(0.0, float(getattr(info, "fps", 0.0) or 0.0))
+        duration_tolerance = max(0.5, (2.0 / source_fps) if source_fps > 0 else 0.0)
+        duration_delta = abs(cache_duration - source_duration)
+        headers["X-Passthrough-VMP4-Cache-Duration"] = f"{cache_duration:.3f}"
+        headers["X-Passthrough-VMP4-Duration-Delta"] = f"{duration_delta:.3f}"
+        headers["X-Passthrough-VMP4-Duration-Tolerance"] = f"{duration_tolerance:.3f}"
+        if source_duration > 0 and (cache_duration <= 0 or duration_delta > duration_tolerance):
+            error_headers = dict(headers)
+            error_headers["X-Passthrough-VMP4-Phase"] = "cache-duration-mismatch"
+            error_headers.pop("Content-Length", None)
+            error_headers.pop("Content-Range", None)
+            error_headers.pop("Content-Type", None)
+            return Response("VMP4 cache duration does not match source", status_code=409, headers=error_headers, media_type="text/plain")
+    except Exception as e:
+        error_headers = dict(headers)
+        error_headers["X-Passthrough-VMP4-Phase"] = "cache-probe-error"
+        error_headers["X-Passthrough-VMP4-Cache-Probe-Error"] = type(e).__name__
+        error_headers.pop("Content-Length", None)
+        error_headers.pop("Content-Range", None)
+        error_headers.pop("Content-Type", None)
+        return Response("VMP4 cache probe failed", status_code=409, headers=error_headers, media_type="text/plain")
+    if cache_size > total:
+        error_headers = dict(headers)
+        error_headers["X-Passthrough-VMP4-Phase"] = "cache-oversize"
+        build = _vmp4_schedule_cache_build(
+            path,
+            info,
+            output_mode,
+            cache_path,
+            total=total,
+            force=True,
+            reason="cache-oversize",
+            observed_cache_size=cache_size,
+        )
+        _apply_vmp4_build_headers(error_headers, build)
+        log.info(
+            "passthrough_seek[%d] VMP4 cache oversize: %s mode=%s cache=%s cache_size=%d total=%d rebuild=%s log=%s reason=%s",
+            rid,
+            path.name,
+            output_mode,
+            cache_path.name,
+            cache_size,
+            total,
+            build.state,
+            build.log_path.name if build.log_path else "",
+            build.reason,
+        )
+        error_headers.pop("Content-Length", None)
+        error_headers.pop("Content-Range", None)
+        error_headers.pop("Content-Type", None)
+        if build.state != "disabled":
+            error_headers["Retry-After"] = "2"
+            return Response("VMP4 cache rebuilding", status_code=503, headers=error_headers, media_type="text/plain")
+        return Response("VMP4 cache exceeds source-size budget", status_code=409, headers=error_headers, media_type="text/plain")
+    if 0 < pad_size < 8:
+        error_headers = dict(headers)
+        error_headers["X-Passthrough-VMP4-Phase"] = "cache-pad-too-small"
+        error_headers.pop("Content-Length", None)
+        error_headers.pop("Content-Range", None)
+        error_headers.pop("Content-Type", None)
+        return Response("VMP4 cache leaves too little room for MP4 free padding", status_code=409, headers=error_headers, media_type="text/plain")
+    response_range = byte_range or ByteRange(start=0, end=max(0, total - 1), total=total)
+    zero_open = _is_zero_open_range(range_header, byte_range)
+    status_code = 206 if byte_range is not None and not zero_open else 200
+    headers["Content-Length"] = str(response_range.length)
+    if status_code == 206:
+        headers["Content-Range"] = f"bytes {byte_range.start}-{byte_range.end}/{total}"
+    else:
+        headers.pop("Content-Range", None)
+    log.info(
+        "passthrough_seek[%d] VMP4 cache response: status=%d mode=%s cache=%s cache_size=%d pad=%d total=%d content_length=%d range=%r content_range=%r head=%s",
+        rid,
+        status_code,
+        output_mode,
+        cache_path.name,
+        cache_size,
+        pad_size,
+        total,
+        response_range.length,
+        range_header,
+        headers.get("Content-Range"),
+        head_only,
+    )
+    if head_only:
+        return Response(status_code=status_code, headers=headers, media_type="video/mp4")
+    body = _iter_mp4_file_with_free_pad_range(
+        cache_path,
+        response_range.start,
+        response_range.end,
+        declared_total=total,
+        chunk_size=DEFAULT_CHUNK_SIZE,
+    )
+    return StreamingResponse(
+        body,
+        status_code=status_code,
+        headers=headers,
+        media_type="video/mp4",
+    )
+
+
+def _seek_vmp4_slot_response(
+    *,
+    path: Path,
+    info,
+    output_mode: str,
+    total: int,
+    range_header: str | None,
+    headers: dict[str, str],
+    head_only: bool,
+    rid: int = 0,
+) -> Response:
+    headers["Accept-Ranges"] = "bytes"
+    headers["Content-Type"] = "video/mp4"
+    headers["X-Passthrough-VMP4-Backend"] = "slot"
+    if total <= 0:
+        error_headers = dict(headers)
+        error_headers["X-Passthrough-VMP4-Phase"] = "source-size-missing"
+        error_headers.pop("Content-Length", None)
+        error_headers.pop("Content-Range", None)
+        error_headers.pop("Content-Type", None)
+        return Response("VMP4 source size unavailable", status_code=409, headers=error_headers, media_type="text/plain")
+
+    byte_range = _parse_byte_range(range_header, total)
+    if range_header and byte_range is None:
+        error_headers = dict(headers)
+        error_headers["X-Passthrough-VMP4-Phase"] = "range-unsatisfiable"
+        error_headers["Content-Range"] = f"bytes */{max(0, int(total))}"
+        error_headers.pop("Content-Length", None)
+        error_headers.pop("Content-Type", None)
+        return Response(status_code=416, headers=error_headers)
+
+    try:
+        output_template = _vmp4_slot_output_template(info, output_mode)
+        layout = _vmp4_slot_cached_layout(path, info, output_mode, total, output_template)
+    except Vmp4SlotLayoutError as exc:
+        error_headers = dict(headers)
+        error_headers["X-Passthrough-VMP4-Phase"] = "slot-layout-error"
+        error_headers["X-Passthrough-VMP4-Slot-Error"] = _header_safe_text(str(exc))
+        error_headers.pop("Content-Length", None)
+        error_headers.pop("Content-Range", None)
+        error_headers.pop("Content-Type", None)
+        return Response("VMP4 slot layout unavailable", status_code=409, headers=error_headers, media_type="text/plain")
+    output_fps = _seek_output_fps(info)
+    cache_status = ensure_vmp4_slot_manifest(
+        layout,
+        RUNTIME_CACHE_DIR / "vmp4_slot",
+        output_mode=output_mode,
+        fps=output_fps,
+        gop_frames=PASSTHROUGH_GOP,
+    )
+
+    response_range = byte_range or ByteRange(start=0, end=max(0, total - 1), total=total)
+    range_bounded_for_ready_only = False
+    ready_only_blocking_slot: int | None = None
+    ready_wait_slot: int | None = None
+    ready_wait: _Vmp4SlotReadyWait | None = None
+    if PASSTHROUGH_SEEK_VMP4_SLOT_READY_ONLY and not head_only:
+        ready_wait_slot = _vmp4_slot_first_unready_slot(
+            layout,
+            cache_status,
+            response_range.start,
+            response_range.end,
+        )
+        if ready_wait_slot is not None:
+            ready_wait = _vmp4_slot_wait_for_ready(
+                layout,
+                cache_status,
+                ready_wait_slot,
+                output_mode,
+                output_fps,
+                PASSTHROUGH_SEEK_VMP4_SLOT_READY_WAIT,
+            )
+            cache_status = ready_wait.status
+    stream_ready_wait = bool(PASSTHROUGH_SEEK_VMP4_SLOT_READY_ONLY and not head_only and not range_header)
+    if ready_wait is not None and not ready_wait.ready:
+        ready_only_blocking_slot = ready_wait_slot
+        if ready_only_blocking_slot is not None and range_header and ready_only_blocking_slot > 0:
+            blocking_sample = layout.samples[ready_only_blocking_slot]
+            blocking_start = layout.mdat_payload_start + blocking_sample.slot_index * layout.slot_stride
+            if response_range.start < blocking_start:
+                response_range = ByteRange(
+                    start=response_range.start,
+                    end=min(response_range.end, blocking_start - 1),
+                    total=total,
+                )
+                range_bounded_for_ready_only = True
+    elif PASSTHROUGH_SEEK_VMP4_SLOT_READY_ONLY and not head_only and not stream_ready_wait:
+        ready_only_blocking_slot = _vmp4_slot_first_unready_slot(
+            layout,
+            cache_status,
+            response_range.start,
+            response_range.end,
+        )
+        if ready_only_blocking_slot is not None and range_header:
+            blocking_sample = layout.samples[ready_only_blocking_slot]
+            blocking_start = layout.mdat_payload_start + blocking_sample.slot_index * layout.slot_stride
+            if response_range.start < blocking_start:
+                response_range = ByteRange(
+                    start=response_range.start,
+                    end=min(response_range.end, blocking_start - 1),
+                    total=total,
+                )
+                range_bounded_for_ready_only = True
+    zero_open = _is_zero_open_range(range_header, byte_range)
+    status_code = 206 if (byte_range is not None and not zero_open) or range_bounded_for_ready_only else 200
+    headers["X-Passthrough-VMP4-Phase"] = "slot-layout"
+    headers["X-Passthrough-VMP4-Source-Codec"] = layout.source_codec_name
+    headers["X-Passthrough-VMP4-Output-Codec"] = layout.codec_name
+    headers["X-Passthrough-VMP4-Output-Size"] = f"{output_template.width}x{output_template.height}"
+    headers["X-Passthrough-VMP4-Slot-Count"] = str(layout.slot_count)
+    headers["X-Passthrough-VMP4-Slot-Size"] = str(layout.slot_size)
+    headers["X-Passthrough-VMP4-Slot-Stride"] = str(layout.slot_stride)
+    headers["X-Passthrough-VMP4-Slot-Gap"] = str(layout.slot_gap_size)
+    headers["X-Passthrough-VMP4-Slot-Duration"] = f"{layout.slot_duration_sec:.3f}"
+    headers["X-Passthrough-VMP4-Slot-Ready-Only"] = "1" if PASSTHROUGH_SEEK_VMP4_SLOT_READY_ONLY else "0"
+    if range_bounded_for_ready_only:
+        headers["X-Passthrough-VMP4-Slot-Ready-Bounded"] = "1"
+    if ready_wait_slot is not None and ready_wait is not None:
+        headers["X-Passthrough-VMP4-Slot-Wait"] = str(ready_wait_slot)
+        headers["X-Passthrough-VMP4-Slot-Wait-Ready"] = "1" if ready_wait.ready else "0"
+        headers["X-Passthrough-VMP4-Slot-Wait-Seconds"] = f"{ready_wait.waited_sec:.3f}"
+    headers["X-Passthrough-VMP4-Moov-Size"] = str(layout.moov_size)
+    headers["X-Passthrough-VMP4-Mdat-Payload-Start"] = str(layout.mdat_payload_start)
+    headers["X-Passthrough-VMP4-Mdat-Payload-Size"] = str(layout.mdat_payload_size)
+    headers["X-Passthrough-VMP4-Slot-Cache"] = cache_status.digest
+    headers["X-Passthrough-VMP4-Slot-Manifest"] = _header_safe_text(cache_status.manifest_path.name)
+    counts = cache_status.state_counts
+    if counts:
+        headers["X-Passthrough-VMP4-Slot-States"] = ",".join(f"{key}:{counts[key]}" for key in sorted(counts))
+    slot_index = (
+        ready_only_blocking_slot
+        if ready_only_blocking_slot is not None and not range_bounded_for_ready_only
+        else vmp4_slot_index_for_offset(layout, response_range.start)
+    )
+    if slot_index is None:
+        slot_index = _vmp4_slot_first_intersecting_slot(layout, response_range.start, response_range.end)
+    if slot_index is not None:
+        sample = layout.samples[slot_index]
+        slot_cache = cache_status.slot(slot_index)
+        slot_build = _vmp4_slot_schedule_placeholder_build(layout, cache_status, slot_index, output_mode)
+        slot_state = slot_cache.state if slot_cache is not None else "placeholder"
+        slot_state = _vmp4_slot_state_with_build(slot_state, slot_build)
+        payload_bytes = slot_cache.payload_size if slot_cache is not None and slot_cache.state == "ready" else len(layout.placeholder_payload)
+        headers["X-Passthrough-VMP4-Slot"] = str(slot_index)
+        headers["X-Passthrough-VMP4-Slot-Time"] = f"{sample.start_time_sec:.3f}"
+        headers["X-Passthrough-VMP4-Slot-Source-Sample"] = str(sample.source_sample_index)
+        headers["X-Passthrough-VMP4-Slot-State"] = slot_state
+        headers["X-Passthrough-VMP4-Slot-Build"] = slot_build.state
+        if slot_build.reason:
+            headers["X-Passthrough-VMP4-Slot-Build-Reason"] = _header_safe_text(slot_build.reason)
+        headers["X-Passthrough-VMP4-Slot-Sample-Size"] = str(sample.sample_size)
+        headers["X-Passthrough-VMP4-Slot-Source-Bytes"] = str(sample.source_size)
+        headers["X-Passthrough-VMP4-Slot-Placeholder-Bytes"] = str(len(layout.placeholder_payload))
+        headers["X-Passthrough-VMP4-Slot-Payload-Bytes"] = str(payload_bytes)
+        headers["X-Passthrough-VMP4-Slot-Filler-Bytes"] = str(max(0, sample.sample_size - payload_bytes))
+        headers["X-Passthrough-VMP4-Slot-Filler"] = "nal"
+        if PASSTHROUGH_SEEK_VMP4_SLOT_READY_ONLY and slot_state != "ready" and not head_only:
+            not_ready_headers = dict(headers)
+            not_ready_headers["X-Passthrough-VMP4-Phase"] = "slot-not-ready"
+            not_ready_headers["Retry-After"] = "1"
+            not_ready_headers.pop("Content-Length", None)
+            not_ready_headers.pop("Content-Range", None)
+            not_ready_headers.pop("Content-Type", None)
+            log.info(
+                "passthrough_seek[%d] VMP4 slot not ready: slot=%d state=%s build=%s range=%r ready_only=%s",
+                rid,
+                slot_index,
+                slot_state,
+                slot_build.state,
+                range_header,
+                PASSTHROUGH_SEEK_VMP4_SLOT_READY_ONLY,
+            )
+            return Response(
+                "VMP4 slot not ready",
+                status_code=503,
+                headers=not_ready_headers,
+                media_type="text/plain",
+            )
+    if range_bounded_for_ready_only and ready_only_blocking_slot is not None:
+        blocking_cache = cache_status.slot(ready_only_blocking_slot)
+        blocking_build = _vmp4_slot_schedule_placeholder_build(layout, cache_status, ready_only_blocking_slot, output_mode)
+        blocking_state = blocking_cache.state if blocking_cache is not None else "placeholder"
+        blocking_state = _vmp4_slot_state_with_build(blocking_state, blocking_build)
+        headers["X-Passthrough-VMP4-Next-Slot"] = str(ready_only_blocking_slot)
+        headers["X-Passthrough-VMP4-Next-Slot-State"] = blocking_state
+        headers["X-Passthrough-VMP4-Next-Slot-Build"] = blocking_build.state
+        if blocking_build.reason:
+            headers["X-Passthrough-VMP4-Next-Slot-Build-Reason"] = _header_safe_text(blocking_build.reason)
+    headers["Content-Length"] = str(response_range.length)
+    if status_code == 206:
+        headers["Content-Range"] = f"bytes {response_range.start}-{response_range.end}/{total}"
+    else:
+        headers.pop("Content-Range", None)
+    log.info(
+        "passthrough_seek[%d] VMP4 slot response: status=%d mode=%s source_codec=%s output_codec=%s output=%s total=%d slots=%d slot_size=%d slot_stride=%d range=%r content_range=%r head=%s",
+        rid,
+        status_code,
+        output_mode,
+        layout.source_codec_name,
+        layout.codec_name,
+        headers.get("X-Passthrough-VMP4-Output-Size"),
+        total,
+        layout.slot_count,
+        layout.slot_size,
+        layout.slot_stride,
+        range_header,
+        headers.get("Content-Range"),
+        head_only,
+    )
+    if head_only:
+        return Response(status_code=status_code, headers=headers, media_type="video/mp4")
+    if stream_ready_wait:
+        body = _iter_vmp4_slot_range_ready_only(
+            layout,
+            cache_status,
+            output_mode,
+            output_fps,
+            response_range.start,
+            response_range.end,
+            chunk_size=DEFAULT_CHUNK_SIZE,
+            wait_timeout_sec=PASSTHROUGH_SEEK_VMP4_SLOT_READY_WAIT,
+            rid=rid,
+        )
+    else:
+        body = iter_vmp4_slot_range(
+            layout,
+            response_range.start,
+            response_range.end,
+            chunk_size=DEFAULT_CHUNK_SIZE,
+            payload_paths=cache_status.ready_payloads,
+        )
+    return StreamingResponse(
+        body,
+        status_code=status_code,
+        headers=headers,
+        media_type="video/mp4",
+    )
+
+
+# --- slot_frames backend: frame-level layout, real fps, background GOP build ---
+
+from pipeline.passthrough_vmp4_slot import _write_bytes_atomic as _vmp4_write_bytes_atomic
+
+
+@dataclass
+class _Vmp4FramesFiller:
+    """A persistent forward streaming-encode run that fills per-frame files.
+
+    Instead of rebuilding the PyNv pipeline per GOP (setup dominated -> ~10fps),
+    one filler sets up decoder/encoder/matter once and streams frames in order at
+    live throughput, writing frame_XXXXXX.bin as it goes. A seek far beyond the
+    write cursor (or before the run's start) restarts the filler at that point.
+    """
+    digest: str
+    cache_dir: Path
+    output_mode: str
+    start_frame: int = 0
+    cursor: int = 0          # next frame index this run will write
+    state: str = "running"   # running | done | stopped | failed
+    reason: str = ""
+    started_at: float = 0.0
+    first_frame_at: float = 0.0   # when this run wrote its first frame
+    last_hit_at: float = 0.0      # last time a request was served from its range
+    stop_event: threading.Event = dataclass_field(default_factory=threading.Event)
+    # Set when the worker has exited and released its Matter, so a replacement
+    # knows when the pool slot is actually free.
+    done_event: threading.Event = dataclass_field(default_factory=threading.Event)
+
+
+# Minimum seconds between filler repositions. Players open several concurrent
+# range connections at different offsets; without this debounce each one's
+# ensure_filler would kill+restart the single filler at its own offset, so it
+# ping-pongs and never produces a frame. With it, one run gets to make real
+# forward progress before a genuine (persistent) seek can reposition it.
+#
+# The cooldown runs from the first frame written, not from the start: an 8K setup
+# (open decoder, CreateEncoder, matter reset) takes 5-10s on its own, so timing
+# from the start spent the whole window on setup and let the next connection
+# preempt the run just as it began producing. Measured with six concurrent
+# connections that way: 26 pipeline rebuilds over 18 requests, and the sequential
+# playback connection needed 203s for its first 4 MB.
+_VMP4_FRAMES_RESTART_COOLDOWN = 8.0
+# Once a run is actually producing frames it is doing the useful work, so give it
+# a longer guaranteed window before another offset may take it over.
+_VMP4_FRAMES_PRODUCTIVE_HOLD = 15.0
+# How long a replacement filler waits for the run it supersedes to release its
+# Matter before starting anyway.
+_VMP4_FRAMES_HANDOVER_TIMEOUT = 20.0
+# A filler is "being followed" while requests keep landing inside the range it
+# covers. Once nothing has for this long, the player has moved on (it seeks by
+# dropping the old connection and opening a new one elsewhere) and the run may be
+# repositioned immediately - the debounce below exists to stop concurrent
+# connections from fighting, not to make a real seek wait.
+_VMP4_FRAMES_FOLLOW_WINDOW = 2.0
+_vmp4_frames_lock = threading.RLock()
+_vmp4_frames_fillers: dict[str, _Vmp4FramesFiller] = {}
+_vmp4_frames_layout_cache_lock = threading.RLock()
+_vmp4_frames_layout_cache: dict[tuple, PassthroughVmp4FramesLayout] = {}
+_VMP4_FRAMES_LAYOUT_CACHE_LIMIT = 32
+
+
+def _media_key_path(path) -> str:
+    """Stable identity for a media file, for cache keys - without touching it.
+
+    ``Path.resolve()`` was used here, which on Windows opens the file to ask for
+    its final path name. On the user's mounted library volume that call raises
+    WinError 1005 ("the volume does not contain a recognized file system") while
+    ``open`` and ``stat`` on the very same path work fine, so every seek request
+    for a title on that mount died with a 500 before it reached any of our code -
+    the player reported the item as unsupported. ``abspath`` is pure string work
+    and gives the same value on volumes where ``resolve`` succeeds, so cache keys
+    (and the frame caches they name) are unchanged there.
+    """
+    return os.path.abspath(str(path))
+
+
+def _vmp4_frames_layout_key(path: Path, info, output_mode: str, template: Vmp4SlotOutputTemplate) -> tuple:
+    try:
+        st = Path(path).stat()
+        stat_key = (int(st.st_size), int(st.st_mtime_ns))
+    except OSError:
+        stat_key = (0, 0)
+    return (
+        _media_key_path(path), stat_key, str(output_mode or "green").lower(),
+        round(float(getattr(info, "duration", 0.0) or 0.0), 6),
+        round(float(_seek_output_fps(info) or 0.0), 6),
+        int(PASSTHROUGH_GOP),
+        int(PASSTHROUGH_SEEK_VMP4_FRAMES_FRAME_BYTES),
+        seek_budget_scale(
+            stat_key[0],
+            float(getattr(info, "duration", 0.0) or 0.0),
+            int(getattr(info, "width", 0) or 0),
+            int(getattr(info, "height", 0) or 0),
+            float(getattr(info, "fps", 0.0) or 0.0),
+            output_mode,
+        ),
+        bool(PASSTHROUGH_SEEK_VMP4_FRAMES_SOURCE_BUDGET),
+        _vmp4_frames_audio_key(path),
+        seek_frame_floor_bytes(
+            int(getattr(info, "width", 0) or 0), int(getattr(info, "height", 0) or 0)
+        ),
+        float(PASSTHROUGH_SEEK_VMP4_FRAMES_IDR_WEIGHT),
+        float(PASSTHROUGH_SEEK_VMP4_FRAMES_BUDGET_FLATTEN),
+        hashlib.sha256(template.stsd).hexdigest(), int(template.width), int(template.height),
+    )
+
+
+_vmp4_audio_table_cache: dict[tuple, object] = {}
+_vmp4_audio_table_lock = threading.Lock()
+
+
+def _vmp4_frames_audio_key(path: Path) -> tuple:
+    try:
+        st = Path(path).stat()
+        return (_media_key_path(path), int(st.st_size), int(st.st_mtime_ns))
+    except OSError:
+        return (str(path), 0, 0)
+
+
+def _vmp4_frames_audio_table(path: Path):
+    """Source audio sample table, or None when the source has no audio.
+
+    Parsing a long title's audio table is not cheap (a 50min 8K file carries
+    ~140k AAC samples) and the layout is built twice - a flat probe for the init
+    size, then the real one - so keep it.
+    """
+    key = _vmp4_frames_audio_key(path)
+    with _vmp4_audio_table_lock:
+        if key in _vmp4_audio_table_cache:
+            return _vmp4_audio_table_cache[key]
+    table = None
+    try:
+        table = read_media_sample_table(Path(path), "audio")
+        if not table.samples:
+            table = None
+    except Exception as exc:
+        log.info("vmp4 frames: no audio track on %s (%s)", Path(path).name, type(exc).__name__)
+        table = None
+    with _vmp4_audio_table_lock:
+        _vmp4_audio_table_cache[key] = table
+        while len(_vmp4_audio_table_cache) > 8:
+            _vmp4_audio_table_cache.pop(next(iter(_vmp4_audio_table_cache)), None)
+    return table
+
+
+def _vmp4_frames_source_budget(
+    path: Path, layout: PassthroughVmp4FramesLayout, output_mode: str, info=None
+) -> SourceBudgetPlan | None:
+    """Per-GOP budgets inherited from the source, or None to keep the flat ones.
+
+    ``layout`` must be a already-built flat layout; only its init size (which the
+    budget values cannot change) and frame count are used.
+    """
+    if not PASSTHROUGH_SEEK_VMP4_FRAMES_SOURCE_BUDGET:
+        return None
+    if str(output_mode or "").lower() == "superres":
+        # Superres emits more pixels than the source, so the source's byte
+        # budget no longer describes the same picture.
+        return None
+    try:
+        source_size = int(Path(path).stat().st_size)
+    except OSError:
+        return None
+    init_size = int(layout.total_size) - int(layout.mdat_payload_size)
+    # Audio is copied through at its source size, so it comes off the top: only
+    # what is left funds the video budgets, and the total still lands on the
+    # size DIDL advertises. That is the source size at 4K and below; above
+    # _BUDGET_SCALE_PIXELS it is source_size * _BUDGET_SCALE, because inheriting
+    # the source's bytes exactly assumes we encode as well as the source did and
+    # at 8K we visibly do not (offline multi-pass x265 vs realtime NVENC).
+    declared_total = seek_declared_total_bytes(
+        source_size,
+        float(getattr(info, "duration", 0.0) or 0.0),
+        int(getattr(info, "width", 0) or 0),
+        int(getattr(info, "height", 0) or 0),
+        float(getattr(info, "fps", 0.0) or 0.0),
+        output_mode,
+    )
+    payload_total = declared_total - init_size - int(layout.audio_bytes)
+    if payload_total <= 0:
+        return None
+    try:
+        return build_source_budget_plan(
+            path,
+            payload_total=payload_total,
+            frame_count=layout.frame_count,
+            gop_frames=layout.gop_frames,
+            output_fps=layout.fps,
+            floor_bytes_per_frame=seek_frame_floor_bytes(
+                int(getattr(info, "width", 0) or 0), int(getattr(info, "height", 0) or 0)
+            ),
+            idr_weight=PASSTHROUGH_SEEK_VMP4_FRAMES_IDR_WEIGHT,
+            flatten=PASSTHROUGH_SEEK_VMP4_FRAMES_BUDGET_FLATTEN,
+        )
+    except SourceBudgetError as exc:
+        log.info(
+            "vmp4 frames source budget unavailable for %s (%s); using flat %dKiB budget",
+            Path(path).name, exc, PASSTHROUGH_SEEK_VMP4_FRAMES_FRAME_BYTES // 1024,
+        )
+        return None
+    except Exception as exc:
+        log.warning(
+            "vmp4 frames source budget failed for %s: %s: %s",
+            Path(path).name, type(exc).__name__, exc,
+        )
+        return None
+
+
+def _vmp4_frames_probe_range(
+    layout: PassthroughVmp4FramesLayout, rng: ByteRange, *, ranged: bool
+) -> str:
+    """Classify a range a player issues to inspect the file, not to play it.
+
+    Returns a short reason (used as a diagnostic header) or "" when the range is
+    real playback and must wait for encoded frames.
+    """
+    if rng.end < layout.mdat_payload_start:
+        return "init"                   # ftyp+moov only; no media bytes at all
+    if not ranged:
+        return ""                       # no Range header == sequential playback
+    if rng.length > PASSTHROUGH_SEEK_VMP4_FRAMES_PROBE_BYTES:
+        return ""
+    tail_start = layout.total_size - max(
+        PASSTHROUGH_SEEK_VMP4_FRAMES_PROBE_BYTES, layout.mdat_payload_size // 64
+    )
+    if rng.start >= tail_start:
+        return "tail"                   # looking for a trailing moov we do not have
+    if rng.start < layout.mdat_payload_start:
+        return "header-crossing"        # header read that spills into the first frames
+    return ""
+
+
+def _vmp4_frames_frame_budget(output_mode: str, template: Vmp4SlotOutputTemplate) -> int:
+    """Per-frame byte budget for the frames layout.
+
+    The configured value is tuned for Green/Alpha, whose output is either the
+    source geometry or a matte-packed picture that codes cheaply. SuperRes
+    emits detail-dense frames at an enlarged size, and at 6K that truncated
+    real frames (measured: frame 3 at 267030 bytes against a 262144 budget),
+    which corrupts the stream the player receives. Scale the budget with output
+    pixels above the 4K reference; HTTP bandwidth is budget*fps*8, so this
+    raises the bandwidth an enlarged SuperRes stream needs.
+    """
+    base = max(32 * 1024, int(PASSTHROUGH_SEEK_VMP4_FRAMES_FRAME_BYTES))
+    if str(output_mode or "").lower() != "superres":
+        return base
+    pixels = max(1, int(template.width) * int(template.height))
+    reference = 3840 * 2160
+    if pixels <= reference:
+        return base
+    scaled = int(base * pixels / reference * 1.15)
+    scaled = ((scaled + 65535) // 65536) * 65536
+    return min(4 * base, scaled)
+
+
+def _vmp4_frames_cached_layout(path: Path, info, output_mode: str, template: Vmp4SlotOutputTemplate) -> PassthroughVmp4FramesLayout:
+    key = _vmp4_frames_layout_key(path, info, output_mode, template)
+    with _vmp4_frames_layout_cache_lock:
+        cached = _vmp4_frames_layout_cache.get(key)
+        if cached is not None:
+            _vmp4_frames_layout_cache.pop(key, None)
+            _vmp4_frames_layout_cache[key] = cached
+            return cached
+    audio_table = _vmp4_frames_audio_table(path)
+    build = functools.partial(
+        build_passthrough_vmp4_frames_layout,
+        path,
+        audio_table=audio_table,
+        duration_sec=float(getattr(info, "duration", 0.0) or 0.0),
+        fps=_seek_output_fps(info),
+        gop_frames=PASSTHROUGH_GOP,
+        idr_budget=_vmp4_frames_frame_budget(output_mode, template),
+        p_budget=_vmp4_frames_frame_budget(output_mode, template),
+        output_stsd=template.stsd,
+        output_codec_name=template.codec_name,
+        output_width=template.width,
+        output_height=template.height,
+        placeholder_payload=template.payload,
+    )
+    layout = build()
+    plan = _vmp4_frames_source_budget(path, layout, output_mode, info)
+    if plan is not None:
+        # The moov is fixed-width (co64 64-bit, stsz 32-bit, one stts run), so
+        # its size does not depend on the budget values - the flat layout above
+        # already tells us the exact init size to subtract.
+        layout = build(frame_budgets=plan.frame_budgets)
+    with _vmp4_frames_layout_cache_lock:
+        _vmp4_frames_layout_cache[key] = layout
+        while len(_vmp4_frames_layout_cache) > _VMP4_FRAMES_LAYOUT_CACHE_LIMIT:
+            _vmp4_frames_layout_cache.pop(next(iter(_vmp4_frames_layout_cache)), None)
+    return layout
+
+
+def _vmp4_frames_budget_fingerprint(layout: PassthroughVmp4FramesLayout) -> str:
+    """Short hash of the per-frame budgets, for cache keys."""
+    if not layout.frames:
+        return "0"
+    h = hashlib.sha256()
+    for fr in layout.frames:
+        h.update(fr.budget.to_bytes(5, "big"))
+    return h.hexdigest()[:16]
+
+
+def _vmp4_frames_digest(path: Path, layout: PassthroughVmp4FramesLayout, output_mode: str) -> str:
+    try:
+        st = Path(path).stat()
+        stat_key = (int(st.st_size), int(st.st_mtime_ns))
+    except OSError:
+        stat_key = (0, 0)
+    raw = "|".join(str(x) for x in (
+        _media_key_path(path), stat_key, str(output_mode or "green").lower(),
+        round(float(layout.fps), 6), int(layout.gop_frames), int(layout.frame_count),
+        int(layout.idr_budget), int(layout.p_budget), layout.output_stsd_sha256, int(layout.total_size),
+        bool(layout.source_budget),
+        # idr_budget/p_budget are the flat-mode constants and do not move with a
+        # source-derived plan, and total_size is pinned to the source size, so
+        # without the actual per-frame budgets a re-planned layout would reuse
+        # frames encoded against the previous budgets.
+        _vmp4_frames_budget_fingerprint(layout),
+    ))
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:32]
+
+
+def _vmp4_frames_ready_payloads(cache_dir: Path) -> dict[int, Path]:
+    res: dict[int, Path] = {}
+    try:
+        for name in os.listdir(cache_dir):
+            if name.startswith("frame_") and name.endswith(".bin"):
+                try:
+                    idx = int(name[6:-4])
+                except ValueError:
+                    continue
+                res[idx] = cache_dir / name
+    except OSError:
+        pass
+    return res
+
+
+def _vmp4_frames_gop_ready(layout: PassthroughVmp4FramesLayout, gop_index: int, ready: dict[int, Path]) -> bool:
+    indices = layout.gop_frame_indices(gop_index)
+    return bool(indices) and all(i in ready for i in indices)
+
+
+def _vmp4_frames_first_frame_of_gop(layout: PassthroughVmp4FramesLayout, gop_index: int) -> int:
+    indices = layout.gop_frame_indices(gop_index)
+    return int(indices[0]) if indices else 0
+
+
+def _vmp4_frames_served_end(
+    layout: PassthroughVmp4FramesLayout,
+    ready: dict[int, Path],
+    start_byte: int,
+    req_end: int,
+) -> int:
+    """Last inclusive byte serveable from already-built frames at ``start_byte``.
+
+    Returns -1 if the frame at ``start_byte`` is not built yet. Bounding a 206 to
+    this extent means every byte we promise (Content-Length) is on disk, so the
+    body never blocks mid-stream and can never come up short of Content-Length.
+    """
+    start_idx = vmp4_frame_index_for_offset(layout, int(start_byte))
+    if start_idx is None:
+        # In the init (ftyp+moov+mdat header) region: serve at least the init,
+        # extended into the leading contiguous ready frames from frame 0.
+        if not layout.frames or 0 not in ready:
+            return min(int(req_end), max(layout.mdat_payload_start - 1, int(start_byte)))
+        start_idx = 0
+    idx = start_idx
+    last = -1
+    while idx < layout.frame_count and idx in ready:
+        last = idx
+        idx += 1
+    if last < 0:
+        return -1
+    end_byte = layout.frames[last].offset + layout.frames[last].budget - 1
+    return min(int(req_end), int(end_byte))
+
+
+def _vmp4_frames_lead_frames(layout: PassthroughVmp4FramesLayout) -> int:
+    # How far ahead of the write cursor a requested frame may be and still be
+    # reachable by waiting (vs. triggering a filler restart at the seek point).
+    return max(int(layout.gop_frames) * 2, int(round(float(layout.fps) * 20.0)))
+
+
+def _vmp4_frames_filler_worker(
+    filler: _Vmp4FramesFiller,
+    layout: PassthroughVmp4FramesLayout,
+    predecessor: _Vmp4FramesFiller | None = None,
+) -> None:
+    from pipeline.pynv_stream import iter_pynv_passthrough_annexb_frames
+
+    matter = None
+    mode = (filler.output_mode or "green").lower()
+    try:
+        if mode not in SEEK_FRAME_MODES:
+            filler.state = "failed"
+            filler.reason = f"unsupported-mode:{mode}"
+            return
+        if predecessor is not None and not predecessor.done_event.is_set():
+            # The run we are replacing still holds a Matter, and the pool only has
+            # PT_MAX_CONCURRENT of them. Asking for one now would either take the
+            # last slot (starving the next seek) or block here holding nothing
+            # useful. Wait for it to actually let go first.
+            waited = time.time()
+            if not predecessor.done_event.wait(timeout=_VMP4_FRAMES_HANDOVER_TIMEOUT):
+                log.warning(
+                    "passthrough_seek VMP4 frames filler: predecessor did not release after %.1fs",
+                    time.time() - waited,
+                )
+            else:
+                log.info(
+                    "passthrough_seek VMP4 frames filler: took over after %.1fs",
+                    time.time() - waited,
+                )
+        if filler.stop_event.is_set():
+            filler.state = "stopped"
+            return
+        matter = acquire_matter(blocking=True, timeout=PASSTHROUGH_SEEK_VMP4_SLOT_MATTER_TIMEOUT)
+        if matter is None:
+            filler.state = "failed"
+            filler.reason = "matter-timeout"
+            return
+        start_frame = int(filler.start_frame)
+        start_sec = start_frame / max(1.0, float(layout.fps))
+        remaining = max(1, layout.frame_count - start_frame)
+        cap = int(layout.frames[start_frame].budget) if layout.frames else 0
+        # Under a source-derived plan the budget varies per GOP, so hand the
+        # encoder the whole schedule from this start frame on; it retargets
+        # itself with Reconfigure at each change instead of being rebuilt.
+        schedule = (
+            [int(f.budget) for f in layout.frames[start_frame:]]
+            if layout.source_budget else None
+        )
+        idx = start_frame
+        for au in iter_pynv_passthrough_annexb_frames(
+            layout.source_path,
+            start_sec=start_sec,
+            frame_count=remaining,
+            matter=matter,
+            output_mode=mode,
+            per_frame_cap_bytes=cap,
+            per_frame_cap_schedule=schedule,
+            cancel=filler.stop_event,
+        ):
+            if filler.stop_event.is_set():
+                filler.state = "stopped"
+                return
+            if idx >= layout.frame_count:
+                break
+            fr = layout.frames[idx]
+            payload = hevc_annexb_to_length_prefixed_sample(au, nal_length_size=layout.nal_length_size)
+            target = filler.cache_dir / f"frame_{idx:06d}.bin"
+            if not target.exists():
+                if len(payload) > fr.budget:
+                    # Should be rare with CBR; clamp to the budget (one corrupt
+                    # frame -> brief glitch) rather than leaving a permanent hole
+                    # that 503s the whole GOP forever.
+                    log.warning(
+                        "passthrough_seek VMP4 frames oversize idx=%d %d>%d (clamped)",
+                        idx, len(payload), fr.budget,
+                    )
+                    payload = payload[: fr.budget]
+                _vmp4_write_bytes_atomic(target, payload)
+            if not filler.first_frame_at:
+                filler.first_frame_at = time.time()
+            filler.cursor = idx + 1
+            idx += 1
+        if filler.stop_event.is_set():
+            # Cancelled during setup or between frames: the generator returns
+            # normally in that case, so without this check the tail-fill below
+            # would mark every remaining frame of the title as an empty payload
+            # and the player would be served filler for the rest of the run.
+            filler.state = "stopped"
+            return
+        # Reaching here means the encode generator ran dry rather than being
+        # preempted (a stop request returns above). frame_count comes from
+        # duration*fps and can overshoot what the decoder actually yields - one
+        # frame short is normal - so the trailing samples would never be written
+        # and their GOP would never count as ready. Every request for that GOP
+        # then restarted the filler, forever: a 6s 8K pipeline rebuild on a loop,
+        # and a 503 for anyone playing to the end of the title. Leave
+        # zero-length payloads instead; the range iterator serves those samples
+        # as filler, which is what they are.
+        for missing in range(idx, layout.frame_count):
+            tail_target = filler.cache_dir / f"frame_{missing:06d}.bin"
+            if not tail_target.exists():
+                _vmp4_write_bytes_atomic(tail_target, b"")
+        if idx < layout.frame_count:
+            log.info(
+                "passthrough_seek VMP4 frames filler ran dry at %d/%d; %d trailing samples left as filler",
+                idx, layout.frame_count, layout.frame_count - idx,
+            )
+        filler.cursor = layout.frame_count
+        filler.state = "done"
+    except Exception as exc:
+        filler.state = "failed"
+        filler.reason = f"{type(exc).__name__}: {exc}"
+        log.warning("passthrough_seek VMP4 frames filler failed: start=%d reason=%s", filler.start_frame, filler.reason)
+    finally:
+        release_matter(matter)
+        filler.done_event.set()
+
+
+def _vmp4_frames_ensure_filler(
+    layout: PassthroughVmp4FramesLayout,
+    cache_dir: Path,
+    digest: str,
+    output_mode: str,
+    gop_index: int,
+) -> _Vmp4FramesFiller | None:
+    if not PASSTHROUGH_SEEK_VMP4_SLOT_BUILD_PLACEHOLDER:
+        return None
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    need_frame = _vmp4_frames_first_frame_of_gop(layout, gop_index)
+    lead = _vmp4_frames_lead_frames(layout)
+    now = time.time()
+    with _vmp4_frames_lock:
+        filler = _vmp4_frames_fillers.get(digest)
+        covered = (
+            filler is not None
+            and filler.state == "running"
+            and filler.start_frame <= need_frame <= filler.cursor + lead
+        )
+        if covered:
+            filler.last_hit_at = now
+            return filler
+        # Debounce: a running filler that simply hasn't reached this GOP yet keeps
+        # running (the request waits/503s and retries) until the cooldown lapses.
+        # This stops concurrent probes at different offsets from ping-ponging the
+        # single filler so it can actually make forward progress. It only applies
+        # while something is still reading from where the filler is: a genuine
+        # seek leaves it with no readers, and then it must move at once or the
+        # player waits out its timeout on a position nobody is producing.
+        if filler is not None and filler.state == "running":
+            # A seek is not a competing probe and must not wait the debounce out.
+            # The debounce exists for connections the player opens AHEAD of
+            # itself, which are always close by; a request thousands of frames
+            # away, or behind a run that only moves forward, can only be a seek.
+            # Distance says so, and "nobody is reading the old position" does
+            # not: the connection the player abandoned keeps draining for a
+            # second or two afterwards and holds last_hit_at fresh, so a real
+            # seek sat out the full follow window. Measured on 8K, 11 of 18
+            # cold starts spent 2.0-2.7s here before the encoder was even
+            # allowed to move - the bulk of the stall where the player still
+            # shows the previous picture.
+            seeked_away = (
+                need_frame < filler.start_frame
+                or need_frame > filler.cursor + 2 * lead
+            )
+            followed = (
+                not seeked_away
+                and (now - (filler.last_hit_at or filler.started_at)) < _VMP4_FRAMES_FOLLOW_WINDOW
+            )
+            if filler.first_frame_at:
+                hold, since = _VMP4_FRAMES_PRODUCTIVE_HOLD, filler.first_frame_at
+            else:
+                hold, since = _VMP4_FRAMES_RESTART_COOLDOWN, filler.started_at
+            if followed and (now - since) < hold:
+                return filler
+        # (Re)start a forward filler at the requested GOP. Already-written frame
+        # files from earlier runs stay valid; the worker skips existing files.
+        predecessor = None
+        if filler is not None and filler.state == "running":
+            filler.stop_event.set()
+            predecessor = filler
+        # Runs for OTHER titles are not stopped by the reposition above; without
+        # this they keep encoding to the end of a title nobody is watching and
+        # hold their Matter, so the pool runs out and the next title never
+        # starts. Retire the least recently read ones down to the limit.
+        others = [
+            (d, f) for d, f in _vmp4_frames_fillers.items()
+            if d != digest and f.state == "running"
+        ]
+        if others:
+            others.sort(key=lambda item: item[1].last_hit_at or item[1].started_at)
+            for other_digest, other in others[: max(0, len(others) - (PASSTHROUGH_SEEK_VMP4_FRAMES_MAX_ACTIVE - 1))]:
+                other.stop_event.set()
+                log.info(
+                    "passthrough_seek VMP4 frames retiring idle filler: digest=%s idle=%.1fs",
+                    other_digest[:8], now - (other.last_hit_at or other.started_at),
+                )
+                if predecessor is None:
+                    predecessor = other
+        new = _Vmp4FramesFiller(
+            digest=digest,
+            cache_dir=cache_dir,
+            output_mode=(output_mode or "green").lower(),
+            start_frame=int(need_frame),
+            cursor=int(need_frame),
+            state="running",
+            started_at=now,
+        )
+        _vmp4_frames_fillers[digest] = new
+        threading.Thread(
+            target=_vmp4_frames_filler_worker,
+            args=(new, layout, predecessor),
+            name=f"vmp4-frames-filler-{digest[:8]}",
+            daemon=True,
+        ).start()
+        return new
+
+
+def _vmp4_frames_wait_gop(
+    layout: PassthroughVmp4FramesLayout,
+    cache_dir: Path,
+    digest: str,
+    gop_index: int,
+    output_mode: str,
+    timeout_sec: float,
+) -> tuple[bool, dict[int, Path], _Vmp4FramesFiller | None]:
+    deadline = time.time() + max(0.0, float(timeout_sec or 0.0))
+    filler: _Vmp4FramesFiller | None = None
+    while True:
+        ready = _vmp4_frames_ready_payloads(cache_dir)
+        if _vmp4_frames_gop_ready(layout, gop_index, ready):
+            return True, ready, filler
+        filler = _vmp4_frames_ensure_filler(layout, cache_dir, digest, output_mode, gop_index)
+        now = time.time()
+        if filler is None or filler.state == "failed" or now >= deadline:
+            return False, ready, filler
+        time.sleep(min(0.05, max(0.001, deadline - now)))
+
+
+def _vmp4_frames_streaming(body, digest: str):
+    """Mark the run as being read while its bytes are going out.
+
+    Whether a filler may be repositioned turns on how recently a request landed
+    inside the range it covers, but that was only recorded when a request
+    ARRIVED. Once a reply started streaming nothing touched it again, so about
+    _VMP4_FRAMES_FOLLOW_WINDOW into playback the run looked abandoned and the
+    player's next connection - opened ahead, as they do - was free to drag it
+    elsewhere. The reply being read at that moment lost its producer mid-stream:
+    picture for a second or two after a seek, then nothing.
+    """
+    for chunk in body:
+        filler = _vmp4_frames_fillers.get(digest)
+        if filler is not None:
+            filler.last_hit_at = time.time()
+        yield chunk
+
+
+def _vmp4_frames_body_waiter(cache_dir: Path, timeout: float, digest: str):
+    """Callback letting a response body block on a frame the encoder owes it.
+
+    Giving up produces a lone filler-data NAL - an access unit with no VCL NAL,
+    which no conforming decoder accepts - so this waits as long as the run is
+    still producing rather than padding after a short deadline. It returns None
+    (and the caller emits filler) only when the run has stopped or failed, where
+    the frame is genuinely never coming.
+    """
+    if timeout <= 0:
+        return None
+
+    def wait(index: int) -> Path | None:
+        target = cache_dir / f"frame_{int(index):06d}.bin"
+        deadline = time.time() + timeout
+        while True:
+            if target.exists():
+                return target
+            filler = _vmp4_frames_fillers.get(digest)
+            if filler is None or filler.state != "running":
+                return None
+            if time.time() >= deadline:
+                log.warning(
+                    "passthrough_seek VMP4 frames body wait exhausted: frame=%d after %.1fs",
+                    index, timeout,
+                )
+                return None
+            time.sleep(0.02)
+
+    return wait
+
+
+def _vmp4_frames_wait_frame(
+    layout: PassthroughVmp4FramesLayout,
+    cache_dir: Path,
+    digest: str,
+    frame_index: int,
+    output_mode: str,
+    timeout_sec: float,
+    want_frames: int = 1,
+) -> tuple[bool, dict[int, Path], _Vmp4FramesFiller | None]:
+    """Wait for a contiguous run of frames from ``frame_index``.
+
+    A 206 is trimmed to whatever contiguous prefix is built, so waiting for the
+    whole GOP is unnecessary - but waiting for just one frame is too little. A
+    player that has just seeked then receives a fraction of a second of video,
+    plays it, finds nothing after it and moves to the next item. Asking for a
+    GOP's worth of frames costs about a second and answers with a few MB.
+    """
+    deadline = time.time() + max(0.0, float(timeout_sec or 0.0))
+    gop_index = layout.frames[frame_index].gop_index if 0 <= frame_index < len(layout.frames) else 0
+    need = max(1, int(want_frames or 1))
+    filler: _Vmp4FramesFiller | None = None
+    while True:
+        ready = _vmp4_frames_ready_payloads(cache_dir)
+        run, idx = 0, frame_index
+        while idx < layout.frame_count and idx in ready and run < need:
+            run += 1
+            idx += 1
+        # Short of `need` only because the title ends there is still enough.
+        if run >= need or (run > 0 and idx >= layout.frame_count):
+            return True, ready, filler
+        filler = _vmp4_frames_ensure_filler(layout, cache_dir, digest, output_mode, gop_index)
+        now = time.time()
+        if filler is None or filler.state == "failed" or now >= deadline:
+            return run > 0, ready, filler
+        # A filler only ever encodes forward. If another request has since
+        # repositioned it past (or away from) this frame, nothing will ever
+        # produce it and waiting here is waiting forever - answer with whatever
+        # exists. Players that fire two requests at one offset and then a third
+        # slightly later (OPlayer does) otherwise leave the first two hanging.
+        if filler.state == "running" and filler.start_frame > frame_index:
+            log.info(
+                "passthrough_seek VMP4 frames wait abandoned: frame=%d filler_start=%d",
+                frame_index, filler.start_frame,
+            )
+            return run > 0, ready, filler
+        time.sleep(min(0.05, max(0.001, deadline - now)))
+
+
+def _iter_vmp4_frames_ready_stream(
+    layout: PassthroughVmp4FramesLayout,
+    cache_dir: Path,
+    digest: str,
+    output_mode: str,
+    start: int,
+    end_inclusive: int,
+    *,
+    chunk_size: int,
+    wait_timeout: float,
+    rid: int = 0,
+):
+    """Stream frame bytes, building/waiting each GOP before it is emitted.
+
+    This is the realtime background-encode-ahead behaviour: as the player pulls
+    bytes the stream ensures the current GOP is built (and prefetches ahead via
+    _vmp4_frames_wait_gop) instead of emitting placeholder bytes. Runs inside the
+    StreamingResponse threadpool, so the per-GOP waits do not block the loop.
+    """
+    cursor = max(0, int(start))
+    stop = min(max(0, int(end_inclusive)), max(0, layout.total_size - 1))
+    if cursor > stop:
+        return
+    init_end = len(layout.init)
+    if cursor < init_end:
+        init_stop = min(stop, init_end - 1)
+        yield layout.init[cursor : init_stop + 1]
+        cursor = init_stop + 1
+    if cursor > stop:
+        return
+    start_idx = vmp4_frame_index_for_offset(layout, cursor)
+    if start_idx is None:
+        start_idx = 0
+    last_gop = -1
+    ready: dict[int, Path] = {}
+    for fr in layout.frames[start_idx:]:
+        frame_end = fr.offset + fr.budget
+        if frame_end <= cursor:
+            continue
+        if fr.offset > stop:
+            break
+        if fr.gop_index != last_gop:
+            ok, ready, _build = _vmp4_frames_wait_gop(
+                layout, cache_dir, digest, fr.gop_index, output_mode, wait_timeout
+            )
+            last_gop = fr.gop_index
+            if not ok:
+                log.warning(
+                    "passthrough_seek[%d] VMP4 frames stream wait failed: gop=%d at byte=%d",
+                    rid, fr.gop_index, cursor,
+                )
+                return
+        sub_end = min(stop, frame_end - 1)
+        yield from iter_vmp4_frames_range(
+            layout, cursor, sub_end, chunk_size=chunk_size, payload_paths=ready
+        )
+        cursor = sub_end + 1
+        if cursor > stop:
+            return
+
+
+def _vmp4_frames_cap_to_reach(
+    layout: PassthroughVmp4FramesLayout,
+    build: _Vmp4FramesFiller | None,
+    start_byte: int,
+    served_end: int,
+) -> int:
+    """Keep a reply's end inside the range the running encode can still reach.
+
+    A player asks for the byte after the reply it just consumed, so the end of
+    every reply picks the start of the next request. The span was measured from
+    the request start (up to _MAX_SPAN_BYTES, ~450 frames) while whether a run
+    can serve an offset is measured from its write cursor (``cursor + lead``).
+    Two different origins: each reply handed the player a next-offset a few
+    hundred frames further ahead than the encoder had moved, so after a handful
+    of replies the player was asking past ``cursor + lead`` - and that request
+    does not wait, it repositions the run. A ~3s pipeline rebuild, and every body
+    still streaming from the old position loses its producer. That is the loop
+    behind "seek, watch a second or two, jump to the next video".
+
+    Capping the end at the last frame the run still covers means the next request
+    always lands inside the window, so it is answered by waiting (milliseconds)
+    instead of by restarting. A seek into fresh ground is untouched: there the
+    cursor sits at the request, and ``lead`` is wider than _MAX_SPAN_BYTES.
+    """
+    if build is None or build.state != "running" or not layout.frames:
+        return served_end
+    reach = int(build.cursor) + _vmp4_frames_lead_frames(layout)
+    reach = min(reach, layout.frame_count - 1)
+    if reach < 0:
+        return served_end
+    fr = layout.frames[reach]
+    limit = fr.offset + fr.budget - 1
+    # Never cap below the request itself - an offset already out of reach needs
+    # the reposition, and trimming it to nothing would only answer 503.
+    return served_end if limit < start_byte else min(served_end, limit)
+
+
+def _seek_vmp4_frames_response(
+    *,
+    path: Path,
+    info,
+    output_mode: str,
+    range_header: str | None,
+    headers: dict[str, str],
+    head_only: bool,
+    rid: int = 0,
+) -> Response:
+    headers["Accept-Ranges"] = "bytes"
+    headers["Content-Type"] = "video/mp4"
+    headers["X-Passthrough-VMP4-Backend"] = "slot_frames"
+    mode = (output_mode or "green").lower()
+    try:
+        template = _vmp4_slot_output_template(info, mode)
+        layout = _vmp4_frames_cached_layout(path, info, mode, template)
+    except Vmp4SlotLayoutError as exc:
+        eh = dict(headers)
+        eh["X-Passthrough-VMP4-Phase"] = "frames-layout-error"
+        eh["X-Passthrough-VMP4-Frames-Error"] = _header_safe_text(str(exc))
+        for k in ("Content-Length", "Content-Range", "Content-Type"):
+            eh.pop(k, None)
+        return Response("VMP4 frames layout unavailable", status_code=409, headers=eh, media_type="text/plain")
+
+    total = layout.total_size
+    byte_range = _parse_byte_range(range_header, total)
+    if range_header and byte_range is None:
+        eh = dict(headers)
+        eh["X-Passthrough-VMP4-Phase"] = "range-unsatisfiable"
+        eh["Content-Range"] = f"bytes */{max(0, int(total))}"
+        for k in ("Content-Length", "Content-Type"):
+            eh.pop(k, None)
+        log.info(
+            "passthrough_seek[%d] VMP4 frames 416: range=%r total=%d", rid, range_header, total
+        )
+        return Response(status_code=416, headers=eh)
+
+    digest = _vmp4_frames_digest(path, layout, mode)
+    cache_dir = RUNTIME_CACHE_DIR / "vmp4_frames" / digest
+    response_range = byte_range or ByteRange(start=0, end=max(0, total - 1), total=total)
+    # "bytes=0-" is answered like a static file would answer it: 206 with a full
+    # Content-Range, so the player learns the total size. Serving it as a 200
+    # chunked body (no Content-Length, the live-path shape) left Skybox without a
+    # size; it then probed bytes=<total>- , got the 416 that offset deserves, and
+    # gave up on the item. A real file survives that same probe because the first
+    # response already told it how big the file is. Only a request with no Range
+    # header at all keeps the chunked shape.
+    status_code = 206 if byte_range is not None else 200
+
+    headers["X-Passthrough-VMP4-Phase"] = "frames-layout"
+    headers["X-Passthrough-VMP4-Output-Codec"] = layout.codec_name
+    headers["X-Passthrough-VMP4-Output-Size"] = f"{template.width}x{template.height}"
+    headers["X-Passthrough-VMP4-Frames-Count"] = str(layout.frame_count)
+    headers["X-Passthrough-VMP4-Frames-Fps"] = f"{layout.fps:.3f}"
+    headers["X-Passthrough-VMP4-Frames-Gop"] = str(layout.gop_frames)
+    headers["X-Passthrough-VMP4-Frames-Budget"] = str(layout.idr_budget)
+    headers["X-Passthrough-VMP4-Frames-Source-Budget"] = "1" if layout.source_budget else "0"
+    headers["X-Passthrough-VMP4-Frames-Audio"] = (
+        f"{len(layout.audio_samples)}/{layout.audio_bytes}" if layout.audio_samples else "none"
+    )
+    if layout.source_budget and layout.frames:
+        budgets = [f.budget for f in layout.frames]
+        headers["X-Passthrough-VMP4-Frames-Budget-Range"] = (
+            f"{min(budgets)}-{max(budgets)}/{layout.mdat_payload_size // max(1, layout.frame_count)}"
+        )
+    headers["X-Passthrough-VMP4-Moov-Size"] = str(layout.moov_size)
+    headers["X-Passthrough-VMP4-Cache"] = digest
+
+    ready: dict[int, Path] = _vmp4_frames_ready_payloads(cache_dir)
+    if mode == "superres" and not seek_supported_target(RTX_VSR_TARGET_HEIGHT):
+        # Only native 1x SuperRes is offered as a virtual file; anything else
+        # belongs to the live chapter container and must not be half-served.
+        eh = dict(headers)
+        eh["X-Passthrough-VMP4-Phase"] = "superres-target-not-seekable"
+        for k in ("Content-Length", "Content-Range", "Content-Type"):
+            eh.pop(k, None)
+        return Response(
+            "SuperRes virtual-file playback requires the native 1x target",
+            status_code=409, headers=eh, media_type="text/plain",
+        )
+    if mode not in SEEK_FRAME_MODES:
+        eh = dict(headers)
+        eh["X-Passthrough-VMP4-Phase"] = "frames-mode-unsupported"
+        for k in ("Content-Length", "Content-Range", "Content-Type"):
+            eh.pop(k, None)
+        return Response(f"VMP4 frames backend does not support mode={mode}", status_code=409, headers=eh, media_type="text/plain")
+
+    if head_only:
+        # HEAD: declare full size, no body, no build wait.
+        headers["Content-Length"] = str(response_range.length)
+        if status_code == 206:
+            headers["Content-Range"] = f"bytes {response_range.start}-{response_range.end}/{total}"
+        else:
+            headers.pop("Content-Range", None)
+        return Response(status_code=status_code, headers=headers, media_type="video/mp4")
+
+    start_idx = vmp4_frame_index_for_offset(layout, response_range.start)
+    gop_index = layout.frames[start_idx].gop_index if start_idx is not None else 0
+
+    # MP4 players open a file by reading its header and probing its tail before
+    # they play anything. Those bytes are structural: the header lives in our
+    # init and the tail bytes are samples the player only inspects, so answering
+    # them with 503 (waiting on an encode that will never matter) is what makes
+    # a player give up before the first frame. Serve any such probe straight
+    # from the layout - real bytes where we have them, filler where we do not.
+    probe = _vmp4_frames_probe_range(layout, response_range, ranged=status_code == 206)
+    if probe:
+        headers["X-Passthrough-VMP4-Frames-Probe"] = probe
+        headers["X-Passthrough-VMP4-Frames-Gop-Index"] = str(gop_index)
+        ready = _vmp4_frames_ready_payloads(cache_dir)
+        log.info(
+            "passthrough_seek[%d] VMP4 frames probe (%s): range=%r len=%d",
+            rid, probe, range_header, response_range.length,
+        )
+        body = iter_vmp4_frames_range(
+            layout, response_range.start, response_range.end,
+            chunk_size=DEFAULT_CHUNK_SIZE, payload_paths=ready,
+        )
+        headers["Content-Length"] = str(response_range.length)
+        if status_code == 206:
+            headers["Content-Range"] = f"bytes {response_range.start}-{response_range.end}/{total}"
+        else:
+            headers.pop("Content-Range", None)
+        return StreamingResponse(body, status_code=status_code, headers=headers, media_type="video/mp4")
+
+    t_wait0 = time.time()
+    if status_code == 206 and start_idx is not None:
+        # Ranged: the body is trimmed to the built prefix anyway, so one frame is
+        # enough to answer. Whole-GOP waits belong to the chunked path below.
+        ok, ready, build = _vmp4_frames_wait_frame(
+            layout, cache_dir, digest, start_idx, mode,
+            PASSTHROUGH_SEEK_VMP4_FRAMES_RANGED_WAIT,
+            want_frames=PASSTHROUGH_SEEK_VMP4_FRAMES_PREBUFFER_FRAMES or 1,
+        )
+        if not ok and build is not None and build.state == "running":
+            # The encoder is working towards this position but has not reached
+            # it. Answering 503 makes a player abandon the item; answer with
+            # filler for the part that is not encoded and let it keep playing
+            # while the encoder closes the gap.
+            ok = True
+    else:
+        ok, ready, build = _vmp4_frames_wait_gop(
+            layout, cache_dir, digest, gop_index, mode, PASSTHROUGH_SEEK_VMP4_FRAMES_READY_WAIT
+        )
+    headers["X-Passthrough-VMP4-Frames-Gop-Index"] = str(gop_index)
+    headers["X-Passthrough-VMP4-Frames-Wait-Ready"] = "1" if ok else "0"
+    if build is not None:
+        headers["X-Passthrough-VMP4-Frames-Build"] = build.state
+        if build.reason:
+            headers["X-Passthrough-VMP4-Frames-Build-Reason"] = _header_safe_text(build.reason)
+    if not ok:
+        eh = dict(headers)
+        eh["X-Passthrough-VMP4-Phase"] = "frames-gop-not-ready"
+        eh["Retry-After"] = "1"
+        for k in ("Content-Length", "Content-Range", "Content-Type"):
+            eh.pop(k, None)
+        log.info(
+            "passthrough_seek[%d] VMP4 frames gop not ready: gop=%d range=%r waited=%.1fs",
+            rid, gop_index, range_header, time.time() - t_wait0,
+        )
+        return Response("VMP4 frames GOP not ready", status_code=503, headers=eh, media_type="text/plain")
+
+    if status_code == 206:
+        # Serve only the already-built contiguous prefix so Content-Length is
+        # exact and the body never blocks mid-stream (which previously raised
+        # "Response content shorter than Content-Length"). The player re-requests
+        # the next byte range; the filler keeps building ahead.
+        served_end = _vmp4_frames_served_end(layout, ready, response_range.start, response_range.end)
+        if build is not None and build.state == "running":
+            # A reply is not limited to what is already encoded. Trimming it there
+            # made a seek into un-encoded ground answer with whatever few MB
+            # existed - 7.9 MB where the same player had been receiving 50 MB per
+            # reply over cached ground - so it came back for more within a second
+            # and had to wait, which is when it gives up and moves on.
+            #
+            # The body can block on frames the run has not reached yet (it is
+            # producing above realtime, so they are milliseconds away), so promise
+            # the same span here as anywhere else and let it deliver at the rate
+            # frames appear. Only the reply's pace differs between cached and
+            # un-cached ground, not its shape.
+            served_end = max(served_end, response_range.start - 1)
+        if PASSTHROUGH_SEEK_VMP4_FRAMES_MIN_SPAN_BYTES > 0 and served_end >= response_range.start - 1:
+            served_end = max(
+                served_end,
+                min(
+                    response_range.end,
+                    response_range.start + PASSTHROUGH_SEEK_VMP4_FRAMES_MIN_SPAN_BYTES - 1,
+                ),
+            )
+        if build is not None and build.state == "running" and PASSTHROUGH_SEEK_VMP4_FRAMES_MAX_SPAN_BYTES > 0:
+            served_end = max(
+                served_end,
+                min(
+                    response_range.end,
+                    response_range.start + PASSTHROUGH_SEEK_VMP4_FRAMES_MAX_SPAN_BYTES - 1,
+                ),
+            )
+        if PASSTHROUGH_SEEK_VMP4_FRAMES_MAX_SPAN_BYTES > 0:
+            served_end = min(
+                served_end,
+                response_range.start + PASSTHROUGH_SEEK_VMP4_FRAMES_MAX_SPAN_BYTES - 1,
+            )
+        served_end = _vmp4_frames_cap_to_reach(layout, build, response_range.start, served_end)
+        if served_end < response_range.start:
+            eh = dict(headers)
+            eh["X-Passthrough-VMP4-Phase"] = "frames-gop-not-ready"
+            eh["Retry-After"] = "1"
+            for k in ("Content-Length", "Content-Range", "Content-Type"):
+                eh.pop(k, None)
+            return Response("VMP4 frames range not ready", status_code=503, headers=eh, media_type="text/plain")
+        response_range = ByteRange(start=response_range.start, end=served_end, total=total)
+        headers["Content-Length"] = str(response_range.length)
+        headers["Content-Range"] = f"bytes {response_range.start}-{response_range.end}/{total}"
+        log.info(
+            "passthrough_seek[%d] VMP4 frames 206: gop=%d range=%r content_range=%s",
+            rid, gop_index, range_header, headers.get("Content-Range"),
+        )
+        body = iter_vmp4_frames_range(
+            layout, response_range.start, response_range.end,
+            chunk_size=DEFAULT_CHUNK_SIZE, payload_paths=ready,
+            wait_for_frame=_vmp4_frames_body_waiter(
+                cache_dir, PASSTHROUGH_SEEK_VMP4_FRAMES_BODY_FRAME_WAIT, digest
+            ),
+        )
+        return StreamingResponse(
+            _vmp4_frames_streaming(body, digest),
+            status_code=206, headers=headers, media_type="video/mp4",
+        )
+
+    # No-Range / zero-open playback: stream chunked (no Content-Length, like the
+    # live path) and block per GOP as needed. Without a declared length the body
+    # can stall when the encoder is briefly behind without erroring.
+    headers.pop("Content-Length", None)
+    headers.pop("Content-Range", None)
+    log.info(
+        "passthrough_seek[%d] VMP4 frames 200 chunked: mode=%s output=%s total=%d frames=%d fps=%.3f range=%r",
+        rid, mode, headers.get("X-Passthrough-VMP4-Output-Size"), total,
+        layout.frame_count, layout.fps, range_header,
+    )
+    body = _iter_vmp4_frames_ready_stream(
+        layout, cache_dir, digest, mode,
+        response_range.start, response_range.end,
+        chunk_size=DEFAULT_CHUNK_SIZE,
+        wait_timeout=PASSTHROUGH_SEEK_VMP4_FRAMES_READY_WAIT,
+        rid=rid,
+    )
+    return StreamingResponse(body, status_code=200, headers=headers, media_type="video/mp4")
 
 
 def _seek_headers(
@@ -1980,7 +4933,7 @@ def _configured_passthrough_modes() -> tuple[str, ...]:
         else:
             tokens = (token,)
         for mode in tokens:
-            if mode in {"green", "alpha", "two_dvr", "superres"} and mode not in out:
+            if mode in {"green", "alpha", "two_dvr", "superres", "dlss5"} and mode not in out:
                 out.append(mode)
     return tuple(out)
 
@@ -2118,6 +5071,56 @@ async def _superres_live_block_reason(path: Path, meta) -> str:
     return ""
 
 
+async def _dlss5_live_block_reason(path: Path, meta) -> str:
+    """Why this source cannot ride the realtime DLSS5 channel, or "".
+
+    Unlike SuperRes there is no NGX evaluation preflight to run: the CUDA
+    zero-copy path fails loudly on its first frame, and what it needs from the
+    process (a blocking-sync primary context) is decided at startup, so
+    source_block_reason_dlss5 can answer without touching the GPU.
+    """
+    from utils.dlss5 import source_block_reason_dlss5
+
+    codec = meta.codec
+    timing = getattr(meta, "timing", None)
+    return source_block_reason_dlss5(
+        int(codec.width or 0),
+        int(codec.height or 0),
+        is_10bit=bool(int(getattr(codec, "bit_depth", 8) or 8) > 8),
+        fps=float(getattr(timing, "source_fps", 0.0) or 0.0),
+        realtime=True,
+    ) or ""
+
+
+# Modes that put a GPU stage between the decoder and NVENC, and the name each
+# one answers a rejected client with.
+_ENHANCED_MODE_LABELS = {"superres": "RTX VSR", "dlss5": "DLSS5"}
+
+
+async def _enhanced_mode_block_reason(path: Path, mode: str, meta=None) -> str:
+    """Why an enhancement mode cannot run for this source, or "".
+
+    Every route that can start one of these stages asks here, so a route cannot
+    admit a source the worker then refuses - which is exactly how SuperRes once
+    came back as a 409 after the listing had already offered it.
+    """
+    name = str(mode or "").strip().lower()
+    if name not in _ENHANCED_MODE_LABELS:
+        return ""
+    try:
+        if meta is None:
+            meta = await asyncio.to_thread(probe_video_metadata, path)
+        if name == "superres":
+            return await _superres_live_block_reason(path, meta)
+        return await _dlss5_live_block_reason(path, meta)
+    except Exception as exc:
+        return f"metadata probe failed: {exc}"
+
+
+def _enhanced_mode_label(mode: str) -> str:
+    return _ENHANCED_MODE_LABELS.get(str(mode or "").strip().lower(), str(mode or "").upper())
+
+
 def _probe_live_request_metadata(path: Path):
     info = probe_cached(path)
     live_meta = probe_video_metadata(path)
@@ -2137,7 +5140,7 @@ def _select_passthrough_stream(
     output_mode = (output_mode or PASSTHROUGH_OUTPUT_MODE).lower()
     if output_mode == "all":
         output_mode = "green"
-    elif output_mode not in {"green", "alpha", "two_dvr", "rm", "superres", "face_beauty"}:
+    elif output_mode not in {"green", "alpha", "two_dvr", "rm", "superres", "dlss5", "face_beauty"}:
         output_mode = _select_live_output_mode("")
     fallback_container = "mpegts" if container == "mpegts" else None
     fallback_max_fps = max_fps
@@ -2160,6 +5163,8 @@ def _select_passthrough_stream(
             raise RuntimeError("face beauty live requires the PyNv NV12 live path")
         if output_mode == "superres":
             raise RuntimeError("RTX VSR live requires the PyNv CUDA path")
+        if output_mode == "dlss5":
+            raise RuntimeError("DLSS5 live requires the PyNv CUDA path")
         return PassthroughStream(
             path,
             start_sec,
@@ -2366,14 +5371,15 @@ async def passthrough_live_get(
                 f"FaceBeauty live unsupported: {face_beauty_block_reason}",
                 status_code=409,
             )
-    if live_output_mode == "superres":
-        superres_block_reason = await _superres_live_block_reason(path, live_meta)
-        if superres_block_reason:
+    if live_output_mode in _ENHANCED_MODE_LABELS:
+        enhanced_block_reason = await _enhanced_mode_block_reason(path, live_output_mode, live_meta)
+        if enhanced_block_reason:
+            label = _enhanced_mode_label(live_output_mode)
             log.info(
-                "passthrough_live[%d] reject unsupported RTX VSR source: %s reason=%s",
-                rid, path.name, superres_block_reason,
+                "passthrough_live[%d] reject unsupported %s source: %s reason=%s",
+                rid, label, path.name, enhanced_block_reason,
             )
-            return Response(f"RTX VSR live unsupported: {superres_block_reason}", status_code=409)
+            return Response(f"{label} live unsupported: {enhanced_block_reason}", status_code=409)
     live_max_fps = _live_adaptive_max_fps(path, live_meta)
     live_profile = _live_response_profile(user_agent)
     is_nplayer = _is_nplayer_client(user_agent)
@@ -3057,13 +6063,24 @@ async def passthrough_live_get(
     )
 
 
-def _seek_output_mode(requested_mode: str | None) -> str:
-    requested = (requested_mode or "").lower()
-    modes = tuple(mode for mode in _configured_passthrough_modes() if mode in {"green", "alpha", "superres"})
+def _seek_output_mode(requested_mode: str | None, route_mode: str | None = None) -> str:
+    """Resolve the seek route's output mode.
+
+    The path-borne mode wins: it survives a player dropping the query.
+    """
+    requested = (str(route_mode or "") or str(requested_mode or "")).lower()
+    modes = tuple(
+        mode for mode in _configured_passthrough_modes()
+        if mode in {"green", "alpha", "superres", "dlss5"}
+    )
     if requested in modes:
         return requested
-    if "superres" in modes and len(modes) == 1:
-        return "superres"
+    # A single enhancement mode is the whole configuration, so it is also the
+    # fallback; with green or alpha alongside it the plain modes win, because an
+    # enhancement stage is the expensive answer to give a client that asked for
+    # nothing in particular.
+    if len(modes) == 1 and modes[0] in {"superres", "dlss5"}:
+        return modes[0]
     if "green" in modes and "alpha" in modes:
         return "green"
     if "alpha" in modes:
@@ -3167,10 +6184,10 @@ async def passthrough_seek_head(
     transfer_mode: str | None = Header(default=None, alias="transferMode.dlna.org"),
 ):
     rid = next(_request_ids)
-    path, route_container = _safe_seek_video_path(name)
+    path, route_container, route_mode = _safe_seek_video_path(name)
     user_agent = request.headers.get("user-agent", "")
     allowed, reason, route_profile = _seek_route_allowed(user_agent)
-    output_mode = _seek_output_mode(mode)
+    output_mode = _seek_output_mode(mode, route_mode)
     annotate_request(
         request,
         media_name=path.name,
@@ -3183,21 +6200,20 @@ async def passthrough_seek_head(
         log.info("passthrough_seek[%d] HEAD blocked: reason=%s profile=%s", rid, reason, route_profile)
         return _seek_blocked_response(reason)
     info = probe_cached(path)
-    if output_mode == "superres":
-        try:
-            seek_meta = await asyncio.to_thread(probe_video_metadata, path)
-            superres_reason = await _superres_live_block_reason(path, seek_meta)
-        except Exception as exc:
-            superres_reason = f"metadata probe failed: {exc}"
-        if superres_reason:
-            return Response(f"RTX VSR seek unsupported: {superres_reason}", status_code=409)
+    if output_mode in _ENHANCED_MODE_LABELS:
+        seek_reason = await _enhanced_mode_block_reason(path, output_mode)
+        if seek_reason:
+            return Response(
+                f"{_enhanced_mode_label(output_mode)} seek unsupported: {seek_reason}",
+                status_code=409,
+            )
     codec = PYNV_OUTPUT_CODEC
     client_host = request.client.host if request.client else ""
-    container = route_container or _seek_container()
+    container = _seek_container() if PASSTHROUGH_SEEK_VMP4 else (route_container or _seek_container())
     media_type = _seek_media_type(container)
-    total = _estimated_seek_passthrough_size(path, info.duration, codec, client_host, container)
+    total = _seek_declared_total(path, info.duration, codec, client_host, container)
     byte_range = _parse_byte_range(range_header, total)
-    if range_header and byte_range is None:
+    if range_header and byte_range is None and not _seek_vmp4_enabled(container):
         return _seek_range_416(total)
     t = 0.0
     mapped = None
@@ -3235,6 +6251,39 @@ async def passthrough_seek_head(
     if status_code == 200:
         headers.pop("Content-Range", None)
     _apply_seek_diag_headers(headers, start_sec=t, output_mode=output_mode, container=container, mapped=mapped)
+    _apply_seek_vmp4_headers(headers, path=path, duration=info.duration, total=total, container=container)
+    if _seek_vmp4_enabled(container):
+        if _seek_vmp4_backend() == "slot_frames":
+            return _seek_vmp4_frames_response(
+                path=path,
+                info=info,
+                output_mode=output_mode,
+                range_header=range_header,
+                headers=headers,
+                head_only=True,
+                rid=rid,
+            )
+        if _seek_vmp4_backend() == "slot":
+            return _seek_vmp4_slot_response(
+                path=path,
+                info=info,
+                output_mode=output_mode,
+                total=total,
+                range_header=range_header,
+                headers=headers,
+                head_only=True,
+                rid=rid,
+            )
+        return _seek_vmp4_cache_response(
+            path=path,
+            info=info,
+            output_mode=output_mode,
+            total=total,
+            range_header=range_header,
+            headers=headers,
+            head_only=True,
+            rid=rid,
+        )
     log.info(
         "passthrough_seek[%d] HEAD: %s @ %.2fs profile=%s reason=%s range=%r time_seek=%r getfeatures=%r transfer=%r",
         rid, path.name, t, route_profile, reason, range_header, time_seek_range, get_content_features, transfer_mode,
@@ -3253,11 +6302,12 @@ async def passthrough_seek_get(
     transfer_mode: str | None = Header(default=None, alias="transferMode.dlna.org"),
 ):
     rid = next(_request_ids)
-    path, route_container = _safe_seek_video_path(name)
+    _t_req_start = time.time()
+    path, route_container, route_mode = _safe_seek_video_path(name)
     user_agent = request.headers.get("user-agent", "")
     accept = request.headers.get("accept", "")
     allowed, reason, route_profile = _seek_route_allowed(user_agent)
-    output_mode = _seek_output_mode(mode)
+    output_mode = _seek_output_mode(mode, route_mode)
     annotate_request(
         request,
         media_name=path.name,
@@ -3271,22 +6321,21 @@ async def passthrough_seek_get(
         return _seek_blocked_response(reason)
 
     info = probe_cached(path)
-    if output_mode == "superres":
-        try:
-            seek_meta = await asyncio.to_thread(probe_video_metadata, path)
-            superres_reason = await _superres_live_block_reason(path, seek_meta)
-        except Exception as exc:
-            superres_reason = f"metadata probe failed: {exc}"
-        if superres_reason:
-            return Response(f"RTX VSR seek unsupported: {superres_reason}", status_code=409)
+    if output_mode in _ENHANCED_MODE_LABELS:
+        seek_reason = await _enhanced_mode_block_reason(path, output_mode)
+        if seek_reason:
+            return Response(
+                f"{_enhanced_mode_label(output_mode)} seek unsupported: {seek_reason}",
+                status_code=409,
+            )
     codec = PYNV_OUTPUT_CODEC
     client_host = request.client.host if request.client else ""
-    container = route_container or _seek_container()
+    container = _seek_container() if PASSTHROUGH_SEEK_VMP4 else (route_container or _seek_container())
     media_type = _seek_media_type(container)
-    total = _estimated_seek_passthrough_size(path, info.duration, codec, client_host, container)
+    total = _seek_declared_total(path, info.duration, codec, client_host, container)
     annotate_request(request, total_estimated_size=total)
     byte_range = _parse_byte_range(range_header, total)
-    if range_header and byte_range is None:
+    if range_header and byte_range is None and not _seek_vmp4_enabled(container):
         return _seek_range_416(total)
 
     t = 0.0
@@ -3320,6 +6369,51 @@ async def passthrough_seek_get(
         info=info,
     )
     _apply_seek_diag_headers(headers, start_sec=t, output_mode=output_mode, container=container, mapped=mapped)
+    _apply_seek_vmp4_headers(headers, path=path, duration=info.duration, total=total, container=container)
+    if _seek_vmp4_enabled(container):
+        log.info(
+            "passthrough_seek[%d] VMP4 %s request: %s mode=%s range=%r total=%d",
+            rid, _seek_vmp4_backend(), path.name, output_mode, range_header, total,
+        )
+        if _seek_vmp4_backend() == "slot_frames":
+            # Frame-level backend blocks waiting for a GOP build; run off the
+            # event loop so a waiting request cannot freeze other connections.
+            return await run_in_threadpool(
+                _seek_vmp4_frames_response,
+                path=path,
+                info=info,
+                output_mode=output_mode,
+                range_header=range_header,
+                headers=headers,
+                head_only=False,
+                rid=rid,
+            )
+        if _seek_vmp4_backend() == "slot":
+            # The slot backend may block up to PASSTHROUGH_SEEK_VMP4_SLOT_READY_WAIT
+            # waiting for a slot payload. Run it off the event loop so a waiting
+            # request cannot freeze every other connection (StreamingResponse
+            # chunks, other players, DLNA browse) while it sleeps.
+            return await run_in_threadpool(
+                _seek_vmp4_slot_response,
+                path=path,
+                info=info,
+                output_mode=output_mode,
+                total=total,
+                range_header=range_header,
+                headers=headers,
+                head_only=False,
+                rid=rid,
+            )
+        return _seek_vmp4_cache_response(
+            path=path,
+            info=info,
+            output_mode=output_mode,
+            total=total,
+            range_header=range_header,
+            headers=headers,
+            head_only=False,
+            rid=rid,
+        )
 
     if byte_range is not None and _is_tail_probe_range(byte_range):
         body = b"\x00" * byte_range.length
@@ -3561,14 +6655,20 @@ async def passthrough_head(
     # The pseudo-VOD route historically bypassed the live route's mode gate.
     # Keep it consistent when RTX VSR is selected globally: reject unsupported
     # sources before advertising a stream that cannot be produced.
-    if _select_live_output_mode("") == "superres":
+    vod_mode = _select_live_output_mode("")
+    if vod_mode in _ENHANCED_MODE_LABELS:
         try:
-            _, superres_meta = await asyncio.to_thread(_probe_live_request_metadata, path)
-            superres_reason = await _superres_live_block_reason(path, superres_meta)
+            _, vod_meta, _ = await asyncio.to_thread(_probe_live_request_metadata, path)
         except Exception as exc:
-            superres_reason = f"metadata probe failed: {exc}"
-        if superres_reason:
-            return Response(f"RTX VSR pseudo-VOD unsupported: {superres_reason}", status_code=409)
+            vod_meta = None
+            vod_reason = f"metadata probe failed: {exc}"
+        else:
+            vod_reason = await _enhanced_mode_block_reason(path, vod_mode, vod_meta)
+        if vod_reason:
+            return Response(
+                f"{_enhanced_mode_label(vod_mode)} pseudo-VOD unsupported: {vod_reason}",
+                status_code=409,
+            )
     estimate_codec = _passthrough_estimate_codec(path) or info.codec_name
     backend_verdict = _passthrough_backend_verdict(path)
     if PASSTHROUGH_SEEK_MODE == "bytes" and _range_unsatisfiable(range_header, path, info.duration, estimate_codec):
@@ -3618,14 +6718,20 @@ async def passthrough_get(
     path = _safe_video_path(name)
     annotate_request(request, media_name=path.name, media_path=str(path), passthrough_route="pseudo_vod")
     info = probe_cached(path)
-    if _select_live_output_mode("") == "superres":
+    vod_mode = _select_live_output_mode("")
+    if vod_mode in _ENHANCED_MODE_LABELS:
         try:
-            _, superres_meta = await asyncio.to_thread(_probe_live_request_metadata, path)
-            superres_reason = await _superres_live_block_reason(path, superres_meta)
+            _, vod_meta, _ = await asyncio.to_thread(_probe_live_request_metadata, path)
         except Exception as exc:
-            superres_reason = f"metadata probe failed: {exc}"
-        if superres_reason:
-            return Response(f"RTX VSR pseudo-VOD unsupported: {superres_reason}", status_code=409)
+            vod_meta = None
+            vod_reason = f"metadata probe failed: {exc}"
+        else:
+            vod_reason = await _enhanced_mode_block_reason(path, vod_mode, vod_meta)
+        if vod_reason:
+            return Response(
+                f"{_enhanced_mode_label(vod_mode)} pseudo-VOD unsupported: {vod_reason}",
+                status_code=409,
+            )
     estimate_codec = _passthrough_estimate_codec(path) or info.codec_name
     backend_verdict = _passthrough_backend_verdict(path)
     user_agent = request.headers.get("user-agent", "")
