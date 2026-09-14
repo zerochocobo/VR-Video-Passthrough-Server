@@ -1864,13 +1864,15 @@ PASSTHROUGH_SEEK_DLNA = _env("PASSTHROUGH_SEEK_DLNA", "0") == "1"
 #     profile - allow only route profiles listed in PT_PASSTHROUGH_SEEK_PROFILES.
 #     all     - allow every client while the master switch is on.
 #     off     - reject even when the master switch is on.
-#   Aliases: auto/manual/list are treated as profile. Default all keeps the
-#   VMP4 route reachable from VR players whose profile is still being tested.
-PASSTHROUGH_SEEK_ROUTE_POLICY = _env("PASSTHROUGH_SEEK_ROUTE_POLICY", "profile").lower()
+#   Aliases: auto/manual/list are treated as profile. Default all: the DLNA
+#   listing offers the seek entry to every client in place of the live one, so
+#   a whitelist left unlisted players (AVPro/ExoPlayer, e.g. DeoVR) with a 403
+#   and nothing else to open.
+PASSTHROUGH_SEEK_ROUTE_POLICY = _env("PASSTHROUGH_SEEK_ROUTE_POLICY", "all").lower()
 if PASSTHROUGH_SEEK_ROUTE_POLICY in {"auto", "manual", "list"}:
     PASSTHROUGH_SEEK_ROUTE_POLICY = "profile"
 if PASSTHROUGH_SEEK_ROUTE_POLICY not in {"profile", "all", "off"}:
-    PASSTHROUGH_SEEK_ROUTE_POLICY = "profile"
+    PASSTHROUGH_SEEK_ROUTE_POLICY = "all"
 
 # PT_PASSTHROUGH_SEEK_PROFILES:
 #   Comma-separated live-response profiles allowed when route policy is
@@ -1978,8 +1980,18 @@ PASSTHROUGH_SEEK_VMP4_FRAMES_BUDGET_MATCH_LIVE = _env(
 ) == "1"
 # Ceiling on how far that may stretch the virtual file, as a multiple of the
 # source size. Bandwidth is real: a headset on wifi has to keep up.
+#
+# 5.0, not 3.0: the bits/pixel floor below is what drives 8K past 3x, and at 3x
+# a 16 Mbps 8K title was held to ~50 Mbps on the wire - 29-44 Mbps of picture
+# once the headroom loop settled, half what 4K gets per pixel - and 0.86% of its
+# frames were truncated (384 in 44k), each one blocking until the next IDR. The
+# cap only binds where that floor does: bitrate-driven targets top out at
+# 2x/headroom = 2.67x, so 4K and 2D land on the same size as before. At 40fps
+# the floor itself tops 8192x4096 out at ~118 Mbps on the wire (a 33 Mbps source
+# gets that, up from 99), and the 16 Mbps title above ~82 Mbps; plan on a link
+# about 1.3x that.
 PASSTHROUGH_SEEK_VMP4_FRAMES_BUDGET_MAX_SCALE = min(
-    6.0, max(1.0, float(_env("PASSTHROUGH_SEEK_VMP4_FRAMES_BUDGET_MAX_SCALE", "3.0")))
+    6.0, max(1.0, float(_env("PASSTHROUGH_SEEK_VMP4_FRAMES_BUDGET_MAX_SCALE", "5.0")))
 )
 # PT_PASSTHROUGH_SEEK_VMP4_FRAMES_MIN_BITS_PER_PIXEL:
 #   Floor under how much each output FRAME gets, per pixel. Without it the output

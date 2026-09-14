@@ -286,12 +286,30 @@ class PyNvSimpleDecoder:
             bitrate=float(meta.bitrate),
             num_frames=int(meta.num_frames),
         )
+        self._last_index = -1
+        self._skipped_forward = False
 
     def __len__(self) -> int:
         return len(self._decoder)
 
     def frame_at(self, index: int) -> GpuNv12Frame | GpuP016Frame:
+        index = int(index)
+        last = len(self._decoder) - 1
+        if self._last_index >= 0 and index > self._last_index + 1:
+            self._skipped_forward = True
+        # PyNvVideoCodec 2.x access-violates (0xC0000005 inside the .pyd, no
+        # Python exception) when a decoder that has skipped frames on its way
+        # forward is asked for the very last frame. A 59.94->40fps run does
+        # exactly that at the end of every title, so the virtual-file filler
+        # took the whole server down when it encoded a title to the end with
+        # nobody watching. Reproduced on 4K and 8K sources: stepping to the
+        # last frame one by one is fine, touching n-2 first does not help, and
+        # stopping at n-2 does. Repeat n-2 instead; one duplicated tail frame
+        # is invisible.
+        if index >= last and self._skipped_forward and last >= 1:
+            index = last - 1
         frame = self._decoder[index]
+        self._last_index = index
         if self.bit_depth > 8:
             return GpuP016Frame.from_decoded_frame(frame, self.info.width, self.info.height)
         return GpuNv12Frame.from_decoded_frame(frame, self.info.width, self.info.height)

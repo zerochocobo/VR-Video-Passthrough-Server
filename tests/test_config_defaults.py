@@ -46,7 +46,7 @@ class ConfigDefaultTests(unittest.TestCase):
         # untouched; when it is switched on it must land on the vmp4 backend.
         self.assertFalse(config.PASSTHROUGH_SEEK_ENABLED)
         self.assertFalse(config.PASSTHROUGH_SEEK_DLNA)
-        self.assertEqual(config.PASSTHROUGH_SEEK_ROUTE_POLICY, "profile")
+        self.assertEqual(config.PASSTHROUGH_SEEK_ROUTE_POLICY, "all")
         self.assertIn("nplayer", config.PASSTHROUGH_SEEK_PROFILES)
         self.assertEqual(config.PASSTHROUGH_SEEK_CONTAINER, "mp4")
         self.assertTrue(config.PASSTHROUGH_SEEK_VMP4)

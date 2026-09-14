@@ -110,7 +110,7 @@ DEFAULTS = {
     "passthrough_playback_mode": "virtual",
     "passthrough_seek_enabled": False,
     "passthrough_seek_dlna": False,
-    "passthrough_seek_route_policy": "profile",
+    "passthrough_seek_route_policy": "all",
     "passthrough_seek_container": "mp4",
     "passthrough_seek_vmp4": True,
     "passthrough_seek_vmp4_backend": "slot_frames",
@@ -287,6 +287,15 @@ class Settings:
                         if int(loaded.get("superres_target_height", 2160) or 2160) == 2160:
                             self.data["superres_target_height"] = 4096
                         self._mark_migration_done("20260720_superres_adaptive_8k_default")
+                    if not self._migration_done("20260914_seek_route_policy_all", loaded):
+                        # The listing offers the virtual-file entry to every client
+                        # instead of the live one, so a per-player whitelist left
+                        # AVPro/ExoPlayer clients (DeoVR, ...) with a 403 and nothing
+                        # else to play. Nothing in the UI sets this, so a stored
+                        # "profile" is the old default, not a choice.
+                        if str(self.data.get("passthrough_seek_route_policy") or "").lower() == "profile":
+                            self.data["passthrough_seek_route_policy"] = "all"
+                        self._mark_migration_done("20260914_seek_route_policy_all")
             except Exception:
                 pass
 
