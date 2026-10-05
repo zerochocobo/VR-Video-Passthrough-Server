@@ -201,7 +201,8 @@ def test_live_and_seek_paths_share_one_superres_stage():
     assert stream_source.count("seek=True") == 1      # only the seek generator asks
     assert "seek_target_height()" in routes_source
     # One authoritative set, read by the route guards and the DLNA browse side.
-    assert 'SEEK_FRAME_MODES = frozenset({"green", "alpha", "superres", "dlss5"})' in stream_source
+    from pipeline.pynv_stream import SEEK_FRAME_MODES
+    assert {"green", "alpha", "superres", "dlss5", "two_dvr", "face_beauty", "rm"} == SEEK_FRAME_MODES
     assert "from pipeline.pynv_stream import SEEK_FRAME_MODES" in routes_source
     assert routes_source.count("in SEEK_FRAME_MODES") >= 4
     dlna_source = (root / "dlna" / "content_directory.py").read_text(encoding="utf-8-sig")

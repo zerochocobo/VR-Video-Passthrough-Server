@@ -10,6 +10,7 @@ import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont
@@ -117,10 +118,10 @@ def _parse_ass_color(value: str) -> tuple[int, int, int] | None:
     return r, g, b
 
 
-def _subtitle_color() -> tuple[int, int, int]:
-    if config.SUBTITLE_COLOR is not None:
-        return config.SUBTITLE_COLOR
-    r, g, b = config.COMPOSITE_BG_RGB
+def _subtitle_color(settings=config) -> tuple[int, int, int]:
+    if settings.SUBTITLE_COLOR is not None:
+        return settings.SUBTITLE_COLOR
+    r, g, b = settings.COMPOSITE_BG_RGB
     return 255 - int(r), 255 - int(g), 255 - int(b)
 
 
@@ -280,13 +281,19 @@ def _merge_same_time_cues(cues: list[SubtitleCue]) -> list[SubtitleCue]:
 
 
 class SubtitleRenderer:
-    def __init__(self, path: Path, video_width: int, video_height: int):
+    def __init__(self, path: Path, video_width: int, video_height: int, *,
+                 stereo: bool | None = None, settings: dict | None = None,
+                 blocking: bool = False):
+        # Seek layouts pin settings so a background run cannot mix UI values.
+        self.config = config if settings is None else SimpleNamespace(**(vars(config) | settings))
+        self.blocking = blocking
         self.path = path
         self.video_width = int(video_width)
         self.video_height = int(video_height)
-        mode = str(config.SUBTITLE_MODE or "auto").lower()
-        stereo_hint = mode in {"dual", "left", "right"} or (mode == "auto" and self.video_width >= 3000)
-        self.eye_width = self.video_width // 2 if stereo_hint else self.video_width
+        mode = str(self.config.SUBTITLE_MODE or "auto").lower()
+        self.stereo = mode in {"dual", "left", "right"} or (
+            mode == "auto" and (self.video_width >= 3000 if stereo is None else stereo))
+        self.eye_width = self.video_width // 2 if self.stereo else self.video_width
         self.eye_height = self.video_height
         suffix = path.suffix.lower()
         self.cues = _parse_ass(path) if suffix == ".ass" else _parse_srt(path)
@@ -298,17 +305,17 @@ class SubtitleRenderer:
         self._font_cache: dict[int, ImageFont.FreeTypeFont | ImageFont.ImageFont] = {
             int(getattr(self._font, "size", 24)): self._font
         }
-        log.info("subtitle loaded: %s cues=%d mode=%s direction=%s", path.name, len(self.cues), config.SUBTITLE_MODE, config.SUBTITLE_DIRECTION)
+        log.info("subtitle loaded: %s cues=%d mode=%s direction=%s", path.name, len(self.cues), self.config.SUBTITLE_MODE, self.config.SUBTITLE_DIRECTION)
 
     @property
     def enabled(self) -> bool:
         return bool(self.cues)
 
     def _load_font(self):
-        size = max(16, int(round(self.eye_height * float(config.SUBTITLE_FONT_SCALE))))
+        size = max(16, int(round(self.eye_height * float(self.config.SUBTITLE_FONT_SCALE))))
         candidates = []
-        if config.SUBTITLE_FONT:
-            candidates.append(config.SUBTITLE_FONT)
+        if self.config.SUBTITLE_FONT:
+            candidates.append(self.config.SUBTITLE_FONT)
         candidates.extend(
             [
                 r"C:\Windows\Fonts\msyh.ttc",
@@ -338,8 +345,8 @@ class SubtitleRenderer:
         if cached is not None:
             return cached
         candidates = []
-        if config.SUBTITLE_FONT:
-            candidates.append(config.SUBTITLE_FONT)
+        if self.config.SUBTITLE_FONT:
+            candidates.append(self.config.SUBTITLE_FONT)
         candidates.extend(
             [
                 r"C:\Windows\Fonts\msyh.ttc",
@@ -389,10 +396,8 @@ class SubtitleRenderer:
                 if future is None:
                     future = _PROJECT_EXECUTOR.submit(self._render_and_store, key)
                     self._pending[key] = future
+                if not self.blocking and not future.done():
                     return None
-                if not future.done():
-                    return None
-                self._pending.pop(key, None)
         if cached_overlay is not None:
             self._prewarm_around(seconds)
             return cached_overlay
@@ -419,12 +424,12 @@ class SubtitleRenderer:
             line_key,
             self.eye_width,
             self.eye_height,
-            config.SUBTITLE_DIRECTION,
-            str(_subtitle_color()),
-            str(config.SUBTITLE_V360),
-            f"{config.SUBTITLE_FOV:.3f}",
-            f"{config.SUBTITLE_YAW:.3f}",
-            f"{config.SUBTITLE_PITCH:.3f}",
+            self.config.SUBTITLE_DIRECTION,
+            str(_subtitle_color(self.config)),
+            str(self.config.SUBTITLE_V360),
+            f"{self.config.SUBTITLE_FOV:.3f}",
+            f"{self.config.SUBTITLE_YAW:.3f}",
+            f"{self.config.SUBTITLE_PITCH:.3f}",
         )
 
     def _prewarm_around(self, seconds: float) -> None:
@@ -455,10 +460,10 @@ class SubtitleRenderer:
         return overlay
 
     def _render_text_overlay(self, styled_lines: tuple[SubtitleLine, ...]) -> tuple[np.ndarray, int, int]:
-        direction = config.SUBTITLE_DIRECTION
+        direction = self.config.SUBTITLE_DIRECTION
         max_width = max(64, int(self.eye_width * 0.86))
-        margin = max(4, int(round(self.eye_height * float(config.SUBTITLE_MARGIN_V_SCALE))))
-        stroke = max(0, int(round(getattr(self._font, "size", 24) * float(config.SUBTITLE_OUTLINE_SCALE))))
+        margin = max(4, int(round(self.eye_height * float(self.config.SUBTITLE_MARGIN_V_SCALE))))
+        stroke = max(0, int(round(getattr(self._font, "size", 24) * float(self.config.SUBTITLE_OUTLINE_SCALE))))
         if direction.startswith("vertical"):
             image = self._render_vertical_image(styled_lines, stroke)
         else:
@@ -479,7 +484,7 @@ class SubtitleRenderer:
             else:
                 top = max(0, self.eye_height - image.height - margin)
             left = max(0, (self.eye_width - image.width) // 2)
-        if config.SUBTITLE_V360:
+        if self.config.SUBTITLE_V360:
             return self._project_flat_to_eye(image, left, top)
         return np.asarray(image, dtype=np.uint8), left, top
 
@@ -494,13 +499,13 @@ class SubtitleRenderer:
         height = sum(line_heights) + line_gap * max(0, len(draw_lines) - 1) + stroke * 2
         image = Image.new("RGBA", (max(1, width), max(1, height)), (0, 0, 0, 0))
         draw = ImageDraw.Draw(image)
-        alpha = int(round(255 * float(config.SUBTITLE_ALPHA)))
+        alpha = int(round(255 * float(self.config.SUBTITLE_ALPHA)))
         y = stroke
         for line, box, line_h in zip(draw_lines, boxes, line_heights):
             line_w = box[2] - box[0]
             x = max(0, (width - line_w) // 2)
-            fill_rgb = line.primary_color or _subtitle_color()
-            outline_rgb = line.outline_color or config.SUBTITLE_OUTLINE_COLOR
+            fill_rgb = line.primary_color or _subtitle_color(self.config)
+            outline_rgb = line.outline_color or self.config.SUBTITLE_OUTLINE_COLOR
             font = self._font_for_line(line)
             draw.text(
                 (x, y),
@@ -540,11 +545,11 @@ class SubtitleRenderer:
         )
         image = Image.new("RGBA", (max(1, width), max(1, height)), (0, 0, 0, 0))
         draw = ImageDraw.Draw(image)
-        alpha = int(round(255 * float(config.SUBTITLE_ALPHA)))
+        alpha = int(round(255 * float(self.config.SUBTITLE_ALPHA)))
         x = 0
         for source, chars, col_width, cell_height, boxes in measured:
-            fill_rgb = source.primary_color or _subtitle_color()
-            outline_rgb = source.outline_color or config.SUBTITLE_OUTLINE_COLOR
+            fill_rgb = source.primary_color or _subtitle_color(self.config)
+            outline_rgb = source.outline_color or self.config.SUBTITLE_OUTLINE_COLOR
             font = self._font_for_line(source)
             col_height = cell_height * len(chars) + stroke * 2
             y = max(stroke, (height - col_height) // 2 + stroke)
@@ -577,15 +582,15 @@ class SubtitleRenderer:
         flat_y = local_ys.astype(np.float32) + float(top) + 0.5
         cx = self.eye_width * 0.5
         cy = self.eye_height * 0.5
-        fov = math.radians(max(1.0, min(179.0, float(config.SUBTITLE_FOV))))
+        fov = math.radians(max(1.0, min(179.0, float(self.config.SUBTITLE_FOV))))
         focal = (self.eye_width * 0.5) / math.tan(fov * 0.5)
 
         x = (flat_x - cx) / focal
         y = -(flat_y - cy) / focal
         z = np.ones_like(x)
 
-        yaw = math.radians(-float(config.SUBTITLE_YAW))
-        pitch = math.radians(-float(config.SUBTITLE_PITCH))
+        yaw = math.radians(-float(self.config.SUBTITLE_YAW))
+        pitch = math.radians(-float(self.config.SUBTITLE_PITCH))
         cyaw = math.cos(yaw)
         syaw = math.sin(yaw)
         cpitch = math.cos(pitch)
@@ -663,6 +668,6 @@ class SubtitleRenderer:
         return [line for line in out if line.text] or [SubtitleLine("")]
 
     def parallax_px(self) -> int:
-        distance_m = max(0.1, float(config.SUBTITLE_DISTANCE_M))
+        distance_m = max(0.1, float(self.config.SUBTITLE_DISTANCE_M))
         angle_rad = 2 * math.atan(IPD_METERS / (2 * distance_m))
         return -int(round((angle_rad / math.pi) * self.eye_width))

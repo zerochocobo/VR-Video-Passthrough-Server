@@ -154,13 +154,30 @@ class SettingsPage(QWidget):
         self.dlna_group.add_row(self.dlna_all_videos_label, self.dlna_all_videos, None)
         self.dlna_group.add_row(self.dlna_save_button, self.dlna_saved_label, None)
 
-        # General group: language.
+        # General group: language and the shared realtime playback mode.
         self.general_group = SettingsGroup()
         self.language_label = QLabel()
         self.language = QComboBox()
         self.language.addItems(["中文", "English", "日本語"])
         self.language.setFixedWidth(150)
         self.general_group.add_row(self.language_label, self.language, None)
+        self.playback_mode_label = QLabel()
+        self.playback_mode = QComboBox()
+        for value in ("virtual", "live"):
+            self.playback_mode.addItem("", value)
+        self.playback_mode.setMinimumWidth(200)
+        self._sync_playback_mode()
+        self.playback_mode_help = _icon_button(question_icon())
+        self.playback_mode_help.clicked.connect(self._show_playback_help)
+        self.playback_mode_note = QLabel()
+        self.playback_mode_note.setWordWrap(True)
+        self.playback_mode_note.setStyleSheet(
+            f"color: {theme.TEXT_FAINT}; background: transparent; font-size: 8.5pt;"
+        )
+        self.general_group.add_row(
+            self.playback_mode_label, self.playback_mode, None, self.playback_mode_help
+        )
+        self.general_group.body.addWidget(self.playback_mode_note)
 
         # Performance group.
         self.performance_group = SettingsGroup()
@@ -267,6 +284,7 @@ class SettingsPage(QWidget):
         self.server_name.editingFinished.connect(self._save_dlna)
         self.http_port.editingFinished.connect(self._save_dlna)
         self.dlna_save_button.clicked.connect(self._save_dlna)
+        self.playback_mode.currentIndexChanged.connect(self._save_playback_mode)
         self.performance_quality.currentIndexChanged.connect(self._save)
         self.performance_fps.currentIndexChanged.connect(self._save)
         self.performance_output_size.currentIndexChanged.connect(self._save)
@@ -280,6 +298,16 @@ class SettingsPage(QWidget):
         self.retranslate()
 
     # ---- persistence ----
+
+    def _save_playback_mode(self) -> None:
+        self.settings.data["passthrough_playback_mode"] = self.playback_mode.currentData()
+        self.settings.save()
+
+    def _sync_playback_mode(self) -> None:
+        mode = str(self.settings.data.get("passthrough_playback_mode") or "virtual").strip().lower()
+        self.playback_mode.blockSignals(True)
+        self.playback_mode.setCurrentIndex(self.playback_mode.findData("live" if mode == "live" else "virtual"))
+        self.playback_mode.blockSignals(False)
 
     def _save(self) -> None:
         self.settings.data["quality_speed"] = self.performance_quality.currentData()
@@ -329,6 +357,7 @@ class SettingsPage(QWidget):
         self.face_beauty_card_visibility_changed.emit(bool(checked))
 
     def sync_from_settings(self) -> None:
+        self._sync_playback_mode()
         value = quality_speed_value(self.settings.data.get("quality_speed"))
         idx = self.performance_quality.findData(value)
         if idx >= 0 and self.performance_quality.currentIndex() != idx:
@@ -338,6 +367,15 @@ class SettingsPage(QWidget):
         self.update_video_dirs_summary()
 
     # ---- dialogs ----
+
+    def _show_playback_help(self) -> None:
+        keys = (
+            "playback.virtual_hint", "playback.live_hint", "playback.note",
+            "si.virtual_hint", "superres.playback_native_only",
+        )
+        QMessageBox.information(
+            self, self.i18n.t("playback.title"), "\n\n".join(self.i18n.t(key) for key in keys)
+        )
 
     def _manage_video_dirs(self) -> None:
         dialog = VideoDirsDialog(self.i18n, self.settings.video_dirs(), self)
@@ -429,6 +467,11 @@ class SettingsPage(QWidget):
         self.dlna_save_button.setText(self.i18n.t("button.save"))
         self.general_group.title_label.setText(self.i18n.t("settings.general"))
         self.language_label.setText(self.i18n.t("settings.language"))
+        self.playback_mode_label.setText(self.i18n.t("playback.title"))
+        self.playback_mode.setItemText(0, self.i18n.t("playback.virtual"))
+        self.playback_mode.setItemText(1, self.i18n.t("playback.live"))
+        self.playback_mode_help.setToolTip(self.i18n.t("playback.title"))
+        self.playback_mode_note.setText(self.i18n.t("playback.apply_note"))
         self.performance_group.title_label.setText(self.i18n.t("group.performance_config_short"))
         self.performance_quality_label.setText(self.i18n.t("performance.quality_speed"))
         self.performance_fps_label.setText(self.i18n.t("performance.output_fps"))

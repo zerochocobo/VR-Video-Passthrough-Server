@@ -278,10 +278,12 @@ class Settings:
                         self.data["passthrough_seek_dlna"] = False
                         self._mark_migration_done("20260620_seek_dlna_default_off")
                     if not self._migration_done("20260910_playback_mode", loaded):
-                        # The virtual-file entry is the default way a passthrough
-                        # mode is offered now; the dialog on each mode's card
-                        # switches an install back to the live entry.
-                        self.data["passthrough_playback_mode"] = DEFAULTS["passthrough_playback_mode"]
+                        # Default legacy installs to virtual MP4, while keeping
+                        # an explicit choice saved in the global settings page.
+                        mode = str(loaded.get("passthrough_playback_mode") or "").strip().lower()
+                        self.data["passthrough_playback_mode"] = (
+                            mode if mode in {"virtual", "live"} else DEFAULTS["passthrough_playback_mode"]
+                        )
                         self._mark_migration_done("20260910_playback_mode")
                     if not self._migration_done("20260720_superres_adaptive_8k_default", loaded):
                         if int(loaded.get("superres_target_height", 2160) or 2160) == 2160:

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
+from pathlib import Path
 from typing import Any
 
 
@@ -171,6 +172,16 @@ class SIMixParams:
             self.duck_preset,
             duck_key_input=bool(duck_key_input) and self.duck_original,
         )
+
+
+def resolve_si_mix_inputs(video: Path, params: SIMixParams) -> tuple[SIMixParams, Path | None]:
+    """Shared live/virtual dubbing settings and subtitle-span duck key."""
+    video = Path(video)
+    if params.dub_mode_enabled and video.suffix.lower() == ".mp4":
+        duck_key = video.with_suffix(".si.duck.wav")
+        if duck_key.is_file():
+            return params.dubbing_variant(), duck_key
+    return params, None
 
 
 def normalize_si_mix_params(data: dict[str, Any] | SIMixParams) -> SIMixParams:

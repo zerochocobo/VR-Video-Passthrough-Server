@@ -1420,7 +1420,7 @@ class Matter:
         cp = _cp
         if cp is None:
             return None, None, np.int32(1)
-        state = get_light_match()
+        state = getattr(self, "_seek_light_match_state", None) or get_light_match()
         if (
             self._g_light_coeffs is None
             or self._g_light_gamma_lut is None

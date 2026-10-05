@@ -139,11 +139,10 @@ class ExistingPassthroughStrategyCharacterizationTests(unittest.TestCase):
         self.assertEqual(blocked_reason, "profile_avpro_blocked")
         self.assertEqual(blocked_profile, "avpro")
 
-    def test_seek_output_mode_excludes_two_dvr(self) -> None:
-        # two_dvr has no seek backend; it must fall back to a supported mode
-        # instead of handing out an endpoint that can only fail.
+    def test_seek_output_mode_preserves_two_dvr(self) -> None:
+        # A requested effect must survive seek routing without falling back.
         with patch.object(routes_media, "PASSTHROUGH_OUTPUT_MODE", "alpha,two_dvr"):
-            self.assertEqual(routes_media._seek_output_mode("two_dvr"), "alpha")
+            self.assertEqual(routes_media._seek_output_mode("two_dvr"), "two_dvr")
             self.assertEqual(routes_media._seek_output_mode("alpha"), "alpha")
             self.assertEqual(routes_media._seek_output_mode(None), "alpha")
 

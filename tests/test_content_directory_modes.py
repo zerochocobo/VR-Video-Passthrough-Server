@@ -46,13 +46,13 @@ class ContentDirectoryModeTests(unittest.TestCase):
             patch.object(cds, "PASSTHROUGH_SEEK_ENABLED", True),
             patch.object(cds, "PASSTHROUGH_SEEK_DLNA", True),
         ):
-            self.assertEqual(cds._video_item_count(source), 3)
+            self.assertEqual(cds._video_item_count(source), 2)
         with (
             patch.object(cds, "PASSTHROUGH_OUTPUT_MODE", "all"),
             patch.object(cds, "PASSTHROUGH_SEEK_ENABLED", True),
             patch.object(cds, "PASSTHROUGH_SEEK_DLNA", True),
         ):
-            self.assertEqual(cds._video_item_count(source), 5)
+            self.assertEqual(cds._video_item_count(source), 3)
 
     def test_live_ids_distinguish_alpha(self) -> None:
         with patch.object(cds, "PASSTHROUGH_OUTPUT_MODE", "all"):

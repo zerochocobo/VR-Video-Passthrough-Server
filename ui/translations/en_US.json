@@ -572,10 +572,12 @@
   "beauty.live_note": "Realtime pins the fastest model (GPEN 256) and its detection settings, so only strength is adjustable here. The full option set lives in Tools > Offline Face Beauty.",
   "beauty.detect_roi": "Follow faces",
   "beauty.detect_roi_hint": "Only rescan around the previous frame's faces (big win at 8K/VR)",
+  "si.virtual_hint": "Supports seeking as a regular video file. Before the first playback, the mixed audio for the entire video is prepared and cached; long videos may take a while. Use the live stream for immediate playback.",
   "playback.title": "Playback mode",
-  "playback.virtual": "Virtual file (recommended)",
+  "playback.virtual": "Virtual MP4 (default)",
+  "playback.apply_note": "Shared by all realtime effects. Applies on the next server start.",
   "playback.virtual_hint": "Appears as an ordinary video file, so the scrub bar works anywhere - whatever you seek to is generated on the spot.",
   "playback.live": "Live stream",
   "playback.live_hint": "A live stream split into fixed chapters. Playback starts at a chapter and the scrub bar does not move. Widest player support.",
-  "playback.note": "Only one of the two is listed at a time. If the virtual file gives you trouble - will not open, breaks up, or jumps away after a few seconds - switch to the live stream."
+  "playback.note": "Only one of the two is listed at a time. If the virtual file gives you trouble - will not open, breaks up, or jumps away after a few seconds - switch to the live stream. This choice applies to all realtime effects."
 }

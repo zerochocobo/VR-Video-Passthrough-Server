@@ -13,7 +13,7 @@ from media_library import safe_resolve_path
 from pipeline.ffmpeg_io import FFMPEG, probe_cached
 from utils.logger import get
 from utils.runtime_settings import SIMixRuntime, get_si_mix
-from utils.si_filter import SIMixParams
+from utils.si_filter import SIMixParams, resolve_si_mix_inputs
 from utils.subprocess_hidden import hidden_subprocess_kwargs
 
 
@@ -263,13 +263,7 @@ class SIStreamService:
         """Return the effective ``(config, duck_key)`` for a video, switching to
         the dubbing variant when dubbing mode is on and a ``.si.duck.wav`` key
         exists next to it."""
-        config = self.current_config()
-        if not config.dub_mode_enabled:
-            return config, None
-        duck_key = self.has_duck_key(video)
-        if duck_key is None:
-            return config, None
-        return config.dubbing_variant(), duck_key
+        return resolve_si_mix_inputs(video, self.current_config())
 
     def estimate_output_size(self, video: Path) -> int:
         video = safe_resolve_path(Path(video))

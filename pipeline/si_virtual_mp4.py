@@ -23,6 +23,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from collections.abc import Iterator, Sequence
 from dataclasses import dataclass
 from fractions import Fraction
+from functools import lru_cache
 from pathlib import Path
 from typing import Literal
 
@@ -39,7 +40,8 @@ from config import (
 from pipeline.ffmpeg_io import FFMPEG
 from utils.cache_key import stat_key
 from utils.logger import get
-from utils.si_filter import SIMixParams, build_si_mix_filter
+from utils.si_filter import SIMixParams, resolve_si_mix_inputs
+from utils.si_prepared_audio import find_prepared_audio
 from utils.subprocess_hidden import hidden_subprocess_kwargs
 
 
@@ -167,6 +169,13 @@ class ProgressiveSIVirtualMp4:
     moov_size: int
     mdat_payload_size: int
     audio_edit_mode: str = "preserve"
+    video_codec_name: str = "hevc"
+
+
+@dataclass(frozen=True)
+class ProgressiveSIInfo:
+    content_length: int
+    video_codec_name: str
 
 
 @dataclass(frozen=True)
@@ -1256,14 +1265,49 @@ def _mix_cache_variant() -> dict[str, object]:
     }
 
 
+@lru_cache(maxsize=64)
+def _prepared_audio_is_valid(identity: tuple) -> bool:
+    """Check sample offsets once per file version, using only the MP4 tables."""
+    audio = Path(identity[0])
+    try:
+        table = _read_sample_table_from_moov(audio, _read_top_level_box(audio, b"moov"), "audio")
+        return (table.codec_name == "aac" and bool(table.samples)
+                and all(s.size > 0 and s.source_offset >= 0
+                        and s.source_offset + s.size <= identity[1] for s in table.samples))
+    except Exception as exc:
+        log.warning("ignoring invalid toolbox prepared SI audio %s: %s", audio, exc)
+        return False
+
+
+def _prepared_mixed_audio(video: Path, si_wav: Path, params: SIMixParams) -> Path | None:
+    params, duck_key = resolve_si_mix_inputs(video, params)
+    audio = find_prepared_audio(
+        video, si_wav, duck_key, params.filter_string(duck_key_input=duck_key is not None),
+    )
+    if audio is not None:
+        try:
+            if _prepared_audio_is_valid(stat_key(audio)):
+                return audio
+        except OSError:
+            pass
+    return None
+
+
 def _cache_digest(video: Path, si_wav: Path, params: SIMixParams) -> str:
+    params, duck_key = resolve_si_mix_inputs(video, params)
+    prepared = _prepared_mixed_audio(video, si_wav, params)
     payload = {
         "schema": _PROGRESSIVE_CACHE_SCHEMA,
         "video": stat_key(video),
         "si_wav": stat_key(si_wav),
         "params": _params_cache_dict(params),
-        "mix": _mix_cache_variant(),
+        "mix": {"implementation": "prepared-mix-v1", "audio": stat_key(prepared)}
+        if prepared is not None else _mix_cache_variant(),
     }
+    if duck_key is not None:
+        # Preserve ordinary SI caches; dubbing caches include the controlling
+        # waveform so adding/replacing/removing it cannot reuse an old mix.
+        payload["duck_key"] = stat_key(duck_key)
     raw = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode("utf-8")
     return hashlib.sha256(raw).hexdigest()
 
@@ -1774,17 +1818,11 @@ def _encode_mix_segment(
     *,
     cancel_event: threading.Event | None,
     low_priority: bool,
+    duck_key: Path | None = None,
 ) -> Path:
     start_seconds = _seconds_for_frame(segment.encode_start_frame)
     duration_seconds = _seconds_for_frame(segment.encode_end_frame - segment.encode_start_frame)
-    filt = build_si_mix_filter(
-        params.mix_channel,
-        params.original_volume_percent,
-        params.si_volume_percent,
-        params.si_delay_seconds,
-        params.duck_original,
-        params.duck_preset,
-    )
+    filt = params.filter_string(duck_key_input=duck_key is not None)
     cmd = [
         FFMPEG,
         "-hide_banner",
@@ -1803,6 +1841,11 @@ def _encode_mix_segment(
         _fmt_ffmpeg_seconds(duration_seconds),
         "-i",
         str(si_wav),
+    ]
+    if duck_key is not None:
+        cmd += ["-ss", _fmt_ffmpeg_seconds(start_seconds),
+                "-t", _fmt_ffmpeg_seconds(duration_seconds), "-i", str(duck_key)]
+    cmd += [
         "-filter_complex",
         filt,
         "-map",
@@ -1937,6 +1980,7 @@ def build_mixed_audio_sidecar_parallel(
     cancel_event: threading.Event | None = None,
     low_priority: bool = False,
 ) -> Path:
+    params, duck_key = resolve_si_mix_inputs(video, params)
     source_audio = build_source_audio_sidecar(video, cancel_event=cancel_event)
     source_table = read_media_sample_table(source_audio, "audio")
     total_frames = max(1, len(source_table.samples))
@@ -1966,6 +2010,7 @@ def build_mixed_audio_sidecar_parallel(
                     segment_path,
                     cancel_event=cancel_event,
                     low_priority=low_priority,
+                    duck_key=duck_key,
                 )
                 for segment, segment_path in zip(segments, segment_paths, strict=True)
             ]
@@ -2001,15 +2046,21 @@ def build_mixed_audio_sidecar(
     cancel_event: threading.Event | None = None,
     low_priority: bool = False,
 ) -> Path:
-    """Build or reuse the small AAC MP4 sidecar for the current SI mix."""
+    """Use a matching toolbox mix, or build/reuse the cached AAC MP4 sidecar."""
     video = Path(video)
     si_wav = Path(si_wav)
+    params, duck_key = resolve_si_mix_inputs(video, params)
+    prepared = _prepared_mixed_audio(video, si_wav, params)
+    if prepared is not None:
+        _raise_if_cancelled(cancel_event)
+        log.info("using toolbox prepared SI mixed AAC audio: video=%s audio=%s", video, prepared)
+        return prepared
     digest = _cache_digest(video, si_wav, params)
     cache_dir = _ensure_cache_dir()
     output = cache_dir / f"{digest}.audio.mp4"
     if output.is_file() and output.stat().st_size > 0:
         log.info(
-            "reusing SI mixed AAC sidecar: video=%s si=%s out=%s digest=%s delay=%.1f mix=%s orig_vol=%s si_vol=%s duck=%s duck_preset=%s",
+            "reusing SI mixed AAC sidecar: video=%s si=%s out=%s digest=%s delay=%.1f mix=%s orig_vol=%s si_vol=%s duck=%s duck_preset=%s duck_key=%s",
             video,
             si_wav,
             output,
@@ -2020,6 +2071,7 @@ def build_mixed_audio_sidecar(
             params.si_volume_percent,
             params.duck_original,
             params.duck_preset,
+            duck_key,
         )
         return output
 
@@ -2072,14 +2124,7 @@ def build_mixed_audio_sidecar(
             source_audio_lock.release()
             source_audio_lock = None
         log.warning("SI source audio sidecar setup failed for %s; falling back to full source input: %s", video, exc)
-    filt = build_si_mix_filter(
-        params.mix_channel,
-        params.original_volume_percent,
-        params.si_volume_percent,
-        params.si_delay_seconds,
-        params.duck_original,
-        params.duck_preset,
-    )
+    filt = params.filter_string(duck_key_input=duck_key is not None)
     cmd = [
         FFMPEG,
         "-hide_banner",
@@ -2090,6 +2135,10 @@ def build_mixed_audio_sidecar(
         audio_input_arg,
         "-i",
         str(si_wav),
+    ]
+    if duck_key is not None:
+        cmd += ["-i", str(duck_key)]
+    cmd += [
         "-filter_complex",
         filt,
         "-map",
@@ -2109,7 +2158,7 @@ def build_mixed_audio_sidecar(
         str(temp),
     ]
     log.info(
-        "building SI mixed AAC sidecar: video=%s audio_input=%s input_kind=%s encoder=%s si=%s out=%s digest=%s delay=%.1f mix=%s orig_vol=%s si_vol=%s duck=%s duck_preset=%s",
+        "building SI mixed AAC sidecar: video=%s audio_input=%s input_kind=%s encoder=%s si=%s out=%s digest=%s delay=%.1f mix=%s orig_vol=%s si_vol=%s duck=%s duck_preset=%s duck_key=%s",
         video,
         audio_input_arg,
         audio_input_kind,
@@ -2123,6 +2172,7 @@ def build_mixed_audio_sidecar(
         params.si_volume_percent,
         params.duck_original,
         params.duck_preset,
+        duck_key,
     )
     try:
         if audio_input_kind == "source-audio-pipe":
@@ -2168,6 +2218,59 @@ _layout_prewarm_queue: queue.PriorityQueue[tuple[int, int, "_PrewarmTask"]] | No
 _layout_prewarm_counter = itertools.count()
 _layout_prewarm_worker_started = False
 _LAYOUT_CACHE_LIMIT = 8
+_info_cache: dict[tuple, ProgressiveSIInfo] = {}
+_metadata_version = 0
+
+
+def progressive_si_metadata_version() -> int:
+    return _metadata_version
+
+
+def progressive_si_info(video: Path, si_wav: Path, params: SIMixParams) -> ProgressiveSIInfo | None:
+    """Exact Browse metadata from an existing mixed sidecar, without encoding.
+
+    Rewriting the moov with dummy offsets has the same byte size as the final
+    layout. Reading stsz is sufficient; no packet scan or video payload read is
+    needed. The sidecar's stat also invalidates this small cache when replaced.
+    """
+    sidecar_digest = _cache_digest(video, si_wav, params)
+    digest = _layout_cache_digest(sidecar_digest, SI_AUDIO_EDIT_MODE)
+    with _layout_cache_lock:
+        layout = _layout_cache.get(digest)
+        if layout is not None:
+            return ProgressiveSIInfo(layout.content_length, layout.video_codec_name)
+    audio = _prepared_mixed_audio(video, si_wav, params)
+    if audio is None:
+        audio = _ensure_cache_dir() / f"{sidecar_digest}.audio.mp4"
+    if not audio.is_file():
+        return None
+    key = (digest, stat_key(audio))
+    with _layout_cache_lock:
+        cached = _info_cache.get(key)
+        if cached is not None:
+            return cached
+    source_moov = _read_top_level_box(video, b"moov")
+    audio_moov = _read_top_level_box(audio, b"moov")
+    def sample_info(moov, kind):
+        trak = _find_track(moov, kind).trak
+        mdia = _require_child(moov, trak, b"mdia")
+        minf = _require_child(moov, mdia, b"minf")
+        stbl = _require_child(moov, minf, b"stbl")
+        return _parse_stsz(moov, stbl), _parse_stsd_codec_name(moov, stbl)
+    video_sizes, codec = sample_info(source_moov, "video")
+    audio_sizes, _ = sample_info(audio_moov, "audio")
+    if not video_sizes or not audio_sizes:
+        return None
+    payload = sum(video_sizes) + sum(audio_sizes)
+    moov = _build_moov(source_moov, audio_moov, [0] * len(video_sizes), [0] * len(audio_sizes),
+                       audio_edit_mode=SI_AUDIO_EDIT_MODE)
+    total = len(_read_top_level_box(video, b"ftyp")) + len(moov) + len(_mdat_header(payload)) + payload
+    info = ProgressiveSIInfo(total, codec)
+    with _layout_cache_lock:
+        _info_cache[key] = info
+        while len(_info_cache) > 64:
+            _info_cache.pop(next(iter(_info_cache)))
+    return info
 
 
 @dataclass(frozen=True)
@@ -2230,9 +2333,11 @@ def build_progressive_si_virtual_mp4(
 ) -> ProgressiveSIVirtualMp4:
     """Build a progressive virtual MP4 layout for SI M1 testing.
 
-    The first call scans the source MP4 and encodes the mixed AAC sidecar. The
-    resulting layout is cached in-process and the AAC sidecar is cached on disk.
+    The first call reads the source tables and uses a matching toolbox-prepared
+    mix, or encodes a mixed AAC sidecar. The resulting layout is cached in-process
+    and generated AAC sidecars are cached on disk.
     """
+    global _metadata_version
     video = Path(video)
     si_wav = Path(si_wav)
     sidecar_digest = _cache_digest(video, si_wav, params)
@@ -2327,9 +2432,11 @@ def build_progressive_si_virtual_mp4(
                 moov_size=len(moov),
                 mdat_payload_size=mdat_payload_size,
                 audio_edit_mode=audio_edit_mode,
+                video_codec_name=video_table.codec_name,
             )
             with _layout_cache_lock:
                 _layout_cache[digest] = layout
+                _metadata_version += 1
                 while len(_layout_cache) > _LAYOUT_CACHE_LIMIT:
                     _layout_cache.pop(next(iter(_layout_cache)))
             log.info(
@@ -2439,7 +2546,33 @@ def iter_virtual_range(
     *,
     chunk_size: int = 64 * 1024,
 ) -> Iterator[bytes]:
-    """Yield bytes for an inclusive logical range across memory/file regions."""
+    """Yield bounded blocks, combining small audio/video regions for HTTP.
+
+    A long SI movie has over 100k samples. Yielding every AAC sample separately
+    forced the HTTP generator to dispatch one thread job per tiny packet.
+    """
+    block_size = max(1, int(chunk_size))
+    parts = _iter_virtual_range_parts(regions, start, end_inclusive, chunk_size=block_size)
+    pending = bytearray()
+    try:
+        for part in parts:
+            view = memoryview(part)
+            while view:
+                take = min(block_size - len(pending), len(view))
+                pending.extend(view[:take])
+                view = view[take:]
+                if len(pending) == block_size:
+                    yield bytes(pending)
+                    pending.clear()
+        if pending:
+            yield bytes(pending)
+    finally:
+        parts.close()
+
+
+def _iter_virtual_range_parts(
+    regions: Sequence[VirtualRegion], start: int, end_inclusive: int, *, chunk_size: int
+) -> Iterator[bytes]:
     if end_inclusive < start:
         return
     range_start = max(0, int(start))
@@ -2459,7 +2592,8 @@ def iter_virtual_range(
             inside = overlap_start - region.start
             length = overlap_end - overlap_start
             if region.kind == "memory":
-                yield region.data[inside:inside + length]
+                for offset in range(inside, inside + length, chunk_size):
+                    yield region.data[offset:min(offset + chunk_size, inside + length)]
             elif region.kind == "file":
                 if region.path is None:
                     raise ValueError("file virtual region requires a path")
@@ -2473,7 +2607,7 @@ def iter_virtual_range(
                 while remaining > 0:
                     chunk = fh.read(min(max(1, int(chunk_size)), remaining))
                     if not chunk:
-                        break
+                        raise EOFError(f"SI source truncated: {path} at byte {fh.tell()}")
                     remaining -= len(chunk)
                     yield chunk
             else:

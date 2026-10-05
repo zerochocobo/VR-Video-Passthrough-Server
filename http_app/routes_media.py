@@ -17,7 +17,7 @@ import subprocess
 import sys
 import threading
 import time
-from dataclasses import dataclass, field as dataclass_field
+from dataclasses import dataclass, field as dataclass_field, replace
 from pathlib import Path
 from urllib.parse import quote, unquote
 
@@ -152,6 +152,7 @@ from pipeline.si_virtual_mp4 import build_progressive_si_virtual_mp4, iter_virtu
 from pipeline.matting import acquire_matter, release_matter
 from pipeline.stream import PassthroughStream
 from pipeline.pynv_stream import SEEK_FRAME_MODES
+from pipeline.seek_effects import effect_settings, settings_digest
 from utils.rtx_vsr import seek_supported_target
 from pipeline.pynv_stream import (
     PYNV_BACKEND_LABEL,
@@ -263,7 +264,7 @@ def _seek_dlna_pn(container: str | None = None) -> str:
 # dropped `mode=superres` then fell back to another mode and played the wrong
 # picture, so the route carries `<key>.<mode>.seek.<ext>` and the query stays
 # as a hint for links that predate this.
-_SEEK_ROUTE_MODES = ("green", "alpha", "superres", "dlss5")
+_SEEK_ROUTE_MODES = tuple(sorted(SEEK_FRAME_MODES))
 
 
 def _split_seek_route_name(name: str) -> tuple[str, str | None, str | None]:
@@ -1261,16 +1262,18 @@ async def media_head(request: Request, name: str, range: str | None = Header(def
     return Response(status_code=200, headers=headers)
 
 
-def _si_dlna_content_features() -> str:
+def _si_dlna_content_features(codec: str = "hevc") -> str:
+    pn = "HEVC_MP4_MAIN" if codec == "hevc" else "AVC_MP4_HP_HD_AAC" if codec == "h264" else ""
+    profile = f"DLNA.ORG_PN={pn};" if pn else ""
     return (
-        "DLNA.ORG_PN=HEVC_MP4_MAIN;"
+        profile +
         f"DLNA.ORG_OP={DLNA_OP_BYTE_SEEK};"
         f"DLNA.ORG_CI=0;DLNA.ORG_FLAGS={DLNA_FLAGS_BASE}"
     )
 
 
-def _si_base_headers(content_length: int) -> dict[str, str]:
-    features = _si_dlna_content_features()
+def _si_base_headers(content_length: int, codec: str = "hevc") -> dict[str, str]:
+    features = _si_dlna_content_features(codec)
     return {
         "Accept-Ranges": "bytes",
         "Content-Type": "video/mp4",
@@ -1311,10 +1314,15 @@ def _si_virtual_disabled() -> bool:
 
 def _si_range_headers(layout, start: int, end: int, status_code: int) -> dict[str, str]:
     content_length = max(0, int(end) - int(start) + 1)
-    headers = _si_base_headers(content_length)
+    headers = _si_base_headers(content_length, getattr(layout, "video_codec_name", "hevc"))
     headers["ETag"] = f'"{layout.etag}"'
     headers["X-SI-Enabled"] = "1"
     headers["X-SI-Transport"] = "progressive-virtual"
+    audio_path = getattr(layout, "audio_path", None)
+    headers["X-SI-Audio-Source"] = (
+        "prepared-m4a" if audio_path is not None and Path(audio_path).name.lower().endswith(".si.mix.m4a")
+        else "runtime-cache"
+    )
     headers["X-SI-Moov-Bytes"] = str(layout.moov_size)
     headers["X-SI-Samples"] = f"{layout.video_samples}+{layout.audio_samples}"
     headers["X-SI-Audio-Edit"] = str(getattr(layout, "audio_edit_mode", "preserve"))
@@ -1332,7 +1340,12 @@ async def _si_virtual_layout(path: Path):
     if not config.enabled or si_wav is None:
         raise HTTPException(404, "SI stream not available")
     try:
-        return await asyncio.to_thread(build_progressive_si_virtual_mp4, path, si_wav, config)
+        started = time.monotonic()
+        log.info("SI virtual preparation begin: path=%s", path)
+        layout = await asyncio.to_thread(build_progressive_si_virtual_mp4, path, si_wav, config)
+        log.info("SI virtual preparation ready: path=%s size=%d elapsed=%.3fs", path.name,
+                 layout.content_length, time.monotonic() - started)
+        return layout
     except FileNotFoundError as exc:
         raise HTTPException(404, str(exc)) from exc
     except subprocess.CalledProcessError as exc:
@@ -1432,9 +1445,9 @@ async def media_si_get(
             while sent < content_length:
                 chunk = await asyncio.to_thread(next, iterator, _SI_EOF)
                 if chunk is _SI_EOF:
-                    break
+                    raise EOFError(f"SI response ended after {sent} of {content_length} bytes")
                 if not chunk:
-                    break
+                    raise EOFError(f"SI response returned an empty block after {sent} of {content_length} bytes")
                 if sent + len(chunk) > content_length:
                     chunk = chunk[: content_length - sent]
                 sent += len(chunk)
@@ -2060,7 +2073,7 @@ def _vmp4_build_command(
     bitrate: str,
 ) -> list[str]:
     mode = (output_mode or "green").lower()
-    if mode in SEEK_FRAME_MODES:
+    if mode in {"green", "alpha", "superres", "dlss5"}:
         return _vmp4_python_command(
             "offline",
             "single",
@@ -2584,7 +2597,11 @@ def _vmp4_slot_output_size(info, output_mode: str) -> tuple[int, int]:
 
         out_w, out_h = alpha_output_size(out_w, out_h)
     elif mode == "two_dvr":
-        out_w = min(8192, _vmp4_slot_even(out_w * 2))
+        out_w = int(getattr(info, "width", 0) or 0) * 2
+        out_h = int(getattr(info, "height", 0) or 0)
+    elif mode in {"face_beauty", "rm"}:
+        out_w = int(getattr(info, "width", 0) or 0)
+        out_h = int(getattr(info, "height", 0) or 0)
     elif mode == "superres":
         from utils.rtx_vsr import seek_target_height, target_dimensions
 
@@ -3652,7 +3669,7 @@ def _media_key_path(path) -> str:
     return os.path.abspath(str(path))
 
 
-def _vmp4_frames_layout_key(path: Path, info, output_mode: str, template: Vmp4SlotOutputTemplate) -> tuple:
+def _vmp4_frames_layout_key(path: Path, info, output_mode: str, template: Vmp4SlotOutputTemplate, settings=None) -> tuple:
     try:
         st = Path(path).stat()
         stat_key = (int(st.st_size), int(st.st_mtime_ns))
@@ -3680,6 +3697,7 @@ def _vmp4_frames_layout_key(path: Path, info, output_mode: str, template: Vmp4Sl
         float(PASSTHROUGH_SEEK_VMP4_FRAMES_IDR_WEIGHT),
         float(PASSTHROUGH_SEEK_VMP4_FRAMES_BUDGET_FLATTEN),
         hashlib.sha256(template.stsd).hexdigest(), int(template.width), int(template.height),
+        settings_digest(settings if settings is not None else effect_settings(output_mode, path)),
     )
 
 
@@ -3765,7 +3783,7 @@ def _vmp4_frames_source_budget(
             gop_frames=layout.gop_frames,
             output_fps=layout.fps,
             floor_bytes_per_frame=seek_frame_floor_bytes(
-                int(getattr(info, "width", 0) or 0), int(getattr(info, "height", 0) or 0)
+                _vmp4_slot_output_size(info, output_mode)[0], int(getattr(info, "height", 0) or 0)
             ),
             idr_weight=PASSTHROUGH_SEEK_VMP4_FRAMES_IDR_WEIGHT,
             flatten=PASSTHROUGH_SEEK_VMP4_FRAMES_BUDGET_FLATTEN,
@@ -3820,7 +3838,7 @@ def _vmp4_frames_frame_budget(output_mode: str, template: Vmp4SlotOutputTemplate
     raises the bandwidth an enlarged SuperRes stream needs.
     """
     base = max(32 * 1024, int(PASSTHROUGH_SEEK_VMP4_FRAMES_FRAME_BYTES))
-    if str(output_mode or "").lower() != "superres":
+    if str(output_mode or "").lower() not in {"superres", "two_dvr", "rm", "face_beauty"}:
         return base
     pixels = max(1, int(template.width) * int(template.height))
     reference = 3840 * 2160
@@ -3832,7 +3850,8 @@ def _vmp4_frames_frame_budget(output_mode: str, template: Vmp4SlotOutputTemplate
 
 
 def _vmp4_frames_cached_layout(path: Path, info, output_mode: str, template: Vmp4SlotOutputTemplate) -> PassthroughVmp4FramesLayout:
-    key = _vmp4_frames_layout_key(path, info, output_mode, template)
+    settings = effect_settings(output_mode, path)
+    key = _vmp4_frames_layout_key(path, info, output_mode, template, settings)
     with _vmp4_frames_layout_cache_lock:
         cached = _vmp4_frames_layout_cache.get(key)
         if cached is not None:
@@ -3862,6 +3881,7 @@ def _vmp4_frames_cached_layout(path: Path, info, output_mode: str, template: Vmp
         # its size does not depend on the budget values - the flat layout above
         # already tells us the exact init size to subtract.
         layout = build(frame_budgets=plan.frame_budgets)
+    layout = replace(layout, processing_settings=settings)
     with _vmp4_frames_layout_cache_lock:
         _vmp4_frames_layout_cache[key] = layout
         while len(_vmp4_frames_layout_cache) > _VMP4_FRAMES_LAYOUT_CACHE_LIMIT:
@@ -3895,6 +3915,7 @@ def _vmp4_frames_digest(path: Path, layout: PassthroughVmp4FramesLayout, output_
         # without the actual per-frame budgets a re-planned layout would reuse
         # frames encoded against the previous budgets.
         _vmp4_frames_budget_fingerprint(layout),
+        settings_digest(layout.processing_settings),
     ))
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:32]
 
@@ -4019,6 +4040,7 @@ def _vmp4_frames_filler_worker(
             per_frame_cap_bytes=cap,
             per_frame_cap_schedule=schedule,
             cancel=filler.stop_event,
+            processing_settings=layout.processing_settings,
         ):
             if filler.stop_event.is_set():
                 filler.state = "stopped"
@@ -6064,28 +6086,40 @@ async def passthrough_live_get(
 
 
 def _seek_output_mode(requested_mode: str | None, route_mode: str | None = None) -> str:
-    """Resolve the seek route's output mode.
+    """The path mode survives players dropping the query; reject disabled modes."""
+    from utils.runtime_settings import get_face_beauty, get_rm
 
-    The path-borne mode wins: it survives a player dropping the query.
-    """
     requested = (str(route_mode or "") or str(requested_mode or "")).lower()
-    modes = tuple(
-        mode for mode in _configured_passthrough_modes()
-        if mode in {"green", "alpha", "superres", "dlss5"}
-    )
+    modes = tuple(mode for mode in _configured_passthrough_modes() if mode in SEEK_FRAME_MODES)
+    independent = {"face_beauty": get_face_beauty().enabled, "rm": get_rm().enabled}
+    if requested in independent:
+        if not independent[requested]:
+            raise HTTPException(409, f"{requested} is disabled")
+        return requested
     if requested in modes:
         return requested
-    # A single enhancement mode is the whole configuration, so it is also the
-    # fallback; with green or alpha alongside it the plain modes win, because an
-    # enhancement stage is the expensive answer to give a client that asked for
-    # nothing in particular.
-    if len(modes) == 1 and modes[0] in {"superres", "dlss5"}:
+    if requested:
+        raise HTTPException(409, f"Unsupported or disabled seek mode: {requested}")
+    if len(modes) == 1:
         return modes[0]
-    if "green" in modes and "alpha" in modes:
+    if "green" in modes:
         return "green"
     if "alpha" in modes:
         return "alpha"
-    return "green"
+    return modes[0] if modes else "green"
+
+
+async def _validate_seek_effect(path: Path, output_mode: str) -> None:
+    if output_mode not in {"two_dvr", "rm", "face_beauty"}:
+        return
+    if not _seek_vmp4_enabled() or _seek_vmp4_backend() != "slot_frames":
+        raise HTTPException(409, "This effect requires the slot_frames virtual MP4 backend")
+    _, effect_meta, common_block = await asyncio.to_thread(_probe_live_request_metadata, path)
+    gate = {"two_dvr": _two_dvr_live_block_reason, "rm": _rm_live_block_reason,
+            "face_beauty": _face_beauty_live_block_reason}[output_mode]
+    block = common_block or gate(path, effect_meta)
+    if block:
+        raise HTTPException(409, block)
 
 
 async def _serve_seek_prefix_or_retry(
@@ -6199,6 +6233,7 @@ async def passthrough_seek_head(
     if not allowed:
         log.info("passthrough_seek[%d] HEAD blocked: reason=%s profile=%s", rid, reason, route_profile)
         return _seek_blocked_response(reason)
+    await _validate_seek_effect(path, output_mode)
     info = probe_cached(path)
     if output_mode in _ENHANCED_MODE_LABELS:
         seek_reason = await _enhanced_mode_block_reason(path, output_mode)
@@ -6254,7 +6289,8 @@ async def passthrough_seek_head(
     _apply_seek_vmp4_headers(headers, path=path, duration=info.duration, total=total, container=container)
     if _seek_vmp4_enabled(container):
         if _seek_vmp4_backend() == "slot_frames":
-            return _seek_vmp4_frames_response(
+            return await run_in_threadpool(
+                _seek_vmp4_frames_response,
                 path=path,
                 info=info,
                 output_mode=output_mode,
@@ -6320,6 +6356,7 @@ async def passthrough_seek_get(
         log.info("passthrough_seek[%d] blocked: reason=%s profile=%s ua=%r", rid, reason, route_profile, user_agent[:160])
         return _seek_blocked_response(reason)
 
+    await _validate_seek_effect(path, output_mode)
     info = probe_cached(path)
     if output_mode in _ENHANCED_MODE_LABELS:
         seek_reason = await _enhanced_mode_block_reason(path, output_mode)

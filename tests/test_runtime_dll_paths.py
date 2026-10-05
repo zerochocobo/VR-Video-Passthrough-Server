@@ -28,6 +28,23 @@ class RuntimeDllPathsTests(unittest.TestCase):
             self.assertEqual(parts[:2], [str(trt_libs), str(cuda_bin)])
             self.assertEqual(parts[2], str(root / "existing"))
 
+    def test_dev_runtime_paths_include_pip_cudnn_and_cublas(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_root:
+            root = Path(raw_root)
+            nvidia = root / ".venv" / "Lib" / "site-packages" / "nvidia"
+            cudnn_bin = nvidia / "cudnn" / "bin"
+            cublas_bin = nvidia / "cublas" / "bin"
+            cudnn_bin.mkdir(parents=True)
+            cublas_bin.mkdir(parents=True)
+            env = {"PATH": str(root / "existing")}
+
+            with patch.object(runtime_dll_paths.config, "ROOT", root):
+                runtime_dll_paths.apply_runtime_dll_paths(env)
+
+            parts = env["PATH"].split(os.pathsep)
+            self.assertEqual(parts[:2], [str(cudnn_bin), str(cublas_bin)])
+            self.assertIn(str(root / "existing"), parts)
+
     def test_frozen_runtime_paths_prepend_internal_tensorrt_dirs(self) -> None:
         with tempfile.TemporaryDirectory() as raw_root:
             root = Path(raw_root)

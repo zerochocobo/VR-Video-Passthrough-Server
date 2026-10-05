@@ -141,6 +141,32 @@ class MediaLibraryTests(unittest.TestCase):
             self.assertEqual([child.name for child in after.children], ["movie.mp4"])
             self.assertNotEqual(before.signature, after.signature)
 
+    def test_media_index_signature_tracks_duck_key_creation_change_and_removal(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            movie = root / "movie.mp4"
+            movie.write_bytes(b"video")
+            library = MediaLibrary(build_media_roots([root]))
+            index = MediaIndex(root / "index.db")
+            duck = movie.with_suffix(".si.duck.wav")
+            try:
+                with patch("utils.media_index.config.MEDIA_LIBRARY", library):
+                    before = index.list_directory(root)
+                    duck.write_bytes(b"control")
+                    created = index.list_directory(root)
+                    duck.write_bytes(b"changed control")
+                    changed = index.list_directory(root)
+                    duck.unlink()
+                    removed = index.list_directory(root)
+            finally:
+                index.close()
+            self.assertNotEqual(before.signature, created.signature)
+            self.assertNotEqual(created.signature, changed.signature)
+            self.assertNotEqual(changed.signature, removed.signature)
+            self.assertEqual(before.signature, removed.signature)
+            for snapshot in (before, created, changed, removed):
+                self.assertEqual([child.name for child in snapshot.children], ["movie.mp4"])
+
 
 if __name__ == "__main__":
     unittest.main()

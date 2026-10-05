@@ -102,9 +102,10 @@ def _signature(parts: list[str]) -> str:
 
 
 def _si_sidecar_source_name(name: str) -> str:
-    if not name.lower().endswith(SI_SIDECAR_SUFFIX):
-        return ""
-    return f"{name[:-len(SI_SIDECAR_SUFFIX)]}{SI_SIDECAR_SOURCE_EXT}"
+    for suffix in (SI_SIDECAR_SUFFIX, ".si.duck.wav", ".si.mix.m4a", ".si.mix.json"):
+        if name.lower().endswith(suffix):
+            return f"{name[:-len(suffix)]}{SI_SIDECAR_SOURCE_EXT}"
+    return ""
 
 
 class MediaIndex:

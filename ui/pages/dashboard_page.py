@@ -20,7 +20,6 @@ from PySide6.QtWidgets import (
 from ui import theme
 from ui.dialogs.feature_dialogs import (
     Alpha2DSettingsDialog,
-    AlphaPassthroughSettingsDialog,
     BG_COLOR_CHOICES,
     FaceBeautySettingsDialog,
     GreenScreenSettingsDialog,
@@ -145,7 +144,7 @@ class DashboardPage(QWidget):
 
         self.cards: dict[str, FeatureCard] = {
             "green": FeatureCard("green_screen"),
-            "alpha": FeatureCard("alpha", configurable=True, with_help=True),
+            "alpha": FeatureCard("alpha", configurable=False, with_help=True),
             "alpha2d": FeatureCard("alpha"),
             "face_beauty": FeatureCard("face_beauty"),
             "two_dvr": FeatureCard("two_dvr"),
@@ -222,7 +221,6 @@ class DashboardPage(QWidget):
         self.cards["si"].toggled.connect(self._toggle_si)
         self.cards["light"].toggled.connect(self._toggle_light_match)
         self.cards["green"].configure_requested.connect(self._configure_green)
-        self.cards["alpha"].configure_requested.connect(self._configure_alpha_passthrough)
         self.cards["alpha"].help_requested.connect(lambda: PlayerSupportDialog(self.i18n, self).exec())
         self.cards["alpha2d"].configure_requested.connect(self._configure_alpha)
         self.cards["superres"].configure_requested.connect(self._configure_superres)
@@ -363,15 +361,6 @@ class DashboardPage(QWidget):
         if dialog.exec() != GreenScreenSettingsDialog.DialogCode.Accepted:
             return
         self.settings.data["background_color"] = dialog.selected_color()
-        self.settings.data["passthrough_playback_mode"] = dialog.selected_playback_mode()
-        self.settings.save()
-        self._update_summaries()
-
-    def _configure_alpha_passthrough(self) -> None:
-        dialog = AlphaPassthroughSettingsDialog(self.i18n, self.settings, self)
-        if dialog.exec() != AlphaPassthroughSettingsDialog.DialogCode.Accepted:
-            return
-        self.settings.data["passthrough_playback_mode"] = dialog.selected_playback_mode()
         self.settings.save()
         self._update_summaries()
 
@@ -397,11 +386,6 @@ class DashboardPage(QWidget):
         self.settings.data["superres_target_height"] = dialog.selected_target_height()
         self.settings.data["superres_quality"] = dialog.selected_quality()
         self.settings.data["superres_hdr_look"] = dialog.selected_hdr_look()
-        # The playback mode is the shared passthrough choice and is only offered
-        # for the native 1x target; an enlarging target leaves it untouched.
-        playback = dialog.selected_playback_mode()
-        if playback:
-            self.settings.data["passthrough_playback_mode"] = playback
         self.settings.save()
         self._update_summaries()
 
@@ -410,9 +394,6 @@ class DashboardPage(QWidget):
         if dialog.exec() != DLSS5SettingsDialog.DialogCode.Accepted:
             return
         self.settings.data.update(dialog.payload())
-        # Virtual file vs live is the shared passthrough choice; NR is 1x, so
-        # unlike SuperRes it is offered at every setting and always applies.
-        self.settings.data["passthrough_playback_mode"] = dialog.selected_playback_mode()
         self.settings.save()
         self._update_summaries()
 
@@ -543,20 +524,14 @@ class DashboardPage(QWidget):
         bg_value = str(data.get("background_color") or DEFAULTS["background_color"])
         bg_key = next((key for key, value in BG_COLOR_CHOICES if value == bg_value), None)
         bg_name = self.i18n.t(bg_key) if bg_key else f"#{bg_value}"
-        # The playback mode decides what the player is even offered, so it belongs
-        # on the card rather than only inside the dialog.
-        playback = str(
-            data.get("passthrough_playback_mode") or DEFAULTS["passthrough_playback_mode"]
-        ).strip().lower()
-        playback_name = self.i18n.t("playback.live" if playback == "live" else "playback.virtual")
         self.cards["green"].set_summary(
-            f"[GREEN] · {self.i18n.t('dashboard.green_bg_color')} {bg_name} · {playback_name}"
+            f"[GREEN] · {self.i18n.t('dashboard.green_bg_color')} {bg_name}"
         )
 
         projection = str(data.get("alpha_2d_projection") or "fisheye").lower()
         projection_key = "alpha2d.projection_flat3d" if projection == "flat3d" else "alpha2d.projection_fisheye"
         distance = int(round(float_setting(data.get("alpha_2d_distance_m"), 4.0)))
-        self.cards["alpha"].set_summary(f"[ALPHA]最好的透视效果 · {playback_name}")
+        self.cards["alpha"].set_summary("[ALPHA]最好的透视效果")
         self.cards["alpha2d"].set_summary(f"{self.i18n.t(projection_key)} · {distance}m")
 
         strength = float_setting(data.get("two_dvr_live_strength"), DEFAULTS["two_dvr_live_strength"])
@@ -578,7 +553,7 @@ class DashboardPage(QWidget):
         # A card line is ~200px wide, so the summary names the three settings
         # that change the picture and leaves the rest to the dialog.
         self.cards["dlss5"].set_summary(
-            f"[DLSS5] · {self.i18n.t(style_key)} · {intensity:.2f} · x{passes} · {playback_name}"
+            f"[DLSS5] · {self.i18n.t(style_key)} · {intensity:.2f} · x{passes}"
         )
 
         self.cards["rm"].set_summary(f"[RM] · {self.i18n.t('dashboard.rm_summary')}")

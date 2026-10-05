@@ -35,7 +35,6 @@ from ui.player_support import load_player_support
 from ui.settings import DEFAULTS, LIGHT_MATCH_PRESETS
 from ui.superres_targets import REALTIME_DEFAULT_TARGET, TARGET_CHOICES, target_i18n_key
 from utils.dlss5 import DLSS5_NR_PASSES_RANGE, DLSS5_RANGES
-from utils.rtx_vsr import NATIVE_TARGET_HEIGHT
 from utils.si_filter import (
     ORIGINAL_VOLUME_CHOICES,
     SI_DELAY_SECONDS_CHOICES,
@@ -160,67 +159,6 @@ class PlayerSupportDialog(QDialog):
         return self.i18n.t("player_support.supported") if supported else "-"
 
 
-class PlaybackModeChooser(QWidget):
-    """How a passthrough mode is handed to the player: virtual file or live stream.
-
-    A two-way, mutually exclusive choice where the consequence of each option is
-    not obvious from its name, so it reads as two radio rows with a line of plain
-    explanation under each rather than a combo box (which hides the alternative)
-    or a switch (which cannot label both sides). The closing note points at the
-    fallback, because the virtual file is the one that can fail on an unusual
-    player and the user needs to know there is somewhere to go.
-    """
-
-    def __init__(self, i18n, settings, parent=None) -> None:
-        super().__init__(parent)
-        self.i18n = i18n
-        mode = str(
-            settings.data.get("passthrough_playback_mode")
-            or DEFAULTS["passthrough_playback_mode"]
-        ).strip().lower()
-
-        self.virtual_radio = QRadioButton(self.i18n.t("playback.virtual"))
-        self.live_radio = QRadioButton(self.i18n.t("playback.live"))
-        self.group = QButtonGroup(self)
-        self.group.addButton(self.virtual_radio)
-        self.group.addButton(self.live_radio)
-        self.live_radio.setChecked(mode == "live")
-        self.virtual_radio.setChecked(mode != "live")
-
-        title = QLabel(self.i18n.t("playback.title"))
-        title.setStyleSheet("font-weight: 600; background: transparent;")
-
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(4)
-        layout.addWidget(title)
-        for radio, hint_key in (
-            (self.virtual_radio, "playback.virtual_hint"),
-            (self.live_radio, "playback.live_hint"),
-        ):
-            radio.setCursor(Qt.CursorShape.PointingHandCursor)
-            hint = QLabel(self.i18n.t(hint_key))
-            hint.setWordWrap(True)
-            hint.setStyleSheet(
-                f"font-size: 8.5pt; color: {theme.TEXT_MUTED}; background: transparent;"
-            )
-            hint.setContentsMargins(22, 0, 0, 0)
-            layout.addWidget(radio)
-            layout.addWidget(hint)
-            layout.addSpacing(2)
-
-        note = QLabel(self.i18n.t("playback.note"))
-        note.setWordWrap(True)
-        note.setStyleSheet(
-            f"font-size: 8.5pt; color: {theme.TEXT_MUTED}; background: {theme.BLUE_SOFT};"
-            " border-radius: 6px; padding: 7px 9px;"
-        )
-        layout.addWidget(note)
-
-    def selected_mode(self) -> str:
-        return "live" if self.live_radio.isChecked() else "virtual"
-
-
 class GreenScreenSettingsDialog(QDialog):
     def __init__(self, i18n, settings, parent=None) -> None:
         super().__init__(parent)
@@ -245,51 +183,15 @@ class GreenScreenSettingsDialog(QDialog):
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
 
-        self.playback = PlaybackModeChooser(self.i18n, settings, self)
-
         layout = QVBoxLayout(self)
         layout.setContentsMargins(16, 14, 16, 14)
         layout.setSpacing(12)
         layout.addLayout(color_row)
-        layout.addWidget(self.playback)
         layout.addWidget(buttons)
-        self.resize(420, 300)
+        self.resize(420, self.sizeHint().height())
 
     def selected_color(self) -> str:
         return str(self.bg_color.currentData() or DEFAULTS["background_color"])
-
-    def selected_playback_mode(self) -> str:
-        return self.playback.selected_mode()
-
-
-class AlphaPassthroughSettingsDialog(QDialog):
-    """Alpha passthrough options. Only the playback mode for now."""
-
-    def __init__(self, i18n, settings, parent=None) -> None:
-        super().__init__(parent)
-        self.i18n = i18n
-        self.setModal(True)
-        self.setWindowTitle(self.i18n.t("mode.alpha"))
-
-        self.playback = PlaybackModeChooser(self.i18n, settings, self)
-
-        buttons = QDialogButtonBox(
-            QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel
-        )
-        buttons.button(QDialogButtonBox.StandardButton.Save).setText(self.i18n.t("button.save"))
-        buttons.button(QDialogButtonBox.StandardButton.Cancel).setText(self.i18n.t("button.cancel"))
-        buttons.accepted.connect(self.accept)
-        buttons.rejected.connect(self.reject)
-
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(16, 14, 16, 14)
-        layout.setSpacing(12)
-        layout.addWidget(self.playback)
-        layout.addWidget(buttons)
-        self.resize(420, 260)
-
-    def selected_playback_mode(self) -> str:
-        return self.playback.selected_mode()
 
 
 class Alpha2DSettingsDialog(QDialog):
@@ -396,43 +298,19 @@ class SuperResSettingsDialog(QDialog):
         self.performance_note = QLabel(self.i18n.t("superres.performance_note"))
         self.performance_note.setWordWrap(True)
         self.performance_note.setStyleSheet("color: #626975; background: transparent;")
-        # Only the native 1x target can be served as a virtual file: enlarging
-        # runs at 25-27 FPS and needs about 173 Mbps, which a player pulling at
-        # playback speed cannot ride. So the choice appears exactly when it
-        # applies, and the note says why it is missing otherwise.
-        self.playback = PlaybackModeChooser(self.i18n, settings, self)
-        self.playback_note = QLabel(self.i18n.t("superres.playback_native_only"))
-        self.playback_note.setWordWrap(True)
-        self.playback_note.setStyleSheet("color: #626975; background: transparent;")
-        self.target.currentIndexChanged.connect(self._update_playback_visibility)
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel)
         buttons.button(QDialogButtonBox.StandardButton.Save).setText(self.i18n.t("button.save"))
         buttons.button(QDialogButtonBox.StandardButton.Cancel).setText(self.i18n.t("button.cancel"))
         buttons.accepted.connect(self.accept); buttons.rejected.connect(self.reject)
         layout = QVBoxLayout(self); layout.setContentsMargins(16, 14, 16, 14); layout.setSpacing(12)
         layout.addLayout(target_row); layout.addLayout(quality_row); layout.addLayout(hdr_row)
-        layout.addWidget(self.performance_note); layout.addWidget(self.playback); layout.addWidget(self.playback_note)
+        layout.addWidget(self.performance_note)
         layout.addWidget(buttons)
         self.quality_keys = ("superres.quality_1", "superres.quality_2", "superres.quality_3", "superres.quality_4")
         for i, key in enumerate(self.quality_keys): self.quality.setItemText(i, self.i18n.t(key))
         self.setMinimumWidth(520)
         self.setMaximumWidth(520)
-        self._update_playback_visibility()
         self.adjustSize()
-
-    def _update_playback_visibility(self) -> None:
-        # The note stays visible at every target: it is the rule that decides
-        # whether the chooser above it exists, so the user should read it
-        # before picking a target, not only after losing the choice.
-        native = int(self.target.currentData() or 0) <= NATIVE_TARGET_HEIGHT
-        self.playback.setVisible(native)
-        self.adjustSize()
-
-    def selected_playback_mode(self) -> str:
-        """The shared passthrough playback mode, unchanged unless 1x is chosen."""
-        if int(self.target.currentData() or 0) > NATIVE_TARGET_HEIGHT:
-            return ""
-        return self.playback.selected_mode()
 
     def selected_target_height(self) -> int:
         return int(self.target.currentData())
@@ -532,11 +410,6 @@ class DLSS5SettingsDialog(QDialog):
         self.advanced_toggle.toggled.connect(self._toggle_advanced)
         self._toggle_advanced(False)
 
-        # NR is 1x, so there is no target that cannot be served as a virtual
-        # file: the chooser is always meaningful and always shown, unlike the
-        # SuperRes dialog where it appears only at the native target. Offline
-        # has no playback channel at all, so there it is absent.
-        self.playback = None if self.offline else PlaybackModeChooser(self.i18n, settings, self)
         self.performance_note = QLabel(
             self.i18n.t("dlss5.offline_note" if self.offline else "dlss5.performance_note")
         )
@@ -557,8 +430,6 @@ class DLSS5SettingsDialog(QDialog):
         layout.addWidget(self.advanced_toggle)
         layout.addWidget(self.advanced_panel)
         layout.addWidget(self.performance_note)
-        if self.playback is not None:
-            layout.addWidget(self.playback)
         layout.addWidget(buttons)
         self.setMinimumWidth(520)
         self.setMaximumWidth(520)
@@ -591,10 +462,6 @@ class DLSS5SettingsDialog(QDialog):
         arrow = "\u25be" if checked else "\u25b8"
         self.advanced_toggle.setText(f"{arrow} {self.i18n.t('dlss5.advanced')}")
         self.adjustSize()
-
-    def selected_playback_mode(self) -> str:
-        """The shared passthrough choice, or "" when this dialog is offline."""
-        return "" if self.playback is None else self.playback.selected_mode()
 
     def payload(self) -> dict:
         """Every DLSS5 setting this dialog owns, ready for settings.data."""
@@ -643,7 +510,7 @@ class TwoDvrSettingsDialog(QDialog):
         layout.setSpacing(12)
         layout.addLayout(row)
         layout.addWidget(buttons)
-        self.resize(320, 120)
+        self.resize(430, self.sizeHint().height())
 
     def selected_strength(self) -> float:
         return float(self.strength.currentData() or DEFAULTS["two_dvr_live_strength"])
@@ -679,7 +546,7 @@ class RmSettingsDialog(QDialog):
         layout.addWidget(self.vr2flat)
         layout.addWidget(hint)
         layout.addWidget(buttons)
-        self.resize(380, 150)
+        self.resize(430, self.sizeHint().height())
 
     def payload(self) -> dict:
         return {"vr2flat_decode": self.vr2flat.isChecked()}
@@ -772,7 +639,7 @@ class FaceBeautySettingsDialog(QDialog):
         layout.addWidget(form)
         layout.addWidget(note)
         layout.addWidget(buttons)
-        self.resize(430, 380)
+        self.resize(460, self.sizeHint().height())
 
         self._syncing = False
         stored_preset = str(stored.get("preset") or "standard")
@@ -921,7 +788,7 @@ class SISettingsDialog(QDialog):
         layout.addWidget(buttons)
         self.duck_original.toggled.connect(self._update_duck_preset_enabled)
         self._update_duck_preset_enabled(self.duck_original.isChecked())
-        self.resize(360, 290)
+        self.resize(460, self.sizeHint().height())
 
     def _update_duck_preset_enabled(self, enabled: bool) -> None:
         self.duck_preset_label.setEnabled(bool(enabled))

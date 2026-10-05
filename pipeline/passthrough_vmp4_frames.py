@@ -117,6 +117,7 @@ class PassthroughVmp4FramesLayout:
     # Byte span [start, end) of each GOP's interleaved block, for locating an
     # arbitrary offset (which may land in audio) on a GOP.
     gop_spans: tuple[tuple[int, int], ...] = ()
+    processing_settings: dict | None = None
 
     def gop_frame_indices(self, gop_index: int) -> tuple[int, ...]:
         return tuple(f.index for f in self.frames if f.gop_index == gop_index)

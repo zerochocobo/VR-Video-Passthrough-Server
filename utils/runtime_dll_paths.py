@@ -34,9 +34,16 @@ def _runtime_dll_candidates(env: dict[str, str]) -> list[Path]:
         # Blackwell/sm_120 requires >=12.8 for native cubin compilation;
         # allowing CUDA_PATH\bin to shadow this directory causes the very slow
         # PTX driver-JIT path described in PROJECT.md.
-        nvrtc_bin = config.ROOT / ".venv" / "Lib" / "site-packages" / "nvidia" / "cuda_nvrtc" / "bin"
+        nvidia_root = config.ROOT / ".venv" / "Lib" / "site-packages" / "nvidia"
+        nvrtc_bin = nvidia_root / "cuda_nvrtc" / "bin"
         if nvrtc_bin.exists():
             candidates.append(nvrtc_bin)
+        # ORT CUDA EP needs cudnn64_9/cublas64_12; use the pip wheels
+        # (nvidia-cudnn-cu12 etc.) instead of relying on a system PATH entry.
+        for name in ("cudnn", "cublas"):
+            lib_bin = nvidia_root / name / "bin"
+            if lib_bin.exists():
+                candidates.append(lib_bin)
         tensorrt_libs = config.ROOT / ".venv" / "Lib" / "site-packages" / "tensorrt_libs"
         if tensorrt_libs.exists():
             candidates.append(tensorrt_libs)

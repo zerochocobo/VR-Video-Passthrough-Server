@@ -59,6 +59,9 @@ from dlna.profiles import passthrough_frame_rate
 from media_library import safe_resolve_path
 from pipeline.alpha_packer import alpha_output_size
 from pipeline.ffmpeg_io import probe_cached
+from pipeline.si_virtual_mp4 import (
+    prewarm_progressive_si_virtual_mp4, progressive_si_info, progressive_si_metadata_version,
+)
 from utils.bitrate_estimator import estimate_for_media
 from utils.logger import get
 from utils.media_index import IndexedChild, get_media_index
@@ -72,6 +75,7 @@ from utils.subtitles import SubtitleTrack, find_external_subtitles
 from utils.video_metadata import probe_video_metadata, select_backend
 from utils.rtx_vsr import is_native_target, source_exceeds_target_resolution
 from utils.vr_naming import (
+    two_dvr_stem,
     has_vr_filename_marker,
     is_half_equirectangular_source,
     alpha_passthrough_stem,
@@ -111,6 +115,9 @@ SEEK_ITEM_PREFIX = "sg_"
 ALPHA_SEEK_ITEM_PREFIX = "sa_"
 SUPERRES_SEEK_ITEM_PREFIX = "ssr_"
 DLSS5_SEEK_ITEM_PREFIX = "sdn_"
+TWO_DVR_SEEK_ITEM_PREFIX = "s3_"
+RM_SEEK_ITEM_PREFIX = "srm_"
+FACE_BEAUTY_SEEK_ITEM_PREFIX = "sfb_"
 IMAGE_ITEM_PREFIX = "img_"
 SI_ITEM_PREFIX = "si_"
 # Realtime SI ([SI]) directory + time-index object ids. The [SI] entry is a
@@ -172,7 +179,7 @@ def clear_dir_items_cache() -> None:
 
 
 def _system_update_id() -> int:
-    return _SYSTEM_UPDATE_ID + int(get_si_mix().version) + int(get_rm().version)
+    return _SYSTEM_UPDATE_ID + int(get_si_mix().version) + int(get_rm().version) + progressive_si_metadata_version()
 
 
 def _parse_bitrate(s: str) -> int:
@@ -430,20 +437,14 @@ def _id_to_live_time_index(object_id: str) -> tuple[Path, str, str, int, int] | 
 
 
 def _id_to_seek(object_id: str) -> tuple[Path, str] | None:
-    mode = "green"
-    if object_id.startswith(DLSS5_SEEK_ITEM_PREFIX):
-        mode = "dlss5"
-        prefix = DLSS5_SEEK_ITEM_PREFIX
-    elif object_id.startswith(SUPERRES_SEEK_ITEM_PREFIX):
-        mode = "superres"
-        prefix = SUPERRES_SEEK_ITEM_PREFIX
-    elif object_id.startswith(ALPHA_SEEK_ITEM_PREFIX):
-        mode = "alpha"
-        prefix = ALPHA_SEEK_ITEM_PREFIX
-    elif object_id.startswith(SEEK_ITEM_PREFIX):
-        prefix = SEEK_ITEM_PREFIX
-    else:
+    prefixes = {DLSS5_SEEK_ITEM_PREFIX: "dlss5", SUPERRES_SEEK_ITEM_PREFIX: "superres",
+                TWO_DVR_SEEK_ITEM_PREFIX: "two_dvr", RM_SEEK_ITEM_PREFIX: "rm",
+                FACE_BEAUTY_SEEK_ITEM_PREFIX: "face_beauty", ALPHA_SEEK_ITEM_PREFIX: "alpha",
+                SEEK_ITEM_PREFIX: "green"}
+    found = next(((prefix, mode) for prefix, mode in prefixes.items() if object_id.startswith(prefix)), None)
+    if found is None:
         return None
+    prefix, mode = found
     rel = object_id[len(prefix):].replace("\\", "/").strip("/")
     rel = _strip_object_id_version(rel)
     path = MEDIA_LIBRARY.key_to_path(rel)
@@ -558,7 +559,6 @@ def _video_item_count(path: Path, child: IndexedChild | None = None) -> int:
     si_items = 1 if _si_dlna_enabled() and get_si_mix().enabled and _has_si_sidecar(path) else 0
     if (
         is_offline_passthrough_output_name(path.name)
-        or PASSTHROUGH_OUTPUT_MODE == "none"
         or has_offline_passthrough_output(path)
         or _hide_passthrough_for_path(path, child)
     ):
@@ -568,12 +568,14 @@ def _video_item_count(path: Path, child: IndexedChild | None = None) -> int:
         mode for mode in _passthrough_modes()
         if (mode != "superres" or _superres_dlna_enabled(path, width, height, child))
         and (mode != "dlss5" or _dlss5_dlna_enabled(path, width, height, child))
+        and (mode != "two_dvr" or (
+            _is_two_d_source(path, width, height) and width <= 4096
+            and not has_offline_two_dvr_output(path)))
     ]
     passthrough_modes = len(passthrough_modes_list)
-    seek_items = passthrough_modes if _seek_passthrough_dlna_enabled() else 0
     rm_items = 1 if _rm_dlna_enabled(path, width, height) else 0
     face_beauty_items = 1 if _face_beauty_dlna_enabled(path, width, height) else 0
-    return 1 + si_items + rm_items + face_beauty_items + passthrough_modes + seek_items
+    return 1 + si_items + rm_items + face_beauty_items + passthrough_modes
 
 
 def _marked_original_title(path: Path, child: IndexedChild | None = None) -> str:
@@ -731,6 +733,35 @@ def _si_directory_child_count(duration: float) -> int:
     # Mirror the Live container: N quick-play chapter leaves + 1 "Select Time
     # Index" subdirectory.
     return len(_live_chapter_offsets(duration)) + 1
+
+
+def _si_file_item(path: Path, parent_id: str, duration: float, width: int, height: int, *,
+                  source_size: int = 0, source_codec: str = "") -> dict:
+    rel = _rel_key(path)
+    params = get_si_mix().params()
+    wav = path.with_suffix(".si.wav")
+    info = None
+    try:
+        info = progressive_si_info(path, wav, params)
+        # Bounded/deduplicated background work moves the whole-audio preparation
+        # ahead of the player's first HEAD/GET. Browse never waits for encoding.
+        prewarm_progressive_si_virtual_mp4(path, wav, params, reason="dlna-virtual-file")
+    except (OSError, ValueError) as exc:
+        log.warning("SI Browse metadata unavailable for %s: %s", path, exc)
+    # A cold library entry has a display estimate until its audio is ready.
+    # HTTP always uses the exact layout size, never this Browse estimate.
+    size = info.content_length if info else max(1, source_size + int(max(0, duration) * 192_000 / 8))
+    codec = info.video_codec_name if info else source_codec
+    pn = "HEVC_MP4_MAIN" if codec == "hevc" else "AVC_MP4_HP_HD_AAC" if codec == "h264" else ""
+    profile = f"DLNA.ORG_PN={pn};" if pn else ""
+    return {"id": f"{SI_ITEM_PREFIX}{_versioned_rel(rel)}", "parent_id": parent_id,
+            "title": _si_directory_title(path, width, height),
+            "url": f"http://{LAN_IP}:{HTTP_PORT}/media_si/{quote(rel)}",
+            "thumb": f"http://{LAN_IP}:{HTTP_PORT}/thumb/{quote(rel)}",
+            "duration": duration, "resolution": _resolution_str(width, height),
+            "size": size, "size_estimated": info is None,
+            "mime": "video/mp4", "dlna_pn": pn, "passthrough_mode": "si_mix",
+            "protocol_info": f"http-get:*:video/mp4:{profile}DLNA.ORG_OP=01;DLNA.ORG_CI=0;DLNA.ORG_FLAGS={DLNA_FLAGS_BASE}"}
 
 
 def _si_container_item(path: Path, parent_id: str, duration: float, width: int, height: int) -> dict:
@@ -1022,6 +1053,8 @@ def _passthrough_seek_title(path: Path, mode: str, width: int = 0, height: int =
     label = _SEEK_TITLE_LABELS.get(str(mode or "").strip().lower(), str(mode or "").upper())
     if str(mode or "").strip().lower() == "alpha":
         stem = alpha_passthrough_stem(path.stem)
+    elif mode == "two_dvr":
+        stem = two_dvr_stem(path.stem)
     else:
         stem = source_display_stem(path.stem, width, height)
     return f"[{label}]{stem}"
@@ -1122,11 +1155,9 @@ def _seek_declared_size(path: Path, mode: str, source_size: int, pt_size: int, d
 
 
 def _passthrough_seek_item_prefix(mode: str) -> str:
-    if mode == "dlss5":
-        return DLSS5_SEEK_ITEM_PREFIX
-    if mode == "superres":
-        return SUPERRES_SEEK_ITEM_PREFIX
-    return ALPHA_SEEK_ITEM_PREFIX if mode == "alpha" else SEEK_ITEM_PREFIX
+    return {"dlss5": DLSS5_SEEK_ITEM_PREFIX, "superres": SUPERRES_SEEK_ITEM_PREFIX,
+            "two_dvr": TWO_DVR_SEEK_ITEM_PREFIX, "rm": RM_SEEK_ITEM_PREFIX,
+            "face_beauty": FACE_BEAUTY_SEEK_ITEM_PREFIX, "alpha": ALPHA_SEEK_ITEM_PREFIX}.get(mode, SEEK_ITEM_PREFIX)
 
 
 def _passthrough_live_query(mode: str) -> str:
@@ -1182,6 +1213,10 @@ def _seek_supported_mode(mode: str) -> bool:
     name = str(mode or "").strip().lower()
     if name not in _seek_supported_modes():
         return False
+    if name in {"two_dvr", "rm", "face_beauty"} and not (
+        PASSTHROUGH_SEEK_VMP4 and PASSTHROUGH_SEEK_VMP4_BACKEND == "slot_frames"
+    ):
+        return False
     if name == "superres":
         # Only native 1x SuperRes can be served as a virtual file; the enlarging
         # targets stay on the live chapter container.
@@ -1218,7 +1253,7 @@ def _seek_passthrough_route_suffix(container: str | None = None, mode: str | Non
     """
     tail = ".seek.mp4" if (container or _seek_passthrough_container()) == "mp4" else ".seek.ts"
     name = str(mode or "").strip().lower()
-    return f".{name}{tail}" if name in {"green", "alpha", "superres", "dlss5"} else tail
+    return f".{name}{tail}" if name in _seek_supported_modes() else tail
 
 
 def _resolution_str(width: int, height: int) -> str:
@@ -1460,6 +1495,7 @@ def _video_items_from_index(
     rel = _rel_key(path)
     quoted = quote(rel)
     size = child.size if child is not None else path.stat().st_size
+    source_codec = ""
     if child is not None and child.video is not None:
         duration = child.video.duration
         width = int(getattr(child.video, "width", 0) or 0)
@@ -1469,6 +1505,7 @@ def _video_items_from_index(
         resolution = _resolution_str(width, height)
         backend_verdict = child.video.backend_verdict
         source_fps = float(getattr(child.video, "fps", 0.0) or 0.0)
+        source_codec = str(getattr(child.video, "codec_name", "") or "")
     else:
         try:
             info = probe_cached(path)
@@ -1477,6 +1514,7 @@ def _video_items_from_index(
             height = int(info.height)
             resolution = _resolution_str(width, height)
             meta = probe_video_metadata(path)
+            source_codec = str(meta.codec.codec_name or "")
             backend = select_backend(meta.timing, meta.codec, meta.color)
             backend_verdict = backend.verdict
             source_fps = float(meta.timing.source_fps or getattr(info, "fps", 0.0) or 0.0)
@@ -1512,7 +1550,10 @@ def _video_items_from_index(
         }
     ]
     if _si_dlna_enabled() and get_si_mix().enabled and _has_si_sidecar(path):
-        items.append(_si_container_item(path, parent_id, duration, width, height))
+        if _seek_passthrough_dlna_enabled():
+            items.append(_si_file_item(path, parent_id, duration, width, height, source_size=size, source_codec=source_codec))
+        else:
+            items.append(_si_container_item(path, parent_id, duration, width, height))
     if (
         is_offline_passthrough_output_name(path.name)
         or has_offline_passthrough_output(path, siblings)
@@ -1520,38 +1561,20 @@ def _video_items_from_index(
     ):
         return items
 
-    if _face_beauty_dlna_enabled(path, width, height):
-        items.append(
-            {
-                "container": True,
-                "id": f"{FACE_BEAUTY_LIVE_PREFIX}{_versioned_rel(rel)}",
-                "parent_id": parent_id,
-                "title": _prefixed_live_directory_title(path, "face_beauty", width, height),
-                "child_count": len(_live_chapter_offsets(duration)) + 1,
-            }
-        )
-
-    if _rm_dlna_enabled(path, width, height):
-        items.append(
-            {
-                "container": True,
-                "id": f"{RM_LIVE_PREFIX}{_versioned_rel(rel)}",
-                "parent_id": parent_id,
-                "title": _prefixed_live_directory_title(path, "rm", width, height),
-                "child_count": len(_live_chapter_offsets(duration)) + 1,
-            }
-        )
-
     estimate_codec = PYNV_OUTPUT_CODEC
     if duration > 0:
         pt_size, pt_bps_est, _ = estimate_for_media(path, duration, estimate_codec)
     else:
         pt_size, pt_bps_est = 0, pt_bps
     # Keep the legacy pseudo-VOD /passthrough endpoint hidden from DLNA. When
-    # seekable passthrough testing is explicitly enabled, add /passthrough_seek
-    # beside the live entry instead of replacing it, so unknown or blocked
-    # clients still have the stable /passthrough_live fallback visible.
-    for mode in _passthrough_modes():
+    # The shared playback setting chooses a virtual file or live directory for
+    # each effect; unsupported backends retain the live directory.
+    modes = list(_passthrough_modes())
+    if _face_beauty_dlna_enabled(path, width, height):
+        modes.append("face_beauty")
+    if _rm_dlna_enabled(path, width, height):
+        modes.append("rm")
+    for mode in modes:
         if mode == "superres" and not _superres_dlna_enabled(path, width, height, child):
             continue
         if mode == "dlss5" and not _dlss5_dlna_enabled(path, width, height, child):
@@ -1927,6 +1950,10 @@ def _children_for_dir(directory: Path, client_profile: str | None = None) -> lis
         int(PASSTHROUGH_LIVE_CHAPTER_MIN_INTERVAL_SEC),
         int(DLNA_IMAGE_ENABLED),
         int(get_si_mix().version),
+        progressive_si_metadata_version(),
+        int(get_rm().version), int(get_face_beauty().version),
+        bool(PASSTHROUGH_SEEK_ENABLED), bool(PASSTHROUGH_SEEK_DLNA),
+        str(PASSTHROUGH_SEEK_VMP4_BACKEND),
         _DIDL_SCHEMA_VERSION,
         str(client_profile or ""),
     )

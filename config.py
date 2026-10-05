@@ -2081,6 +2081,8 @@ def seek_budget_scale(
     # frame rate is a frame-rate choice and not a quality one. It only binds where
     # pixels are many and the rate is high; 4K never reaches it.
     px = max(0, int(width or 0)) * max(0, int(height or 0))
+    if str(mode or "").lower() == "two_dvr":
+        px *= 2
     fps = seek_output_fps(source_fps)
     if px > 0 and fps > 0:
         floor_bps = float(PASSTHROUGH_SEEK_VMP4_FRAMES_MIN_BITS_PER_PIXEL) * px * fps

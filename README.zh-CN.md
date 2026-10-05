@@ -132,7 +132,9 @@ netsh advfirewall firewall add rule name="PTServer SSDP Private" dir=in action=a
 - Alpha 模式下虚拟条目标题为 `Alpha Passthrough`
 - 实时 2D 转 3D 使用 `PT_TWO_DVR_MODEL`、`PT_TWO_DVR_STRENGTH` 和相关 `PT_TWO_DVR_*` 设置；离线 2D 转 3D / VR 在桌面 UI 中提供模型、画质速度、时域稳定和“目标文件存在则跳过”等控制。
 - 实时超分使用 `PT_RTX_VSR_TARGET_HEIGHT`、`PT_RTX_VSR_QUALITY` 和 `PT_RTX_VSR_HDR_LOOK`。自适应4096目标对识别出的2:1 SBS VR输出8192x4096，对普通2D输出3840x2160。HDR观感设为 `truehdr` 只影响离线任务，实时链路保持SDR观感。
-- 同名 `.si.wav` 文件会启用 `[SI]` DLNA入口。当前DLNA播放通过 `/si_live` 实时输出MPEG-TS并支持起播偏移；旧的渐进式 `/media_si` 保留为后备路由。
+- 同名 `.si.wav` 文件会启用 `[SI]` DLNA入口。实时播放通过 `/si_live` 输出 MPEG-TS；选择虚拟 MP4 播放时使用 `/media_si`，复制原视频样本并搭配混音 AAC 音轨。
+- 工具箱可在生成同声/克隆音频后提前输出同名 `.si.mix.m4a` 和 `.si.mix.json`。虚拟 MP4 会校验输入文件、混音规则和输出音轨，再直接使用预生成 AAC，跳过整片混音编码。普通 SI 需匹配服务器默认参数；带 `.si.duck.wav` 的配音匹配配音模式固定参数。文件过期、损坏或设置不匹配时自动走原有音频缓存/转换流程；请保留原 `.si.wav` 和可选的 `.si.duck.wav`。
+- 有效的 `.si.mix.m4a` 会直接作为虚拟 MP4 音轨；浏览、后台预热和 HEAD/GET 都不会再向 `runtime_cache/si_virtual_mp4` 复制或生成源音轨、混音音轨。响应头 `X-SI-Audio-Source: prepared-m4a` 表示正在使用它；`runtime-cache` 表示使用服务器缓存/转换结果。
 - DLNA Live目录会按功能显示 `[GREEN]`、`[ALPHA]`、`[2D>3D]`、`[SuperRes]` 和 `[SI]` 标记，并提供本地化的 `[选择时间索引]` 目录。
 - 桌面设置页可修改DLNA服务器名称和HTTP端口；保存网络身份配置后需要重启服务器。
 - Windows发布包已包含验证过的CUDA 12.6 RTX VSR bridge、NGX运行库、本地CUDA runtime、许可证和版本信息，终端用户不需要自行编译bridge。

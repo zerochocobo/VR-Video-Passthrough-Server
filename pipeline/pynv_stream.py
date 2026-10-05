@@ -29,6 +29,8 @@ from pipeline import matting as matting_module
 from pipeline.matting import Matter
 from pipeline.pynv_io import GpuNv12AppFrame, GpuP016Frame, PyNvSimpleDecoder, PyNvThreadedSerialDecoder
 from pipeline.subtitles import SubtitleRenderer, find_subtitle_for_video
+from pipeline.gpu_subtitles import GpuSubtitleOverlay
+from pipeline.seek_effects import iter_stage_frames
 from utils.logger import get, warmup_event
 from utils.startup_status import get_startup_state, set_startup_phase
 from utils.cache_key import fingerprint, stat_key
@@ -61,8 +63,6 @@ _audio_cache_locks_guard = threading.Lock()
 _audio_tmp_cleanup_done = False
 _audio_tmp_cleanup_lock = threading.Lock()
 _pynv_runtime_tainted = threading.Event()
-_SUBTITLE_BLEND_Y_KERNEL = None
-_SUBTITLE_BLEND_UV_KERNEL = None
 
 
 def _realtime_pynv_bitrate() -> str:
@@ -304,11 +304,11 @@ def _hevc_nal_summary(data: bytes | bytearray | memoryview, *, limit: int = 12) 
 # route, its GOP/filler builders and the DLNA browse side all read this one
 # set: keeping separate copies in step by comment is what let SuperRes be
 # advertised, routed and then refused by a guard nobody updated.
-SEEK_FRAME_MODES = frozenset({"green", "alpha", "superres", "dlss5"})
+SEEK_FRAME_MODES = frozenset({"green", "alpha", "superres", "dlss5", "two_dvr", "face_beauty", "rm"})
 
 # Modes served by a per-session GPU stage that takes a decoded NV12 frame and
 # hands back an enhanced GPU NV12 surface.
-_FRAME_STAGE_MODES = frozenset({"superres", "dlss5"})
+_FRAME_STAGE_MODES = frozenset({"superres", "dlss5", "two_dvr", "face_beauty", "rm"})
 
 
 def make_frame_stage(
@@ -320,6 +320,7 @@ def make_frame_stage(
     is_10bit: bool = False,
     source_fps: float = 0.0,
     seek: bool = False,
+    processing_settings: dict | None = None,
     logger=None,
     label: str = "",
 ):
@@ -335,11 +336,19 @@ def make_frame_stage(
     configured one; whether that target is offered as a virtual file at all is
     decided when the listing is built (utils.rtx_vsr.seek_supported_target).
 
-    Every stage returned exposes ``output_size`` and ``process(frame, index)``.
+    Stages expose ``output_size`` and either ``process(frame, index)`` or a
+    chunk-aware ``iter_process(frames)`` adapter (RM).
     """
     name = str(mode or "").lower()
     if name not in _FRAME_STAGE_MODES:
         return None
+    if name in {"face_beauty", "two_dvr", "rm"}:
+        from pipeline.seek_effects import FaceBeautyStage, TwoDvrStage, RmStage
+
+        if name == "face_beauty":
+            return FaceBeautyStage(width, height, settings=processing_settings, logger=logger)
+        cls = TwoDvrStage if name == "two_dvr" else RmStage
+        return cls(width, height, settings=processing_settings, logger=logger)
     if name == "dlss5":
         from pipeline.dlss5_stage import DLSS5Stage
         from utils.dlss5 import DLSS5Settings
@@ -381,6 +390,7 @@ def iter_pynv_passthrough_annexb_frames(
     per_frame_cap_bytes: int = 0,
     per_frame_cap_schedule: Sequence[int] | None = None,
     cancel: threading.Event | None = None,
+    processing_settings: dict | None = None,
 ):
     """Persistent streaming encode: set up decoder/encoder/matter ONCE and yield
     one HEVC Annex-B access unit per output frame (in order).
@@ -433,6 +443,11 @@ def iter_pynv_passthrough_annexb_frames(
     dec = None
     enc = None
     pending_nv12_slots: list[object] = []
+    previous_light_state = getattr(matter, "_seek_light_match_state", None)
+    if processing_settings and "light_match" in processing_settings:
+        from utils.runtime_settings import LightMatchRuntime
+        matter._seek_light_match_state = LightMatchRuntime(**processing_settings["light_match"])
+        matter._light_match_version = -1
     try:
         info = meta_dec.info
         dec_len = len(meta_dec)
@@ -453,6 +468,7 @@ def iter_pynv_passthrough_annexb_frames(
             is_10bit=bool(bit_depth > 8),
             source_fps=source_fps,
             seek=True,
+            processing_settings=processing_settings,
             logger=log,
             label="PyNv frame stream",
         )
@@ -465,6 +481,26 @@ def iter_pynv_passthrough_annexb_frames(
 
             out_w, out_h = alpha_output_size(alpha_process_w, alpha_process_h)
             alpha_packer = AlphaPacker(matter, src_fisheye_fov=alpha_src_fisheye_fov(source.stem))
+
+        subtitle_overlay = GpuSubtitleOverlay()
+        subtitle_renderer = None
+        if processing_settings is None:
+            subtitle_path = find_subtitle_for_video(source)
+        else:
+            subtitle_entry = processing_settings.get("subtitle")
+            subtitle_path = Path(subtitle_entry[0]) if subtitle_entry else None
+        if subtitle_path is not None:
+            from pipeline.alpha_packer import is_sbs_vr_size
+
+            # Alpha positions are projected by the packer from the pre-pack
+            # surface; every other stage blends directly into its output.
+            subtitle_w, subtitle_h = (alpha_process_w, alpha_process_h) if alpha_packer else (out_w, out_h)
+            subtitle_renderer = SubtitleRenderer(
+                subtitle_path, subtitle_w, subtitle_h,
+                stereo=mode == "two_dvr" or is_sbs_vr_size(subtitle_w, subtitle_h),
+                settings=processing_settings.get("config") if processing_settings else None,
+                blocking=True,
+            )
 
         start_out = int(round(max(0.0, float(start_sec or 0.0)) * fps))
         max_target = int((dec_len - 1) * fps / source_fps) + 1 if source_fps > 0 else dec_len
@@ -566,7 +602,6 @@ def iter_pynv_passthrough_annexb_frames(
         enc = _make_encoder()
         if _cancelled():
             return
-        last_src_idx = -1
         max_pending_nv12_slots = max(0, int(config.PASSTHROUGH_NV12_RING_SLOTS) - 1)
         active_budget = schedule[0] if schedule else int(per_frame_cap_bytes or 0)
         applied = (active_budget, round(headroom, 3))
@@ -581,7 +616,25 @@ def iter_pynv_passthrough_annexb_frames(
                 return schedule[idx]
             return int(per_frame_cap_bytes or 0)
 
-        for i in range(target):
+        def decoded_frames():
+            last_src = -1
+            for offset in range(target):
+                if _cancelled():
+                    return
+                index = start_out + offset
+                src_index = min(dec_len - 1, cfr_source_index(index, source_fps, fps))
+                src_index = max(src_index, last_src + 1)
+                src_index = min(dec_len - 1, src_index)
+                last_src = src_index
+                frame = dec.frame_at(src_index)
+                if frame_stage is not None or alpha_threaded_owned_copy:
+                    frame = frame.owned_copy()
+                yield index, frame
+
+        frames = decoded_frames()
+        if frame_stage is not None:
+            frames = iter_stage_frames(frame_stage, frames)
+        for i, (out_idx, frame) in enumerate(frames):
             if _cancelled():
                 return
             want = _budget_for(i)
@@ -610,30 +663,29 @@ def iter_pynv_passthrough_annexb_frames(
                     )
                     schedule = []       # stop retrying; stay on the initial rate
                     hr_adapt = False
-            out_idx = start_out + i
-            src_idx = min(dec_len - 1, cfr_source_index(out_idx, source_fps, fps))
-            if src_idx <= last_src_idx:
-                src_idx = min(dec_len - 1, last_src_idx + 1)
-            last_src_idx = src_idx
-            frame = dec.frame_at(src_idx)
             nv12_slot = None
             if frame_stage is not None:
-                out_nv12 = frame_stage.process(frame, out_idx)
+                out_nv12 = frame
             elif alpha_packer is not None:
-                if alpha_threaded_owned_copy:
-                    frame = frame.owned_copy()
+                overlay = subtitle_overlay._subtitle_overlay_for_time(subtitle_renderer, out_idx / fps)
+                def before_pack(nv12):
+                    if subtitle_renderer is None or overlay is None:
+                        return []
+                    return subtitle_overlay._subtitle_overlay_positions(nv12, subtitle_renderer, overlay)
                 if isinstance(frame, GpuP016Frame):
                     out_nv12, _timing = alpha_packer.pack_gpu_p016_frame(
                         frame,
                         shift_bits=config.PASSTHROUGH_PYNV_10BIT_SHIFT,
                         out_h=out_h,
                         out_w=out_w,
+                        before_pack=before_pack,
                     )
                 else:
                     out_nv12, _timing = alpha_packer.pack_gpu_nv12_frame(
                         frame,
                         out_h=out_h,
                         out_w=out_w,
+                        before_pack=before_pack,
                     )
             elif isinstance(frame, GpuP016Frame):
                 nv12_slot = matter.acquire_nv12_output_slot(out_h, out_w)
@@ -652,6 +704,8 @@ def iter_pynv_passthrough_annexb_frames(
                     out_w=out_w,
                     out_slot=nv12_slot,
                 )
+            if alpha_packer is None:
+                subtitle_overlay._apply_subtitle_overlay(out_nv12, subtitle_renderer, out_idx / fps)
             cuda_stream = getattr(matting_module, "_CUDA_STREAM", None)
             if cuda_stream is not None:
                 cuda_stream.synchronize()
@@ -721,6 +775,9 @@ def iter_pynv_passthrough_annexb_frames(
             for au in split_hevc_annexb_access_units(tail):
                 yield au
     finally:
+        if processing_settings and "light_match" in processing_settings:
+            matter._seek_light_match_state = previous_light_state
+            matter._light_match_version = -1
         while pending_nv12_slots:
             matter.release_nv12_output_slot(pending_nv12_slots.pop(0))
         if dec is not None:
@@ -862,7 +919,7 @@ def _cleanup_stale_audio_tmp_files() -> None:
         _audio_tmp_cleanup_done = True
 
 
-class PyNvPassthroughStream:
+class PyNvPassthroughStream(GpuSubtitleOverlay):
     """PyNv decode -> GPU matting -> PyNv HEVC encode -> FFmpeg mux."""
 
     def __init__(
@@ -1506,203 +1563,6 @@ class PyNvPassthroughStream:
         uv[:, :, 0].fill(u)
         uv[:, :, 1].fill(v)
         return frame
-
-    def _subtitle_kernels(self):
-        global _SUBTITLE_BLEND_Y_KERNEL, _SUBTITLE_BLEND_UV_KERNEL
-        if _SUBTITLE_BLEND_Y_KERNEL is not None and _SUBTITLE_BLEND_UV_KERNEL is not None:
-            return _SUBTITLE_BLEND_Y_KERNEL, _SUBTITLE_BLEND_UV_KERNEL
-        import cupy as cp
-
-        _SUBTITLE_BLEND_Y_KERNEL = cp.RawKernel(
-            r"""
-            extern "C" __global__
-            void blend_rgba_y_to_nv12(
-                unsigned char* frame,
-                const unsigned char* rgba,
-                int frame_w,
-                int frame_h,
-                int overlay_w,
-                int overlay_h,
-                int dst_x,
-                int dst_y)
-            {
-                int x = blockDim.x * blockIdx.x + threadIdx.x;
-                int y = blockDim.y * blockIdx.y + threadIdx.y;
-                if (x >= overlay_w || y >= overlay_h) return;
-                int fx = dst_x + x;
-                int fy = dst_y + y;
-                if (fx < 0 || fy < 0 || fx >= frame_w || fy >= frame_h) return;
-                int oi = (y * overlay_w + x) * 4;
-                float a = rgba[oi + 3] / 255.0f;
-                if (a <= 0.0f) return;
-                float r = rgba[oi + 0];
-                float g = rgba[oi + 1];
-                float b = rgba[oi + 2];
-                float yy = 16.0f + (65.738f * r + 129.057f * g + 25.064f * b) / 256.0f;
-                int yi = fy * frame_w + fx;
-                frame[yi] = (unsigned char)(frame[yi] * (1.0f - a) + yy * a + 0.5f);
-            }
-            """,
-            "blend_rgba_y_to_nv12",
-        )
-        _SUBTITLE_BLEND_UV_KERNEL = cp.RawKernel(
-            r"""
-            extern "C" __global__
-            void blend_rgba_uv_to_nv12(
-                unsigned char* frame,
-                const unsigned char* rgba,
-                int frame_w,
-                int frame_h,
-                int overlay_w,
-                int overlay_h,
-                int dst_x,
-                int dst_y)
-            {
-                int ux = blockDim.x * blockIdx.x + threadIdx.x;
-                int uy = blockDim.y * blockIdx.y + threadIdx.y;
-                int uv_w = (overlay_w + 1) / 2;
-                int uv_h = (overlay_h + 1) / 2;
-                if (ux >= uv_w || uy >= uv_h) return;
-                int ox0 = ux * 2;
-                int oy0 = uy * 2;
-                int fx0 = dst_x + ox0;
-                int fy0 = dst_y + oy0;
-                int uv_fx = fx0 & ~1;
-                int uv_fy = fy0 & ~1;
-                if (uv_fx < 0 || uv_fy < 0 || uv_fx + 1 >= frame_w || uv_fy + 1 >= frame_h) return;
-
-                float a_sum = 0.0f;
-                float r_sum = 0.0f;
-                float g_sum = 0.0f;
-                float b_sum = 0.0f;
-                for (int dy = 0; dy < 2; ++dy) {
-                    for (int dx = 0; dx < 2; ++dx) {
-                        int ox = ox0 + dx;
-                        int oy = oy0 + dy;
-                        int fx = dst_x + ox;
-                        int fy = dst_y + oy;
-                        if (ox >= overlay_w || oy >= overlay_h || fx < 0 || fy < 0 || fx >= frame_w || fy >= frame_h) continue;
-                        int oi = (oy * overlay_w + ox) * 4;
-                        float a = rgba[oi + 3] / 255.0f;
-                        if (a <= 0.0f) continue;
-                        a_sum += a;
-                        r_sum += rgba[oi + 0] * a;
-                        g_sum += rgba[oi + 1] * a;
-                        b_sum += rgba[oi + 2] * a;
-                    }
-                }
-                if (a_sum <= 0.0f) return;
-                float a = fminf(1.0f, a_sum / 4.0f);
-                float r = r_sum / a_sum;
-                float g = g_sum / a_sum;
-                float b = b_sum / a_sum;
-                float uu = 128.0f + (-37.945f * r - 74.494f * g + 112.439f * b) / 256.0f;
-                float vv = 128.0f + (112.439f * r - 94.154f * g - 18.285f * b) / 256.0f;
-                int uv_i = frame_w * frame_h + (uv_fy / 2) * frame_w + uv_fx;
-                frame[uv_i] = (unsigned char)(frame[uv_i] * (1.0f - a) + uu * a + 0.5f);
-                frame[uv_i + 1] = (unsigned char)(frame[uv_i + 1] * (1.0f - a) + vv * a + 0.5f);
-            }
-            """,
-            "blend_rgba_uv_to_nv12",
-        )
-        return _SUBTITLE_BLEND_Y_KERNEL, _SUBTITLE_BLEND_UV_KERNEL
-
-    def _subtitle_overlay_for_time(self, renderer: SubtitleRenderer | None, pts_sec: float):
-        if renderer is None or not renderer.enabled:
-            return None
-        return renderer.overlay_for_time(pts_sec)
-
-    def _subtitle_overlay_positions(self, out_nv12, renderer: SubtitleRenderer, overlay):
-        rgba, left, top = overlay
-        if rgba.size <= 0:
-            return []
-        h, w = int(out_nv12.shape[0] * 2 // 3), int(out_nv12.shape[1])
-        del h
-        eye_w = w // 2 if w >= 3000 else w
-        mode = config.SUBTITLE_MODE
-        if mode == "auto":
-            mode = "dual" if w >= 3000 else "mono"
-        if mode == "left":
-            positions = [(left, top)]
-        elif mode == "right":
-            positions = [(eye_w + left, top)]
-        elif mode == "dual":
-            parallax = renderer.parallax_px()
-            positions = [(left, top), (eye_w + left + parallax, top)]
-        else:
-            positions = [(max(0, (w - int(rgba.shape[1])) // 2), top)]
-        return [(rgba, x, y) for x, y in positions]
-
-    def _blend_subtitle_overlay(self, out_nv12, renderer: SubtitleRenderer, overlay) -> None:
-        if overlay is None:
-            return
-        import cupy as cp
-
-        rgba, left, top = overlay
-        if rgba.size <= 0:
-            return
-        rgba_dev = cp.asarray(rgba)
-        y_kernel, uv_kernel = self._subtitle_kernels()
-        h, w = int(out_nv12.shape[0] * 2 // 3), int(out_nv12.shape[1])
-        positions = [(x, y) for _rgba, x, y in self._subtitle_overlay_positions(out_nv12, renderer, overlay)]
-        block = (16, 16)
-        grid_y = ((int(rgba.shape[1]) + block[0] - 1) // block[0], (int(rgba.shape[0]) + block[1] - 1) // block[1])
-        grid_uv = (((int(rgba.shape[1]) + 1) // 2 + block[0] - 1) // block[0], ((int(rgba.shape[0]) + 1) // 2 + block[1] - 1) // block[1])
-        for x, y in positions:
-            y_kernel(
-                grid_y,
-                block,
-                (
-                    out_nv12,
-                    rgba_dev,
-                    w,
-                    h,
-                    int(rgba.shape[1]),
-                    int(rgba.shape[0]),
-                    int(x),
-                    int(y),
-                ),
-            )
-            uv_kernel(
-                grid_uv,
-                block,
-                (
-                    out_nv12,
-                    rgba_dev,
-                    w,
-                    h,
-                    int(rgba.shape[1]),
-                    int(rgba.shape[0]),
-                    int(x),
-                    int(y),
-                ),
-            )
-        cp.cuda.get_current_stream().synchronize()
-
-    def _blend_positioned_subtitle_overlays(self, out_nv12, positioned_overlays) -> None:
-        if not positioned_overlays:
-            return
-        import cupy as cp
-
-        y_kernel, uv_kernel = self._subtitle_kernels()
-        h, w = int(out_nv12.shape[0] * 2 // 3), int(out_nv12.shape[1])
-        block = (16, 16)
-        for rgba, x, y in positioned_overlays:
-            if rgba.size <= 0:
-                continue
-            rgba_dev = cp.asarray(rgba)
-            overlay_h, overlay_w = int(rgba.shape[0]), int(rgba.shape[1])
-            grid_y = ((overlay_w + block[0] - 1) // block[0], (overlay_h + block[1] - 1) // block[1])
-            grid_uv = (((overlay_w + 1) // 2 + block[0] - 1) // block[0], ((overlay_h + 1) // 2 + block[1] - 1) // block[1])
-            y_kernel(grid_y, block, (out_nv12, rgba_dev, w, h, overlay_w, overlay_h, int(x), int(y)))
-            uv_kernel(grid_uv, block, (out_nv12, rgba_dev, w, h, overlay_w, overlay_h, int(x), int(y)))
-        cp.cuda.get_current_stream().synchronize()
-
-    def _apply_subtitle_overlay(self, out_nv12, renderer: SubtitleRenderer | None, pts_sec: float) -> None:
-        overlay = self._subtitle_overlay_for_time(renderer, pts_sec)
-        if renderer is None or overlay is None:
-            return
-        self._blend_subtitle_overlay(out_nv12, renderer, overlay)
 
     def _slate_audio_server_loop(self, server: socket.socket) -> None:
         conn: socket.socket | None = None

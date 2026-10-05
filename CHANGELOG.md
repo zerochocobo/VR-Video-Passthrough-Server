@@ -4,10 +4,26 @@ This file only keeps version releases, major bug fixes, major UI/UX updates, and
 
 ## English
 
+### 2026-10-03
+
+- **SI virtual-file playback fixes:** DLNA now advertises an estimated size while audio is cold and the exact size once prepared, refreshes Browse metadata when preparation finishes, and reports the copied video's HEVC/H.264 profile. Background audio preparation, bounded HTTP read batching, and nonblocking virtual MP4 HEAD handling reduce first-play delays and request stalls.
+- **SI dubbing ducking parity:** Virtual-file audio mixing now honors the dedicated `.si.duck.wav` control track and the same dubbing preset as live SI. Audio, layout, and library caches track duck-file and effective-setting changes so playback does not reuse an outdated mix.
+- **Preprocessed SI mixed audio:** Added validated reuse of same-stem `.si.mix.m4a` and `.si.mix.json` files produced by the video toolbox. Matching prepared AAC is read directly for Browse, prewarm, HEAD, and Range playback without extracting, re-encoding, or duplicating audio into the runtime cache; original video samples are preserved. Missing, stale, damaged, or mismatched prepared audio falls back to the existing mixing path.
+
+### 2026-10-02
+
+- **More seekable virtual MP4 modes:** Face Beauty, Remove Mosaic, 2D-to-3D, and SI now offer virtual-file playback through the shared playback selector, while retaining live directories when live mode is selected. The new video effects use the frame-based GPU path; RM retains eight-frame processing and recurrent state, and 2D-to-3D outputs native side-by-side stereo. SI uses copied video with a prepared whole-file mixed AAC track.
+- **Virtual-file subtitles and effect consistency:** Added shared GPU subtitle rendering to seek playback, including stereo placement and Alpha subtitles before packing. Effect settings and subtitle fingerprints now identify frame caches, first-frame subtitle rendering waits for completion, and lighting settings remain fixed during frame generation to prevent stale or inconsistent output after seeking or changing settings.
+- **DLNA and seek-route correctness:** Added dedicated virtual-file IDs for the new video effects, corrected output dimensions and Browse child counts, and preserved the playback mode in the URL path across Range requests. HEAD and GET share feature/source validation and reject disabled or unsupported effects instead of silently switching modes.
+
 ### 2026-09-13
 
-- **DLSS 5 Neural Rendering (hidden):** Added realtime `[DLSS5]` playback and offline DLSS5 conversion. It did not beat RTX VSR 1x on VR sources, so its entries are hidden by default (`dlss5_card_visible` in `ui_settings.json`).
+- **DLSS 5 Neural Rendering (hidden):** Added realtime live and seekable `[DLSS5]` playback with parameter controls and source/performance gates. It did not beat RTX VSR 1x on VR sources, so its entries are hidden by default (`dlss5_card_visible` in `ui_settings.json`).
 - **Adaptive Dashboard columns:** The card grid switches between three and four columns with the visible cards, without gaps.
+
+### 2026-09-12
+
+- **DLSS 5 processing groundwork:** Added the Neural Rendering runtime bridge, configurable rendering parameters, GPU-resident NV12/RGB processing stage, and a single/batch offline conversion engine with `[DLSS5]` output naming. Runtime initialization and GPU-stage inference were verified on an RTX 5060 Ti; public playback channels and UI integration followed on September 13.
 
 ### 2026-09-11
 
@@ -67,15 +83,31 @@ This file only keeps version releases, major bug fixes, major UI/UX updates, and
 
 ### 2026-07-20
 
-- **Desktop UI v1.2.0 overhaul:** Replaced the legacy expanding Home layout with a fixed navigation rail, feature-card dashboard, standalone Offline Tools, Subtitle Style, Logs, and scrolling Settings pages. Updated card grouping, naming, lock-state feedback, player-support entry points, and the three localized interfaces.
-- **DLNA/settings update:** Added editable DLNA server name and HTTP port with an explicit Save/restart flow, synchronized the active port across status polling and live controls, and made normal DLNA subtitle-sidecar discovery independent from the realtime hard-subtitle switch.
-- **Remove Mosaic model update:** Integrated the 8-frame recurrent chunk restoration model with batched mosaic regions and cross-chunk state reuse for realtime and offline processing. The release UI now hides the experimental Remove Mosaic cards and the Settings-page Feature debug status block while retaining saved-setting compatibility.
-- **RTX Video Super Resolution:** Added standalone realtime and offline NVIDIA RTX VSR features, isolated evaluation preflight/timeouts, unified source/resolution/bit-depth gates, `[SuperRes]` DLNA routes, time-index/seek handling, and safe rejection instead of silent fallback when a source or runtime is unsupported.
+- **Desktop UI refinements:** Refined dashboard card ordering and SuperRes settings wording. The release UI hides the experimental Remove Mosaic cards and the Settings-page Feature debug status block while retaining saved-setting compatibility.
 - **GPU-resident offline SuperRes:** Added the NVDEC/PyNv -> CUDA -> NGX VSR -> HDR-look -> NVENC pipeline, source-audio stream-copy remuxing, progress/ETA reporting, and adaptive `8K VR / 4K 2D` output. SBS VR is processed as two GPU-resident eyes and rejoined at 8192x4096; existing `_2K`, `_4K`, and `_8K` outputs are skipped by batch discovery.
 - **SuperRes quality and appearance controls:** Added Off/Natural/Vivid SDR HDR-look processing, Low/Medium/High/Ultra NGX quality choices on the dashboard, P1/P4/P7 offline NVENC presets, and a prominent localized warning recommending lower quality or global output FPS for 4K-VR-to-8K-VR work on lower-end GPUs.
 - **RTX VSR performance diagnostics:** Added opt-in Python/CUDA and native bridge stage timing, fused NV12 conversion with left/right-eye RGBA preparation, and verified identical output with SSIM 1.0. RTX 5060 Ti testing established that 8K VR Ultra is NGX-compute-bound at roughly 23-24 FPS; whole-frame evaluation, removed synchronizations, async encode, and dual-instance ideas do not provide a safe path to 60 FPS.
-- **SuperRes correctness fixes:** Fixed realtime RGBA stride handling that caused gray/tiled frames, fixed empty DLNA SuperRes directories and stale object IDs, made preflight non-blocking/retryable, fixed realtime target/quality/HDR environment propagation, protected GPU output with ring buffers, drained FFmpeg pipes safely, and preserved audio through the offline HEVC mux flow.
+- **SuperRes configuration and audio fixes:** Fixed realtime target/quality/HDR environment propagation and preserved source audio through the offline HEVC mux flow.
 - **RTX VSR packaging:** Bundled the precompiled CUDA 12.6 bridge, NGX runtime, local CUDA runtime, license, and version metadata into both PyInstaller outputs; added build-time runtime verification and confirmed frozen bridge loading, real NGX evaluation, and the standalone offline SuperRes command.
+
+### 2026-07-19
+
+- **RTX Video Super Resolution:** Completed standalone realtime and offline RTX VSR entry points, localized target/quality controls, aspect-preserving output, `[SuperRes]` DLNA directories and time indexes, and SuperRes seek routing. Added isolated evaluation preflight/timeouts and shared source/resolution/bit-depth gates, with explicit rejection when a source or runtime is unsupported. Short realtime and offline GPU video checks succeeded.
+- **SuperRes playback fixes:** Fixed RGBA stride handling that caused gray/tiled realtime frames, empty DLNA directories and stale object IDs, and blocking or permanently cached failed preflight checks. Ring buffers protect GPU output, FFmpeg pipes are drained safely, and batch discovery skips existing SuperRes outputs.
+- **Dashboard controls:** Refined feature grouping, names, player-support entry points, and server-running lock feedback. Added a persisted 2D passthrough switch and separate projection controls, with matching English, Chinese, and Japanese interfaces.
+
+### 2026-07-18
+
+- **RTX VSR runtime integration:** Added the initial CUDA 12.6 native bridge, Python bindings, configuration, realtime/offline processing branches, and PyInstaller runtime collection under `models/rtx_vsr`. Capability initialization succeeded; end-to-end video evaluation was still pending and was completed on July 19.
+
+### 2026-07-17
+
+- **Desktop UI v1.2.0 overhaul:** Replaced the expanding Home configuration rows with a fixed navigation rail, feature-card dashboard, and separate Offline Tools, Subtitle Style, Logs, and scrolling Settings pages. A shared debug visibility setting gates both realtime and offline Remove Mosaic entries and blocks direct navigation when hidden.
+- **DLNA/settings update:** Added editable DLNA server name and HTTP port with an explicit Save/restart flow, synchronized the active port across status polling and live controls, and made normal DLNA subtitle-sidecar discovery independent from the realtime hard-subtitle switch.
+
+### 2026-07-16
+
+- **Remove Mosaic model update:** Integrated the eight-frame recurrent chunk restoration model into realtime and offline processing, with batched mosaic regions, region matching and state reuse across chunks, and correct final-chunk padding. A separate TensorRT cache bucket prevents reuse of the old window-model engines; the reopened UI entry preserves saved enablement while remaining disabled by default.
 
 ### 2026-07-01
 
@@ -133,6 +165,11 @@ This file only keeps version releases, major bug fixes, major UI/UX updates, and
 - **GPU-resident 2DVR pipeline:** Added the PyNv/CuPy GPU path for decode, DA3 depth, stereo rendering, NVENC output, and VR projections, with TensorRT as the default DA3 acceleration path.
 - **Realtime 2D-to-3D groundwork:** Added the `two_dvr` passthrough mode, DLNA `[2D>3D]` live entries, `/passthrough_live mode=two_dvr`, offline output detection/naming, and DA3 TensorRT startup prewarm.
 - **CUDA runtime hardening:** Moved toward self-contained pip CUDA runtime components for CuPy/ONNX Runtime and sm_120-class GPUs, reducing dependence on a system CUDA toolkit.
+
+### 2026-06-02
+
+- **Optional BiRefNet recognition:** Added YOLO26m + BiRefNet ROI segmentation as a higher-VRAM recognition option for offline MatAnyone2 Medium, with CLI/UI selection and updated setup instructions. The default remains YOLO26m + EfficientSAM; the BiRefNet option is labeled for 11 GB+ VRAM. Stable sigmoid handling also removes overflow warnings from extreme mask logits across the prepass backends.
+- **Offline UI exit-code crash fix:** Normalized unsigned Windows process exit codes before emitting Qt signals, preventing an `OverflowError` when an offline child exits with values such as `0xFFFFFFFF`.
 
 ### 2026-06-01
 
@@ -334,10 +371,26 @@ This file only keeps version releases, major bug fixes, major UI/UX updates, and
 
 ## 中文
 
+### 2026-10-03
+
+- **SI虚拟文件播放修复：** DLNA在冷音轨阶段显示估算大小，准备完成后更新为准确大小并刷新Browse元数据，视频编码声明跟随原片HEVC/H.264。后台音轨准备、分块合并HTTP读取和非阻塞虚拟MP4 HEAD处理减少首次播放等待与请求阻塞。
+- **SI配音压低一致性：** 虚拟文件混音现在使用专用`.si.duck.wav`控制音轨，并与实时SI采用相同配音预设；音频、布局及媒体库缓存会跟踪duck文件和实际混音参数变化，避免复用旧混音。
+- **复用预生成SI混音：** 支持校验并直接使用视频工具箱生成的同名`.si.mix.m4a`和`.si.mix.json`。参数匹配的AAC在Browse、预热、HEAD和Range播放中直接读取，不再提取、重编码或向runtime缓存复制音频，并保留原视频样本；文件缺失、过期、损坏或参数不匹配时回退到原混音流程。
+
+### 2026-10-02
+
+- **更多可拖动虚拟MP4模式：** 美颜、马赛克复原、2D转3D及SI接入共享播放方式选择器，可选择虚拟文件或保留实时目录。新增视频效果使用逐帧GPU链路，RM保留8帧处理与递归状态，2D转3D输出原生左右SBS；SI采用原视频复制与整片混音AAC音轨。
+- **虚拟文件字幕与效果一致性：** seek播放接入共享GPU字幕渲染，支持双眼字幕定位及Alpha打包前字幕。帧缓存加入效果参数和字幕指纹，首帧等待字幕渲染完成，生成期间固定光照设置，避免拖动或调参后复用旧画面或产生效果不一致。
+- **DLNA与seek路由修复：** 为新增视频效果加入独立虚拟文件ID，修正输出尺寸和Browse子项计数，并将播放模式保留在URL路径中以适配Range请求。HEAD与GET共用功能/片源校验，禁用或不支持的效果会明确拒绝，不再静默切换模式。
+
 ### 2026-09-13
 
-- **DLSS 5神经渲染（已隐藏）：** 新增实时`[DLSS5]`播放和离线DLSS5转换。VR片源上效果不如RTX VSR 1x，入口默认隐藏（`ui_settings.json`中的`dlss5_card_visible`）。
+- **DLSS 5神经渲染（已隐藏）：** 新增实时直播及可拖动`[DLSS5]`播放、参数控制与片源/性能门控。VR片源上效果不如RTX VSR 1x，入口默认隐藏（`ui_settings.json`中的`dlss5_card_visible`）。
 - **首页自适应列数：** 卡片网格随可见卡片在3列和4列之间切换，不留空位。
+
+### 2026-09-12
+
+- **DLSS 5处理链基础：** 新增神经渲染运行时bridge、可调渲染参数、GPU驻留NV12/RGB处理stage，以及支持单文件/批量和`[DLSS5]`命名的离线转换引擎。RTX 5060 Ti上已验证运行时初始化与GPU stage推理；对外播放通道和UI于9月13日接通。
 
 ### 2026-09-11
 
@@ -397,15 +450,31 @@ This file only keeps version releases, major bug fixes, major UI/UX updates, and
 
 ### 2026-07-20
 
-- **桌面UI v1.2.0重构：** 将旧版首页伸缩配置区替换为固定导航栏、功能卡片首页以及独立的离线工具、字幕样式、日志和可滚动设置页面；同步调整功能分组、名称、服务器运行锁定提示、播放器支持入口和中英日界面。
-- **DLNA与设置更新：** 新增可编辑的DLNA服务器名称和HTTP端口、明确的保存/重启生效流程，并让状态轮询和实时控制始终使用实际端口；普通DLNA外挂字幕发现不再受实时硬字幕开关影响。
-- **马赛克复原模型更新：** 实时与离线处理接入8帧递归chunk复原模型，支持多马赛克区域批处理和跨chunk状态复用。发布界面隐藏实验性的马赛克复原卡片及设置页“功能调试状态”区块，同时保留已保存配置兼容性。
-- **NVIDIA RTX视频超分辨率：** 新增独立的实时和离线RTX VSR功能、隔离子进程Evaluate预检/超时、统一源分辨率/位深门控、`[SuperRes]` DLNA目录、时间索引和seek支持；运行时或视频不支持时明确拒绝，不再静默降级。
+- **桌面UI细节调整：** 调整首页卡片顺序和超分设置文案。发布界面隐藏实验性的马赛克复原卡片及设置页“功能调试状态”区块，同时保留已保存配置兼容性。
 - **全GPU离线超分：** 新增NVDEC/PyNv -> CUDA -> NGX VSR -> HDR观感 -> NVENC链路、源音频无损复用封装、进度/ETA日志和自适应“8K VR / 4K 2D”输出。SBS VR在GPU内拆成左右眼处理并重组为8192x4096，批处理会跳过已有`_2K`、`_4K`和`_8K`成品。
 - **超分质量与观感配置：** 新增关闭/自然/鲜明三种SDR HDR观感，首页目标质量提供低/中/高/超高，离线NVENC提供P1/P4/P7；增加醒目的多语言提示，建议低端显卡进行4K VR转8K VR时降低目标质量或全局输出FPS。
 - **RTX VSR性能诊断：** 新增可选Python/CUDA及Native bridge分阶段计时，融合NV12转换和左右眼RGBA准备，并以SSIM 1.0确认画面完全一致。RTX 5060 Ti实测表明8K VR超高质量受NGX计算限制，约23-24 FPS；整帧调用、删除同步、异步编码及双实例均无法安全实现60 FPS。
-- **SuperRes正确性修复：** 修复实时RGBA步幅错误造成的灰色/重复平铺画面、空DLNA SuperRes目录及旧Object ID缓存；预检改为非阻塞且失败可重试，修复实时目标/质量/HDR环境变量传递，使用环形GPU输出缓冲，安全排空FFmpeg管道，并修复离线HEVC封装丢失音频。
+- **SuperRes配置与音频修复：** 修复实时目标/质量/HDR环境变量传递，并修复离线HEVC封装丢失源音频。
 - **RTX VSR打包：** 两个PyInstaller产物均打包预编译CUDA 12.6 bridge、NGX运行库、本地CUDA runtime、许可证和版本信息；增加构建后资源校验，并验证冻结程序可加载bridge、完成真实NGX Evaluate及运行独立离线超分命令。
+
+### 2026-07-19
+
+- **NVIDIA RTX视频超分辨率：** 完成独立实时/离线RTX VSR入口、多语言目标分辨率/质量控制、保持宽高比的输出、`[SuperRes]` DLNA目录与时间索引及SuperRes seek路由；增加隔离子进程Evaluate预检/超时和统一片源分辨率/位深门控，不支持的片源或运行时会明确拒绝。短片实时与离线GPU链路均已验证。
+- **SuperRes播放修复：** 修复RGBA步幅错误造成的实时灰色/重复平铺画面、空DLNA目录和旧Object ID缓存，以及预检阻塞或失败结果被永久缓存的问题；使用环形缓冲保护GPU输出，安全排空FFmpeg管道，批处理跳过已有超分成品。
+- **首页控制调整：** 调整功能分组、名称、播放器支持入口与服务器运行锁定提示；新增持久化2D透视开关和独立投影设置，同步中英日界面。
+
+### 2026-07-18
+
+- **RTX VSR运行时接入：** 新增首版CUDA 12.6 native bridge、Python绑定、配置项、实时/离线处理分支，以及统一位于`models/rtx_vsr`的PyInstaller运行库收集。已验证能力初始化，端到端视频Evaluate当日仍待验证，于7月19日完成。
+
+### 2026-07-17
+
+- **桌面UI v1.2.0重构：** 将首页伸缩配置行替换为固定导航栏、功能卡片首页，以及独立的离线工具、字幕样式、日志和可滚动设置页面。共享调试可见性设置同时控制实时/离线马赛克复原入口，并在隐藏时阻止直接进入。
+- **DLNA与设置更新：** 新增可编辑的DLNA服务器名称和HTTP端口、明确的保存/重启生效流程，并让状态轮询和实时控制始终使用实际端口；普通DLNA外挂字幕发现不再受实时硬字幕开关影响。
+
+### 2026-07-16
+
+- **马赛克复原模型更新：** 实时与离线处理接入8帧递归chunk复原模型，支持多区域批处理、区域匹配与跨chunk状态复用，并正确补齐尾部chunk。独立TensorRT缓存目录避免复用旧滑窗模型引擎；重新开放UI入口并保留用户已有启用设置，默认仍关闭。
 
 ### 2026-07-01
 
@@ -463,6 +532,11 @@ This file only keeps version releases, major bug fixes, major UI/UX updates, and
 - **GPU 常驻 2DVR 链路：** 新增 PyNv/CuPy GPU 路径，覆盖解码、DA3 深度、立体渲染、NVENC 输出和 VR 投影，并默认使用 TensorRT 加速 DA3。
 - **实时 2D 转 3D 基座：** 新增 `two_dvr` passthrough 模式、DLNA `[2D>3D]` live 入口、`/passthrough_live mode=two_dvr`、离线输出识别/命名，以及 DA3 TensorRT 启动预热。
 - **CUDA 运行时加固：** 转向使用自包含的 pip CUDA 运行时组件支持 CuPy/ONNX Runtime 和 sm_120 级 GPU，降低对系统 CUDA toolkit 的依赖。
+
+### 2026-06-02
+
+- **可选BiRefNet识别：** 为离线MatAnyone2中速新增高显存YOLO26m + BiRefNet ROI分割选项、CLI/UI选择及模型说明。默认仍为YOLO26m + EfficientSAM，BiRefNet标注需要至少11GB显存；各前置识别后端改用稳定sigmoid，消除极端mask logits导致的溢出警告。
+- **离线UI退出码崩溃修复：** 在发送Qt信号前将Windows无符号进程退出码转换为有符号值，避免离线子进程返回`0xFFFFFFFF`等值时触发`OverflowError`。
 
 ### 2026-06-01
 
