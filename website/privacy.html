@@ -1,0 +1,233 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="Privacy policy for Thru3D Media Player on Meta Quest and PICO, and Thru3D Media Server for Windows.">
+  <title>Privacy Policy | Thru3D Media Player &amp; Media Server</title>
+  <link rel="icon" type="image/png" href="assets/thru3d-icon.png">
+  <link rel="stylesheet" href="styles.css">
+  <link rel="stylesheet" href="privacy.css">
+  <script src="privacy.js" defer></script>
+</head>
+<body class="privacy-page">
+  <header class="site-header">
+    <a class="brand" href="index.html" data-home-link><img src="assets/thru3d-icon.png" alt="" width="40" height="40"><span>Thru3D</span><span class="sr-only">Media Player / <span data-server-name>Thru3D Media Server</span></span></a>
+    <nav class="language-switcher" aria-label="Language">
+      <a href="?lang=en#en" lang="en" hreflang="en" data-policy-language="en">EN</a>
+      <a href="?lang=zh#zh" lang="zh-CN" hreflang="zh-CN" data-policy-language="zh">中文</a>
+      <a href="?lang=ja#ja" lang="ja" hreflang="ja" data-policy-language="ja">日本語</a>
+    </nav>
+  </header>
+  <main class="privacy-main">
+    <article id="en" lang="en" class="privacy-policy" data-policy="en">
+      <header class="privacy-heading">
+        <p class="eyebrow">FFSKY / THRU3D / VR VIDEO PASSTHROUGH SERVER</p>
+        <h1>Privacy Policy</h1>
+        <p class="privacy-date"><time datetime="2026-10-07">Effective and last updated: October 7, 2026</time></p>
+        <p>This policy covers <strong>Thru3D Media Player</strong> for Meta Quest and PICO (application ID: <code>com.wapok.thru3d</code>), <strong>Thru3D Media Server</strong> for Windows, and this website. These products are provided by <strong>FFSKY</strong>, with producer <strong>FFSKYChocobo</strong>.</p>
+        <p>Your media is processed on your headset or PC. No FFSKY account is required. We do not automatically upload your library or viewing history to our servers, and do not include advertising or behavioral analytics SDKs.</p>
+        <a class="privacy-contact" href="mailto:ffskyteam@gmail.com">ffskyteam@gmail.com <span aria-hidden="true">↗</span></a>
+      </header>
+      <nav class="privacy-contents" aria-label="Privacy Policy">
+        <a href="#en-data">Data & use</a>
+        <a href="#en-xr">XR & permissions</a>
+        <a href="#en-connections">Connections</a>
+        <a href="#en-deletion">Delete your data</a>
+      </nav>
+      <section id="en-data">
+        <h2>1. Media, settings and local data</h2>
+        <p>The apps read the media you select or authorize, including videos, pictures, audio, subtitles, file names, paths/URIs, sizes, durations and thumbnails, to browse, decode, display and process it. Local AI features process media frames on the device running the feature; we do not receive those frames for model training.</p>
+        <p>Thru3D saves recent media, playback positions, per-file display preferences and thumbnails locally for history, resume and browsing. You can disable saving history and clear existing history. The Windows server saves selected folders, processing settings, generated media and caches locally.</p>
+        <p>Local diagnostic logs may include device/runtime details, errors, performance information, media paths and network addresses. PC server request logs may include client IP addresses and requested URLs/media. Logs are not automatically sent to us.</p>
+      </section>
+      <section id="en-xr">
+        <h2>2. Headset data and permissions</h2>
+        <p>Thru3D uses head/controller poses, button input and, when enabled and supported, hand joint and gesture data from the headset runtime for viewpoint rendering and interaction. These data are processed during use; we do not build biometric profiles or send them to our servers. Passthrough displays your surroundings through the platform compositor. The app does not capture, save or upload raw passthrough camera images, and does not request microphone recording, eye tracking, contacts or precise location access.</p>
+        <p><strong>Media and storage:</strong> access to videos, images, audio and related files enables browsing and playback. On supported Android versions, “All files access” enables folder browsing across shared storage. A system file picker can also grant access to selected files.</p>
+        <p><strong>Network, Wi-Fi state and multicast:</strong> used to connect to selected sources and discover local DLNA/SMB servers. Internet access supports remote media and optional cloud connections. Head tracking, optional hand tracking and passthrough support immersive playback and controls.</p>
+        <p>You may deny or revoke applicable permissions in device settings and disable optional features. Functions dependent on that access may then be unavailable.</p>
+      </section>
+      <section id="en-connections">
+        <h2>3. Network sources and cloud accounts</h2>
+        <p>The Windows server makes the folders you configure, media metadata and streams available to clients that can reach its DLNA/HTTP service. Thru3D connects directly to the DLNA, SMB or other media sources you select. These servers receive your network address and browsing/playback requests, plus authentication information where required. Use a trusted network: local DLNA/HTTP traffic may be unencrypted.</p>
+        <p>When you save an SMB source, Thru3D stores its server address, share path and supplied username locally; saved passwords are encrypted using Android Keystore. Optional <strong>115 and Baidu Netdisk</strong> connections process account labels, login session cookies, file lists and playback URLs. Saved cloud sessions are encrypted with Android Keystore on the headset and excluded from Android app backup.</p>
+        <p>Cloud login is handled by the selected provider. The app sends session credentials and file requests to that provider and connects to its media/CDN servers for playback. The provider receives your IP address and request information under its own policy. This access uses no FFSKY-operated cloud relay. Removing a cloud account from Thru3D does not delete the provider’s account or files.</p>
+        <p>Software downloads and PC model/runtime downloads contact your selected host, such as GitHub, Hugging Face, a configured mirror or NVIDIA. The host receives ordinary network request information, such as IP address and requested resource. External sites and services apply their own privacy terms.</p>
+        <p>If you enable <strong>LAN WebDAV sharing</strong> in Thru3D, devices on your local network with the generated sharing password can browse and stream connected cloud files through your headset. This is optional and uses HTTP without transport encryption. Share the password only with trusted users; turn sharing off to stop access or reset its password to revoke existing credentials.</p>
+        <p>For other media-server connections, the app also processes server labels/addresses, account IDs, usernames and API keys or access tokens where required. Saved server profiles and credentials are encrypted on the headset using Android Keystore. They are used only to authenticate with and browse/play from the server you select; cover images may be cached locally.</p>
+      </section>
+      <section id="en-platforms">
+        <h2>4. Meta Quest, PICO and third-party services</h2>
+        <p>Meta and PICO independently operate their stores, accounts, device services and runtimes. They may process purchase, device and diagnostic data under their own policies. We do not request your Meta/PICO password or import your friends list. Platform-side data processing is separate from the local processing described here.</p>
+        <p>You can manage platform privacy, diagnostic and account options using the relevant platform’s settings. See the privacy policies of <a href="https://www.meta.com/legal/privacy-policy/">Meta</a>, <a href="https://www.picoxr.com/global/legal/privacy-policy">PICO</a>, and <a href="https://policies.google.com/privacy">Google / Gmail</a>. For cloud accounts, consult the policy shown by your chosen provider during login.</p>
+      </section>
+      <section id="en-website">
+        <h2>5. Website and support</h2>
+        <p>This website reads your browser language and stores only your language preference in browser local storage (<code>ptserver-language</code>). Its pages do not embed advertising or analytics trackers. You can clear site data to remove the preference. The web host may process IP addresses, request times, browser/request information and access/security logs to deliver and protect the site; retention depends on the host’s configuration and policy.</p>
+        <p>If you email <a href="mailto:ffskyteam@gmail.com">ffskyteam@gmail.com</a>, we receive your email address, message and any attachments you choose to send. We use these only to respond to your request or provide support. Correspondence is processed through our email provider. Please do not send passwords, session cookies or unnecessary private media.</p>
+      </section>
+      <section id="en-deletion">
+        <h2>6. Retention and deleting your data</h2>
+        <p><strong>Thru3D:</strong> use the library history controls to disable or clear history, and Settings → Video → Clear cache to remove thumbnails. Remove saved cloud accounts and network servers from their management screens. Clearing app storage in device settings or uninstalling the app removes local app data. Source media and files outside app storage must be deleted separately. Revoke cloud sessions with the provider to invalidate them there; platform backups may need separate removal.</p>
+        <p><strong>Windows server:</strong> stop the server to stop sharing, or remove a shared folder from its configuration to stop exposing that folder. When no longer needed, delete saved application configuration, logs and caches, and remove generated output separately. Local files remain until cleared, replaced or deleted.</p>
+        <p><strong>Support:</strong> we retain correspondence only as needed to resolve your request, handle related issues or meet legal obligations, then delete or anonymize it. You can request deletion at any time. We do not hold a central copy of your local library or viewing history.</p>
+        <p>To request access, correction or deletion of personal data held by us, email <a href="mailto:ffskyteam@gmail.com?subject=Privacy%20data%20deletion%20request">ffskyteam@gmail.com</a> with the subject <strong>“Privacy data deletion request”</strong>, the product name and enough information to identify your previous contact. We may request minimal verification and will respond within the period required by applicable law. We will explain any legally required retention. For data held independently by Meta, PICO or a cloud provider, contact that provider or use its privacy controls.</p>
+      </section>
+      <section id="en-rights">
+        <h2>7. Use, security and your rights</h2>
+        <p>We do not sell personal information or share it for cross-service targeted advertising. We use information to provide requested functions, respond to support requests and protect the service. Necessary information may be processed by the email, hosting and platform providers described above, or disclosed when legally required.</p>
+        <p>Where a legal basis is required, processing relies on performing the service you request, legitimate interests in secure support, legal obligations or your consent for optional processing where required. Depending on applicable law, you may have rights to access, correct, delete, restrict or object to processing, obtain a portable copy, withdraw consent or complain to a data protection authority. Contact the email above to exercise applicable rights. Withdrawing consent does not affect prior lawful processing.</p>
+        <p>We use app-private storage and the credential protections described above. Security also depends on your device, servers and network; no storage or transmission method is completely secure. Service providers may process data outside your region under their own policies and applicable legal safeguards.</p>
+      </section>
+      <section id="en-children">
+        <h2>8. Children’s privacy</h2>
+        <p>We do not knowingly solicit or collect personal information from children or create advertising profiles about them. If a child has sent us personal information through support, a parent or guardian may contact us to request its deletion. Follow applicable age requirements, store ratings and platform parental controls when using these products or third-party services.</p>
+      </section>
+      <section id="en-changes">
+        <h2>9. Changes and contact</h2>
+        <p>When features or data practices change, we will update this page and its date, and provide additional notice or obtain consent where required. All three language versions describe the same products and practices. For privacy questions or requests, contact FFSKY at <a href="mailto:ffskyteam@gmail.com">ffskyteam@gmail.com</a>.</p>
+      </section>
+    </article>
+    <article id="zh" lang="zh-CN" class="privacy-policy" data-policy="zh">
+      <header class="privacy-heading">
+        <p class="eyebrow">FFSKY / THRU3D / VR VIDEO PASSTHROUGH SERVER</p>
+        <h1>隐私政策</h1>
+        <p class="privacy-date"><time datetime="2026-10-07">生效及更新日期：2026 年 10 月 7 日</time></p>
+        <p>本政策适用于 Meta Quest、PICO 版 <strong>Thru3D Media Player</strong>（应用 ID：<code>com.wapok.thru3d</code>）、Windows 版 <strong>Thru3D媒体服务器</strong>及本网站。上述产品由 <strong>FFSKY</strong> 提供，制作人为 <strong>FFSKYChocobo</strong>。</p>
+        <p>媒体在您的头显或电脑上处理，无需注册 FFSKY 账号。我们不将媒体库或观看历史自动上传至我们的服务器，也不使用广告或用户行为分析 SDK。</p>
+        <a class="privacy-contact" href="mailto:ffskyteam@gmail.com">ffskyteam@gmail.com <span aria-hidden="true">↗</span></a>
+      </header>
+      <nav class="privacy-contents" aria-label="隐私政策">
+        <a href="#zh-data">数据与用途</a>
+        <a href="#zh-xr">头显与权限</a>
+        <a href="#zh-connections">网络连接</a>
+        <a href="#zh-deletion">删除数据</a>
+      </nav>
+      <section id="zh-data">
+        <h2>1. 媒体、设置与本地数据</h2>
+        <p>应用读取您选择或授权访问的视频、图片、音频、字幕，以及文件名、路径或 URI、大小、时长、缩略图，用于浏览、解码、显示和处理。设备端 AI 功能在运行该功能的设备上处理媒体画面；我们不会接收这些画面用于模型训练。</p>
+        <p>Thru3D 在本地保存最近媒体、播放进度、逐文件显示偏好和缩略图，用于历史记录、续播和浏览。您可以关闭历史保存并清除已有记录。Windows 服务器在本地保存所选目录、处理设置、生成的媒体和缓存。</p>
+        <p>本地诊断日志可能包含设备或运行环境、错误、性能信息、媒体路径和网络地址。PC 服务器请求日志可能包含客户端 IP 和请求的地址或媒体。日志不会自动发送给我们。</p>
+      </section>
+      <section id="zh-xr">
+        <h2>2. 头显数据与权限</h2>
+        <p>Thru3D 使用头显运行时提供的头部和手柄位姿、按键输入，以及在启用且受支持时的手部关节和手势数据，用于视角渲染与交互。这些数据在使用过程中处理；我们不会建立生物特征档案，也不会将其发送到我们的服务器。透视通过平台合成器显示周围环境，应用不采集、保存或上传原始透视摄像头画面，也不请求麦克风录音、眼动追踪、通讯录或精确定位权限。</p>
+        <p><strong>媒体与存储：</strong>访问视频、图片、音频及相关文件，用于浏览和播放。在支持的 Android 版本中，“所有文件访问权限”用于浏览共享存储中的目录；也可通过系统文件选择器授予所选文件访问权限。</p>
+        <p><strong>网络、Wi-Fi 状态与组播：</strong>用于连接所选来源，发现局域网 DLNA/SMB 服务器。互联网连接用于远程媒体和可选网盘功能。头部追踪、可选手部追踪与透视用于沉浸式播放和操作。</p>
+        <p>您可在设备设置中拒绝或撤销相应权限，并关闭可选功能。依赖这些权限的功能可能因此无法使用。</p>
+      </section>
+      <section id="zh-connections">
+        <h2>3. 网络来源与网盘账号</h2>
+        <p>Windows 服务器将您配置的共享目录、媒体信息和媒体流提供给能够连接其 DLNA/HTTP 服务的客户端。Thru3D 直接连接您选择的 DLNA、SMB 或其他媒体来源。这些服务器会收到设备网络地址、浏览或播放请求，以及在需要认证时的身份验证信息。请使用可信网络：局域网 DLNA/HTTP 通信可能不加密。</p>
+        <p>保存 SMB 来源时，Thru3D 在本地保存服务器地址、共享路径及您提供的用户名；保存的密码使用 Android Keystore 加密。可选的 <strong>115、百度网盘</strong>连接会处理账号标签、登录会话 Cookie、文件列表和播放地址。保存的网盘会话在头显上使用 Android Keystore 加密，并排除在 Android 应用备份之外。</p>
+        <p>网盘登录由所选服务商处理。应用向对应服务发送会话凭据和文件请求，播放时还会连接其媒体或 CDN 服务器。服务商按自身政策接收您的 IP 地址和请求信息。这些访问不经过 FFSKY 运营的云端中转服务器。从 Thru3D 移除网盘账号不会删除服务商处的账号或文件。</p>
+        <p>下载软件或 PC 所需的模型、运行组件时，会连接您选择的下载来源，例如 GitHub、Hugging Face、配置的镜像或 NVIDIA。下载方会收到 IP 地址、所请求资源等常规网络请求信息。外部网站与服务适用各自的隐私条款。</p>
+        <p>如果在 Thru3D 中开启<strong>局域网 WebDAV 共享</strong>，同一局域网内持有生成的共享密码的设备可通过您的头显浏览和播放已连接的网盘文件。此功能需主动开启，使用未经传输加密的 HTTP。请仅向可信用户提供密码；关闭共享可停止访问，重置共享密码可使旧凭据失效。</p>
+        <p>对于其他媒体服务器连接，应用还会按需处理服务器名称或地址、账号 ID、用户名及 API 密钥或访问令牌。保存的服务器配置和凭据在头显上通过 Android Keystore 加密，仅用于向您选择的服务器认证、浏览和播放；封面图片可能缓存在本地。</p>
+      </section>
+      <section id="zh-platforms">
+        <h2>4. Meta Quest、PICO 与第三方服务</h2>
+        <p>Meta 与 PICO 独立运营商店、账号、设备服务和运行时，可能按各自政策处理购买、设备和诊断数据。我们不索取您的 Meta/PICO 密码，也不导入好友列表。平台自身的数据处理与本政策描述的本地处理相互独立。</p>
+        <p>您可以在对应平台设置中管理隐私、诊断和账号选项。请参阅 <a href="https://www.meta.com/legal/privacy-policy/">Meta</a>、<a href="https://www.picoxr.com/global/legal/privacy-policy">PICO</a> 及 <a href="https://policies.google.com/privacy">Google / Gmail</a> 的隐私政策。网盘账号请参阅所选服务商登录时展示的隐私政策。</p>
+      </section>
+      <section id="zh-website">
+        <h2>5. 网站与主动联系</h2>
+        <p>本网站读取浏览器语言，仅在浏览器本地存储中保存语言偏好（<code>ptserver-language</code>），页面不嵌入广告或行为分析追踪器。您可清除站点数据以删除偏好。网站托管服务可能为提供页面和保障安全而处理 IP 地址、请求时间、浏览器或请求信息及访问、安全日志；保留方式取决于托管服务配置和政策。</p>
+        <p>当您发送邮件至 <a href="mailto:ffskyteam@gmail.com">ffskyteam@gmail.com</a> 时，我们会收到您的邮箱、消息及您主动提供的附件，仅用于响应请求或提供支持。此类通信通过邮件服务商处理。请勿发送密码、会话 Cookie 或不必要的私人媒体。</p>
+      </section>
+      <section id="zh-deletion">
+        <h2>6. 保存期限与删除方式</h2>
+        <p><strong>Thru3D：</strong>通过媒体库的历史控制关闭保存或清除历史，通过“设置 → 视频 → 清除缓存”移除缩略图。在相应管理界面移除已保存的网盘账号和网络服务器。通过设备设置清除应用存储，或卸载应用，可删除本地应用数据。源媒体和应用存储之外的文件需另行删除。如需使网盘会话在服务商处失效，请同时通过服务商撤销会话；平台备份可能需要另行删除。</p>
+        <p><strong>Windows 服务器：</strong>停止服务器可停止共享，从配置中移除共享目录可停止公开该目录。无需保留时，删除应用保存的配置、日志和缓存，并按需另行删除生成的输出文件。本地文件会保留至被清理、覆盖或删除。</p>
+        <p><strong>支持邮件：</strong>仅在解决请求、处理相关问题或履行法律义务所需期间保存，之后删除或匿名化。您可随时申请删除。我们没有集中保存您的本地媒体库或观看历史副本。</p>
+        <p>如需访问、更正或删除我们持有的个人信息，请发送邮件至 <a href="mailto:ffskyteam@gmail.com?subject=Privacy%20data%20deletion%20request">ffskyteam@gmail.com</a>，主题注明<strong>“隐私数据删除申请”</strong>，附上产品名称及识别此前联系记录所需的信息。我们可能进行最低限度的必要身份核验，并在适用法律规定的期限内处理；如需依法保留部分信息，将说明原因。Meta、PICO 或网盘服务商独立持有的数据，请联系服务商或通过其隐私设置处理。</p>
+      </section>
+      <section id="zh-rights">
+        <h2>7. 使用、安全与您的权利</h2>
+        <p>我们不出售个人信息，也不将其共享用于跨服务定向广告。信息仅用于提供您请求的功能、响应支持请求和保障服务安全。必要信息可能由前述邮件、托管及平台服务商处理，或在法律要求时依法披露。</p>
+        <p>如适用法律要求处理依据，我们依靠履行您请求的服务、安全支持的正当利益、法定义务，或在需要时取得的可选处理同意。根据适用法律，您可能享有访问、更正、删除、限制或反对处理、获取可携带副本、撤回同意以及向数据保护机构投诉的权利。您可通过上述邮箱行使适用权利。撤回同意不影响此前合法处理的效力。</p>
+        <p>我们使用应用私有存储及前述凭据保护措施。安全还取决于您的设备、服务器和网络，任何存储或传输方式都无法保证绝对安全。服务商可能根据各自政策及适用法律保障措施，在您所在地区以外处理数据。</p>
+      </section>
+      <section id="zh-children">
+        <h2>8. 儿童隐私</h2>
+        <p>我们不故意向儿童索取或收集个人信息，也不对儿童进行广告画像。如儿童已通过支持渠道向我们发送个人信息，家长或监护人可联系我们申请删除。使用产品或第三方服务时，请遵循适用年龄要求、商店年龄分级及平台家长控制设置。</p>
+      </section>
+      <section id="zh-changes">
+        <h2>9. 政策更新与联系</h2>
+        <p>功能或数据处理方式变化时，我们会更新本页面及日期，并在需要时另行通知或取得同意。三种语言版本描述相同的产品及数据处理方式。隐私问题与权利申请请联系 FFSKY：<a href="mailto:ffskyteam@gmail.com">ffskyteam@gmail.com</a>。</p>
+      </section>
+    </article>
+    <article id="ja" lang="ja" class="privacy-policy" data-policy="ja">
+      <header class="privacy-heading">
+        <p class="eyebrow">FFSKY / THRU3D / VR VIDEO PASSTHROUGH SERVER</p>
+        <h1>プライバシーポリシー</h1>
+        <p class="privacy-date"><time datetime="2026-10-07">施行日・最終更新日：2026年10月7日</time></p>
+        <p>本ポリシーは Meta Quest・PICO 向け <strong>Thru3D Media Player</strong>（アプリ ID：<code>com.wapok.thru3d</code>）、Windows 向け <strong>Thru3D Media Server</strong>、および本サイトに適用されます。提供元は <strong>FFSKY</strong>、制作者は <strong>FFSKYChocobo</strong> です。</p>
+        <p>メディアはヘッドセットまたは PC で処理され、FFSKY アカウントの登録は不要です。ライブラリや視聴履歴を当方サーバーへ自動送信せず、広告・行動分析 SDK も使用しません。</p>
+        <a class="privacy-contact" href="mailto:ffskyteam@gmail.com">ffskyteam@gmail.com <span aria-hidden="true">↗</span></a>
+      </header>
+      <nav class="privacy-contents" aria-label="プライバシーポリシー">
+        <a href="#ja-data">データと目的</a>
+        <a href="#ja-xr">XR と権限</a>
+        <a href="#ja-connections">ネットワーク接続</a>
+        <a href="#ja-deletion">データの削除</a>
+      </nav>
+      <section id="ja-data">
+        <h2>1. メディア、設定、ローカルデータ</h2>
+        <p>選択またはアクセスを許可した動画、画像、音声、字幕、およびファイル名、パス・URI、サイズ、長さ、サムネイルを読み取り、一覧表示、デコード、表示、処理に使用します。端末内 AI 機能はその機能を実行する端末で映像を処理し、当方がモデル学習のために映像を受け取ることはありません。</p>
+        <p>Thru3D は最近使用したメディア、再生位置、ファイルごとの表示設定、サムネイルを端末内に保存し、履歴、続きからの再生、一覧表示に使用します。履歴保存の無効化や既存履歴の消去が可能です。Windows サーバーは選択フォルダー、処理設定、生成メディア、キャッシュをローカルに保存します。</p>
+        <p>ローカル診断ログには端末・実行環境、エラー、性能情報、メディアパス、ネットワークアドレスが含まれる場合があります。PC サーバーのリクエストログにはクライアント IP や要求された URL・メディアも含まれる場合があります。ログは当方へ自動送信されません。</p>
+      </section>
+      <section id="ja-xr">
+        <h2>2. ヘッドセットのデータと権限</h2>
+        <p>Thru3D はランタイムが提供する頭部・コントローラーの位置と向き、ボタン入力、および対応端末で有効にした場合の手の関節・ジェスチャーデータを視点の描画と操作に使用します。これらは利用中に処理され、生体認証プロファイルの作成や当方サーバーへの送信には使用しません。パススルーはプラットフォームのコンポジターを通して周囲を表示します。アプリは生のパススルーカメラ画像を取得・保存・アップロードせず、マイク録音、視線追跡、連絡先、正確な位置情報の権限も要求しません。</p>
+        <p><strong>メディアとストレージ：</strong>動画、画像、音声、関連ファイルへのアクセスを参照・再生に使用します。対応する Android では「すべてのファイルへのアクセス」で共有ストレージのフォルダーを参照できます。システムのファイル選択画面で個別ファイルへのアクセスを許可することもできます。</p>
+        <p><strong>ネットワーク・Wi-Fi 状態・マルチキャスト：</strong>選択したソースへの接続とローカル DLNA/SMB サーバーの検出に使用します。インターネットはリモートメディアや任意のクラウド接続に使用します。頭部追跡、任意のハンドトラッキング、パススルーを没入型再生と操作に使用します。</p>
+        <p>端末設定で対象の権限を拒否・取り消し、任意の機能を無効にできます。そのアクセスに依存する機能は使用できなくなる場合があります。</p>
+      </section>
+      <section id="ja-connections">
+        <h2>3. ネットワークソースとクラウドアカウント</h2>
+        <p>Windows サーバーは設定した共有フォルダー、メディア情報、ストリームを、その DLNA/HTTP サービスへ接続できるクライアントに提供します。Thru3D は選択した DLNA、SMB などのメディアソースへ直接接続します。接続先はネットワークアドレス、参照・再生リクエスト、必要な場合は認証情報を受け取ります。ローカル DLNA/HTTP 通信は暗号化されない場合があるため、信頼できるネットワークを使用してください。</p>
+        <p>SMB ソースを保存すると、サーバーアドレス、共有パス、入力したユーザー名を端末内に保存し、パスワードは Android Keystore で暗号化します。任意の <strong>115・Baidu Netdisk</strong> 接続はアカウントのラベル、ログインセッション Cookie、ファイル一覧、再生 URL を処理します。保存するクラウドセッションはヘッドセットの Android Keystore で暗号化し、Android アプリバックアップから除外します。</p>
+        <p>クラウドのログインは選択した事業者が処理します。アプリはセッション認証情報とファイルリクエストをそのサービスへ送り、再生時にはメディア・CDN サーバーにも接続します。事業者は自身のポリシーに基づき IP アドレスやリクエスト情報を受け取ります。FFSKY 運営のクラウド中継サーバーは使用しません。Thru3D から削除しても、事業者のアカウントやファイルは削除されません。</p>
+        <p>ソフトウェアや PC 用モデル・実行コンポーネントのダウンロード時には、GitHub、Hugging Face、設定したミラー、NVIDIA など選択した配信元に接続します。配信元は IP アドレスや要求されたリソースなど通常の通信情報を受け取ります。外部サイト・サービスには各自のプライバシー規約が適用されます。</p>
+        <p>Thru3D の<strong>LAN WebDAV 共有</strong>を有効にすると、生成された共有パスワードを持つローカルネットワーク上の端末が、ヘッドセットを介して接続済みクラウドのファイルを参照・再生できます。この機能は任意で、転送が暗号化されない HTTP を使用します。パスワードは信頼できる相手にのみ共有し、アクセスを停止するには共有を無効にするか、パスワードを再設定して古い認証情報を無効にしてください。</p>
+        <p>その他のメディアサーバー接続では、必要に応じてサーバー名・アドレス、アカウント ID、ユーザー名、API キーやアクセストークンも処理します。保存する設定と認証情報はヘッドセットの Android Keystore で暗号化し、選択したサーバーへの認証、参照、再生にのみ使用します。カバー画像は端末内にキャッシュされる場合があります。</p>
+      </section>
+      <section id="ja-platforms">
+        <h2>4. Meta Quest、PICO と第三者サービス</h2>
+        <p>Meta と PICO はストア、アカウント、端末サービス、ランタイムを独立して運営し、各自のポリシーに基づいて購入・端末・診断データを処理する場合があります。当方は Meta/PICO のパスワードを要求せず、フレンドリストも取り込みません。プラットフォーム側のデータ処理は、ここで説明するローカル処理とは別です。</p>
+        <p>プライバシー、診断、アカウントの設定は各プラットフォームで管理できます。<a href="https://www.meta.com/legal/privacy-policy/">Meta</a>、<a href="https://www.picoxr.com/global/legal/privacy-policy">PICO</a>、<a href="https://policies.google.com/privacy">Google / Gmail</a> のプライバシーポリシーをご確認ください。クラウドアカウントについてはログイン時に表示される事業者のポリシーをご確認ください。</p>
+      </section>
+      <section id="ja-website">
+        <h2>5. ウェブサイトとお問い合わせ</h2>
+        <p>本サイトはブラウザーの言語を読み取り、ローカルストレージに言語設定（<code>ptserver-language</code>）のみを保存します。広告・行動分析トラッカーは埋め込みません。サイトデータの消去で設定を削除できます。ホスティング事業者はサイトの提供・保護のため、IP アドレス、リクエスト時刻、ブラウザー・リクエスト情報、アクセス・セキュリティログを処理する場合があり、保存期間はその設定とポリシーに従います。</p>
+        <p><a href="mailto:ffskyteam@gmail.com">ffskyteam@gmail.com</a> へメールを送ると、当方はメールアドレス、メッセージ、自発的に提供された添付ファイルを受け取り、回答やサポートにのみ使用します。通信はメールサービス事業者を通じて処理されます。パスワード、セッション Cookie、不要な私的メディアは送らないでください。</p>
+      </section>
+      <section id="ja-deletion">
+        <h2>6. 保存期間と削除方法</h2>
+        <p><strong>Thru3D：</strong>ライブラリの履歴操作で保存を無効にするか履歴を消去し、「設定 → 動画 → キャッシュを削除」でサムネイルを消去できます。保存したクラウドアカウントやネットワークサーバーは各管理画面で削除できます。端末設定でアプリのストレージを消去するかアンインストールすると、ローカルのアプリデータが削除されます。元のメディアやアプリ領域外のファイルは別途削除してください。クラウドセッションは事業者側でも取り消すと無効になります。プラットフォームのバックアップは別途削除が必要な場合があります。</p>
+        <p><strong>Windows サーバー：</strong>サーバーを停止すると共有が停止し、設定から共有フォルダーを削除するとそのフォルダーの公開が停止します。不要になった設定、ログ、キャッシュを削除し、生成した出力も必要に応じて別途削除してください。ローカルファイルは消去、上書き、削除されるまで残ります。</p>
+        <p><strong>サポート：</strong>お問い合わせと関連問題の解決または法的義務の履行に必要な期間のみ保存し、その後削除または匿名化します。いつでも削除を依頼できます。当方はローカルライブラリや視聴履歴のコピーを一元的に保有していません。</p>
+        <p>当方が保有する個人データの開示・訂正・削除は、<a href="mailto:ffskyteam@gmail.com?subject=Privacy%20data%20deletion%20request">ffskyteam@gmail.com</a> へ、件名 <strong>「Privacy data deletion request」</strong>、製品名、過去のお問い合わせの特定に必要な情報を添えて依頼してください。必要最小限の本人確認をお願いする場合があり、適用法令が定める期間内に対応します。法令上必要な保存があれば説明します。Meta、PICO、クラウド事業者が独立して保有するデータは各事業者の窓口やプライバシー設定をご利用ください。</p>
+      </section>
+      <section id="ja-rights">
+        <h2>7. 利用、安全性、利用者の権利</h2>
+        <p>個人情報を販売したり、サービスを横断したターゲティング広告のために共有したりしません。要求された機能の提供、サポートへの回答、サービスの保護に使用します。必要な情報は前述のメール、ホスティング、プラットフォーム事業者が処理し、法令により必要な場合は開示することがあります。</p>
+        <p>法的根拠が必要な場合、要求されたサービスの履行、安全なサポートの正当な利益、法的義務、または必要に応じて取得する任意の処理への同意を根拠とします。適用法令により、開示、訂正、削除、処理の制限・異議申立て、データポータビリティ、同意の撤回、監督機関への苦情申立てなどの権利があります。上記メールで適用される権利を行使できます。同意の撤回はそれ以前の適法な処理に影響しません。</p>
+        <p>アプリ専用ストレージと前述の認証情報保護を使用します。安全性は端末、サーバー、ネットワークにも依存し、完全に安全な保存・通信方法はありません。サービス事業者は自身のポリシーと適用法令の保護措置に基づき、居住地域の外でデータを処理する場合があります。</p>
+      </section>
+      <section id="ja-children">
+        <h2>8. 子どものプライバシー</h2>
+        <p>子どもから故意に個人情報を求めたり収集したりせず、広告プロファイルも作成しません。子どもがサポートへ個人情報を送った場合、保護者は削除を依頼できます。製品や第三者サービスの利用時には、適用される年齢要件、ストアの年齢区分、プラットフォームの保護者向け設定に従ってください。</p>
+      </section>
+      <section id="ja-changes">
+        <h2>9. 更新とお問い合わせ</h2>
+        <p>機能やデータの取扱いが変わる場合、本ページと更新日を変更し、必要に応じて追加の通知や同意取得を行います。3 言語の各版は同じ製品と取扱いを説明しています。プライバシーに関するお問い合わせは FFSKY（<a href="mailto:ffskyteam@gmail.com">ffskyteam@gmail.com</a>）へご連絡ください。</p>
+      </section>
+    </article>
+  </main>
+  <footer class="site-footer"><a href="index.html" data-home-link data-home-label>← Home</a><span>© 2026 FFSKY</span></footer>
+</body>
+</html>

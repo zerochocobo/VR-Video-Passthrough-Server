@@ -1,245 +1,261 @@
 <!doctype html>
 <html lang="en">
-  <head>
-    <meta charset="utf-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1">
-    <meta name="description" data-i18n-attr="content:meta.description" content="VR Video Passthrough Server brings passthrough viewing to local VR videos.">
-    <title>VR Video Passthrough Server</title>
-    <link rel="icon" href="favicon.ico" sizes="any">
-    <link rel="shortcut icon" href="favicon.ico">
-    <link rel="stylesheet" href="styles.css">
-  </head>
-  <body>
-    <header class="site-header" data-scrolled="false">
-      <a class="brand" href="#top" aria-label="VR Video Passthrough Server">
-        <img src="assets/logo_192.png" alt="" width="44" height="44">
-        <span class="brand-text">
-          <span class="brand-local" data-i18n="brand.local">VR Video Passthrough Server</span>
-          <span class="brand-sub" data-i18n="brand.sub"></span>
-        </span>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#071724">
+  <meta name="description" data-i18n-content="meta.description" content="Meet Thru3D: an independent VR media player and Windows media server. Enjoy AI passthrough, 2D-to-3D videos and photos, and your own media library.">
+  <meta property="og:type" content="website">
+  <meta property="og:site_name" content="Thru3D">
+  <meta property="og:title" data-i18n-content="meta.title" content="Thru3D — Your media, beyond the screen">
+  <meta property="og:description" data-i18n-content="meta.description" content="Meet Thru3D: an independent VR media player and Windows media server. Enjoy AI passthrough, 2D-to-3D videos and photos, and your own media library.">
+  <meta property="og:url" content="https://wapok.com/">
+  <meta property="og:image" content="https://wapok.com/assets/player-library.jpg">
+  <meta property="og:image:width" content="1600">
+  <meta property="og:image:height" content="900">
+  <link rel="canonical" href="https://wapok.com/">
+  <link rel="icon" type="image/png" href="assets/thru3d-icon.png">
+  <link rel="apple-touch-icon" href="assets/thru3d-icon.png">
+  <link rel="stylesheet" href="styles.css">
+  <title>Thru3D — Your media, beyond the screen</title>
+  <script src="script.js" defer></script>
+</head>
+<body>
+  <a class="skip-link" href="#main" data-i18n="skip">Skip to content</a>
+  <svg class="icon-definitions" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
+    <symbol id="i-arrow" viewBox="0 0 24 24"><path d="M4 12h15m-6-6 6 6-6 6"/></symbol>
+    <symbol id="i-up-right" viewBox="0 0 24 24"><path d="M6 18 18 6M6 6h12v12"/></symbol>
+    <symbol id="i-headset" viewBox="0 0 24 24"><path d="M4 7h16l2 10a2 2 0 0 1-2 2h-5l-3-4-3 4H4a2 2 0 0 1-2-2L4 7Z"/><path d="M7 11h2m6 0h2M7 4h10"/></symbol>
+    <symbol id="i-monitor" viewBox="0 0 24 24"><rect x="2" y="3" width="20" height="14" rx="2"/><path d="M8 21h8m-4-4v4"/></symbol>
+    <symbol id="i-layers" viewBox="0 0 24 24"><path d="m12 3 10 5-10 5L2 8l10-5Zm-10 9 10 5 10-5M2 16l10 5 10-5"/></symbol>
+    <symbol id="i-person" viewBox="0 0 24 24"><circle cx="12" cy="6" r="3"/><path d="M6 21v-5a6 6 0 0 1 12 0v5M2 3v4m0-4h4m16 0v4m0-4h-4"/></symbol>
+    <symbol id="i-photo" viewBox="0 0 24 24"><rect x="3" y="3" width="18" height="18" rx="3"/><circle cx="8" cy="8" r="1.5"/><path d="m3 17 6-6 4 4 3-3 5 5"/></symbol>
+    <symbol id="i-library" viewBox="0 0 24 24"><path d="M3 6a2 2 0 0 1 2-2h5l3 3h6a2 2 0 0 1 2 2v10a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V6Z"/><path d="m10 11 5 3-5 3v-6Z"/></symbol>
+    <symbol id="i-spark" viewBox="0 0 24 24"><path d="m12 2 3 7 7 3-7 3-3 7-3-7-7-3 7-3 3-7Z"/></symbol>
+    <symbol id="i-film" viewBox="0 0 24 24"><rect x="3" y="3" width="18" height="18" rx="2"/><path d="M7 3v18m10-18v18M3 8h4m10 0h4M3 16h4m10 0h4"/></symbol>
+    <symbol id="i-subtitle" viewBox="0 0 24 24"><rect x="2" y="4" width="20" height="16" rx="3"/><path d="M6 10h4m4 0h4M6 15h7m3 0h2"/></symbol>
+    <symbol id="i-audio" viewBox="0 0 24 24"><path d="M4 9v6m4-10v14m4-17v20m4-17v14m4-10v6"/></symbol>
+    <symbol id="i-network" viewBox="0 0 24 24"><rect x="8" y="2" width="8" height="6" rx="1"/><rect x="2" y="16" width="8" height="6" rx="1"/><rect x="14" y="16" width="8" height="6" rx="1"/><path d="M12 8v4m-6 4v-4h12v4"/></symbol>
+    <symbol id="i-bookmark" viewBox="0 0 24 24"><path d="M5 3h14v19l-7-5-7 5V3Z"/></symbol>
+    <symbol id="i-expand" viewBox="0 0 24 24"><path d="M8 3H3v5m13-5h5v5M3 16v5h5m13-5v5h-5"/></symbol>
+    <symbol id="i-close" viewBox="0 0 24 24"><path d="m6 6 12 12M6 18 18 6"/></symbol>
+    <symbol id="i-menu" viewBox="0 0 24 24"><path d="M3 6h18M3 12h18M3 18h18"/></symbol>
+    <symbol id="i-check" viewBox="0 0 24 24"><path d="m5 12 4 4L19 6"/></symbol>
+    <symbol id="i-github" viewBox="0 0 24 24"><path d="M9 19c-4 1-4-2-6-2m12 5v-4c0-1 .1-2-1-3 4-.5 6-2 6-6 0-2-.6-3-1.5-4 .3-1 .3-2-.2-3-1 0-2 .5-3 1a12 12 0 0 0-7 0c-1-1-2-1-3-1-.5 1-.5 2-.2 3C4 6 4 7 4 9c0 4 2 5.5 6 6-1 1-1 2-1 3v4"/></symbol>
+  </svg>
+
+  <header class="site-header">
+    <div class="header-inner">
+      <a class="brand" href="#top" aria-label="Thru3D home" data-i18n-label="brand.home">
+        <img src="assets/thru3d-icon.png" alt="" width="40" height="40">
+        <span>Thru3D</span>
       </a>
-      <nav class="top-nav" aria-label="Main navigation">
-        <a href="#features" data-i18n="nav.features">Features</a>
-        <a href="#gallery" data-i18n="nav.gallery">Gallery</a>
-        <a href="#download" data-i18n="nav.download">Download</a>
+      <nav class="top-nav" id="main-nav" aria-label="Main navigation" data-i18n-label="nav.label">
+        <a href="#player" data-i18n="nav.player">Media Player</a>
+        <a href="#server" data-i18n="nav.server">Media Server</a>
+        <a href="#together" data-i18n="nav.together">Better together</a>
+        <a class="nav-download" href="#download"><span data-i18n="nav.download">Get Thru3D</span><svg class="icon" aria-hidden="true"><use href="#i-arrow"/></svg></a>
       </nav>
-      <div class="language-switcher" aria-label="Language">
-        <button type="button" data-lang-button="en">EN</button>
-        <button type="button" data-lang-button="zh">中文</button>
-        <button type="button" data-lang-button="ja">日本語</button>
+      <div class="header-controls">
+        <div class="language-switcher" role="group" aria-label="Language" data-i18n-label="language">
+          <button type="button" data-lang-button="en" lang="en" aria-pressed="true">EN</button>
+          <button type="button" data-lang-button="zh" lang="zh-CN" aria-pressed="false">中文</button>
+          <button type="button" data-lang-button="ja" lang="ja" aria-pressed="false">日本語</button>
+        </div>
+        <button class="menu-toggle icon-button" type="button" aria-controls="main-nav" aria-expanded="false" aria-label="Open navigation" data-i18n-label="nav.toggle">
+          <svg class="icon" aria-hidden="true"><use href="#i-menu"/></svg>
+        </button>
       </div>
-    </header>
+    </div>
+  </header>
 
-    <main id="top">
-      <section class="hero section-reveal">
+  <main id="main">
+    <section class="hero dark-section" id="top">
+      <div class="hero-orbit" aria-hidden="true"></div>
+      <div class="container hero-grid">
         <div class="hero-copy">
-          <p class="eyebrow" data-i18n="hero.eyebrow">A mixed reality video tool for VR180 and local media libraries</p>
-          <h1 data-i18n="hero.title">Give your VR videos a passthrough viewing experience</h1>
-          <p class="hero-text" data-i18n="hero.text">
-            Run a local DLNA media server on Windows, stream videos to Quest and other VR players, and generate green-screen or Alpha passthrough output in realtime.
-          </p>
+          <p class="eyebrow"><span class="status-dot"></span><span data-i18n="hero.eyebrow">A new dimension for your media</span></p>
+          <h1><span data-i18n="hero.title">Your media.</span><span class="mint-text" data-i18n="hero.accent">Beyond the screen.</span></h1>
+          <p class="hero-text" data-i18n="hero.text">Bring videos into your space. Rediscover photos in 3D. Meet the player and server that open up your own media.</p>
           <div class="hero-actions">
-            <a class="button primary" href="#download" data-i18n="hero.primary">Download</a>
-            <a class="button ghost" href="#gallery" data-i18n="hero.secondary">View Results</a>
+            <a class="button primary" href="#player"><svg class="icon" aria-hidden="true"><use href="#i-headset"/></svg><span data-i18n="hero.player">Explore the Player</span><svg class="icon" aria-hidden="true"><use href="#i-arrow"/></svg></a>
+            <a class="text-link" href="#server"><span data-i18n="hero.server">Meet the Server</span><svg class="icon" aria-hidden="true"><use href="#i-arrow"/></svg></a>
           </div>
-          <div class="release-strip" aria-label="Release information">
-            <span><span data-i18n="release.versionLabel">Current version</span> <strong>v1.5.0</strong></span>
-            <span><span data-i18n="release.dateLabel">Release date</span> <strong>2026-9-13</strong></span>
-          </div>
+          <p class="hero-independent" data-i18n="hero.independent">Two independent apps. Even more possibilities together.</p>
         </div>
-        <div class="hero-visual" aria-label="Software preview">
-          <img class="hero-logo" src="assets/app_icon_256.jpg" alt="">
-          <img class="hero-screen" data-lang-image="heroScreen" src="assets/soft_mainwindow_en.png" alt="VR Video Passthrough Server main window">
-          <div class="signal-card">
-            <span class="pulse-dot"></span>
-            <span data-i18n="hero.badge">Realtime passthrough stream</span>
-          </div>
-        </div>
-      </section>
-
-      <section class="intro-band section-reveal" aria-label="Overview">
-        <img data-lang-image="intro" src="assets/intro_en_s.png" alt="VR Video Passthrough Server overview">
-      </section>
-
-      <section id="features" class="features section-reveal">
-        <div class="section-heading">
-          <p class="eyebrow" data-i18n="features.eyebrow">No need to rebuild your video library</p>
-          <h2 data-i18n="features.title">Turn local VR videos into a passthrough-ready media library</h2>
-          <p data-i18n="features.text">Your PC handles the video processing. Your VR player discovers and plays the library over your home network.</p>
-        </div>
-        <div class="feature-grid">
-          <article class="feature-card">
-            <span class="feature-icon">DLNA</span>
-            <h3 data-i18n="featureCards.discovery.title">Automatic VR player discovery</h3>
-            <p data-i18n="featureCards.discovery.text">Expose local video folders through DLNA/UPnP for common VR players such as Skybox, Moon Player, 4XVR, DeoVR, and HereSphere.</p>
-          </article>
-          <article class="feature-card">
-            <span class="feature-icon">MR</span>
-            <h3 data-i18n="featureCards.realtime.title">Realtime passthrough output</h3>
-            <p data-i18n="featureCards.realtime.text">Use GPU matting and HEVC encoding to convert normal VR video into green-screen or Alpha passthrough streams.</p>
-          </article>
-          <article class="feature-card">
-            <span class="feature-icon">TXT</span>
-            <h3 data-i18n="featureCards.subtitles.title">Realtime subtitle embedding</h3>
-            <p data-i18n="featureCards.subtitles.text">Keep subtitles visible in passthrough playback, with desktop preview and style controls.</p>
-          </article>
-          <article class="feature-card">
-            <span class="feature-icon">OFF</span>
-            <h3 data-i18n="featureCards.offline.title">Offline video generation</h3>
-            <p data-i18n="featureCards.offline.text">Pre-generate passthrough videos when you want saved output or less realtime load while watching.</p>
-          </article>
-          <article class="feature-card">
-            <span class="feature-icon">UI</span>
-            <h3 data-i18n="featureCards.ui.title">Desktop control</h3>
-            <p data-i18n="featureCards.ui.text">Start the server, select folders, switch output modes, and manage settings from a Chinese, English, or Japanese desktop UI.</p>
-          </article>
-          <article class="feature-card">
-            <span class="feature-icon" data-i18n="featureCards.performance.icon">RTX</span>
-            <h3 data-i18n="featureCards.performance.title">HD Super Resolution</h3>
-            <p data-i18n="featureCards.performance.text">Use NVIDIA RTX Video Super Resolution to upscale 2D video from 1080p to 4K in realtime, or VR video from 4K to 8K.</p>
-          </article>
-          <article class="feature-card">
-            <span class="feature-icon">3D</span>
-            <h3 data-i18n="featureCards.twoDvr.title">Realtime 2D to 3D</h3>
-            <p data-i18n="featureCards.twoDvr.text">Convert flat 2D videos into stereo 3D output for VR playback, with DA3 depth estimation and GPU rendering for live and offline workflows.</p>
-          </article>
-          <article class="feature-card">
-            <span class="feature-icon">SI</span>
-            <h3 data-i18n="featureCards.si.title">Simultaneous interpretation</h3>
-            <p data-i18n="featureCards.si.text">Add same-stem interpretation audio as a .si.wav sidecar and play a mixed [SI] virtual MP4 entry from DLNA.</p>
-          </article>
-          <article class="feature-card">
-            <span class="feature-icon">VR</span>
-            <h3 data-i18n="featureCards.naming.title">VR player filename compatibility</h3>
-            <p data-i18n="featureCards.naming.text">Generated and virtual titles automatically use VR-friendly naming patterns so common players recognize stereo, fisheye, alpha, and live entries correctly.</p>
-          </article>
-        </div>
-      </section>
-
-      <section id="gallery" class="gallery section-reveal">
-        <div class="section-heading">
-          <p class="eyebrow" data-i18n="gallery.eyebrow">Output examples</p>
-          <h2 data-i18n="gallery.title">Choose the passthrough format your player supports</h2>
-          <p data-i18n="gallery.text">Alpha works best with players that support transparency. Green-screen output works with ChromaKey playback.</p>
-        </div>
-        <div class="showcase">
-          <figure>
-            <img src="assets/sample_alpha_1200.jpg" alt="Alpha Passthrough output example">
-            <figcaption>Alpha Passthrough</figcaption>
+        <div class="hero-scene">
+          <div class="scene-glow" aria-hidden="true"></div>
+          <div class="scene-orbit" aria-hidden="true"></div>
+          <div class="scene-label"><span class="status-dot"></span>THRU3D <span data-i18n="scene.label">/ SPATIAL MEDIA</span></div>
+          <figure class="scene-player">
+            <img src="assets/player-photo.jpg" width="1600" height="900" fetchpriority="high" alt="Panoramic photo viewed inside Thru3D Media Player" data-i18n-alt="alt.photo">
+            <figcaption><svg class="icon" aria-hidden="true"><use href="#i-headset"/></svg><span>Media Player</span><span class="scene-platform">QUEST / PICO</span></figcaption>
           </figure>
-          <figure>
-            <img src="assets/sample_green_1200.jpg" alt="Green-screen Passthrough output example">
-            <figcaption>Green-screen Passthrough</figcaption>
+          <div class="scene-format" aria-hidden="true"><span>180°</span><span>360°</span><span>3D</span></div>
+          <figure class="scene-server">
+            <figcaption><svg class="icon" aria-hidden="true"><use href="#i-monitor"/></svg><span>Media Server</span><span class="mini-dot"></span></figcaption>
+            <img src="assets/soft_mainwindow_en.png" data-server-image width="1100" height="656" alt="Thru3D Media Server Windows interface" data-i18n-alt="alt.server">
+          </figure>
+          <div class="scene-coordinate" aria-hidden="true">01 / VIDEO · PHOTO · SPACE</div>
+        </div>
+      </div>
+      <div class="container hero-bottom">
+        <div><svg class="icon" aria-hidden="true"><use href="#i-headset"/></svg><span data-i18n="hero.strip1">VR &amp; mixed reality</span></div>
+        <div><svg class="icon" aria-hidden="true"><use href="#i-layers"/></svg><span data-i18n="hero.strip2">AI passthrough &amp; 3D depth</span></div>
+        <div><svg class="icon" aria-hidden="true"><use href="#i-library"/></svg><span data-i18n="hero.strip3">Your own media library</span></div>
+      </div>
+    </section>
+
+    <section class="player-section light-section section-space" id="player">
+      <div class="container">
+        <div class="product-kicker"><img src="assets/thru3d-icon.png" width="36" height="36" alt=""><span>THRU3D MEDIA PLAYER</span><span class="pill">QUEST / PICO</span></div>
+        <div class="section-heading split-heading">
+          <h2><span data-i18n="player.title">A whole new dimension.</span><span class="green-text" data-i18n="player.accent">No PC required.</span></h2>
+          <p data-i18n="player.intro">Your standalone VR player for videos and photos. AI runs right on your headset, so you can start with the media you already have.</p>
+        </div>
+        <div class="player-layout">
+          <div class="experience">
+            <div class="experience-toolbar"><span class="window-dots" aria-hidden="true"><i></i><i></i><i></i></span><span data-i18n="gallery.label">Inside Thru3D</span><span class="live-label" data-i18n="gallery.capture">In-app capture</span></div>
+            <div class="experience-frame" role="tabpanel" id="experience-panel" aria-labelledby="tab-library">
+              <button class="screenshot-button" type="button" data-open-gallery aria-label="Enlarge screenshot" data-i18n-label="gallery.enlarge">
+                <img src="assets/player-library.jpg" data-gallery-image width="1600" height="900" loading="lazy" alt="Media server library in Thru3D Media Player" data-i18n-alt="alt.library">
+                <span class="image-expand" aria-hidden="true"><svg class="icon"><use href="#i-expand"/></svg></span>
+              </button>
+            </div>
+            <div class="experience-tabs" role="tablist" aria-label="Player screenshots" data-i18n-label="gallery.tabs">
+              <button id="tab-library" type="button" role="tab" aria-selected="true" aria-controls="experience-panel" tabindex="0" data-gallery="library"><svg class="icon" aria-hidden="true"><use href="#i-library"/></svg><span data-i18n="gallery.library">Your library</span></button>
+              <button id="tab-photo" type="button" role="tab" aria-selected="false" aria-controls="experience-panel" tabindex="-1" data-gallery="photo"><svg class="icon" aria-hidden="true"><use href="#i-photo"/></svg><span data-i18n="gallery.photo">Immersive photos</span></button>
+              <button id="tab-video" type="button" role="tab" aria-selected="false" aria-controls="experience-panel" tabindex="-1" data-gallery="video"><svg class="icon" aria-hidden="true"><use href="#i-film"/></svg><span data-i18n="gallery.video">VR video</span></button>
+            </div>
+          </div>
+          <div class="player-features">
+            <article class="editorial-feature"><span class="feature-symbol"><svg class="icon" aria-hidden="true"><use href="#i-person"/></svg></span><div><h3 data-i18n="player.passthrough.title">People beyond the screen.</h3><p data-i18n="player.passthrough.text">AI removes the background from supported 180° videos, bringing people into your real surroundings. No green screen needed.</p></div></article>
+            <article class="editorial-feature"><span class="feature-symbol"><svg class="icon" aria-hidden="true"><use href="#i-layers"/></svg></span><div><h3 data-i18n="player.depth.title">Flat media. New depth.</h3><p data-i18n="player.depth.text">Turn everyday 2D videos and photos into stereoscopic 3D. Adjust the depth to find your perfect view.</p></div></article>
+            <article class="editorial-feature"><span class="feature-symbol"><svg class="icon" aria-hidden="true"><use href="#i-library"/></svg></span><div><h3 data-i18n="player.library.title">Your library, within reach.</h3><p data-i18n="player.library.text">Local files, SMB, WebDAV, DLNA, Emby, Jellyfin, XBVR and Stash. Browse and sign in inside VR.</p></div></article>
+          </div>
+        </div>
+        <div class="player-extras">
+          <span><svg class="icon" aria-hidden="true"><use href="#i-photo"/></svg><span data-i18n="player.extra1">Pinch, browse &amp; zoom photos</span></span>
+          <span><svg class="icon" aria-hidden="true"><use href="#i-bookmark"/></svg><span data-i18n="player.extra2">Bookmarks &amp; resume playback</span></span>
+          <span><svg class="icon" aria-hidden="true"><use href="#i-subtitle"/></svg><span data-i18n="player.extra3">Audio tracks &amp; VR subtitles</span></span>
+          <a class="text-link" href="#download-player"><span data-i18n="player.cta">Get the Player</span><svg class="icon" aria-hidden="true"><use href="#i-arrow"/></svg></a>
+        </div>
+      </div>
+    </section>
+
+    <section class="server-section dark-section section-space" id="server">
+      <div class="container">
+        <div class="product-kicker"><svg class="icon" aria-hidden="true"><use href="#i-monitor"/></svg><span>THRU3D MEDIA SERVER</span><span class="pill">WINDOWS</span></div>
+        <div class="server-overview">
+          <div>
+            <h2><span data-i18n="server.title">More possibilities.</span><span class="mint-text" data-i18n="server.accent">Powered by your PC.</span></h2>
+            <p class="server-intro" data-i18n="server.intro">Transform your local video library with the power of your GPU. Stream over DLNA to Thru3D or another compatible VR player, or save the results for later.</p>
+            <a class="button primary" href="#download-server"><span data-i18n="server.cta">Get the Server</span><svg class="icon" aria-hidden="true"><use href="#i-arrow"/></svg></a>
+            <div class="server-spec"><span>Windows 10 / 11</span><span>NVIDIA GPU</span></div>
+          </div>
+          <figure class="server-preview">
+            <div class="server-preview-top"><span class="window-dots" aria-hidden="true"><i></i><i></i><i></i></span><span>Thru3D Media Server</span></div>
+            <img src="assets/soft_mainwindow_en.png" data-server-image width="1100" height="656" loading="lazy" alt="Thru3D Media Server Windows interface" data-i18n-alt="alt.server">
+            <figcaption><span class="status-dot"></span><span data-i18n="server.caption">Local library. Powerful processing.</span></figcaption>
           </figure>
         </div>
-      </section>
+        <div class="server-feature-grid">
+          <article><svg class="icon" aria-hidden="true"><use href="#i-person"/></svg><h3 data-i18n="server.f1.title">AI passthrough</h3><p data-i18n="server.f1.text">GPU background removal with Alpha or green-screen output.</p></article>
+          <article><svg class="icon" aria-hidden="true"><use href="#i-layers"/></svg><h3 data-i18n="server.f2.title">2D → 3D</h3><p data-i18n="server.f2.text">Add stereo depth to flat videos, live or offline.</p></article>
+          <article><svg class="icon" aria-hidden="true"><use href="#i-spark"/></svg><h3 data-i18n="server.f3.title">RTX super resolution</h3><p data-i18n="server.f3.text">Enhance supported 2D and VR video with NVIDIA RTX Video.</p></article>
+          <article><svg class="icon" aria-hidden="true"><use href="#i-film"/></svg><h3 data-i18n="server.f4.title">Offline tools</h3><p data-i18n="server.f4.text">Generate videos ahead of time and keep the output.</p></article>
+          <article><svg class="icon" aria-hidden="true"><use href="#i-subtitle"/></svg><h3 data-i18n="server.f5.title">Embedded subtitles</h3><p data-i18n="server.f5.text">Keep subtitles in the stream, with adjustable styles.</p></article>
+          <article><svg class="icon" aria-hidden="true"><use href="#i-audio"/></svg><h3 data-i18n="server.f6.title">Interpretation audio</h3><p data-i18n="server.f6.text">Mix your matching interpretation track into playback.</p></article>
+        </div>
+      </div>
+    </section>
 
-      <section class="requirements section-reveal">
-        <div class="section-heading">
-          <p class="eyebrow" data-i18n="requirements.eyebrow">Requirements</p>
-          <h2 data-i18n="requirements.title">Designed for local Windows PCs</h2>
+    <section class="together-section light-section section-space" id="together">
+      <div class="container">
+        <div class="section-heading centered">
+          <p class="eyebrow" data-i18n="together.eyebrow">Choose your own setup</p>
+          <h2><span data-i18n="together.title">Great on their own.</span><span class="green-text" data-i18n="together.accent">Better together.</span></h2>
+          <p data-i18n="together.text">Let your PC handle demanding processing while you enjoy the results in your headset. Your library stays on your devices.</p>
         </div>
-        <div class="requirement-list">
-          <div><strong>Windows 10 / 11</strong><span data-i18n="requirements.windows">Primary runtime platform</span></div>
-          <div><strong>NVIDIA GPU</strong><span data-i18n="requirements.gpu">RTX 20 series or newer is recommended. Realtime processing is recommended with 6GB+ VRAM.</span></div>
-          <div><strong>FFmpeg / FFprobe</strong><span data-i18n="requirements.ffmpeg">Used for media probing, encoding, and muxing.</span></div>
-          <div><strong>Meta Quest 3 / Pico 4</strong><span data-i18n="requirements.quest">Tested on Quest 3 and Pico 4, and usable with compatible DLNA passthrough players.</span></div>
+        <div class="connection-flow">
+          <div class="flow-node"><div class="flow-icon"><svg class="icon" aria-hidden="true"><use href="#i-library"/></svg></div><strong data-i18n="flow.library">Your video library</strong><span data-i18n="flow.librarySub">On your Windows PC</span></div>
+          <div class="flow-link" aria-hidden="true"><span></span><svg class="icon"><use href="#i-arrow"/></svg></div>
+          <div class="flow-node"><div class="flow-icon server-flow"><svg class="icon" aria-hidden="true"><use href="#i-monitor"/></svg></div><strong>Media Server</strong><span data-i18n="flow.serverSub">Process &amp; share</span></div>
+          <div class="flow-link"><span class="flow-protocol">DLNA / LAN</span><span aria-hidden="true"></span><svg class="icon" aria-hidden="true"><use href="#i-arrow"/></svg></div>
+          <div class="flow-node"><div class="flow-icon player-flow"><svg class="icon" aria-hidden="true"><use href="#i-headset"/></svg></div><strong>Media Player</strong><span data-i18n="flow.playerSub">Browse &amp; enjoy</span></div>
         </div>
-      </section>
-
-      <section class="compatibility section-reveal">
-        <div class="section-heading">
-          <p class="eyebrow" data-i18n="compatibility.eyebrow">Player compatibility</p>
-          <h2 data-i18n="compatibility.title">Match the output mode to your VR player</h2>
-          <p data-i18n="compatibility.text">Support varies by player and playback mode. Choose Alpha when your player supports it, or use ChromaKey green-screen mode as the broader fallback.</p>
+        <div class="setup-steps">
+          <article><span class="step-number">01</span><div><h3 data-i18n="step1.title">Open your library</h3><p data-i18n="step1.text">Add video folders to Server on your PC.</p></div></article>
+          <article><span class="step-number">02</span><div><h3 data-i18n="step2.title">Choose your output</h3><p data-i18n="step2.text">Use Alpha passthrough for Thru3D Player, or choose another supported mode.</p></div></article>
+          <article><span class="step-number">03</span><div><h3 data-i18n="step3.title">Connect in VR</h3><p data-i18n="step3.text">On the same local network, open Player's DLNA library and select Server.</p></div></article>
         </div>
-        <div class="compat-table-wrap">
-          <table class="compat-table">
-            <thead>
-              <tr>
-                <th scope="col" data-i18n="compatibility.player">Player</th>
-                <th scope="col" data-i18n="compatibility.alpha">Alpha passthrough</th>
-                <th scope="col" data-i18n="compatibility.gray">Gray green screen</th>
-                <th scope="col" data-i18n="compatibility.chroma">ChromaKey green screen</th>
-              </tr>
-            </thead>
-            <tbody>
-              <tr>
-                <th scope="row">Skybox VR Player 2.0.2 Preview</th>
-                <td class="yes">✓</td>
-                <td class="no">-</td>
-                <td class="yes">✓</td>
-              </tr>
-              <tr>
-                <th scope="row">Moon Player</th>
-                <td class="no">-</td>
-                <td class="yes">✓</td>
-                <td class="yes">✓</td>
-              </tr>
-              <tr>
-                <th scope="row">4XVR Video Player</th>
-                <td class="yes">✓</td>
-                <td class="no">-</td>
-                <td class="yes">✓</td>
-              </tr>
-              <tr>
-                <th scope="row">DeoVR Player</th>
-                <td class="yes">✓</td>
-                <td class="no">-</td>
-                <td class="yes">✓</td>
-              </tr>
-              <tr>
-                <th scope="row">HereSphere VR Video Player</th>
-                <td class="yes">✓</td>
-                <td class="no">-</td>
-                <td class="yes">✓</td>
-              </tr>
-            </tbody>
-          </table>
-        </div>
-      </section>
-
-      <section id="download" class="download section-reveal">
-        <div>
-          <p class="eyebrow" data-i18n="download.eyebrow">Get started</p>
-          <h2 data-i18n="download.title">Download the package and connect your VR player</h2>
-          <p data-i18n="download.text">
-            Run it on your Windows PC, choose your local video folders, then find the server from your VR player through DLNA.
-          </p>
-        </div>
-        <div class="download-panel">
-          <div class="version-box">
-            <span data-i18n="release.versionLabel">Current version</span>
-            <strong>v1.5.0</strong>
-            <small><span data-i18n="release.dateLabel">Release date</span>: 2026-9-13</small>
+        <details class="compatibility">
+          <summary><span><svg class="icon" aria-hidden="true"><use href="#i-network"/></svg><span data-i18n="compat.title">Using Server with another VR player?</span></span><span class="plus" aria-hidden="true">+</span></summary>
+          <div class="compatibility-content">
+            <p data-i18n="compat.text">Server also works with compatible DLNA players. Match the output to the player and version you use. Thru3D Player uses Alpha passthrough.</p>
+            <div class="compat-table-wrap">
+              <table><caption class="sr-only" data-i18n="compat.caption">Passthrough output compatibility</caption><thead><tr><th scope="col" data-i18n="compat.player">Player</th><th scope="col">Alpha</th><th scope="col" data-i18n="compat.gray">Gray green screen</th><th scope="col">ChromaKey</th></tr></thead>
+                <tbody>
+                  <tr><th scope="row">Thru3D Media Player</th><td><span data-i18n="supported">Supported</span></td><td>—</td><td>—</td></tr>
+                  <tr><th scope="row">SKYBOX 2.0.2 Preview</th><td><span data-i18n="supported">Supported</span></td><td>—</td><td><span data-i18n="supported">Supported</span></td></tr>
+                  <tr><th scope="row">Moon Player</th><td>—</td><td><span data-i18n="supported">Supported</span></td><td><span data-i18n="supported">Supported</span></td></tr>
+                  <tr><th scope="row">4XVR</th><td><span data-i18n="supported">Supported</span></td><td>—</td><td><span data-i18n="supported">Supported</span></td></tr>
+                  <tr><th scope="row">DeoVR</th><td><span data-i18n="supported">Supported</span></td><td>—</td><td><span data-i18n="supported">Supported</span></td></tr>
+                  <tr><th scope="row">HereSphere</th><td><span data-i18n="supported">Supported</span></td><td>—</td><td><span data-i18n="supported">Supported</span></td></tr>
+                </tbody>
+              </table>
+            </div>
           </div>
-          <a class="button primary full download-link" data-download-link="githubRelease" href="https://github.com/zerochocobo/VR-Video-Passthrough-Server/releases/latest" rel="noopener" target="_blank">
-            <span class="link-icon github-icon" aria-hidden="true"></span>
-            <span data-i18n="download.githubRelease">Download from GitHub Releases</span>
-          </a>
-          <div class="china-downloads">
-            <a class="button secondary full" href="https://pan.quark.cn/s/573eb1709e18?pwd=T3bS" rel="noopener" target="_blank">
-              <span class="link-icon quark-icon" aria-hidden="true">Q</span>
-              <span data-i18n="download.quark">Quark Cloud Drive</span>
-            </a>
-            <a class="button secondary full" href="https://pan.baidu.com/s/1uHFVFjKwlaXVxrYQ0_qcnQ?pwd=1234" rel="noopener" target="_blank">
-              <span class="link-icon baidu-icon" aria-hidden="true">B</span>
-              <span data-i18n="download.baidu">Baidu Netdisk</span>
-            </a>
-          </div>
-          <a class="source-link" href="https://github.com/zerochocobo/VR-Video-Passthrough-Server" rel="noopener" target="_blank">
-            <span class="link-icon github-icon" aria-hidden="true"></span>
-            <span data-i18n="download.source">GitHub source code</span>
-          </a>
+        </details>
+      </div>
+    </section>
+
+    <section class="download-section section-space" id="download">
+      <div class="container">
+        <div class="section-heading centered"><p class="eyebrow" data-i18n="download.eyebrow">Your next dimension starts here</p><h2 data-i18n="download.title">Find your Thru3D.</h2><p data-i18n="download.text">Pick the app that fits your setup. You can add the other whenever you like.</p></div>
+        <div class="download-grid">
+          <article class="download-card" id="download-player">
+            <div class="download-card-top"><img src="assets/thru3d-icon.png" width="56" height="56" alt=""><span class="pill" data-i18n="download.early">Meta · Coming soon</span></div>
+            <h3>Media Player</h3><p class="download-description" data-i18n="download.playerText">Your videos and photos, right in your headset.</p>
+            <div class="platform-tags"><span>QUEST</span><span>PICO</span><span class="experimental">OpenXR <small data-i18n="experimental">Experimental</small></span></div>
+            <a class="button primary full" href="https://www.meta.com/experiences/thru3d-media-player/2508393509572009" target="_blank" rel="noopener noreferrer"><svg class="icon" aria-hidden="true"><use href="#i-headset"/></svg><span data-i18n="download.playerLink">View on Meta</span><svg class="icon" aria-hidden="true"><use href="#i-up-right"/></svg></a>
+            <p class="download-note" data-i18n="download.playerNote">The Meta store release is pending. Source code and build instructions are available on GitHub.</p>
+            <div class="player-source-links"><a class="text-link small" href="https://github.com/zerochocobo/Thru3D-Media-Player" target="_blank" rel="noopener noreferrer"><span data-i18n="download.playerSource">Player source</span><svg class="icon" aria-hidden="true"><use href="#i-up-right"/></svg></a><a class="text-link small" href="https://github.com/zerochocobo/Thru3D-Media-Player/blob/main/docs/BUILD.md" target="_blank" rel="noopener noreferrer"><span data-i18n="download.build">Build guide</span><svg class="icon" aria-hidden="true"><use href="#i-up-right"/></svg></a></div>
+          </article>
+          <article class="download-card server-download" id="download-server">
+            <div class="download-card-top"><span class="download-product-icon"><svg class="icon" aria-hidden="true"><use href="#i-monitor"/></svg></span><span class="pill">WINDOWS</span></div>
+            <h3>Media Server</h3><p class="download-description" data-i18n="download.serverText">Transform and share your PC video library.</p>
+            <div class="platform-tags"><span>Windows 10 / 11</span><span>NVIDIA GPU</span></div>
+            <a class="button primary full" href="https://github.com/zerochocobo/Thru3D-Media-Server/releases/latest" target="_blank" rel="noopener noreferrer"><svg class="icon" aria-hidden="true"><use href="#i-github"/></svg><span data-i18n="download.serverLink">Download Server</span><svg class="icon" aria-hidden="true"><use href="#i-up-right"/></svg></a>
+            <p class="download-note" data-i18n="download.serverNote">Check the release page for the available version and package details.</p>
+            <div class="download-mirrors"><a href="https://pan.quark.cn/s/573eb1709e18?pwd=T3bS" target="_blank" rel="noopener noreferrer" data-i18n="download.quark">Quark Drive</a><span aria-hidden="true">/</span><a href="https://pan.baidu.com/s/1uHFVFjKwlaXVxrYQ0_qcnQ?pwd=1234" target="_blank" rel="noopener noreferrer" data-i18n="download.baidu">Baidu Netdisk</a><a class="source-link" href="https://github.com/zerochocobo/Thru3D-Media-Server" target="_blank" rel="noopener noreferrer" data-i18n="download.source">Source ↗</a></div>
+          </article>
         </div>
-      </section>
-    </main>
+      </div>
+    </section>
 
-    <footer class="site-footer">
-      <span>VR Video Passthrough Server</span>
-      <span>License: AGPL-3.0-or-later</span>
-    </footer>
+    <section class="faq-section light-section">
+      <div class="container faq-layout">
+        <div><p class="eyebrow" data-i18n="faq.eyebrow">A little clarity</p><h2 data-i18n="faq.title">Before you begin.</h2><a class="text-link small" href="mailto:ffskyteam@gmail.com"><span data-i18n="faq.contact">Get in touch</span><svg class="icon" aria-hidden="true"><use href="#i-up-right"/></svg></a></div>
+        <div class="faq-list">
+          <details><summary><span data-i18n="faq.q1">Do I need both apps?</span><span class="plus" aria-hidden="true">+</span></summary><p data-i18n="faq.a1">No. Media Player plays local and network media independently, with AI processing on the headset. Media Server works on Windows with compatible DLNA players and offline tools. You can use either app, or combine them.</p></details>
+          <details><summary><span data-i18n="faq.q2">Which headsets can I use?</span><span class="plus" aria-hidden="true">+</span></summary><p data-i18n="faq.a2">Player has separate QUEST and PICO builds, targeting Quest 2 and PICO Neo3 or newer. Features and AI performance vary by device and content. The standard OpenXR Android build is experimental and requires a compatible runtime; it is not a promise of support for every headset.</p></details>
+          <details><summary><span data-i18n="faq.q3">What does Server need?</span><span class="plus" aria-hidden="true">+</span></summary><p data-i18n="faq.a3">Windows 10 or 11 and an NVIDIA GPU for GPU processing. RTX 20 series or newer and at least 6 GB of VRAM are recommended for common realtime workflows. High-quality offline processing can need substantially more VRAM; see the project documentation for each mode.</p></details>
+          <details><summary><span data-i18n="faq.q4">Which media works with the AI features?</span><span class="plus" aria-hidden="true">+</span></summary><p data-i18n="faq.a4">Player's background removal is for supported 180° videos; its depth conversion is for flat mono videos and photos. AI results depend on the source and device. When streaming passthrough from Server to Thru3D Player, choose Alpha output. Server can also generate green-screen output for other compatible players.</p></details>
+        </div>
+      </div>
+    </section>
+  </main>
 
-    <script src="script.js"></script>
-  </body>
+  <footer class="site-footer dark-section">
+    <div class="container footer-top"><a class="brand" href="#top"><img src="assets/thru3d-icon.png" alt="" width="36" height="36"><span>Thru3D</span></a><p data-i18n="footer.tagline">Your media. Your space. Your way.</p><a class="text-link" href="privacy.html" data-privacy-link data-i18n="footer.privacy">Privacy Policy</a></div>
+    <div class="container footer-bottom"><span>© 2026 FFSKY</span><div><a href="https://github.com/zerochocobo/Thru3D-Media-Player" target="_blank" rel="noopener noreferrer">Player · GPL-3.0</a><a href="https://github.com/zerochocobo/Thru3D-Media-Server" target="_blank" rel="noopener noreferrer">Server · AGPL-3.0</a></div><span data-i18n="footer.made">Made for a new dimension.</span></div>
+  </footer>
+
+  <dialog class="image-dialog" aria-label="Player screenshot" data-i18n-label="gallery.dialog">
+    <form method="dialog"><button class="icon-button dialog-close" aria-label="Close screenshot" data-i18n-label="gallery.close"><svg class="icon" aria-hidden="true"><use href="#i-close"/></svg></button></form>
+    <img data-dialog-image src="assets/player-library.jpg" alt="Media server library in Thru3D Media Player">
+    <p data-dialog-caption></p>
+  </dialog>
+</body>
 </html>
