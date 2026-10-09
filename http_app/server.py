@@ -96,7 +96,7 @@ def create_app(startup_hook: StartupHook | None = None) -> FastAPI:
                 log.warning("SI stream shutdown failed: %s", e)
             get_request_history().flush()
 
-    app = FastAPI(title="PT VR Passthrough Server", docs_url=None, redoc_url=None, lifespan=lifespan)
+    app = FastAPI(title="Thru3D Media Server", docs_url=None, redoc_url=None, lifespan=lifespan)
 
     @app.middleware("http")
     async def request_history_middleware(request: Request, call_next):

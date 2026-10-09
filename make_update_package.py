@@ -10,7 +10,7 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parent
-APP_NAME = "VR_Video_Passthrough_Server"
+APP_NAME = "Thru3D_Media_Server"
 DEFAULT_SOURCE = ROOT / "dist" / APP_NAME
 DEFAULT_BASELINE = ROOT / ".base" / APP_NAME
 DEFAULT_OUTPUT = ROOT / "dist" / "update"

@@ -1,16 +1,22 @@
-﻿# VR视频透视服务器
+﻿# Thru3D媒体服务器
+
+**Thru3D媒体服务器原名为“VR视频透视服务器”（VR Video Passthrough Server）。**
 
 中文 | [English](README.md) | [日本語](README.ja-JP.md)
 
 项目官网：[https://wapok.com](https://wapok.com)
 
-VR视频透视服务器 的目标是让所有VR视频都可以透视，实现混合现实(MR)。
+Thru3D媒体服务器 的目标是让所有VR视频都可以透视，实现混合现实(MR)。
 
-![VR视频透视服务器概览](assets/intro_cn_s.png)
+![Thru3D媒体服务器概览](assets/intro_cn_s.png)
 
 它是以 Windows 为主要运行平台的 VR DLNA 本地媒体服务器，提供多语言桌面界面和独立离线工具。软件通过 DLNA/UPnP 暴露本地视频库，并提供实时绿幕透视、Alpha透视、2D视频透视、2D转3D / VR、NVIDIA RTX视频超分辨率、VR硬字幕、匹配环境光，以及基于同名 `.si.wav` sidecar 的配音/同传播放。软件主要针对 VR180 半等柱体投影（half-equirectangular）视频优化，同时支持符合条件的普通2D视频。
 
-当前桌面版本：**v1.2.0**。
+桌面版本号见[应用元数据](ui/app_metadata.json)。
+
+Thru3D媒体服务器 是 Thru3D 系列的 Windows 媒体服务端，与 Thru3D Media Player 配套使用，也支持其他兼容的 DLNA 播放器。
+
+Windows 打包程序名为 `Thru3D_Media_Server.exe`，输出目录为 `dist/Thru3D_Media_Server/`。
 
 ## 项目起源
 
@@ -118,6 +124,7 @@ netsh advfirewall firewall add rule name="PTServer SSDP Private" dir=in action=a
 
 | 播放器 | Alpha 直通 | 灰色绿幕 | ChromaKey 绿幕 | 网站 | 备注 |
 | --- | --- | --- | --- | --- | --- |
+| Thru3D Media Player | 支持 | - | - | - | 仅支持 Alpha 透视 |
 | Skybox VR Player 2.0.2 Preview | 支持 | - | 支持 | [官网](https://skybox.xyz) | [安装说明](https://forum.skybox.xyz/d/2920-skybox-quest-v202-preview-performance-improvements) |
 | Moon Player | - | 支持 | 支持 | [官网](https://moonvrplayer.com) | - |
 | 4XVR Video Player | 支持 | - | 支持 | [官网](https://www.4xvr.net/) | - |
@@ -165,7 +172,7 @@ prompt/        交接记录与调研文档
 
 ## 引用的开源模型
 
-VR视频透视服务器 本身不训练抠像模型，只使用下列上游项目提供的模型与模型文件。
+Thru3D媒体服务器 本身不训练抠像模型，只使用下列上游项目提供的模型与模型文件。
 
 | 模型 | 用途 | 上游链接 |
 | --- | --- | --- |

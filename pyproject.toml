@@ -1,7 +1,7 @@
 [project]
 name = "ptserver"
 version = "0.1.0"
-description = "VR DLNA media server with realtime green-screen or alpha passthrough"
+description = "Thru3D Media Server: VR DLNA media server with realtime green-screen or alpha passthrough"
 readme = "README.md"
 requires-python = ">=3.12,<3.13"
 

@@ -246,7 +246,7 @@ def build_diagnostic_report(
         marker = _read_marker(Path(marker_path))
         marker_path_str = str(marker_path)
 
-    section_header = "=== PTServer Diagnostic Report ==="
+    section_header = "=== Thru3D Media Server Diagnostic Report ==="
     lines: list[str] = [
         section_header,
         f"generated:        {now}",

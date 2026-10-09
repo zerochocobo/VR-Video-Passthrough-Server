@@ -1,5 +1,5 @@
 ﻿{
-  "app.title": "VR Video Passthrough Server",
+  "app.title": "Thru3D Media Server",
   "app.subtitle": "VR DLNA media server with realtime passthrough and 2D->3D",
   "project.url_label": "Website",
   "button.start_server": "Start Realtime Passthrough Server",
@@ -252,6 +252,7 @@
   "player_support.gray_green": "Gray green screen",
   "player_support.chroma_key": "ChromaKey green screen",
   "player_support.website": "Website",
+  "player_support.alpha_only": "Alpha passthrough only",
   "player_support.notes": "Notes",
   "player_support.supported": "Supported",
   "player_support.official_site": "Official site",

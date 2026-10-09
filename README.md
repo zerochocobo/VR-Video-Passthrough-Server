@@ -1,16 +1,22 @@
-﻿# VR Video Passthrough Server
+﻿# Thru3D Media Server
+
+**Thru3D Media Server was formerly known as VR Video Passthrough Server (Chinese name: VR视频透视服务器).**
 
 English | [中文](README.zh-CN.md) | [日本語](README.ja-JP.md)
 
 Website: [https://wapok.com](https://wapok.com)
 
-VR Video Passthrough Server aims to make every VR video passthrough-capable, enabling mixed reality (MR).
+Thru3D Media Server aims to make every VR video passthrough-capable, enabling mixed reality (MR).
 
-![VR Video Passthrough Server overview](assets/intro_en_s.png)
+![Thru3D Media Server overview](assets/intro_en_s.png)
 
 It is a Windows-first VR DLNA local media server with a multilingual desktop UI and dedicated offline tools. It exposes local video libraries over DLNA/UPnP and provides realtime Green-screen and Alpha passthrough, 2D perspective conversion, 2D-to-3D / VR generation, NVIDIA RTX Video Super Resolution, hard subtitles, light matching, and dubbing / simultaneous-interpretation playback from same-stem `.si.wav` sidecars. It is optimized for VR180 half-equirectangular sources while also supporting eligible flat 2D videos.
 
-Current desktop release: **v1.2.0**.
+Desktop version: see [application metadata](ui/app_metadata.json).
+
+Thru3D Media Server is the Windows media server in the Thru3D family, alongside Thru3D Media Player. Other compatible DLNA players are also supported.
+
+Windows builds use `Thru3D_Media_Server.exe` in `dist/Thru3D_Media_Server/`.
 
 ## Project Origin
 
@@ -119,6 +125,7 @@ Tested on Meta Quest 3.
 
 | Player | Alpha passthrough | Gray green screen | ChromaKey green screen | Website | Notes |
 | --- | --- | --- | --- | --- | --- |
+| Thru3D Media Player | Supported | - | - | - | Alpha passthrough only |
 | Skybox VR Player 2.0.2 Preview | Supported | - | Supported | [Official site](https://skybox.xyz) | [Installation notes](https://forum.skybox.xyz/d/2920-skybox-quest-v202-preview-performance-improvements) |
 | Moon Player | - | Supported | Supported | [Official site](https://moonvrplayer.com) | - |
 | 4XVR Video Player | Supported | - | Supported | [Official site](https://www.4xvr.net/) | - |
@@ -158,7 +165,7 @@ prompt/        Handover notes and investigation reports
 
 ## Referenced Open Source Models
 
-VR Video Passthrough Server does not train matting models itself. It consumes upstream models and model files from the projects below.
+Thru3D Media Server does not train matting models itself. It consumes upstream models and model files from the projects below.
 
 | Model | Role | Upstream |
 | --- | --- | --- |

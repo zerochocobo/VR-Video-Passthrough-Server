@@ -136,7 +136,7 @@ def _startup_plan_estimate_profiles(provider_kind: str) -> dict[str, str]:
 
 
 def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Start VR Video Passthrough Server.")
+    parser = argparse.ArgumentParser(description="Start Thru3D Media Server.")
     parser.add_argument("mode", nargs="?", choices=["DEBUG", "debug"], default=None, help="use DEBUG to enable verbose diagnostics")
     parser.add_argument("--debug", action="store_true", help="enable verbose diagnostic logs")
     return parser.parse_args(argv)

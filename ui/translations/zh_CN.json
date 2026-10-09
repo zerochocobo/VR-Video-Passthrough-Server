@@ -1,5 +1,5 @@
 ﻿{
-  "app.title": "VR视频透视服务器",
+  "app.title": "Thru3D媒体服务器",
   "app.subtitle": "支持实时透视和2D转3D的VR DLNA媒体服务器",
   "project.url_label": "网址",
   "button.start_server": "启动实时透视服务器",
@@ -252,6 +252,7 @@
   "player_support.gray_green": "灰色绿幕",
   "player_support.chroma_key": "ChromaKey 绿幕",
   "player_support.website": "网站",
+  "player_support.alpha_only": "仅支持 Alpha 透视",
   "player_support.notes": "备注",
   "player_support.supported": "支持",
   "player_support.official_site": "官网",

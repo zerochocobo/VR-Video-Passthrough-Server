@@ -14,6 +14,7 @@ class PlayerSupportRow:
     chroma_key: bool
     website_url: str
     notes_url: str
+    notes_key: str = ""
 
 
 def load_player_support() -> list[PlayerSupportRow]:
@@ -28,6 +29,7 @@ def load_player_support() -> list[PlayerSupportRow]:
                 chroma_key=bool(item.get("chroma_key")),
                 website_url=str(item.get("website_url", "")),
                 notes_url=str(item.get("notes_url", "")),
+                notes_key=str(item.get("notes_key", "")),
             )
         )
     return rows

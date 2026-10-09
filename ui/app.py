@@ -83,7 +83,7 @@ def _install_qt_message_filter() -> None:
 def main() -> int:
     _install_qt_message_filter()
     app = QApplication(sys.argv)
-    app.setApplicationName("VR Video Passthrough Server")
+    app.setApplicationName("Thru3D Media Server")
     app.setWindowIcon(app_icon())
     app.setFont(font_for_language(system_language()))
     app.setStyleSheet(load_app_stylesheet())

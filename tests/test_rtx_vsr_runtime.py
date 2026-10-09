@@ -17,6 +17,6 @@ def test_development_runtime_is_owned_by_models_tree():
 
 def test_pyinstaller_specs_copy_owned_runtime_tree():
     root = Path(__file__).resolve().parents[1]
-    for name in ("pt_core.spec", "VR_Video_Passthrough_Server.spec"):
+    for name in ("pt_core.spec", "Thru3D_Media_Server.spec"):
         text = (root / name).read_text(encoding="utf-8-sig").replace("/", "\\").lower()
         assert re.search(r"models\\+rtx_vsr\\+runtime", text)

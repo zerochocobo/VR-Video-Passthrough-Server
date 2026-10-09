@@ -203,11 +203,11 @@ SSDP_INTERVAL_SEC: int = 60
 # PT_SERVER_NAME:
 #   Friendly name shown by DLNA clients during discovery. Some clients cache it,
 #   so restart the server and refresh/re-discover the client after changing it.
-SERVER_NAME = _env("SERVER_NAME", "VR Passthrough Server")
+SERVER_NAME = _env("SERVER_NAME", "Thru3D Media Server")
 
 # Static strings included in device description XML.
-MANUFACTURER = "PT"
-MODEL_NAME = "PT-DLNA"
+MANUFACTURER = "Thru3D"
+MODEL_NAME = "Thru3D Media Server"
 
 # UUID is stable for one LAN_IP/HTTP_PORT pair. Changing IP or port changes the
 # advertised UDN, helping clients treat the endpoint as a different device.

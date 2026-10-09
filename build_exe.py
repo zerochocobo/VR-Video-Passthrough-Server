@@ -11,7 +11,7 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parent
-APP_NAME = "VR_Video_Passthrough_Server"
+APP_NAME = "Thru3D_Media_Server"
 SERVER_NAME = "pt_core"
 DIST_DIR = ROOT / "dist" / APP_NAME
 ICON = ROOT / "resources" / "app.ico"

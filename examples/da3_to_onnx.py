@@ -1,4 +1,4 @@
-"""Convert Depth Anything 3 (Small / Base) to a depth-only ONNX graph.
+"""Convert Depth Anything 3 (Small / Base / Large) to a depth-only ONNX graph.
 
 DA3 ships as PyTorch + safetensors. This project (PTMediaServer) runs every
 model through onnxruntime, so before the 2D->VR pipeline can be ported we need
@@ -6,8 +6,8 @@ DA3 as a single ``.onnx`` file.
 
 What gets exported
 ------------------
-Only the *depth-only* sub-graph: ``DepthAnything3Net.forward(..., skip_camera=
-True, skip_sky=True)``. That path is the ONNX-friendly subset -- it drops the
+Only the *depth-only* sub-graph: the backbone followed by the depth head.
+That path is the ONNX-friendly subset -- it drops the
 camera / sky / Gaussian-Splat branches whose ``torch.quantile`` / ``randint`` /
 ``.item()`` / boolean-mask control flow cannot be traced. The remaining graph is
 DINOv2 (ViT-S for Small, ViT-B for Base) + DualDPT head, all static ops.
@@ -38,6 +38,7 @@ Run it with the VR_Video_Toolbox_NE venv, which already has the DA3 deps:
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 import time
 from pathlib import Path
@@ -47,13 +48,14 @@ import torch
 import torch.nn as nn
 
 # --- Locations -------------------------------------------------------------
-# tool_2dvr vendors the DA3 source under _vendor/da3; weights live under
-# VR_Video_Toolbox_NE/models/DA3/<Variant>. Outputs land in this project's
-# models/DA3 as da3_small.onnx / da3_base.onnx.
+# Prefer this repository's upstream checkout; retain the old vendor fallback.
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_TOOLBOX = Path(r"G:/GIT/debug/VR_Video_Toolbox_NE")
-DEFAULT_VENDOR = DEFAULT_TOOLBOX / "tool_2dvr" / "_vendor" / "da3"
-DEFAULT_SRC_ROOT = DEFAULT_TOOLBOX / "models" / "DA3"
-DEFAULT_OUT_DIR = Path(__file__).resolve().parent.parent / "models" / "DA3"
+DEFAULT_VENDOR = PROJECT_ROOT / "reference" / "da3"
+if not DEFAULT_VENDOR.exists():
+    DEFAULT_VENDOR = DEFAULT_TOOLBOX / "tool_2dvr" / "_vendor" / "da3"
+DEFAULT_SRC_ROOT = PROJECT_ROOT / "models" / "DA3"
+DEFAULT_OUT_DIR = DEFAULT_SRC_ROOT
 
 VARIANTS = {
     "small": {"src": "Small", "onnx": "da3_small.onnx"},
@@ -68,9 +70,9 @@ IMAGENET_STD = np.asarray([0.229, 0.224, 0.225], dtype=np.float32)
 class DepthOnlyWrapper(nn.Module):
     """Wraps DepthAnything3 so ONNX sees ``-> depth (B,H,W)``.
 
-    Calls the inner ``DepthAnything3Net`` directly (bypassing the api-level
-    bf16 autocast) so the whole graph stays fp32, matching the head, which
-    already runs autocast-disabled.
+    Calls the backbone and depth head directly, bypassing the API's bf16
+    autocast and camera/sky processing. Works with unmodified upstream DA3;
+    no custom ``skip_camera`` / ``skip_sky`` forward arguments are needed.
 
     ``fold_preprocess`` makes the graph take a uint8 ``(B,H,W,3)`` letterboxed
     canvas and do the ImageNet normalize + channel transpose on-device, so the
@@ -93,17 +95,14 @@ class DepthOnlyWrapper(nn.Module):
             image = (x - self._mean) / self._std
         # (B, 3, H, W) -> (B, S=1, 3, H, W): one independent view per frame.
         x = image.unsqueeze(1)
-        out = self.net(
+        feats, _ = self.net.backbone(
             x,
-            None,            # extrinsics
-            None,            # intrinsics
-            [],              # export_feat_layers
-            False,           # infer_gs
-            False,           # use_ray_pose
-            "middle",        # ref_view_strategy (unused at S=1)
-            skip_camera=True,
-            skip_sky=True,
+            cam_token=None,
+            export_feat_layers=[],
+            ref_view_strategy="middle",  # unused at S=1
         )
+        with torch.autocast(device_type=x.device.type, enabled=False):
+            out = self.net.head(feats, x.shape[-2], x.shape[-1], patch_start_idx=0)
         depth = out["depth"]
         # Net returns (B, S, H, W); collapse the singleton view dim -> (B, H, W).
         if depth.dim() == 4:
@@ -138,12 +137,21 @@ def _patch_position_getter() -> None:
 
 
 def load_da3(model_dir: Path, vendor_root: Path):
-    if str(vendor_root) not in sys.path:
-        sys.path.insert(0, str(vendor_root))
-    from depth_anything_3.api import DepthAnything3  # noqa: E402
+    # Accept both the official checkout (src/) and the old vendored layout.
+    source_root = vendor_root / "src" if (vendor_root / "src").is_dir() else vendor_root
+    if str(source_root) not in sys.path:
+        sys.path.insert(0, str(source_root))
+    from depth_anything_3.cfg import create_object, load_config
+    from depth_anything_3.registry import MODEL_REGISTRY
+    from safetensors.torch import load_model
 
     _patch_position_getter()
-    model = DepthAnything3.from_pretrained(str(model_dir))
+    config = json.loads((model_dir / "config.json").read_text(encoding="utf-8"))
+    # Match the upstream API's preset selection without importing its optional
+    # scene export, pose alignment, and image-processing dependencies.
+    model = nn.Module()
+    model.model = create_object(load_config(MODEL_REGISTRY[config["model_name"]]))
+    load_model(model, str(model_dir / "model.safetensors"), strict=True)
     model.eval()
     return model
 
@@ -170,8 +178,12 @@ def export_variant(
     print(f"\n=== DA3 {variant} ===")
     print(f"  weights : {model_dir}")
     print(f"  output  : {out_path}  (size={size}, fold_preprocess={fold_preprocess})")
-    if not (model_dir / "model.safetensors").exists():
-        raise FileNotFoundError(f"DA3 weights not found under {model_dir}")
+    for filename in ("config.json", "model.safetensors"):
+        if not (model_dir / filename).is_file():
+            raise FileNotFoundError(f"Missing {model_dir / filename}; use --download to fetch official weights")
+    config = json.loads((model_dir / "config.json").read_text(encoding="utf-8"))
+    if config.get("model_name") != f"da3-{variant}":
+        raise ValueError(f"Expected da3-{variant} weights, got {config.get('model_name')!r}")
 
     t0 = time.time()
     da3 = load_da3(model_dir, vendor_root)
@@ -207,8 +219,10 @@ def export_variant(
 
 def validate_variant(wrapper: nn.Module, out_path: Path, size: int, device: str,
                      fold_preprocess: bool = False) -> None:
+    import onnx
     import onnxruntime as ort
 
+    onnx.checker.check_model(str(out_path))
     rng = np.random.default_rng(0)
     if fold_preprocess:
         sample = rng.integers(0, 255, (2, size, size, 3), dtype=np.uint8)
@@ -230,6 +244,8 @@ def validate_variant(wrapper: nn.Module, out_path: Path, size: int, device: str,
         raise SystemExit(
             f"  [FAIL] shape mismatch torch={torch_depth.shape} onnx={onnx_depth.shape}"
         )
+    if not np.isfinite(torch_depth).all() or not np.isfinite(onnx_depth).all():
+        raise SystemExit("  [FAIL] non-finite depth values")
     diff = np.abs(torch_depth - onnx_depth)
     denom = np.abs(torch_depth).mean() + 1e-6
     print(
@@ -238,7 +254,7 @@ def validate_variant(wrapper: nn.Module, out_path: Path, size: int, device: str,
         f"rel {diff.mean() / denom:.4e} | providers={sess.get_providers()}"
     )
     if diff.mean() / denom > 1e-2:
-        print("  [WARN] relative error > 1e-2; inspect before trusting depth output")
+        raise SystemExit("  [FAIL] relative error > 1e-2")
     else:
         print("  [OK] torch vs onnxruntime match within tolerance")
 
@@ -247,9 +263,13 @@ def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--variant", choices=["small", "base", "large", "both"], default="both")
     p.add_argument("--src-root", type=Path, default=DEFAULT_SRC_ROOT,
-                   help="Folder holding Small/ and Base/ DA3 weight dirs")
+                   help="Folder holding Small/, Base/, and Large/ DA3 weight dirs (default models/DA3)")
     p.add_argument("--vendor", type=Path, default=DEFAULT_VENDOR,
-                   help="Vendored DA3 source root (contains depth_anything_3/)")
+                   help="DA3 checkout or source root (contains src/depth_anything_3/ or depth_anything_3/)")
+    p.add_argument("--download", action="store_true",
+                   help="Download official Hugging Face config and weights into --src-root")
+    p.add_argument("--revision", default="main",
+                   help="Hugging Face revision used by --download (default main)")
     p.add_argument("--out-dir", type=Path, default=DEFAULT_OUT_DIR,
                    help="Where to write da3_*.onnx (this project's models/DA3)")
     p.add_argument("--size", type=int, default=518,
@@ -257,7 +277,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--opset", type=int, default=18)
     p.add_argument("--device", default="cpu", choices=["cpu", "cuda"],
                    help="Trace device; cpu keeps the graph fp32 and deterministic")
-    p.add_argument("--no-validate", dest="validate", action="store_false")
+    validation = p.add_mutually_exclusive_group()
+    validation.add_argument("--validate", dest="validate", action="store_true",
+                            help="Check ONNX and compare with PyTorch (default)")
+    validation.add_argument("--no-validate", dest="validate", action="store_false")
     p.add_argument("--fold-preprocess", dest="fold_preprocess", action="store_true",
                    help="Bake ImageNet normalize into the graph; input becomes uint8 (B,size,size,3)")
     p.set_defaults(validate=True)
@@ -266,8 +289,8 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
-    if args.size % 14 != 0:
-        raise SystemExit(f"--size must be a multiple of 14, got {args.size}")
+    if args.size <= 0 or args.size % 14 != 0:
+        raise SystemExit(f"--size must be a positive multiple of 14, got {args.size}")
     if args.device == "cuda" and not torch.cuda.is_available():
         print("[info] CUDA unavailable, falling back to CPU")
         args.device = "cpu"
@@ -275,6 +298,15 @@ def main() -> None:
     variants = ["small", "base"] if args.variant == "both" else [args.variant]
     written = []
     for v in variants:
+        if args.download:
+            from huggingface_hub import snapshot_download
+
+            snapshot_download(
+                repo_id=f"depth-anything/DA3-{v.upper()}",
+                revision=args.revision,
+                allow_patterns=["config.json", "model.safetensors"],
+                local_dir=str(args.src_root / VARIANTS[v]["src"]),
+            )
         written.append(
             export_variant(v, args.src_root, args.vendor, args.out_dir,
                            args.size, args.opset, args.device, args.validate,

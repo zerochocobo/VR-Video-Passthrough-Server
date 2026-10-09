@@ -1,2 +1,2 @@
-﻿"""Desktop UI package for VR Video Passthrough Server."""
+﻿"""Desktop UI package for Thru3D Media Server."""
 

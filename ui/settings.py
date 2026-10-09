@@ -43,7 +43,7 @@ LIGHT_MATCH_PRESETS = {
 }
 
 DEFAULT_HTTP_PORT = 8200
-DEFAULT_SERVER_NAME = "VR Passthrough Server"  # config.py fallback when PT_SERVER_NAME is unset.
+DEFAULT_SERVER_NAME = "Thru3D Media Server"  # config.py fallback when PT_SERVER_NAME is unset.
 
 DEFAULTS = {
     "language": system_language(),

@@ -1,16 +1,22 @@
-﻿# VR Video Passthrough Server
+﻿# Thru3D Media Server
+
+**Thru3D Media Server の旧名称は「VR视频透视服务器」（VR Video Passthrough Server）です。**
 
 日本語 | [English](README.md) | [中文](README.zh-CN.md)
 
 公式サイト：[https://wapok.com](https://wapok.com)
 
-VR Video Passthrough Server の目標は、すべてのVR動画をパススルー対応にし、複合現実（MR）を実現することです。
+Thru3D Media Server の目標は、すべてのVR動画をパススルー対応にし、複合現実（MR）を実現することです。
 
-![VR Video Passthrough Server 概要](assets/intro_jp_s.png)
+![Thru3D Media Server 概要](assets/intro_jp_s.png)
 
 これは Windows を主な実行環境とする VR DLNA ローカルメディアサーバーで、多言語デスクトップUIと専用オフラインツールを備えています。DLNA/UPnP経由でローカル動画ライブラリを公開し、リアルタイムのグリーンスクリーン/Alphaパススルー、2D投影、2D→3D / VR、NVIDIA RTX Video Super Resolution、ハード字幕、ライトマッチング、同名 `.si.wav` サイドカーによる吹替/同時通訳再生に対応します。VR180 half-equirectangularソース向けに最適化されていますが、対応する平面2D動画も処理できます。
 
-現在のデスクトップ版：**v1.2.0**。
+デスクトップ版のバージョンは[アプリのメタデータ](ui/app_metadata.json)を参照してください。
+
+Thru3D Media Server は Thru3D シリーズの Windows 向けメディアサーバーです。Thru3D Media Player と連携し、ほかの互換 DLNA プレーヤーにも対応します。
+
+Windows ビルドの実行ファイルは `Thru3D_Media_Server.exe`、出力先は `dist/Thru3D_Media_Server/` です。
 
 ## プロジェクトの起源
 
@@ -118,6 +124,7 @@ Meta Quest 3 でテストしています。
 
 | プレイヤー | Alpha パススルー | グレーグリーンスクリーン | ChromaKey グリーンスクリーン | Web サイト | 備考 |
 | --- | --- | --- | --- | --- | --- |
+| Thru3D Media Player | 対応 | - | - | - | Alpha パススルーのみ対応 |
 | Skybox VR Player 2.0.2 Preview | 対応 | - | 対応 | [公式サイト](https://skybox.xyz) | [インストール説明](https://forum.skybox.xyz/d/2920-skybox-quest-v202-preview-performance-improvements) |
 | Moon Player | - | 対応 | 対応 | [公式サイト](https://moonvrplayer.com) | - |
 | 4XVR Video Player | 対応 | - | 対応 | [公式サイト](https://www.4xvr.net/) | - |
@@ -157,7 +164,7 @@ prompt/        引き継ぎメモと調査レポート
 
 ## 参照しているオープンソースモデル
 
-VR Video Passthrough Server 自体はマッティングモデルを学習しません。以下の上流プロジェクトが提供するモデルとモデルファイルを使用します。
+Thru3D Media Server 自体はマッティングモデルを学習しません。以下の上流プロジェクトが提供するモデルとモデルファイルを使用します。
 
 | モデル | 役割 | 上流 |
 | --- | --- | --- |

@@ -1,5 +1,5 @@
 ﻿@echo off
-REM VR Passthrough Server startup.
+REM Thru3D Media Server startup.
 REM Runtime defaults live in config.py. Override PT_* here only for temporary diagnostics.
 
 REM Development runtime dependency: ONNX Runtime CUDAExecutionProvider needs cuDNN 9.

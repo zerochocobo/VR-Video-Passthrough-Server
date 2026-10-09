@@ -31,12 +31,13 @@ The conversion script defaults are currently:
 
 | Purpose | Default |
 | --- | --- |
-| DA3 source tree | `G:/GIT/debug/VR_Video_Toolbox_NE/tool_2dvr/_vendor/da3` |
-| PyTorch weights | `G:/GIT/debug/VR_Video_Toolbox_NE/models/DA3/Small` and `Base` |
+| DA3 source tree | `reference/da3` if present; otherwise `G:/GIT/debug/VR_Video_Toolbox_NE/tool_2dvr/_vendor/da3` |
+| PyTorch weights | `models/DA3/Small`, `Base`, and `Large` in this repository |
 | ONNX output | `models/DA3` in this repository |
 
-The `Large` weights live in this repository at `models/DA3/Large`, so the Large
-export is run with `--src-root models/DA3` (see Convert From PyTorch Weights).
+Use `--download` to fetch `config.json` and `model.safetensors` from the official
+Hugging Face repository for each selected variant. Original checkpoints and
+generated ONNX files are ignored by Git.
 
 Canonical output names at the default size:
 
@@ -58,15 +59,12 @@ which is the highest-quality depth tier PTMediaServer exposes.
 
 ## Exported Graph
 
-The converter wraps `DepthAnything3Net.forward(...)` with a singleton view
-dimension and these fixed branch settings:
+The converter adds a singleton view dimension and directly calls the upstream
+backbone and depth head:
 
 ```python
-skip_camera=True
-skip_sky=True
-infer_gs=False
-use_ray_pose=False
-ref_view_strategy="middle"
+feats, _ = net.backbone(x, cam_token=None, export_feat_layers=[], ref_view_strategy="middle")
+output = net.head(feats, height, width, patch_start_idx=0)
 ```
 
 Only the depth-only sub-graph is exported:
@@ -75,6 +73,11 @@ Only the depth-only sub-graph is exported:
 - DualDPT depth head.
 - Single-view input, `S=1`, one independent view per frame.
 - Dynamic batch axis only.
+
+This works with unmodified upstream DA3. The old `skip_camera` / `skip_sky`
+arguments were specific to the former vendored copy. The loader constructs the
+same model preset as the upstream API and strictly loads all safetensors weights,
+without importing optional scene-export and pose-alignment dependencies.
 
 Camera, sky, and Gaussian-splatting branches are intentionally excluded because
 their `torch.quantile`, random sampling, `.item()`, and boolean-mask control
@@ -205,7 +208,34 @@ RGB `[batch, size, size, 3]`.
 ## Convert From PyTorch Weights
 
 Run the exporter from this repository root. The VR_Video_Toolbox_NE virtual
-environment already contains the DA3 PyTorch dependencies:
+environment on this workstation contains the required PyTorch dependencies.
+Elsewhere, use a Python environment with `torch`, `torchvision`, `numpy`, `onnx`,
+`onnxruntime` (or `onnxruntime-gpu`), `safetensors`, `omegaconf`, `einops`, and
+`addict`; `--download` additionally needs `huggingface_hub`.
+
+The DA3 source is also required. `--vendor` accepts an official checkout (with
+`src/depth_anything_3/`) or a source directory containing `depth_anything_3/`.
+If there is no local checkout, obtain it with:
+
+```bash
+git clone https://github.com/ByteDance-Seed/depth-anything-3 reference/da3
+```
+
+Download and export the official [DA3-SMALL](https://huggingface.co/depth-anything/DA3-SMALL)
+for PTMediaServer, including preprocessing and validation (PowerShell):
+
+```powershell
+& G:/GIT/debug/VR_Video_Toolbox_NE/.venv/Scripts/python.exe examples/da3_to_onnx.py --variant small --download --vendor reference/da3 --validate --fold-preprocess
+```
+
+The result is `models/DA3/da3_small.onnx`, with RGB uint8 input
+`[batch, 518, 518, 3]` and float32 depth output `[batch, 518, 518]`.
+For reproducible downloads, add `--revision e08cab65ca0ec38e7826075418411ab90cab4da3`
+(the DA3-SMALL revision verified on 2026-10-08). Omit `--download` when weights
+are already available locally. Omit `--fold-preprocess` for normalized float32
+NCHW input.
+
+Export both Small and Base from already downloaded weights:
 
 ```bash
 G:/GIT/debug/VR_Video_Toolbox_NE/.venv/Scripts/python.exe \
@@ -219,11 +249,11 @@ python examples/da3_to_onnx.py --variant small --validate
 python examples/da3_to_onnx.py --variant base --validate
 ```
 
-Export the Large high-detail model (weights are in this repo's `models/DA3`):
+Download and export the Large high-detail model into this repo's `models/DA3`:
 
 ```bash
 G:/GIT/debug/VR_Video_Toolbox_NE/.venv/Scripts/python.exe \
-  examples/da3_to_onnx.py --variant large --size 1036 \
+  examples/da3_to_onnx.py --variant large --download --size 1036 \
   --src-root models/DA3 --out-dir models/DA3 --device cuda --validate
 ```
 
@@ -244,11 +274,14 @@ Useful options:
 ```text
 --variant small|base|large|both
 --src-root PATH       Folder containing Small/, Base/, and Large/ weight directories.
---vendor PATH         Vendored DA3 source root containing depth_anything_3/.
+--vendor PATH         DA3 checkout or source root containing depth_anything_3/.
+--download            Fetch official config.json and model.safetensors into --src-root.
+--revision REVISION   Hugging Face revision for --download (default main).
 --out-dir PATH        Output folder for da3_*.onnx.
 --size 518            Fixed square input side. Must be a multiple of 14.
 --opset 18            ONNX opset version.
 --device cpu|cuda     Device used for tracing. CPU is the default.
+--validate            Check ONNX and compare with PyTorch (enabled by default).
 --no-validate         Skip ONNX Runtime validation.
 --fold-preprocess     Export uint8 NHWC input with ImageNet normalize inside ONNX.
 ```
@@ -258,10 +291,13 @@ Expected weight layout:
 ```text
 DA3/
   Small/
+    config.json
     model.safetensors
   Base/
+    config.json
     model.safetensors
   Large/
+    config.json
     model.safetensors
 ```
 
@@ -278,7 +314,9 @@ Runtime output and reports:
 - relative mean error
 - active ONNX Runtime providers
 
-The script warns if relative error is higher than `1e-2`.
+The script also runs `onnx.checker` and fails if the output shape differs,
+either output contains non-finite values, or relative mean error exceeds `1e-2`.
+Validation uses batch size 2 to exercise the dynamic batch axis.
 
 ## Notes
 

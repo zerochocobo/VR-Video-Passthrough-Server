@@ -1,6 +1,15 @@
 {
   "rows": [
     {
+      "player": "Thru3D Media Player",
+      "alpha": true,
+      "gray_green": false,
+      "chroma_key": false,
+      "website_url": "",
+      "notes_url": "",
+      "notes_key": "player_support.alpha_only"
+    },
+    {
       "player": "Skybox VR Player 2.0.2 Preview",
       "alpha": true,
       "gray_green": false,

@@ -1,5 +1,5 @@
 ﻿{
-  "app.title": "VR動画透視サーバー",
+  "app.title": "Thru3D Media Server",
   "app.subtitle": "リアルタイムの視点表示と2Dから3Dへの変換をサポートするVR DLNAメディアサーバー",
   "project.url_label": "URL",
   "button.start_server": "リアルタイム透視サーバーを起動",
@@ -252,6 +252,7 @@
   "player_support.gray_green": "グレーグリーンスクリーン",
   "player_support.chroma_key": "ChromaKey グリーンスクリーン",
   "player_support.website": "Web サイト",
+  "player_support.alpha_only": "Alpha パススルーのみ対応",
   "player_support.notes": "備考",
   "player_support.supported": "対応",
   "player_support.official_site": "公式サイト",

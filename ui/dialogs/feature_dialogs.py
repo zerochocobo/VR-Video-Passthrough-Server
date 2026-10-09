@@ -136,10 +136,10 @@ class PlayerSupportDialog(QDialog):
             table.setCellWidget(
                 row_index,
                 5,
-                _link_label(self.i18n.t("player_support.install_notes"), row.notes_url),
+                (QLabel(self.i18n.t(row.notes_key)) if row.notes_key else
+                 _link_label(self.i18n.t("player_support.install_notes"), row.notes_url)),
             )
-        table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
-        for column in range(1, len(headers)):
+        for column in range(len(headers)):
             table.horizontalHeader().setSectionResizeMode(column, QHeaderView.ResizeMode.ResizeToContents)
         table.resizeRowsToContents()
 
@@ -153,7 +153,7 @@ class PlayerSupportDialog(QDialog):
         layout.addWidget(title)
         layout.addWidget(table)
         layout.addLayout(button_row)
-        self.resize(760, 330)
+        self.resize(max(760, table.horizontalHeader().length() + 60), 380)
 
     def _support_text(self, supported: bool) -> str:
         return self.i18n.t("player_support.supported") if supported else "-"
