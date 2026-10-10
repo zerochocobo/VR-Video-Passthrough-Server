@@ -389,7 +389,7 @@ class SIMixTests(unittest.TestCase):
         # The [SI] entry is now a realtime directory (chapters + time index),
         # not a single cached item.
         self.assertTrue(items[1].get("container"))
-        self.assertEqual(items[1]["id"], "six_ptv11_movie.mp4")
+        self.assertEqual(items[1]["id"], f"six_{cds._versioned_rel('movie.mp4')}")
         self.assertEqual(items[1]["title"], "[SI]movie_LR_180_SBS")
         # 60s source -> one quick chapter (t=0) + one "Select Time Index" entry.
         self.assertEqual(items[1]["child_count"], 2)
@@ -409,10 +409,10 @@ class SIMixTests(unittest.TestCase):
                 children = cds._si_chapter_items(video)
         # First child is the "Select Time Index" subdirectory.
         self.assertTrue(children[0].get("container"))
-        self.assertEqual(children[0]["id"], "sxi_ptv11_movie.mp4")
+        self.assertEqual(children[0]["id"], f"sxi_{cds._versioned_rel('movie.mp4')}")
         self.assertIn("[SI]movie_LR_180_SBS", children[0]["title"])
         # Then up to N quick-play chapter leaves hitting /si_live.
-        self.assertEqual(children[1]["id"], "sic_ptv11_movie.mp4@0")
+        self.assertEqual(children[1]["id"], f"sic_{cds._versioned_rel('movie.mp4')}@0")
         self.assertIn("/si_live/movie.mp4", children[1]["url"])
         self.assertIn("t=0", children[1]["url"])
         self.assertEqual(children[1]["mime"], "video/MP2T")
@@ -433,10 +433,10 @@ class SIMixTests(unittest.TestCase):
                 minute_items = cds._si_time_index_items(video, "minute", start=0)
         # 60s -> a single 10-min group, so [SI] shows the minute directories directly.
         self.assertTrue(index_items[0].get("container"))
-        self.assertEqual(index_items[0]["id"], "sin_ptv11_movie.mp4@0")
+        self.assertEqual(index_items[0]["id"], f"sin_{cds._versioned_rel('movie.mp4')}@0")
         # Each 5s point is a playable leaf hitting the realtime MPEG-TS route.
         first_leaf = minute_items[0]
-        self.assertEqual(first_leaf["id"], "sit_ptv11_movie.mp4@0")
+        self.assertEqual(first_leaf["id"], f"sit_{cds._versioned_rel('movie.mp4')}@0")
         self.assertIn("/si_live/movie.mp4", first_leaf["url"])
         self.assertIn("t=0", first_leaf["url"])
         self.assertEqual(first_leaf["mime"], "video/MP2T")

@@ -368,6 +368,48 @@ class OfflinePage(QWidget):
         combo.addItem("", "alpha")
         return combo
 
+    def _source_row(self, scope: str) -> QHBoxLayout:
+        projection = _fit_combo(QComboBox())
+        for value in ("auto", "hequirect", "fisheye"):
+            projection.addItem("", value)
+        fov = _fit_combo(QComboBox())
+        for angle in range(140, 281, 10):
+            fov.addItem(f"{angle}°", angle)
+        fov_label = QLabel()
+        setattr(self, f"{scope}_source_projection", projection)
+        setattr(self, f"{scope}_source_fov", fov)
+        setattr(self, f"{scope}_source_fov_label", fov_label)
+        projection.setCurrentIndex(max(0, projection.findData(self.settings.data.get(f"offline_{scope}_source_projection", "auto"))))
+        index = fov.findData(self.settings.data.get(f"offline_{scope}_source_fov", 180))
+        fov.setCurrentIndex(index if index >= 0 else fov.findData(180))
+        projection.currentIndexChanged.connect(lambda: self._save_source_selection(scope))
+        fov.currentIndexChanged.connect(lambda: self._save_source_selection(scope))
+        row = QHBoxLayout()
+        row.addWidget(projection)
+        row.addWidget(fov_label)
+        row.addWidget(fov)
+        row.addStretch(1)
+        self._update_source_visibility(scope)
+        return row
+
+    def _update_source_visibility(self, scope: str) -> None:
+        fisheye = getattr(self, f"{scope}_source_projection").currentData() == "fisheye"
+        getattr(self, f"{scope}_source_fov").setVisible(fisheye)
+        getattr(self, f"{scope}_source_fov_label").setVisible(fisheye)
+
+    def _save_source_selection(self, scope: str) -> None:
+        self.settings.data[f"offline_{scope}_source_projection"] = getattr(self, f"{scope}_source_projection").currentData()
+        self.settings.data[f"offline_{scope}_source_fov"] = getattr(self, f"{scope}_source_fov").currentData()
+        self._update_source_visibility(scope)
+        self.settings.save()
+
+    def _source_args(self, scope: str) -> list[str]:
+        projection = getattr(self, f"{scope}_source_projection").currentData()
+        args = ["--source-projection", projection]
+        if projection == "fisheye":
+            args.extend(["--source-fov", str(getattr(self, f"{scope}_source_fov").currentData())])
+        return args
+
     def _duration_combo(self) -> QComboBox:
         combo = _fit_combo(QComboBox())
         combo.addItem("", 15.0)
@@ -494,41 +536,43 @@ class OfflinePage(QWidget):
         grid = QGridLayout(page)
         grid.setColumnMinimumWidth(0, OFFLINE_LABEL_WIDTH)
         grid.setColumnStretch(1, 1)
-        self.single_labels = {key: _label() for key in ("video", "output", "mode", "engine", "precision", "recognition", "sam3_prompt", "trt", "performance")}
+        self.single_labels = {key: _label() for key in ("video", "output", "mode", "source", "engine", "precision", "recognition", "sam3_prompt", "trt", "performance")}
         grid.addWidget(self.single_labels["video"], 0, 0)
         grid.addLayout(row_video, 0, 1)
         grid.addWidget(self.single_labels["output"], 1, 0)
         grid.addLayout(row_out, 1, 1)
         grid.addWidget(self.single_labels["mode"], 2, 0)
         grid.addWidget(self.single_mode, 2, 1, alignment=Qt.AlignLeft)
-        grid.addWidget(self.single_labels["engine"], 3, 0)
+        grid.addWidget(self.single_labels["source"], 3, 0)
+        grid.addLayout(self._source_row("single"), 3, 1)
+        grid.addWidget(self.single_labels["engine"], 4, 0)
         single_engine_row = QHBoxLayout()
         single_engine_row.addWidget(self.single_engine)
         single_engine_row.addStretch(1)
-        grid.addLayout(single_engine_row, 3, 1)
-        grid.addWidget(self.single_labels["precision"], 4, 0)
-        grid.addWidget(self.single_precision, 4, 1, alignment=Qt.AlignLeft)
-        grid.addWidget(self.single_labels["recognition"], 5, 0)
+        grid.addLayout(single_engine_row, 4, 1)
+        grid.addWidget(self.single_labels["precision"], 5, 0)
+        grid.addWidget(self.single_precision, 5, 1, alignment=Qt.AlignLeft)
+        grid.addWidget(self.single_labels["recognition"], 6, 0)
         single_recognition_row = QHBoxLayout()
         single_recognition_row.addWidget(self.single_recognition)
         single_recognition_row.addWidget(self.single_matanyone_help)
         single_recognition_row.addStretch(1)
-        grid.addLayout(single_recognition_row, 5, 1)
-        grid.addWidget(self.single_labels["sam3_prompt"], 6, 0)
+        grid.addLayout(single_recognition_row, 6, 1)
+        grid.addWidget(self.single_labels["sam3_prompt"], 7, 0)
         single_sam3_row = QHBoxLayout()
         single_sam3_row.addWidget(self.single_sam3_prompt_button)
         single_sam3_row.addWidget(self.single_sam3_preview_button)
         single_sam3_row.addWidget(self.single_sam3_prompt_label)
         single_sam3_row.addStretch(1)
-        grid.addLayout(single_sam3_row, 6, 1)
-        grid.addWidget(self.single_labels["trt"], 7, 0)
-        grid.addLayout(self._trt_cache_row("single"), 7, 1)
-        grid.addWidget(self.single_labels["performance"], 8, 0)
-        grid.addLayout(self._performance_row(self.single_quality_speed), 8, 1)
-        grid.addWidget(self.single_time_mode, 9, 0, alignment=Qt.AlignRight)
-        grid.addLayout(self._time_row(), 9, 1)
-        grid.addWidget(self.single_skip, 10, 1)
-        grid.addLayout(actions, 11, 1)
+        grid.addLayout(single_sam3_row, 7, 1)
+        grid.addWidget(self.single_labels["trt"], 8, 0)
+        grid.addLayout(self._trt_cache_row("single"), 8, 1)
+        grid.addWidget(self.single_labels["performance"], 9, 0)
+        grid.addLayout(self._performance_row(self.single_quality_speed), 9, 1)
+        grid.addWidget(self.single_time_mode, 10, 0, alignment=Qt.AlignRight)
+        grid.addLayout(self._time_row(), 10, 1)
+        grid.addWidget(self.single_skip, 11, 1)
+        grid.addLayout(actions, 12, 1)
         self.tabs.addTab(page, "")
         self._update_custom_duration_visibility()
         self._update_time_mode_visibility()
@@ -571,38 +615,40 @@ class OfflinePage(QWidget):
         grid = QGridLayout(page)
         grid.setColumnMinimumWidth(0, OFFLINE_LABEL_WIDTH)
         grid.setColumnStretch(1, 1)
-        self.batch_labels = {key: _label() for key in ("directory", "mode", "engine", "precision", "recognition", "sam3_prompt", "trt", "performance")}
+        self.batch_labels = {key: _label() for key in ("directory", "mode", "source", "engine", "precision", "recognition", "sam3_prompt", "trt", "performance")}
         grid.addWidget(self.batch_labels["directory"], 0, 0)
         grid.addLayout(row_dir, 0, 1)
         grid.addWidget(self.batch_labels["mode"], 1, 0)
         grid.addWidget(self.batch_mode, 1, 1, alignment=Qt.AlignLeft)
-        grid.addWidget(self.batch_labels["engine"], 2, 0)
+        grid.addWidget(self.batch_labels["source"], 2, 0)
+        grid.addLayout(self._source_row("batch"), 2, 1)
+        grid.addWidget(self.batch_labels["engine"], 3, 0)
         batch_engine_row = QHBoxLayout()
         batch_engine_row.addWidget(self.batch_engine)
         batch_engine_row.addStretch(1)
-        grid.addLayout(batch_engine_row, 2, 1)
-        grid.addWidget(self.batch_labels["precision"], 3, 0)
-        grid.addWidget(self.batch_precision, 3, 1, alignment=Qt.AlignLeft)
-        grid.addWidget(self.batch_labels["recognition"], 4, 0)
+        grid.addLayout(batch_engine_row, 3, 1)
+        grid.addWidget(self.batch_labels["precision"], 4, 0)
+        grid.addWidget(self.batch_precision, 4, 1, alignment=Qt.AlignLeft)
+        grid.addWidget(self.batch_labels["recognition"], 5, 0)
         batch_recognition_row = QHBoxLayout()
         batch_recognition_row.addWidget(self.batch_recognition)
         batch_recognition_row.addWidget(self.batch_matanyone_help)
         batch_recognition_row.addStretch(1)
-        grid.addLayout(batch_recognition_row, 4, 1)
-        grid.addWidget(self.batch_labels["sam3_prompt"], 5, 0)
+        grid.addLayout(batch_recognition_row, 5, 1)
+        grid.addWidget(self.batch_labels["sam3_prompt"], 6, 0)
         batch_sam3_row = QHBoxLayout()
         batch_sam3_row.addWidget(self.batch_sam3_prompt_button)
         batch_sam3_row.addWidget(self.batch_sam3_preview_button)
         batch_sam3_row.addWidget(self.batch_sam3_prompt_label)
         batch_sam3_row.addStretch(1)
-        grid.addLayout(batch_sam3_row, 5, 1)
-        grid.addWidget(self.batch_labels["trt"], 6, 0)
-        grid.addLayout(self._trt_cache_row("batch"), 6, 1)
-        grid.addWidget(self.batch_labels["performance"], 7, 0)
-        grid.addLayout(self._performance_row(self.batch_quality_speed), 7, 1)
-        grid.addWidget(self.batch_recursive, 8, 1)
-        grid.addWidget(self.batch_skip, 9, 1)
-        grid.addLayout(actions, 10, 1)
+        grid.addLayout(batch_sam3_row, 6, 1)
+        grid.addWidget(self.batch_labels["trt"], 7, 0)
+        grid.addLayout(self._trt_cache_row("batch"), 7, 1)
+        grid.addWidget(self.batch_labels["performance"], 8, 0)
+        grid.addLayout(self._performance_row(self.batch_quality_speed), 8, 1)
+        grid.addWidget(self.batch_recursive, 9, 1)
+        grid.addWidget(self.batch_skip, 10, 1)
+        grid.addLayout(actions, 11, 1)
         self.tabs.addTab(page, "")
 
     def _browse_file(self, target: QLineEdit) -> None:
@@ -1060,6 +1106,7 @@ class OfflinePage(QWidget):
             "--skip-frames",
             "0",
         ]
+        args.extend(self._source_args("single"))
         if str(self.single_time_mode.currentData()) == "segments":
             segments = self._validated_single_time_segments()
             if segments is None:
@@ -1103,6 +1150,7 @@ class OfflinePage(QWidget):
             "--skip-frames",
             "0",
         ]
+        args.extend(self._source_args("batch"))
         args.append("--recursive" if self.batch_recursive.isChecked() else "--no-recursive")
         if self.batch_skip.isChecked():
             args.append("--skip-existing")
@@ -1128,6 +1176,9 @@ class OfflinePage(QWidget):
         env["PT_OFFLINE_MATANYONE2_TRT_ENABLE"] = "1" if model_key == TRT_MODEL_MATANYONE2 and enabled else "0"
 
     def set_running(self, running: bool) -> None:
+        for scope in ("single", "batch"):
+            getattr(self, f"{scope}_source_projection").setEnabled(not running)
+            getattr(self, f"{scope}_source_fov").setEnabled(not running)
         self.start_single.setEnabled(not running)
         self.start_batch.setEnabled(not running)
         self.stop_single.setEnabled(running)
@@ -1153,6 +1204,12 @@ class OfflinePage(QWidget):
         self.log.moveCursor(self.log.textCursor().MoveOperation.End)
 
     def retranslate(self) -> None:
+        for scope in ("single", "batch"):
+            getattr(self, f"{scope}_labels")["source"].setText(self.i18n.t("offline.source_projection"))
+            getattr(self, f"{scope}_source_fov_label").setText(self.i18n.t("offline.source_fov"))
+            combo = getattr(self, f"{scope}_source_projection")
+            for index, key in enumerate(("offline.source_auto", "offline.source_hequirect", "offline.source_fisheye")):
+                combo.setItemText(index, self.i18n.t(key))
         self.title_label.setText(self.i18n.t("button.offline"))
         self.back_button.setText(self.i18n.t("button.back"))
         self.tabs.setTabText(0, self.i18n.t("offline.single_tab"))

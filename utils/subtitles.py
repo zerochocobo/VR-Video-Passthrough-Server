@@ -14,6 +14,7 @@ SUBTITLE_MIME_BY_SUFFIX = {
     ".ssa": "application/x-ssa",
     ".vtt": "text/vtt",
 }
+SRT_DLNA_MIME = "text/srt"
 
 
 @dataclass(frozen=True)
@@ -30,6 +31,29 @@ class SubtitleTrack:
 
 def subtitle_mime(path: Path) -> str:
     return SUBTITLE_MIME_BY_SUFFIX.get(path.suffix.lower(), "text/plain")
+
+
+def subtitle_response_mime(path: Path, requested: str | None = None) -> str:
+    """Allow only MIME aliases that describe this subtitle format."""
+    canonical = subtitle_mime(path)
+    if requested is None or requested == canonical:
+        return canonical
+    if path.suffix.lower() == ".srt" and requested == SRT_DLNA_MIME:
+        return requested
+    raise ValueError("unsupported subtitle MIME type")
+
+
+def caption_url(url: str, kind: str) -> str:
+    """Use the legacy SRT MIME for clients consuming SEC/PV captions."""
+    if kind.lower() != "srt":
+        return url
+    separator = "&" if "?" in url else "?"
+    return f"{url}{separator}mime={SRT_DLNA_MIME}"
+
+
+def preferred_subtitle(tracks: list[SubtitleTrack]) -> SubtitleTrack | None:
+    """Prefer SRT for the single caption link; preserve language ordering."""
+    return next((track for track in tracks if track.kind == "srt"), tracks[0] if tracks else None)
 
 
 def is_subtitle_path(path: Path) -> bool:
@@ -79,28 +103,36 @@ def find_external_subtitles(video_path: Path) -> list[SubtitleTrack]:
     stem = video_path.stem
     tracks: list[SubtitleTrack] = []
     seen: set[str] = set()
-    for suffix in SUBTITLE_MIME_BY_SUFFIX:
-        candidates = [parent / f"{stem}{suffix}"]
-        candidates.extend(sorted(parent.glob(f"{stem}.*{suffix}")))
-        for path in candidates:
-            try:
-                resolved = safe_resolve_path(path)
-            except Exception:
-                continue
+    try:
+        candidates = sorted(parent.iterdir(), key=lambda path: (path.name.casefold(), path.name))
+    except OSError:
+        return []
+    for path in candidates:
+        # Literal matching matters for movie names containing glob characters,
+        # e.g. "Movie [2026].zh.srt", and for mixed-case names/extensions.
+        sub_stem = path.stem.casefold()
+        if not is_subtitle_path(path) or not (
+            sub_stem == stem.casefold() or sub_stem.startswith(f"{stem.casefold()}.")
+        ):
+            continue
+        try:
+            resolved = safe_resolve_path(path)
             key = str(resolved).casefold()
-            if key in seen or not resolved.is_file():
+            if key in seen or not resolved.is_file() or not is_subtitle_path(resolved):
                 continue
             if not config.MEDIA_LIBRARY.contains(resolved):
                 continue
-            seen.add(key)
-            kind = resolved.suffix.lower().lstrip(".")
-            tracks.append(
-                SubtitleTrack(
-                    path=resolved,
-                    lang=_infer_lang(stem, resolved.stem),
-                    kind=kind,
-                    mime=subtitle_mime(resolved),
-                )
+        except OSError:
+            continue
+        seen.add(key)
+        kind = resolved.suffix.lower().lstrip(".")
+        tracks.append(
+            SubtitleTrack(
+                path=resolved,
+                lang=_infer_lang(stem, path.stem),
+                kind=kind,
+                mime=subtitle_mime(resolved),
             )
+        )
     tracks.sort(key=lambda item: (_lang_rank(item.lang), item.path.name.casefold()))
     return tracks

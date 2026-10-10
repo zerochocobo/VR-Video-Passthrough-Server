@@ -29,6 +29,7 @@ Windows ビルドの実行ファイルは `Thru3D_Media_Server.exe`、出力先�
 ## 機能
 
 - DLNA 検出と ContentDirectory ブラウズ
+- DLNA メタデータと HTTP 字幕リンクによる、元動画の外部 SRT・ASS・SSA・WebVTT 字幕配信
 - GPU マッティングと HEVC 出力によるリアルタイムパススルーストリーミング
 - パススルーストリームへのリアルタイム字幕埋め込み
 - グリーンスクリーンモードと Alpha パススルーモード
@@ -60,6 +61,14 @@ Windows ビルドの実行ファイルは `Thru3D_Media_Server.exe`、出力先�
 | --- | --- |
 | ![Alpha Passthrough の例](assets/sample_alpha.jpg) | ![グリーンスクリーン Passthrough の例](assets/sample_green.jpg) |
 | ![Screenshot](assets/passthrough_screenshot.jpg) |
+
+## DLNA の外部字幕
+
+UTF-8 字幕を元動画と同じフォルダーに置きます。例：`movie.mp4` と `movie.srt`、`movie.zh-CN.srt`、`movie.en.srt`。大文字・小文字は区別せず、ファイル名の角括弧は文字として扱います。ASS、SSA、VTT も配信しますが、再生可否はクライアントに依存します。
+
+字幕リソース、Samsung の `CaptionInfo` / `CaptionInfoEx`、`pv:subtitleFileUri` を提供します。SRT は `application/x-subrip` と `text/srt` の両方を提示し、HTTP の MIME も各リソースと一致します。単一字幕リンクは SRT を優先し、次に言語接尾辞なし、中国語、英語の順に選択します。字幕の追加・名前変更・削除は次回のディレクトリ Browse に反映されます。プレーヤーが一覧をキャッシュしている場合はライブラリーを更新してください。
+
+元動画の外部字幕は、リアルタイム字幕焼き込みのスイッチと独立しています。プレーヤー側の DLNA 字幕検出対応が必要です。字幕ファイルのバイト列は変更せず、文字コードの自動変換は行いません。
 
 ## 動作要件
 

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from config import DLNA_IMAGE_ENABLED, IMAGE_MIME_BY_EXT
+from utils.subtitles import SRT_DLNA_MIME, SUBTITLE_MIME_BY_SUFFIX
 
 
 def _source_protocol_info() -> str:
@@ -10,6 +11,10 @@ def _source_protocol_info() -> str:
         "http-get:*:video/MP2T:*",
         "http-get:*:video/x-matroska:*",
     ]
+    protocols.extend(
+        f"http-get:*:{mime}:*"
+        for mime in dict.fromkeys([*SUBTITLE_MIME_BY_SUFFIX.values(), SRT_DLNA_MIME])
+    )
     if DLNA_IMAGE_ENABLED:
         protocols.extend(f"http-get:*:{mime}:*" for mime in dict.fromkeys(IMAGE_MIME_BY_EXT.values()))
     return ",".join(protocols)

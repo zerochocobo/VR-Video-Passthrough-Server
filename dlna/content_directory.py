@@ -71,7 +71,7 @@ from utils.offline_outputs import (
     is_offline_passthrough_output_name,
 )
 from utils.runtime_settings import get_face_beauty, get_rm, get_si_mix
-from utils.subtitles import SubtitleTrack, find_external_subtitles
+from utils.subtitles import SRT_DLNA_MIME, SubtitleTrack, caption_url, find_external_subtitles
 from utils.video_metadata import probe_video_metadata, select_backend
 from utils.rtx_vsr import is_native_target, source_exceeds_target_resolution
 from utils.vr_naming import (
@@ -146,7 +146,7 @@ DLNA_OP_BYTE_AND_TIME_SEEK = "11"
 DIDL_NS = "urn:schemas-upnp-org:metadata-1-0/DIDL-Lite/"
 
 _DIR_ITEMS_CACHE_MAX = 256
-_DIDL_SCHEMA_VERSION = 11
+_DIDL_SCHEMA_VERSION = 12
 _SYSTEM_UPDATE_ID = _DIDL_SCHEMA_VERSION
 _OBJECT_ID_VERSION_PREFIX = f"ptv{_DIDL_SCHEMA_VERSION}_"
 _dir_items_cache: dict[tuple, list[dict]] = {}
@@ -450,6 +450,16 @@ def _id_to_seek(object_id: str) -> tuple[Path, str] | None:
     path = MEDIA_LIBRARY.key_to_path(rel)
     if path is not None and MEDIA_LIBRARY.contains(path) and path.is_file() and path.suffix.lower() in VIDEO_EXTS:
         return path, mode
+    return None
+
+
+def _id_to_video(object_id: str) -> Path | None:
+    if not object_id.startswith("v_"):
+        return None
+    rel = _strip_object_id_version(object_id[2:].replace("\\", "/").strip("/"))
+    path = MEDIA_LIBRARY.key_to_path(rel)
+    if path is not None and MEDIA_LIBRARY.contains(path) and path.is_file() and path.suffix.lower() in VIDEO_EXTS:
+        return path
     return None
 
 
@@ -2043,7 +2053,8 @@ def _didl_for(items: list[dict]) -> str:
         'xmlns:dc="http://purl.org/dc/elements/1.1/" '
         'xmlns:upnp="urn:schemas-upnp-org:metadata-1-0/upnp/" '
         'xmlns:dlna="urn:schemas-dlna-org:metadata-1-0/" '
-        'xmlns:sec="http://www.sec.co.kr/">'
+        'xmlns:sec="http://www.sec.co.kr/" '
+        'xmlns:pv="http://www.pv.com/pvns/">'
     ]
     for it in items:
         title = html.escape(it["title"])
@@ -2109,18 +2120,30 @@ def _didl_for(items: list[dict]) -> str:
         if it.get("frame_rate"):
             attrs.append(f'frameRate="{it["frame_rate"]}"')
         attrs.append(f'protocolInfo="{proto}"')
-        res_attrs = " ".join(attrs)
-
         subtitle_xml = []
-        for sub in it.get("subtitles", []):
+        subtitles = it.get("subtitles", [])
+        for sub in subtitles:
             sub_url = html.escape(sub["url"])
             sub_mime = html.escape(sub["mime"])
-            sub_type = html.escape(sub["type"])
             lang = str(sub.get("lang") or "")
             lang_attr = f' xml:lang="{html.escape(lang)}"' if lang else ""
             subtitle_xml.append(f'<res protocolInfo="http-get:*:{sub_mime}:*"{lang_attr}>{sub_url}</res>')
-            subtitle_xml.append(f'<sec:CaptionInfoEx sec:type="{sub_type}">{sub_url}</sec:CaptionInfoEx>')
-            subtitle_xml.append(f'<sec:CaptionInfo sec:type="{sub_type}">{sub_url}</sec:CaptionInfo>')
+            if sub["type"] == "srt" and sub["mime"] != SRT_DLNA_MIME:
+                legacy_url = html.escape(caption_url(sub["url"], sub["type"]))
+                subtitle_xml.append(f'<res protocolInfo="http-get:*:{SRT_DLNA_MIME}:*"{lang_attr}>{legacy_url}</res>')
+        if subtitles:
+            # SEC/PV consumers often accept only one caption link. Keep it
+            # consistent with the video's HTTP CaptionInfo.sec header.
+            preferred = next((sub for sub in subtitles if sub["type"] == "srt"), subtitles[0])
+            preferred_url = html.escape(caption_url(preferred["url"], preferred["type"]))
+            preferred_type = html.escape(preferred["type"])
+            attrs.extend([
+                f'pv:subtitleFileUri="{preferred_url}"',
+                f'pv:subtitleFileType="{preferred_type}"',
+            ])
+            subtitle_xml.append(f'<sec:CaptionInfoEx sec:type="{preferred_type}">{preferred_url}</sec:CaptionInfoEx>')
+            subtitle_xml.append(f'<sec:CaptionInfo sec:type="{preferred_type}">{preferred_url}</sec:CaptionInfo>')
+        res_attrs = " ".join(attrs)
 
         thumb_profile = html.escape(str(it.get("thumb_profile") or "JPEG_TN"))
         album_art_xml = (
@@ -2282,6 +2305,7 @@ def handle_soap(
         si_time = _id_to_si_time_index(object_id)
         si_point = _id_to_si_point(object_id)
         image = _id_to_image(object_id)
+        video = _id_to_video(object_id)
         all_video = _id_to_all_video(object_id)
 
         if time_index is not None:
@@ -2335,6 +2359,10 @@ def handle_soap(
             elif live is not None:
                 live_path, live_mode = live
                 didl = _metadata_didl_for_live(live_path, live_mode)
+            elif video is not None:
+                original = _video_items(video, _folder_id(video.parent), client_profile)[0]
+                # Echo legacy IDs so metadata keeps identifying the requested item.
+                didl = _metadata_didl_for_item(dict(original, id=object_id))
             elif image is not None:
                 didl = _metadata_didl_for_item(_image_item_from_index(image, _folder_id(image.parent)))
             elif si_point is not None:

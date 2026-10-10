@@ -230,9 +230,26 @@ def live_passthrough_title(stem_or_name: str, mode: str, width: int = 0, height:
     return f"{green_passthrough_stem(stem_or_name, width, height)}_live"
 
 
-def offline_passthrough_stem(stem_or_name: str, mode: str, width: int = 0, height: int = 0) -> str:
+def strip_source_vr_markers(stem_or_name: str) -> str:
+    """Remove source geometry markers before an explicit projection replaces them."""
+    stem = strip_projection_markers(stem_or_name)
+    stem = re.sub(r"(?:^|[_\-])(lr|rl|sbs|sbsf|180|vr180|180x180)(?=$|[_\-])", "_", stem, flags=re.IGNORECASE)
+    return re.sub(r"[_\-]{2,}", "_", stem).strip("_- ") or stem
+
+
+def offline_passthrough_stem(
+    stem_or_name: str, mode: str, width: int = 0, height: int = 0,
+    source_projection: str = "auto", source_fov: int = 180,
+) -> str:
     if mode == "alpha":
         return alpha_passthrough_stem(stem_or_name)
+    # Green output preserves the source pixels, just like realtime green.
+    # An explicit input selection must therefore replace conflicting filename
+    # markers, rather than reprojecting the video or leaving its old markers.
+    if source_projection != "auto" and is_half_equirectangular_source(width, height):
+        stem = strip_source_vr_markers(stem_or_name)
+        suffix = f"_LR_FISHEYE{int(source_fov)}" if source_projection == "fisheye" else SBS_180_SOURCE_SUFFIX
+        return f"{stem}{suffix}{GREEN_LIVE_PASSTHROUGH_SUFFIX}"
     stem = _as_stem(stem_or_name)
     if stem.lower().endswith(GREEN_OFFLINE_PASSTHROUGH_SUFFIX.lower()):
         return stem

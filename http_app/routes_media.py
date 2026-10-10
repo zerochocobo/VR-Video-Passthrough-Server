@@ -176,7 +176,10 @@ from utils.runtime_settings import get_light_match
 from utils.subprocess_hidden import hidden_subprocess_kwargs
 from utils.mkv_cues import probe_mkv_cues
 from utils.offline_outputs import has_offline_two_dvr_output, is_internal_intermediate_name, matches_offline_output_for_source, matches_offline_two_dvr_output_for_source
-from utils.subtitles import find_external_subtitles, is_subtitle_path, subtitle_mime
+from utils.subtitles import (
+    caption_url, find_external_subtitles, is_subtitle_path,
+    preferred_subtitle, subtitle_response_mime,
+)
 from utils.video_metadata import probe_video_metadata, select_backend
 from utils.vr_naming import has_vr_filename_marker, is_half_equirectangular_source, offline_passthrough_stem, two_dvr_stem
 
@@ -1107,17 +1110,16 @@ def _safe_subtitle_path(name: str) -> Path:
 
 
 def _subtitle_headers_for_video(path: Path) -> dict[str, str]:
-    tracks = find_external_subtitles(path)
-    if not tracks:
+    track = preferred_subtitle(find_external_subtitles(path))
+    if track is None:
         return {}
     try:
-        rel = MEDIA_LIBRARY.path_to_key(tracks[0].path)
+        rel = MEDIA_LIBRARY.path_to_key(track.path)
     except Exception:
         return {}
-    url = f"http://{LAN_IP}:{HTTP_PORT}/subs/{quote(rel)}"
+    url = caption_url(f"http://{LAN_IP}:{HTTP_PORT}/subs/{quote(rel)}", track.kind)
     return {
         "CaptionInfo.sec": url,
-        "getCaptionInfo.sec": "1",
     }
 
 
@@ -1181,9 +1183,12 @@ def _file_range_response(path: Path, media_type: str, range_header: str | None, 
     size = path.stat().st_size
     headers = {
         "Accept-Ranges": "bytes",
+        "Content-Type": media_type,
         **(extra_headers or {}),
     }
     byte_range = _parse_byte_range(range_header, size)
+    if range_header and byte_range is None:
+        raise HTTPException(416, "range not satisfiable", headers={"Content-Range": f"bytes */{size}"})
     if byte_range is None:
         return FileResponse(path, media_type=media_type, headers=headers)
 
@@ -1211,28 +1216,38 @@ def _file_range_response(path: Path, media_type: str, range_header: str | None, 
 
 
 @router.get("/subs/{name:path}")
-async def subtitle_get(request: Request, name: str, range: str | None = Header(default=None)):
+async def subtitle_get(request: Request, name: str, range: str | None = Header(default=None), mime: str | None = None):
     path = _safe_subtitle_path(name)
+    try:
+        media_type = subtitle_response_mime(path, mime)
+    except ValueError as e:
+        raise HTTPException(400, str(e)) from e
     annotate_request(request, media_name=path.name, media_path=str(path))
     headers = {
         "Content-Disposition": "inline",
         "Access-Control-Allow-Origin": "*",
     }
-    return _file_range_response(path, subtitle_mime(path), range, headers)
+    return _file_range_response(path, media_type, range, headers)
 
 
 @router.head("/subs/{name:path}")
-async def subtitle_head(request: Request, name: str, range: str | None = Header(default=None)):
+async def subtitle_head(request: Request, name: str, range: str | None = Header(default=None), mime: str | None = None):
     path = _safe_subtitle_path(name)
+    try:
+        media_type = subtitle_response_mime(path, mime)
+    except ValueError as e:
+        raise HTTPException(400, str(e)) from e
     annotate_request(request, media_name=path.name, media_path=str(path))
     size = path.stat().st_size
     headers = {
         "Accept-Ranges": "bytes",
         "Content-Disposition": "inline",
         "Access-Control-Allow-Origin": "*",
-        "Content-Type": subtitle_mime(path),
+        "Content-Type": media_type,
     }
     byte_range = _parse_byte_range(range, size)
+    if range and byte_range is None:
+        raise HTTPException(416, "range not satisfiable", headers={"Content-Range": f"bytes */{size}"})
     if byte_range is not None:
         headers["Content-Range"] = f"bytes {byte_range.start}-{byte_range.end}/{size}"
         headers["Content-Length"] = str(byte_range.length)

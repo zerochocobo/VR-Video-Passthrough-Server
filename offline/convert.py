@@ -128,8 +128,12 @@ def _tool_command(mode: str) -> list[str]:
     return [sys.executable, str(_script_for(mode))]
 
 
-def _default_out(src: Path, mode: str, width: int = 0, height: int = 0) -> Path:
-    return src.with_name(f"{offline_passthrough_stem(src.stem, mode, width, height)}.mp4")
+def _default_out(
+    src: Path, mode: str, width: int = 0, height: int = 0,
+    source_projection: str = "auto", source_fov: int = 180,
+) -> Path:
+    stem = offline_passthrough_stem(src.stem, mode, width, height, source_projection, source_fov)
+    return src.with_name(f"{stem}.mp4")
 
 
 def _time_tag(seconds: float) -> str:
@@ -206,7 +210,9 @@ def _single_out(src: Path, args: argparse.Namespace, width: int = 0, height: int
         base = f"{src.stem}_{engine_tag}_{start_tag}_{end_tag}_{duration_tag}"
     else:
         base = f"{src.stem}_{engine_tag}_{start_tag}_{duration_tag}"
-    return src.with_name(f"{offline_passthrough_stem(base, args.mode, width, height)}.mp4")
+    stem = offline_passthrough_stem(base, args.mode, width, height,
+        getattr(args, "source_projection", "auto"), getattr(args, "source_fov", 180))
+    return src.with_name(f"{stem}.mp4")
 
 
 def _single_segments_out(
@@ -228,7 +234,9 @@ def _single_segments_out(
     start_tag = f"S{_time_tag(segments[0][0])}"
     end_tag = f"E{_time_tag(segments[-1][1])}"
     base = f"{src.stem}_{engine_tag}_SEG{len(segments)}_{start_tag}_{end_tag}"
-    return src.with_name(f"{offline_passthrough_stem(base, args.mode, width, height)}.mp4")
+    stem = offline_passthrough_stem(base, args.mode, width, height,
+        getattr(args, "source_projection", "auto"), getattr(args, "source_fov", 180))
+    return src.with_name(f"{stem}.mp4")
 
 
 def _video_files(root: Path, recursive: bool) -> list[Path]:
@@ -260,6 +268,12 @@ def _base_cmd(args: argparse.Namespace, src: Path, out: Path) -> list[str]:
     ]
     if model is not None:
         cmd.extend(["--model", str(model)])
+    if args.mode == "alpha":
+        projection = getattr(args, "source_projection", "auto")
+        source_fov = {"auto": -1, "hequirect": 0}.get(projection)
+        if source_fov is None:
+            source_fov = getattr(args, "source_fov", 180)
+        cmd.extend(["--src-fisheye-fov", str(source_fov)])
     if args.start > 0:
         cmd.extend(["--start", str(args.start)])
     if args.duration > 0:
@@ -365,7 +379,8 @@ def _run_one(args: argparse.Namespace, src: Path) -> int:
     ) if args.engine == "dlss5" else (
         _single_out(src, args, width, height)
         if getattr(args, "command", "") == "single"
-        else _default_out(src, args.mode, width, height)
+        else _default_out(src, args.mode, width, height,
+            getattr(args, "source_projection", "auto"), getattr(args, "source_fov", 180))
     )
     if getattr(args, "out_dir", ""):
         out = Path(args.out_dir).resolve() / default_out.name
@@ -599,6 +614,8 @@ def main(argv: list[str] | None = None) -> int:
     single.add_argument("--out", default="")
     single.add_argument("--out-dir", default="")
     single.add_argument("--mode", choices=["green", "alpha"], default="green")
+    single.add_argument("--source-projection", choices=["auto", "hequirect", "fisheye"], default="auto")
+    single.add_argument("--source-fov", type=int, choices=range(140, 281), default=180)
     single.add_argument("--engine", choices=sorted(ENGINES), default="rvm_fast")
     single.add_argument("--rtx-vsr-target-height", type=int, default=config.RTX_VSR_TARGET_HEIGHT)
     single.add_argument("--rtx-vsr-quality", type=int, choices=[2, 3, 4], default=config.RTX_VSR_QUALITY)
@@ -641,6 +658,8 @@ def main(argv: list[str] | None = None) -> int:
     batch = sub.add_parser("batch", help="convert all videos under a directory")
     batch.add_argument("directory")
     batch.add_argument("--mode", choices=["green", "alpha"], default="green")
+    batch.add_argument("--source-projection", choices=["auto", "hequirect", "fisheye"], default="auto")
+    batch.add_argument("--source-fov", type=int, choices=range(140, 281), default=180)
     batch.add_argument("--engine", choices=sorted(ENGINES), default="rvm_fast")
     batch.add_argument("--rtx-vsr-target-height", type=int, default=config.RTX_VSR_TARGET_HEIGHT)
     batch.add_argument("--rtx-vsr-quality", type=int, choices=[2, 3, 4], default=config.RTX_VSR_QUALITY)

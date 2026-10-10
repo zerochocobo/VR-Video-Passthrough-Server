@@ -141,6 +141,33 @@ class MediaLibraryTests(unittest.TestCase):
             self.assertEqual([child.name for child in after.children], ["movie.mp4"])
             self.assertNotEqual(before.signature, after.signature)
 
+    def test_media_index_signature_tracks_subtitles_without_listing_them(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            movie = root / "movie.mp4"
+            movie.write_bytes(b"video")
+            library = MediaLibrary(build_media_roots([root]))
+            index = MediaIndex(root / "index.db")
+            try:
+                with patch("utils.media_index.config.MEDIA_LIBRARY", library):
+                    before = index.list_directory(root)
+                    for suffix in (".SRT", ".ass", ".ssa", ".vtt"):
+                        with self.subTest(suffix=suffix):
+                            subtitle = movie.with_suffix(suffix)
+                            subtitle.write_bytes(b"subtitle")
+                            created = index.list_directory(root)
+                            subtitle.write_bytes(b"changed subtitle")
+                            changed = index.list_directory(root)
+                            subtitle.unlink()
+                            removed = index.list_directory(root)
+                            self.assertNotEqual(before.signature, created.signature)
+                            self.assertNotEqual(created.signature, changed.signature)
+                            self.assertEqual(before.signature, removed.signature)
+                            for snapshot in (created, changed, removed):
+                                self.assertEqual([child.name for child in snapshot.children], ["movie.mp4"])
+            finally:
+                index.close()
+
     def test_media_index_signature_tracks_duck_key_creation_change_and_removal(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw)

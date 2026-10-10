@@ -14,6 +14,35 @@ import offline.convert as convert
 
 
 class OfflineConvertTests(unittest.TestCase):
+    def test_source_selection_reaches_alpha_tool_for_single_and_batch(self) -> None:
+        for command in ("single", "batch"):
+            for projection, fov, expected in (("auto", 200, -1), ("hequirect", 190, 0), ("fisheye", 180, 180), ("fisheye", 190, 190), ("fisheye", 200, 200)):
+                with self.subTest(command=command, projection=projection, fov=fov):
+                    with patch.object(convert, "_run_one", return_value=0) as run, patch.object(convert, "_video_files", return_value=[Path("clip_FISHEYE220.mp4")]):
+                        rc = convert.main([command, "clip_FISHEYE220.mp4" if command == "single" else ".",
+                            "--mode", "alpha", "--source-projection", projection, "--source-fov", str(fov)])
+                    self.assertEqual(rc, 0)
+                    args, src = run.call_args.args
+                    cmd = convert._base_cmd(args, src, Path("out.mp4"))
+                    self.assertEqual(float(cmd[cmd.index("--src-fisheye-fov") + 1]), expected)
+
+    def test_source_fov_outside_supported_range_is_rejected(self) -> None:
+        for command in ("single", "batch"):
+            with self.subTest(command=command), patch.object(sys, "stderr", io.StringIO()), self.assertRaises(SystemExit) as caught:
+                convert.main([command, "input", "--source-projection", "fisheye", "--source-fov", "300"])
+            self.assertEqual(caught.exception.code, 2)
+
+    def test_green_source_override_names_match_preserved_geometry(self) -> None:
+        src = Path("clip_LR_180_FISHEYE190.mp4")
+        args = SimpleNamespace(mode="green", engine="rvm_fast", start=0, duration=0, source_projection="fisheye", source_fov=200)
+        self.assertEqual(convert._default_out(src, "green", 4096, 2048, "fisheye", 200), Path("clip_LR_FISHEYE200_passthrough.mp4"))
+        self.assertEqual(convert._single_out(src, args, 4096, 2048), Path("clip_rvm1_S000000_ALL_LR_FISHEYE200_passthrough.mp4"))
+        self.assertEqual(convert._single_segments_out(src, args, [(0, 15), (60, 90)], 4096, 2048), Path("clip_rvm1_SEG2_S000000_E000130_LR_FISHEYE200_passthrough.mp4"))
+        args.source_projection = "hequirect"
+        self.assertEqual(convert._single_out(src, args, 4096, 2048), Path("clip_rvm1_S000000_ALL_LR_180_SBS_passthrough.mp4"))
+        # Flat video keeps its existing handling even when the VR selector is set.
+        self.assertEqual(convert._default_out(Path("flat.mp4"), "green", 1920, 1080, "fisheye", 200), Path("flat_passthrough.mp4"))
+
     def test_default_output_names(self) -> None:
         src = Path("sample.mp4")
         self.assertEqual(convert._default_out(src, "green", 1920, 1080), Path("sample_passthrough.mp4"))

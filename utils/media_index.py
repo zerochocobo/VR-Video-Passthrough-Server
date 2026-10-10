@@ -20,6 +20,7 @@ import config
 from media_library import safe_resolve_path
 from utils.logger import get
 from utils.mkv_cues import MkvCuesInfo, probe_mkv_cues
+from utils.subtitles import is_subtitle_path
 from utils.offline_outputs import (
     has_offline_passthrough_output,
     is_internal_intermediate_name,
@@ -337,9 +338,15 @@ class MediaIndex:
                 is_image = is_file and config.DLNA_IMAGE_ENABLED and suffix in config.IMAGE_EXTS
                 si_source_name = _si_sidecar_source_name(child.name).lower()
                 is_si_sidecar = is_file and bool(si_source_name) and si_source_name in child_names
-                if not is_dir and not is_video and not is_image and not is_si_sidecar:
+                is_subtitle = is_file and is_subtitle_path(child)
+                if not is_dir and not is_video and not is_image and not is_si_sidecar and not is_subtitle:
                     continue
                 st = child.stat()
+                if is_subtitle:
+                    # Sidecars invalidate DIDL metadata without becoming
+                    # standalone playable entries or triggering video probes.
+                    signature_parts.append(f"{child.name}|subtitle|{int(st.st_size)}|{int(st.st_mtime_ns)}")
+                    continue
                 if is_si_sidecar and not is_video and not is_image:
                     signature_parts.append(f"{child.name}|si-sidecar|{int(st.st_size)}|{int(st.st_mtime_ns)}")
                     continue

@@ -29,6 +29,7 @@ Windows 打包程序名为 `Thru3D_Media_Server.exe`，输出目录为 `dist/Thr
 ## 功能
 
 - DLNA 发现与 视频资源目录 浏览
+- 通过 DLNA 元数据与 HTTP 字幕链接，为原始视频提供外挂 SRT、ASS、SSA、WebVTT 字幕
 - 基于 GPU 抠像和 HEVC 编码的实时透视串流
 - 实时透视流内嵌字幕
 - 绿幕模式与 Alpha 直通模式
@@ -60,6 +61,14 @@ Windows 打包程序名为 `Thru3D_Media_Server.exe`，输出目录为 `dist/Thr
 | --- | --- |
 | ![Alpha Passthrough 效果图](assets/sample_alpha.jpg) | ![绿幕 Passthrough 效果图](assets/sample_green.jpg) |
 | ![截图](assets/passthrough_screenshot.jpg) |
+
+## DLNA 外挂字幕
+
+将 UTF-8 字幕放在原始视频旁，例如 `movie.mp4` 搭配 `movie.srt`、`movie.zh-CN.srt` 或 `movie.en.srt`。匹配不区分大小写，文件名中的方括号按字面处理。ASS、SSA、VTT 也会下发，能否播放取决于客户端。
+
+服务端同时提供字幕资源、三星 `CaptionInfo` / `CaptionInfoEx` 和 `pv:subtitleFileUri` 关联。SRT 提供 `application/x-subrip` 与 `text/srt` 两种资源，HTTP MIME 与各自声明一致。单字幕链接优先选 SRT，再按同名无语言后缀、中文、英文顺序选择。新增、重命名或删除字幕后，下次目录 Browse 即可更新；若播放器缓存了列表，请刷新媒体库。
+
+原始视频的外挂字幕独立于实时字幕烧录开关。播放器仍需支持 DLNA 字幕发现，服务端元数据无法强制不支持的播放器加载字幕。字幕文件按原始字节提供，不自动转换编码。
 
 ## 运行要求
 

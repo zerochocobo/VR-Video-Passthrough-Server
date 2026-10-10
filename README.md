@@ -29,6 +29,7 @@ This is the miracle of the AI era.
 ## Features
 
 - DLNA discovery and ContentDirectory browsing
+- External SRT, ASS, SSA, and WebVTT subtitle delivery for original videos through DLNA metadata and HTTP caption links
 - Realtime passthrough streaming with GPU matting and HEVC output
 - Realtime subtitle embedding in the passthrough stream
 - Green-screen and alpha passthrough modes
@@ -61,6 +62,14 @@ This is the miracle of the AI era.
 | ![Alpha Passthrough example](assets/sample_alpha.jpg) | ![Green-screen Passthrough example](assets/sample_green.jpg) |
 | ![Screenshot](assets/passthrough_screenshot.jpg) |
 
+
+## External Subtitles over DLNA
+
+Place UTF-8 subtitles beside the original video: `movie.mp4` with `movie.srt`, `movie.zh-CN.srt`, or `movie.en.srt`. Matching ignores case and treats brackets in filenames literally. ASS, SSA, and VTT files are also exposed, with playback support depending on the client.
+
+The server advertises subtitle resources, Samsung `CaptionInfo` / `CaptionInfoEx`, and `pv:subtitleFileUri`. SRT resources offer both `application/x-subrip` and `text/srt`, with matching HTTP content types. Single-caption links prefer SRT, then same-stem / Chinese / English language order. Adding, renaming, or removing subtitles takes effect on the next directory Browse; refresh the player's library if it has cached the listing.
+
+External subtitles for the original video are independent of the realtime subtitle burning switch. The player must support DLNA subtitle discovery; metadata cannot force an unsupported player to load subtitles. Files are served unchanged, without encoding conversion.
 
 ## Requirements
 

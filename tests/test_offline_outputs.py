@@ -16,6 +16,14 @@ from utils.offline_outputs import (
 
 
 class OfflineOutputDetectionTests(unittest.TestCase):
+    def test_green_outputs_with_overridden_source_geometry_are_recognized(self) -> None:
+        source = Path("movie_LR_180_FISHEYE190.mp4")
+        for name in ("movie_LR_FISHEYE200_passthrough.mp4", "movie_rvm1_S000000_ALL_LR_FISHEYE200_passthrough.mp4", "movie_rvm1_SEG2_S000000_E000130_LR_FISHEYE200_passthrough.mp4", "movie_LR_180_SBS_passthrough.mp4"):
+            with self.subTest(name=name):
+                self.assertTrue(is_offline_passthrough_output_name(name))
+                self.assertTrue(matches_offline_output_for_source(source, Path(name)))
+                self.assertFalse(matches_offline_output_for_source(Path("another.mp4"), Path(name)))
+
     def test_detects_default_and_segment_outputs_for_source(self) -> None:
         source = Path("movie.mp4")
 

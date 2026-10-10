@@ -59,6 +59,47 @@ class _FakeProcess(QObject):
 
 
 class OfflinePageTimeRangeTests(unittest.TestCase):
+    def test_source_controls_emit_persist_and_restore_independent_selections(self) -> None:
+        app = QApplication.instance() or QApplication([])
+        settings = _FakeSettings()
+        process = _FakeProcess()
+        with patch("ui.pages.offline_page.cache_status", return_value="missing"):
+            page = OfflinePage(I18n("en_US"), settings, process)
+            try:
+                self.assertTrue(page.single_source_fov.isHidden())
+                page.single_source_projection.setCurrentIndex(page.single_source_projection.findData("fisheye"))
+                page.single_source_fov.setCurrentIndex(page.single_source_fov.findData(190))
+                self.assertFalse(page.single_source_fov.isHidden())
+                with patch.object(page, "_validated_single_time_range", return_value=(0.0, 15.0)):
+                    page.run_single()
+                args = process.started_args or []
+                self.assertEqual(args[args.index("--source-projection") + 1], "fisheye")
+                self.assertEqual(args[args.index("--source-fov") + 1], "190")
+                page.batch_source_projection.setCurrentIndex(page.batch_source_projection.findData("hequirect"))
+                page.run_batch()
+                args = process.started_args or []
+                self.assertEqual(args[args.index("--source-projection") + 1], "hequirect")
+                self.assertNotIn("--source-fov", args)
+                for lang in ("zh_CN", "ja_JP", "en_US"):
+                    page.i18n.load(lang)
+                    page.retranslate()
+                    self.assertEqual(page.single_source_projection.currentData(), "fisheye")
+                    self.assertEqual(page.single_source_fov.currentData(), 190)
+                page.set_running(True)
+                self.assertFalse(page.single_source_projection.isEnabled())
+                self.assertFalse(page.batch_source_fov.isEnabled())
+            finally:
+                page.close()
+            restored = OfflinePage(I18n("en_US"), settings, process)
+            try:
+                self.assertEqual(restored.single_source_projection.currentData(), "fisheye")
+                self.assertEqual(restored.single_source_fov.currentData(), 190)
+                self.assertEqual(restored.batch_source_projection.currentData(), "hequirect")
+                self.assertTrue(restored.batch_source_fov.isHidden())
+            finally:
+                restored.close()
+                app.processEvents()
+
     def test_parse_time_text_accepts_hhmmss_mmss_and_seconds(self) -> None:
         self.assertEqual(_parse_time_text("01:02:03"), 3723.0)
         self.assertEqual(_parse_time_text("02:03"), 123.0)

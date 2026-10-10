@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Iterable
 
 import config
-from utils.vr_naming import strip_projection_markers
+from utils.vr_naming import strip_projection_markers, strip_source_vr_markers
 
 
 OFFLINE_PASSTHROUGH_SUFFIXES = (
@@ -31,9 +31,11 @@ OFFLINE_TWO_DVR_SUFFIXES = (
 OFFLINE_GENERATED_SUFFIXES = OFFLINE_PASSTHROUGH_SUFFIXES + OFFLINE_TWO_DVR_SUFFIXES
 
 _ENGINE_SEGMENT_RE = re.compile(
-    r"_(?:rvm1|rvm|matanyone2m|matanyone2)_s\d{6}(?:_e\d{6})?_(?:all|\d+s|\d+m)$",
+    r"_(?:rvm1|rvm|matanyone2m|matanyone2)_(?:s\d{6}(?:_e\d{6})?_(?:all|\d+s|\d+m)|seg\d+_s\d{6}_e\d{6})$",
     re.IGNORECASE,
 )
+
+_GREEN_FISHEYE_SUFFIX_RE = re.compile(r"_lr_fisheye(?:1[4-9]\d|2[0-7]\d|280)_passthrough$", re.IGNORECASE)
 
 # Optional segment tag that offline 2D->3D flat outputs append between the source
 # stem and the ``_3D_LR_Screen`` suffix (see offline/two_dvr.py output_path):
@@ -103,15 +105,17 @@ def _source_stem_variants(source_stem: str) -> tuple[str, ...]:
     so the generated name no longer starts with the full source stem.
     """
     stripped = strip_projection_markers(source_stem).lower()
-    return (source_stem,) if stripped == source_stem else (source_stem, stripped)
+    return tuple(dict.fromkeys((source_stem, stripped, strip_source_vr_markers(source_stem).lower())))
 
 
 def matches_offline_output_for_source(source: Path, candidate: Path) -> bool:
     if candidate == source or candidate.suffix.lower() not in config.VIDEO_EXTS:
         return False
     candidate_stem = candidate.stem.lower()
+    fisheye_suffix = _GREEN_FISHEYE_SUFFIX_RE.search(candidate_stem)
+    suffixes = OFFLINE_PASSTHROUGH_SUFFIXES + ((fisheye_suffix.group(),) if fisheye_suffix else ())
     for source_stem in _source_stem_variants(source.stem.lower()):
-        for suffix in OFFLINE_PASSTHROUGH_SUFFIXES:
+        for suffix in suffixes:
             suffix_l = suffix.lower()
             if candidate_stem == f"{source_stem}{suffix_l}":
                 return True

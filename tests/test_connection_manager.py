@@ -47,6 +47,11 @@ class ConnectionManagerTests(unittest.TestCase):
         text = payload.decode("utf-8")
         self.assertIn("<u:GetProtocolInfoResponse", text)
         self.assertIn("<Source>http-get:*:video/mp4:*", text)
+        self.assertIn("http-get:*:text/srt:*", text)
+        self.assertIn("http-get:*:application/x-subrip:*", text)
+        self.assertIn("http-get:*:text/vtt:*", text)
+        self.assertIn("http-get:*:application/x-ass:*", text)
+        self.assertIn("http-get:*:application/x-ssa:*", text)
         self.assertNotIn("http-get:*:image/jpeg:*", text)
         self.assertIn("<Sink></Sink>", text)
 
