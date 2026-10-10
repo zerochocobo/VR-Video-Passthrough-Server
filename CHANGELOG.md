@@ -4,6 +4,22 @@ This file only keeps version releases, major bug fixes, major UI/UX updates, and
 
 ## English
 
+### 2026-10-10
+
+- **Offline VR source controls:** Added Auto Detect / VR180 / Fisheye selection to single-file and batch passthrough conversion, with a 140°–280° fisheye FOV selector in 10° steps. The CLI exposes `--source-projection` and `--source-fov`; manual choices override filename detection, segmented jobs retain the selection, and output naming/library matching follow the selected projection. Alpha reuses the realtime projection and packing path; green-screen output preserves source projection pixels.
+- **DLNA external subtitle compatibility:** Improved same-stem and language-suffix discovery for SRT, ASS, SSA, and WebVTT with case-insensitive literal matching, including bracketed filenames. Subtitle names, sizes, and modification times now invalidate directory caches; video BrowseMetadata returns the video's own metadata and subtitles. Added PV subtitle associations and `text/srt` compatibility resources alongside existing SRT MIME and SEC caption links, with consistent default selection across DLNA and video HTTP responses.
+- **Subtitle HTTP correctness:** Subtitle GET, HEAD, and Range responses preserve original file bytes and return the MIME declared by each resource; invalid MIME overrides and invalid/out-of-bounds ranges are rejected. ConnectionManager advertises all four subtitle formats. External discovery remains independent of realtime subtitle burning, and rendering/style/selection require client support. Multiple compatibility links remain available, so some clients may show duplicate entries for the same subtitle.
+
+### 2026-10-09
+
+- **Thru3D Media Server rebranding and packaging:** Renamed VR Video Passthrough Server (Chinese: VR视频透视服务器) to Thru3D Media Server (Chinese: Thru3D媒体服务器). Updated multilingual application titles, the default DLNA name, device/HTTP/diagnostic branding, READMEs, banners, and software screenshots. The Windows executable and package directory are now `Thru3D_Media_Server.exe` and `Thru3D_Media_Server/`; build and update-package scripts use the new name. Desktop metadata was advanced to v1.5.0. Custom DLNA names, settings paths, device UUID generation, `PT_*` options, and the `pt_core.exe` backend retain compatibility.
+- **Thru3D Media Player compatibility:** Added the player to desktop, README, and website compatibility tables with localized Alpha-only passthrough notes. The server continues to support green-screen output for other compatible players.
+- **Thru3D website redesign:** Rebuilt the Chinese, English, and Japanese site around the independent Player and Server products, with a responsive dark layout, actual product screenshots, keyboard-accessible gallery controls, compatibility guidance, and updated source/download links. Retained the shared privacy-policy URL.
+
+### 2026-10-08
+
+- **Official DA3 Small export:** Updated the ONNX exporter to use upstream DA3 source and strictly matched official checkpoints instead of obsolete vendor-only arguments. Added selected-model downloads, revision pinning, model-variant validation, and working ONNX/numerical validation. Exported and verified the Small 518 model with folded preprocessing, dynamic batch, and the application's depth engine; Base/Large and TensorRT builds were not revalidated in this update.
+
 ### 2026-10-03
 
 - **SI virtual-file playback fixes:** DLNA now advertises an estimated size while audio is cold and the exact size once prepared, refreshes Browse metadata when preparation finishes, and reports the copied video's HEVC/H.264 profile. Background audio preparation, bounded HTTP read batching, and nonblocking virtual MP4 HEAD handling reduce first-play delays and request stalls.
@@ -370,6 +386,22 @@ This file only keeps version releases, major bug fixes, major UI/UX updates, and
 - **Core update:** Added initial DLNA time-seek metadata, passthrough HEAD support, and `PT_CONTAINER` support for MP4 and MPEG-TS passthrough output.
 
 ## 中文
+
+### 2026-10-10
+
+- **离线透视原始VR模式：** 单文件与批量转换新增自动识别 / 180VR / 鱼眼选择，鱼眼角度范围140°–280°、每档10°。CLI增加`--source-projection`与`--source-fov`；手动选择覆盖文件名识别，分段任务保留选择，输出命名与媒体库匹配跟随所选投影。Alpha复用在线投影与打包链路，绿幕保留原始投影像素。
+- **DLNA外挂字幕兼容性：** 完善SRT、ASS、SSA、WebVTT同名与语言后缀发现，采用不区分大小写的字面匹配，正确处理带方括号的文件名。字幕名称、大小、修改时间纳入目录缓存失效条件；视频BrowseMetadata返回视频本身及字幕。增加PV字幕关联与`text/srt`兼容资源，保留原有SRT MIME和SEC链接，DLNA与视频HTTP响应统一使用默认字幕选择规则。
+- **字幕HTTP修复：** 字幕GET、HEAD、Range保留原始字节，返回各资源声明的MIME；拒绝非法MIME覆盖及非法/越界Range。ConnectionManager声明四种字幕格式。外挂发现仍独立于实时字幕烧录，显示、样式与切换需要客户端支持。保留多种兼容链接，部分客户端可能将同一字幕显示为重复条目。
+
+### 2026-10-09
+
+- **Thru3D媒体服务器更名与打包：** “VR视频透视服务器”（VR Video Passthrough Server）更名为“Thru3D媒体服务器”（Thru3D Media Server）。同步更新多语言软件标题、默认DLNA名称、设备/HTTP/诊断品牌、README、介绍图与软件截图。Windows启动程序与完整包目录改为`Thru3D_Media_Server.exe`和`Thru3D_Media_Server/`，打包与更新包脚本同步使用新名称；桌面元数据版本更新为v1.5.0。自定义DLNA名称、设置路径、设备UUID生成、`PT_*`选项与`pt_core.exe`后台程序保持兼容。
+- **Thru3D Media Player兼容信息：** 桌面、README与官网兼容表新增该播放器，并以本地化备注注明其透视播放仅支持Alpha；服务器继续为其他兼容播放器提供绿幕输出。
+- **Thru3D官网重做：** 中、英、日三语官网分别介绍可独立使用的Player与Server，新增响应式深色布局、实际产品截图、支持键盘的图库控件、兼容说明与更新后的源码/下载链接；保留共用隐私政策网址。
+
+### 2026-10-08
+
+- **官方DA3 Small导出：** ONNX导出脚本改为使用上游DA3源码与严格匹配的官方权重，替代已失效的vendor私有参数。增加按模型下载、固定revision、模型变体校验及有效的ONNX/数值验证。已导出并验证预处理内置、动态batch的Small 518模型及应用深度引擎调用；本次未重新验证Base/Large与TensorRT构建。
 
 ### 2026-10-03
 
